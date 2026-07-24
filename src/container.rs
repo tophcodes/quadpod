@@ -1,3 +1,5 @@
+use crate::{resource::ResourceError, space::StorageSpace, store::SparqlStore};
+
 pub const LDP_CONTAINER: &str = "http://www.w3.org/ns/ldp#Container";
 pub const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
 pub const LDP_CONTAINS: &str = "http://www.w3.org/ns/ldp#contains";
@@ -19,9 +21,106 @@ pub fn parent_container(request_path: &str) -> Option<String> {
     }
 }
 
+pub async fn ensure_container(
+    store: &dyn SparqlStore, space: &StorageSpace, path: &str,
+) -> Result<(), ResourceError> {
+    let c = space.graph_iri(path)?;
+    let update = format!(
+        "INSERT DATA {{ GRAPH <{c}> {{ \
+         <{c}> <{RDF_TYPE}> <{LDP_CONTAINER}> . \
+         <{c}> <{RDF_TYPE}> <{LDP_BASIC_CONTAINER}> }} }}",
+    );
+    store.update(&update).await?;
+    Ok(())
+}
+
+pub async fn add_containment(
+    store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
+) -> Result<(), ResourceError> {
+    let p = space.graph_iri(parent)?;
+    let c = space.graph_iri(child)?;
+    store.update(&format!(
+        "INSERT DATA {{ GRAPH <{p}> {{ <{p}> <{LDP_CONTAINS}> <{c}> }} }}",
+    )).await?;
+    Ok(())
+}
+
+pub async fn remove_containment(
+    store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
+) -> Result<(), ResourceError> {
+    let p = space.graph_iri(parent)?;
+    let c = space.graph_iri(child)?;
+    store.update(&format!(
+        "DELETE DATA {{ GRAPH <{p}> {{ <{p}> <{LDP_CONTAINS}> <{c}> }} }}",
+    )).await?;
+    Ok(())
+}
+
+pub async fn container_is_empty(
+    store: &dyn SparqlStore, space: &StorageSpace, path: &str,
+) -> Result<bool, ResourceError> {
+    let c = space.graph_iri(path)?;
+    let triples = store.query_triples(&format!(
+        "CONSTRUCT {{ <{c}> <{LDP_CONTAINS}> ?x }} \
+         WHERE {{ GRAPH <{c}> {{ <{c}> <{LDP_CONTAINS}> ?x }} }}",
+    )).await?;
+    Ok(triples.is_empty())
+}
+
+pub async fn ensure_ancestors(
+    store: &dyn SparqlStore, space: &StorageSpace, request_path: &str,
+) -> Result<(), ResourceError> {
+    let mut child = request_path.to_string();
+    while let Some(parent) = parent_container(&child) {
+        ensure_container(store, space, &parent).await?;
+        add_containment(store, space, &parent, &child).await?;
+        child = parent;
+    }
+    Ok(())
+}
+
+pub async fn provision_root(
+    store: &dyn SparqlStore, space: &StorageSpace,
+) -> Result<(), ResourceError> {
+    ensure_container(store, space, "/").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{space::StorageSpace, store::OxigraphStore};
+
+    fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
+
+    #[tokio::test]
+    async fn ensure_ancestors_creates_chain_and_links() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let space = sp();
+        ensure_ancestors(&store, &space, "/a/b/c").await.unwrap();
+
+        // /a/b/ contains /a/b/c
+        assert!(!container_is_empty(&store, &space, "/a/b/").await.unwrap());
+        // /a/ contains /a/b/
+        assert!(!container_is_empty(&store, &space, "/a/").await.unwrap());
+        // root contains /a/
+        assert!(!container_is_empty(&store, &space, "/").await.unwrap());
+        // /a/b/ is typed as a container (its graph is non-empty with type triples)
+        let g = crate::resource::get_rdf(&store, &space, "/a/b/").await.unwrap().unwrap();
+        assert!(g.iter().any(|t| t.predicate.as_str() == RDF_TYPE
+            && matches!(&t.object, oxigraph::model::Term::NamedNode(n) if n.as_str() == LDP_BASIC_CONTAINER)));
+    }
+
+    #[tokio::test]
+    async fn add_then_remove_containment_toggles_emptiness() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let space = sp();
+        ensure_container(&store, &space, "/c/").await.unwrap();
+        assert!(container_is_empty(&store, &space, "/c/").await.unwrap());
+        add_containment(&store, &space, "/c/", "/c/x").await.unwrap();
+        assert!(!container_is_empty(&store, &space, "/c/").await.unwrap());
+        remove_containment(&store, &space, "/c/", "/c/x").await.unwrap();
+        assert!(container_is_empty(&store, &space, "/c/").await.unwrap());
+    }
 
     #[test]
     fn container_paths_end_with_slash() {
