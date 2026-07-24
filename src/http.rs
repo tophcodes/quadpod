@@ -65,11 +65,33 @@ async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Byte
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    // Task 4 will branch container paths here; for now, resource path only:
-    if !container::is_container_path(&req_path) {
+    if container::is_container_path(&req_path) {
+        if container::body_sets_containment(&triples) {
+            return StatusCode::CONFLICT.into_response();
+        }
         if let Err(e) = container::ensure_ancestors(st.store.as_ref(), &st.space, &req_path).await {
             return (put_status(&e), e.to_string()).into_response();
         }
+        // preserve existing containment, re-assert type, add user triples (minus any type/contains the server owns)
+        let existing = match get_rdf(st.store.as_ref(), &st.space, &req_path).await {
+            Ok(v) => v.unwrap_or_default(),
+            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+        };
+        let kept_containment: Vec<_> = existing.into_iter()
+            .filter(|t| t.predicate.as_str() == container::LDP_CONTAINS)
+            .collect();
+        let mut merged = triples.clone();
+        merged.extend(kept_containment);
+        if let Err(e) = put_rdf(st.store.as_ref(), &st.space, &req_path, &merged).await {
+            return (put_status(&e), e.to_string()).into_response();
+        }
+        if let Err(e) = container::ensure_container(st.store.as_ref(), &st.space, &req_path).await {
+            return (put_status(&e), e.to_string()).into_response();
+        }
+        return (StatusCode::CREATED, [(header::LOCATION, g)]).into_response();
+    }
+    if let Err(e) = container::ensure_ancestors(st.store.as_ref(), &st.space, &req_path).await {
+        return (put_status(&e), e.to_string()).into_response();
     }
     match put_rdf(st.store.as_ref(), &st.space, &req_path, &triples).await {
         Ok(()) => (StatusCode::CREATED, [(header::LOCATION, g)]).into_response(),
@@ -122,6 +144,25 @@ async fn handle_delete_root(State(st): State<AppState>) -> Response {
 }
 
 async fn delete_impl(st: AppState, req_path: String) -> Response {
+    if container::is_container_path(&req_path) {
+        match container::container_is_empty(st.store.as_ref(), &st.space, &req_path).await {
+            Ok(false) => return StatusCode::CONFLICT.into_response(),
+            Ok(true) => {}
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+        // is the container present at all? (root always is)
+        let present = matches!(get_rdf(st.store.as_ref(), &st.space, &req_path).await, Ok(Some(_)));
+        if !present {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if let Err(e) = delete_rdf(st.store.as_ref(), &st.space, &req_path).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        if let Some(parent) = container::parent_container(&req_path) {
+            let _ = container::remove_containment(st.store.as_ref(), &st.space, &parent, &req_path).await;
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
     match delete_rdf(st.store.as_ref(), &st.space, &req_path).await {
         Ok(true) => {
             if let Some(parent) = container::parent_container(&req_path) {
@@ -360,5 +401,45 @@ mod tests {
             .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(body_string(res).await.contains("ldp#BasicContainer"));
+    }
+
+    #[tokio::test]
+    async fn put_container_rejecting_client_containment_is_409() {
+        let app = provisioned_app().await;
+        let put = Request::builder().method("PUT").uri("/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<https://pod.toph.so/box/> <http://www.w3.org/ns/ldp#contains> <https://pod.toph.so/box/x> .",
+            )).unwrap();
+        assert_eq!(app.oneshot(put).await.unwrap().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn put_container_stores_user_triples_and_keeps_type() {
+        let app = provisioned_app().await;
+        let put = Request::builder().method("PUT").uri("/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<https://pod.toph.so/box/> <http://purl.org/dc/terms/title> \"My Box\" .")).unwrap();
+        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+        let res = app.oneshot(Request::builder().method("GET").uri("/box/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        let body = body_string(res).await;
+        assert!(body.contains("My Box"));                 // user triple kept
+        assert!(body.contains("ldp#BasicContainer"));     // server type re-asserted
+    }
+
+    #[tokio::test]
+    async fn delete_nonempty_container_is_409_empty_is_204() {
+        let app = provisioned_app().await;
+        // create a child → parent /box/ becomes non-empty
+        app.clone().oneshot(Request::builder().method("PUT").uri("/box/doc")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
+        let del_full = Request::builder().method("DELETE").uri("/box/").body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(del_full).await.unwrap().status(), StatusCode::CONFLICT);
+        // remove child, then container is deletable
+        app.clone().oneshot(Request::builder().method("DELETE").uri("/box/doc").body(Body::empty()).unwrap()).await.unwrap();
+        let del_empty = Request::builder().method("DELETE").uri("/box/").body(Body::empty()).unwrap();
+        assert_eq!(app.oneshot(del_empty).await.unwrap().status(), StatusCode::NO_CONTENT);
     }
 }

@@ -1,4 +1,5 @@
 use crate::{resource::ResourceError, space::StorageSpace, store::SparqlStore};
+use oxigraph::model::Triple;
 
 pub const LDP_CONTAINER: &str = "http://www.w3.org/ns/ldp#Container";
 pub const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
@@ -7,6 +8,11 @@ pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 pub fn is_container_path(request_path: &str) -> bool {
     request_path.ends_with('/')
+}
+
+/// True if the client is attempting to set server-managed containment triples.
+pub fn body_sets_containment(triples: &[Triple]) -> bool {
+    triples.iter().any(|t| t.predicate.as_str() == LDP_CONTAINS)
 }
 
 /// Parent container path (always trailing-slash), or None for the root "/".
