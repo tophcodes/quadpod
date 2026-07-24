@@ -1,3 +1,4 @@
+use oxigraph::model::NamedNode;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -6,6 +7,8 @@ pub enum SpaceError {
     NotAbsolute,
     #[error("base URI must end with a trailing slash")]
     NoTrailingSlash,
+    #[error("resource path does not form a valid IRI")]
+    InvalidResourceIri,
 }
 
 #[derive(Debug, Clone)]
@@ -27,9 +30,16 @@ impl StorageSpace {
 
     /// Map a request path to the absolute graph IRI, using the configured
     /// base only — the request host/scheme is deliberately ignored.
-    pub fn graph_iri(&self, request_path: &str) -> String {
+    ///
+    /// The result is validated as a well-formed absolute IRI before being
+    /// returned, since it is later interpolated verbatim into SPARQL as
+    /// `<{iri}>`: an unvalidated path (e.g. containing a decoded `>`, space,
+    /// or `{`) could otherwise break out of the IRIREF and inject SPARQL.
+    pub fn graph_iri(&self, request_path: &str) -> Result<String, SpaceError> {
         let trimmed = request_path.strip_prefix('/').unwrap_or(request_path);
-        format!("{}{}", self.base, trimmed)
+        let iri = format!("{}{}", self.base, trimmed);
+        NamedNode::new(&iri).map_err(|_| SpaceError::InvalidResourceIri)?;
+        Ok(iri)
     }
 }
 
@@ -40,9 +50,18 @@ mod tests {
     #[test]
     fn graph_iri_uses_config_base_not_request_host() {
         let s = StorageSpace::new("https://pod.toph.so/").unwrap();
-        assert_eq!(s.graph_iri("/foo"), "https://pod.toph.so/foo");
-        assert_eq!(s.graph_iri("/a/b"), "https://pod.toph.so/a/b");
-        assert_eq!(s.graph_iri("/"), "https://pod.toph.so/");
+        assert_eq!(s.graph_iri("/foo").unwrap(), "https://pod.toph.so/foo");
+        assert_eq!(s.graph_iri("/a/b").unwrap(), "https://pod.toph.so/a/b");
+        assert_eq!(s.graph_iri("/").unwrap(), "https://pod.toph.so/");
+    }
+
+    #[test]
+    fn graph_iri_rejects_iri_breaking_chars() {
+        let s = StorageSpace::new("https://pod.toph.so/").unwrap();
+        assert!(matches!(
+            s.graph_iri("/foo> bar"),
+            Err(SpaceError::InvalidResourceIri)
+        ));
     }
 
     #[test]

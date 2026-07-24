@@ -1,5 +1,5 @@
 use crate::{
-    space::StorageSpace,
+    space::{SpaceError, StorageSpace},
     store::{SparqlStore, StoreError},
 };
 use oxigraph::io::{RdfFormat, RdfParser};
@@ -12,6 +12,8 @@ pub enum ResourceError {
     Parse(String),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    InvalidIri(#[from] SpaceError),
 }
 
 /// Parse Turtle (resolved against `base_iri`) into a `\n`-separated block of
@@ -41,7 +43,7 @@ pub async fn put_rdf<S: SparqlStore>(
     request_path: &str,
     turtle: &str,
 ) -> Result<(), ResourceError> {
-    let g = space.graph_iri(request_path);
+    let g = space.graph_iri(request_path)?;
     let triples = turtle_to_ntriples(turtle, &g)?;
     let update =
         format!("DROP SILENT GRAPH <{g}>; INSERT DATA {{ GRAPH <{g}> {{ {triples} }} }}");
@@ -54,7 +56,7 @@ pub async fn get_rdf<S: SparqlStore>(
     space: &StorageSpace,
     request_path: &str,
 ) -> Result<Option<String>, ResourceError> {
-    let g = space.graph_iri(request_path);
+    let g = space.graph_iri(request_path)?;
     let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}");
     let ttl = store.query_construct(&q).await?;
     if ttl.trim().is_empty() {

@@ -1,7 +1,14 @@
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
     http::{StatusCode, HeaderMap, header}, response::{IntoResponse, Response}};
-use crate::{space::StorageSpace, store::OxigraphStore, resource::{put_rdf, get_rdf}};
+use crate::{space::StorageSpace, store::OxigraphStore, resource::{put_rdf, get_rdf, ResourceError}};
+
+fn resource_error_status(e: &ResourceError) -> StatusCode {
+    match e {
+        ResourceError::Parse(_) | ResourceError::InvalidIri(_) => StatusCode::BAD_REQUEST,
+        ResourceError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,13 +29,16 @@ async fn handle_put(
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
     let req_path = format!("/{path}");
-    let turtle = String::from_utf8_lossy(&body);
-    match put_rdf(st.store.as_ref(), &st.space, &req_path, &turtle).await {
-        Ok(()) => {
-            let loc = st.space.graph_iri(&req_path);
-            (StatusCode::CREATED, [(header::LOCATION, loc)]).into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    let turtle = match std::str::from_utf8(&body) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match put_rdf(st.store.as_ref(), &st.space, &req_path, turtle).await {
+        Ok(()) => match st.space.graph_iri(&req_path) {
+            Ok(loc) => (StatusCode::CREATED, [(header::LOCATION, loc)]).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        },
+        Err(e) => (resource_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -37,7 +47,7 @@ async fn handle_get(State(st): State<AppState>, Path(path): Path<String>) -> Res
     match get_rdf(st.store.as_ref(), &st.space, &req_path).await {
         Ok(Some(ttl)) => ([(header::CONTENT_TYPE, "text/turtle")], ttl).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (resource_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -89,5 +99,27 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from("{}")).unwrap();
         assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // Regression test for the SPARQL-injection seam: axum 0.8 percent-decodes
+    // the wildcard `Path` extraction, so a request path containing an
+    // encoded `>` (here `%3E`) would previously decode to `foo> bar`, break
+    // out of the `<...>` IRIREF when interpolated into SPARQL, and let the
+    // rest of the path be parsed as injected query syntax. Both handlers
+    // must reject it with 400 before it ever reaches the store.
+    #[tokio::test]
+    async fn get_with_iri_breaking_path_is_400_not_500() {
+        let res = app().oneshot(
+            Request::builder().method("GET").uri("/foo%3E%20bar").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_with_iri_breaking_path_is_400_not_500() {
+        let req = Request::builder().method("PUT").uri("/foo%3E%20bar")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 }
