@@ -1,0 +1,23 @@
+[package]
+name = "sparql-pod"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sparql_pod"
+
+[[bin]]
+name = "sparql-pod"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+oxigraph = "0.5.9"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+http-body-util = "0.1.4"
+tower = { version = "0.5.3", features = ["util"] }
