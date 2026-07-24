@@ -88,24 +88,25 @@ mod tests {
 
 - [ ] **Step 2: Create `Cargo.toml` with Plan-1 dependencies only**
 
+**Use latest versions everywhere.** Prefer `cargo add <crate>` (resolves the newest release) over hand-editing versions. Versions below are the latest as of 2026-07-24 — if `cargo add` pulls something newer, keep the newer one and adjust any API in later tasks to match.
+
+```bash
+cargo add tokio --features full
+cargo add axum
+cargo add oxigraph
+cargo add thiserror
+cargo add tracing tracing-subscriber
+cargo add --dev tower --features util
+cargo add --dev http-body-util
+```
+
+Resulting `[dependencies]` should be at least:
+
 ```toml
-[package]
-name = "sparql-pod"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-name = "sparql_pod"
-path = "src/lib.rs"
-
-[[bin]]
-name = "sparql-pod"
-path = "src/main.rs"
-
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-axum = "0.7"
-oxigraph = "0.4"
+tokio = { version = "1.53", features = ["full"] }
+axum = "0.8"          # 0.8 wildcard route syntax is "/{*path}", NOT "/*path"
+oxigraph = "0.5"      # 0.5 I/O API lives under oxigraph::io (oxrdfio)
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -115,7 +116,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 ```
 
-(Confirm the exact current `oxigraph` and `axum` minor versions against docs.rs before pinning; adjust if the API in later tasks differs.)
+Also add `[lib] name = "sparql_pod"` / `[[bin]] name = "sparql-pod"` targets and `edition = "2021"` (or newer if the toolchain defaults higher).
 
 - [ ] **Step 3: Minimal `main.rs`**
 
@@ -259,7 +260,7 @@ git commit -m "feat: StorageSpace maps request path to public graph IRI"
   - `struct OxigraphStore` wrapping `oxigraph::store::Store` (in-memory via `Store::new()`).
   - `impl OxigraphStore { fn in_memory() -> Result<Self, StoreError> }`.
   - `enum StoreError { Backend(String) }` (`Debug`, `thiserror::Error`).
-- Consumes: `oxigraph` crate. Confirm exact method names against `docs.rs/oxigraph/0.4` — the intended calls are `Store::new()`, `store.update(&str)`, `store.query(&str)` returning `QueryResults::Graph(iter)`, and serializing the resulting triples to Turtle via oxigraph's `RdfSerializer`/`oxttl`. If a method name differs in the pinned version, adjust the impl (the trait signature stays).
+- Consumes: `oxigraph` crate. Confirm exact method names against `docs.rs/oxigraph/0.5` — the intended calls are `Store::new()`, `store.update(&str)`, `store.query(&str)` returning `QueryResults::Graph(iter)`, and serializing the resulting triples to Turtle via `oxigraph::io::RdfSerializer` (0.5 API). If a method name differs in the pinned version, adjust the impl (the trait signature stays).
 
 - [ ] **Step 1: Write failing tests**
 
@@ -388,7 +389,7 @@ Discharges Spec §14 risk #3 (atomic multi-statement update) at single-graph sco
   - `async fn put_rdf<S: SparqlStore>(store: &S, space: &StorageSpace, request_path: &str, turtle: &str) -> Result<(), ResourceError>` — parses `turtle` (base = the resource's graph IRI), then **atomically** replaces the named graph via a single update string: `DROP SILENT GRAPH <g>; INSERT DATA { GRAPH <g> { …parsed triples as N-Triples… } }`.
   - `async fn get_rdf<S: SparqlStore>(store: &S, space: &StorageSpace, request_path: &str) -> Result<Option<String>, ResourceError>` — CONSTRUCTs graph `<g>`; returns `None` if empty, else `Some(turtle)`.
   - `enum ResourceError { Parse(String), Store(StoreError) }`.
-- Note: parse Turtle → N-Triples using oxigraph's `oxttl`/`RdfParser` (confirm API on docs.rs). The single combined update string is one `Store::update` call → atomic on Oxigraph; the `DROP; INSERT DATA` pair is standard SPARQL 1.1 and portable.
+- Note: parse Turtle → N-Triples using `oxigraph::io::RdfParser` (0.5 API; confirm on docs.rs/oxigraph/0.5). The single combined update string is one `Store::update` call → atomic on Oxigraph; the `DROP; INSERT DATA` pair is standard SPARQL 1.1 and portable.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -596,7 +597,8 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new().route("/*path", get(handle_get).put(handle_put)).with_state(state)
+    // axum 0.8 wildcard capture syntax: "/{*path}" (NOT the old "/*path").
+    Router::new().route("/{*path}", get(handle_get).put(handle_put)).with_state(state)
 }
 
 async fn handle_put(
@@ -631,7 +633,7 @@ async fn handle_get(State(st): State<AppState>, Path(path): Path<String>) -> Res
 
 Add `pub mod http;` to `src/lib.rs`, then:
 Run: `cargo test http::`
-Expected: PASS (3 tests). (Confirm the axum 0.7 wildcard-route syntax `"/*path"` and extractor signatures against docs.rs; adjust if the pinned minor differs.)
+Expected: PASS (3 tests). (axum 0.8 wildcard route = `"/{*path}"`; confirm extractor signatures against docs.rs/axum/0.8 and adjust if a newer minor differs.)
 
 - [ ] **Step 5: Wire `main.rs` to actually serve**
 
