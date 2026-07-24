@@ -1,3 +1,5 @@
+pub mod space;
+
 #[cfg(test)]
 mod tests {
     #[test]
