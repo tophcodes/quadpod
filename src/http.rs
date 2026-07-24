@@ -91,7 +91,9 @@ mod tests {
         let put = Request::builder().method("PUT").uri("/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+        let put_res = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(put_res.status(), StatusCode::CREATED);
+        assert_eq!(put_res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/foo");
 
         let get = Request::builder().method("GET").uri("/foo")
             .header(header::ACCEPT, "application/ld+json").body(Body::empty()).unwrap();
