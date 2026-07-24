@@ -53,6 +53,19 @@ pub async fn get_rdf(
     }
 }
 
+pub async fn delete_rdf(
+    store: &dyn SparqlStore,
+    space: &StorageSpace,
+    request_path: &str,
+) -> Result<bool, ResourceError> {
+    let existed = get_rdf(store, space, request_path).await?.is_some();
+    if existed {
+        let g = space.graph_iri(request_path)?;
+        store.update(&format!("DROP SILENT GRAPH <{g}>")).await?;
+    }
+    Ok(existed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +117,20 @@ mod tests {
     async fn get_absent_is_none() {
         let store = OxigraphStore::in_memory().unwrap();
         assert!(get_rdf(&store, &space(), "/nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_and_reports_existence() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let t = rdf::parse(
+            b"<#it> <http://schema.org/name> \"Toph\" .",
+            RdfFormat::Turtle,
+            "https://pod.toph.so/foo",
+        )
+        .unwrap();
+        put_rdf(&store, &space(), "/foo", &t).await.unwrap();
+        assert!(delete_rdf(&store, &space(), "/foo").await.unwrap()); // existed
+        assert!(get_rdf(&store, &space(), "/foo").await.unwrap().is_none()); // gone
+        assert!(!delete_rdf(&store, &space(), "/foo").await.unwrap()); // already absent
     }
 }
