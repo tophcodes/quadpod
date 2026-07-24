@@ -1,5 +1,5 @@
 use oxigraph::io::{RdfFormat, RdfSerializer};
-use oxigraph::sparql::QueryResults;
+use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use thiserror::Error;
 
@@ -33,18 +33,18 @@ impl OxigraphStore {
 }
 
 impl SparqlStore for OxigraphStore {
-    #[allow(deprecated)]
     async fn update(&self, sparql: &str) -> Result<(), StoreError> {
         self.inner
             .update(sparql)
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    #[allow(deprecated)]
     async fn query_construct(&self, sparql: &str) -> Result<String, StoreError> {
-        let results = self
-            .inner
-            .query(sparql)
+        let results = SparqlEvaluator::new()
+            .parse_query(sparql)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .on_store(&self.inner)
+            .execute()
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         let QueryResults::Graph(triples) = results else {
             return Err(StoreError::Backend("expected CONSTRUCT/graph results".into()));
