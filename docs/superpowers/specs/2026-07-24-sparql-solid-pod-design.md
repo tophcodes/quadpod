@@ -265,6 +265,21 @@ registry/provisioning, Notifications, SPARQL UPDATE, data migration from the exi
    `solid_oidc_types`, `webid`, `acp` build on current stable Rust? Confirm versions + licenses
    (MIT/Apache). If badly bit-rotted, fork the specific crate (small blast radius) or fall back
    to writing that piece.
+
+   **Spike Results (2026-07-24):**
+   All seven crates compile cleanly on Rust 1.95.0 (cargo). No bit-rot detected.
+
+   | Crate | Version | License |
+   |---|---|---|
+   | `rdf_dynsyn` | 0.3.1 | MIT OR Apache-2.0 |
+   | `dpop` | 0.1.1 | MIT OR Apache-2.0 |
+   | `solid_oidc_types` | 0.1.0 | MIT OR Apache-2.0 |
+   | `webid` | 0.1.0 | MIT OR Apache-2.0 |
+   | `acp` | 0.1.0 | MIT OR Apache-2.0 |
+   | `manas_access_control` | 0.1.0 | MIT OR Apache-2.0 |
+   | `manas_space` | 0.1.0 | MIT OR Apache-2.0 |
+
+   **Implication:** Risk de-risked. Proceed with shallow reuse of these leaf crates as planned. No forking required.
 2. **WAC engine usability.** Confirm `WacDecisionPoint` + `manas_space::SolidStorageSpace` are
    usable with our own PRP (we supply the ACL chain), without dragging in `manas_repo`.
 3. **Atomicity.** A PUT touches the data graph + container `ldp:contains` + system graph; verify
