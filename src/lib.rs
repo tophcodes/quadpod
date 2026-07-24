@@ -1,3 +1,4 @@
+pub mod container;
 pub mod http;
 pub mod rdf;
 pub mod resource;
