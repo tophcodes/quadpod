@@ -1,3 +1,4 @@
+pub mod resource;
 pub mod space;
 pub mod store;
 
