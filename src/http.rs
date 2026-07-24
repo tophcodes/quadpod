@@ -73,6 +73,10 @@ async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Byte
             return (put_status(&e), e.to_string()).into_response();
         }
         // preserve existing containment, re-assert type, add user triples (minus any type/contains the server owns)
+        // Note: this read-then-write (get_rdf here, then DROP+INSERT in put_rdf) is not
+        // transactional across the two graph operations; a concurrent child add landing
+        // between the read and the write could be lost. Accepted for single-user v1
+        // per the plan's cross-graph-atomicity note.
         let existing = match get_rdf(st.store.as_ref(), &st.space, &req_path).await {
             Ok(v) => v.unwrap_or_default(),
             Err(e) => return (put_status(&e), e.to_string()).into_response(),
@@ -80,7 +84,7 @@ async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Byte
         let kept_containment: Vec<_> = existing.into_iter()
             .filter(|t| t.predicate.as_str() == container::LDP_CONTAINS)
             .collect();
-        let mut merged = triples.clone();
+        let mut merged = triples;
         merged.extend(kept_containment);
         if let Err(e) = put_rdf(st.store.as_ref(), &st.space, &req_path, &merged).await {
             return (put_status(&e), e.to_string()).into_response();
@@ -145,6 +149,9 @@ async fn handle_delete_root(State(st): State<AppState>) -> Response {
 
 async fn delete_impl(st: AppState, req_path: String) -> Response {
     if container::is_container_path(&req_path) {
+        if req_path == "/" {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
         match container::container_is_empty(st.store.as_ref(), &st.space, &req_path).await {
             Ok(false) => return StatusCode::CONFLICT.into_response(),
             Ok(true) => {}
@@ -159,7 +166,9 @@ async fn delete_impl(st: AppState, req_path: String) -> Response {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         if let Some(parent) = container::parent_container(&req_path) {
-            let _ = container::remove_containment(st.store.as_ref(), &st.space, &parent, &req_path).await;
+            if let Err(e) = container::remove_containment(st.store.as_ref(), &st.space, &parent, &req_path).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
         }
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -441,5 +450,32 @@ mod tests {
         app.clone().oneshot(Request::builder().method("DELETE").uri("/box/doc").body(Body::empty()).unwrap()).await.unwrap();
         let del_empty = Request::builder().method("DELETE").uri("/box/").body(Body::empty()).unwrap();
         assert_eq!(app.oneshot(del_empty).await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_root_container_is_405() {
+        let app = provisioned_app().await;
+        let res = app.oneshot(Request::builder().method("DELETE").uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn put_container_preserves_existing_containment() {
+        let app = provisioned_app().await;
+        // create a child so /box/ is non-empty
+        app.clone().oneshot(Request::builder().method("PUT").uri("/box/doc")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
+        // PUT the container itself with only user triples (no ldp:contains)
+        let put = Request::builder().method("PUT").uri("/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<https://pod.toph.so/box/> <http://purl.org/dc/terms/title> \"Box\" .")).unwrap();
+        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+        // the child's containment link must survive
+        let res = app.oneshot(Request::builder().method("GET").uri("/box/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        let body = body_string(res).await;
+        assert!(body.contains("https://pod.toph.so/box/doc"));  // containment preserved
+        assert!(body.contains("Box"));                           // user triple stored
     }
 }
