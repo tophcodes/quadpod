@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
-    http::{StatusCode, HeaderMap, header}, response::{IntoResponse, Response}};
+    http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use crate::{space::StorageSpace, store::SparqlStore, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
     rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}};
 
@@ -34,21 +34,22 @@ async fn handle_put(
         Ok(g) => g,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let current = get_rdf(st.store.as_ref(), &st.space, &req_path).await;
-    let current_tag = match &current {
-        Ok(Some(tr)) => Some(etag(tr)),
-        Ok(None) => None,
-        Err(e) => return (put_status(e), e.to_string()).into_response(),
-    };
-    if let Some(im) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
-        if Some(im) != current_tag.as_deref() {
+    if headers.contains_key(IF_MATCH) || headers.contains_key(IF_NONE_MATCH) {
+        let current_tag = match get_rdf(st.store.as_ref(), &st.space, &req_path).await {
+            Ok(Some(tr)) => Some(etag(&tr)),
+            Ok(None) => None,
+            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+        };
+        if let Some(im) = headers.get(IF_MATCH).and_then(|v| v.to_str().ok()) {
+            if Some(im) != current_tag.as_deref() {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+        }
+        if headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("*")
+            && current_tag.is_some()
+        {
             return StatusCode::PRECONDITION_FAILED.into_response();
         }
-    }
-    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("*")
-        && current_tag.is_some()
-    {
-        return StatusCode::PRECONDITION_FAILED.into_response();
     }
     let triples = match parse(&body, fmt, &g) {
         Ok(t) => t,
@@ -182,6 +183,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_iri_breaking_path_is_400() {
+        let req = Request::builder().method("PUT").uri("/foo%3E%20bar")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn get_emits_etag_and_304_on_if_none_match() {
         let app = app();
         let put = Request::builder().method("PUT").uri("/foo")
@@ -225,6 +234,34 @@ mod tests {
             .header(header::IF_NONE_MATCH, "*")
             .body(Body::from("<#it> <http://schema.org/name> \"X\" .")).unwrap();
         assert_eq!(app.oneshot(create_only).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn put_if_match_matching_succeeds() {
+        let app = app();
+        let put = Request::builder().method("PUT").uri("/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        app.clone().oneshot(put).await.unwrap();
+        // read current etag
+        let res = app.clone().oneshot(Request::builder().method("GET").uri("/foo").body(Body::empty()).unwrap()).await.unwrap();
+        let etag = res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        // conditional update with matching If-Match must succeed
+        let upd = Request::builder().method("PUT").uri("/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_MATCH, &etag)
+            .body(Body::from("<#it> <http://schema.org/name> \"New\" .")).unwrap();
+        assert_eq!(app.oneshot(upd).await.unwrap().status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn put_if_none_match_star_on_absent_creates() {
+        let app = app();
+        let req = Request::builder().method("PUT").uri("/brand-new")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_NONE_MATCH, "*")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

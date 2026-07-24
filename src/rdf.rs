@@ -77,6 +77,8 @@ pub fn parse(bytes: &[u8], fmt: RdfFormat, base_iri: &str) -> Result<Vec<Triple>
     Ok(out)
 }
 
+/// Renders terms via `Display`, so this assumes stable blank-node labeling from the store
+/// (fine for ground graphs; revisit when bnode-bearing graphs arrive).
 pub fn etag(triples: &[Triple]) -> String {
     let mut lines: Vec<String> = triples
         .iter()
