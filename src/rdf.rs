@@ -1,5 +1,6 @@
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::Triple;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -76,6 +77,20 @@ pub fn parse(bytes: &[u8], fmt: RdfFormat, base_iri: &str) -> Result<Vec<Triple>
     Ok(out)
 }
 
+pub fn etag(triples: &[Triple]) -> String {
+    let mut lines: Vec<String> = triples
+        .iter()
+        .map(|t| format!("{} {} {} .", t.subject, t.predicate, t.object))
+        .collect();
+    lines.sort();
+    let mut h = Sha256::new();
+    for l in &lines {
+        h.update(l.as_bytes());
+        h.update(b"\n");
+    }
+    format!("\"{}\"", hex::encode(h.finalize()))
+}
+
 pub fn serialize(triples: &[Triple], fmt: RdfFormat) -> Result<Vec<u8>, RdfError> {
     let mut ser = RdfSerializer::from_format(fmt).for_writer(Vec::new());
     for t in triples {
@@ -114,6 +129,21 @@ mod tests {
         assert!(format_for_accept("application/ld+json").is_some());
         assert!(format_for_accept("application/xhtml+xml, application/ld+json").is_some());
         assert!(format_for_accept("image/png").is_none());
+    }
+
+    #[test]
+    fn etag_is_order_independent_and_changes_with_content() {
+        use oxigraph::model::{Triple, NamedNode, Literal};
+        let s = NamedNode::new("https://pod.toph.so/foo#it").unwrap();
+        let p1 = NamedNode::new("http://schema.org/name").unwrap();
+        let p2 = NamedNode::new("http://schema.org/age").unwrap();
+        let t1 = Triple::new(s.clone(), p1, Literal::new_simple_literal("Toph"));
+        let t2 = Triple::new(s, p2, Literal::new_simple_literal("40"));
+        let ab = etag(&[t1.clone(), t2.clone()]);
+        let ba = etag(&[t2, t1.clone()]);
+        assert_eq!(ab, ba);                       // order-independent
+        assert_ne!(ab, etag(&[t1]));              // content-sensitive
+        assert!(ab.starts_with('"') && ab.ends_with('"'));
     }
 
     #[test]

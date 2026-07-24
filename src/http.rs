@@ -2,7 +2,7 @@ use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
     http::{StatusCode, HeaderMap, header}, response::{IntoResponse, Response}};
 use crate::{space::StorageSpace, store::SparqlStore, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
-    rdf::{format_for_content_type, format_for_accept, parse, serialize}};
+    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +34,22 @@ async fn handle_put(
         Ok(g) => g,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+    let current = get_rdf(st.store.as_ref(), &st.space, &req_path).await;
+    let current_tag = match &current {
+        Ok(Some(tr)) => Some(etag(tr)),
+        Ok(None) => None,
+        Err(e) => return (put_status(e), e.to_string()).into_response(),
+    };
+    if let Some(im) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
+        if Some(im) != current_tag.as_deref() {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+    }
+    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("*")
+        && current_tag.is_some()
+    {
+        return StatusCode::PRECONDITION_FAILED.into_response();
+    }
     let triples = match parse(&body, fmt, &g) {
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -53,10 +69,20 @@ async fn handle_get(
     };
     let req_path = format!("/{path}");
     match get_rdf(st.store.as_ref(), &st.space, &req_path).await {
-        Ok(Some(triples)) => match serialize(&triples, fmt) {
-            Ok(bytes) => ([(header::CONTENT_TYPE, fmt.media_type())], bytes).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
+        Ok(Some(triples)) => {
+            let tag = etag(&triples);
+            if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
+                return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response();
+            }
+            match serialize(&triples, fmt) {
+                Ok(bytes) => (
+                    [(header::CONTENT_TYPE, fmt.media_type().to_string()), (header::ETAG, tag)],
+                    bytes,
+                )
+                    .into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(ResourceError::InvalidIri) => StatusCode::BAD_REQUEST.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -153,6 +179,52 @@ mod tests {
     async fn iri_breaking_path_is_400() {
         let res = app().oneshot(Request::builder().method("GET").uri("/foo%3E%20bar").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_emits_etag_and_304_on_if_none_match() {
+        let app = app();
+        let put = Request::builder().method("PUT").uri("/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        app.clone().oneshot(put).await.unwrap();
+
+        let res = app.clone().oneshot(Request::builder().method("GET").uri("/foo").body(Body::empty()).unwrap()).await.unwrap();
+        let etag = res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+
+        let cond = Request::builder().method("GET").uri("/foo")
+            .header(header::IF_NONE_MATCH, &etag).body(Body::empty()).unwrap();
+        assert_eq!(app.oneshot(cond).await.unwrap().status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn put_if_match_mismatch_is_412() {
+        let app = app();
+        let put = Request::builder().method("PUT").uri("/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        app.clone().oneshot(put).await.unwrap();
+
+        let stale = Request::builder().method("PUT").uri("/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_MATCH, "\"deadbeef\"")
+            .body(Body::from("<#it> <http://schema.org/name> \"X\" .")).unwrap();
+        assert_eq!(app.oneshot(stale).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn put_if_none_match_star_on_existing_is_412() {
+        let app = app();
+        let put = Request::builder().method("PUT").uri("/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        app.clone().oneshot(put).await.unwrap();
+
+        let create_only = Request::builder().method("PUT").uri("/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_NONE_MATCH, "*")
+            .body(Body::from("<#it> <http://schema.org/name> \"X\" .")).unwrap();
+        assert_eq!(app.oneshot(create_only).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
