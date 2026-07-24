@@ -94,6 +94,8 @@ async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Byte
         }
         return (StatusCode::CREATED, [(header::LOCATION, g)]).into_response();
     }
+    // Note: ensure_ancestors and subsequent put_rdf are separate store updates and not transactional.
+    // Accepted for single-user v1 per the plan's cross-graph-atomicity note.
     if let Err(e) = container::ensure_ancestors(st.store.as_ref(), &st.space, &req_path).await {
         return (put_status(&e), e.to_string()).into_response();
     }
@@ -125,6 +127,8 @@ async fn post_impl(st: AppState, container_path: String, headers: HeaderMap, bod
     // unique child path
     let mut name = container::child_name(slug);
     let mut child_path = format!("{container_path}{name}");
+    // Note: this existence check (get_rdf) followed by write (put_rdf below) is not transactional;
+    // a concurrent write landing between these operations could be missed. Accepted for single-user v1.
     if matches!(get_rdf(st.store.as_ref(), &st.space, &child_path).await, Ok(Some(_))) {
         name = format!("{name}-{}", uuid::Uuid::new_v4());
         child_path = format!("{container_path}{name}");

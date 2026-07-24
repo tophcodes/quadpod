@@ -98,7 +98,11 @@ pub fn child_name(slug: Option<&str>) -> String {
     let cleaned: String = slug.unwrap_or("").chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         .collect();
-    if cleaned.is_empty() { uuid::Uuid::new_v4().to_string() } else { cleaned }
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        cleaned
+    }
 }
 
 #[cfg(test)]
@@ -153,5 +157,12 @@ mod tests {
         assert_eq!(parent_container("/foo").as_deref(), Some("/"));
         assert_eq!(parent_container("/foo/").as_deref(), Some("/"));
         assert_eq!(parent_container("/"), None);
+    }
+
+    #[test]
+    fn child_name_rejects_dot_only_slugs() {
+        assert_ne!(child_name(Some("..")), "..");
+        assert_ne!(child_name(Some(".")), ".");
+        assert_eq!(child_name(Some("photo")), "photo");
     }
 }
