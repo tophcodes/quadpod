@@ -53,6 +53,7 @@ second pass, built from existing, non-rotting components plus a thin custom core
 | **Verify-only auth, external IdP** | Running an IdP is a whole subsystem. Verify-only is far less surface; WebID profile docs can still live in the pod. |
 | **URI-template config for topology** | One declarative knob (§9) expresses single/multi user/pod and subdomain-vs-path, instead of ad-hoc flags. Realizes the `StorageSpace` abstraction from day one. |
 | **Reverse-proxy TLS; server is public-URL-aware via config** | Removes cert/ACME/wildcard burden from the server. In Solid, URL = identity and DPoP binds to URL, so the server must mint from configured public base-URI, never the socket. |
+| **Fresh build, not a fork of jeswr's `solid-server-rs`** | The architecture is convergent (SPARQL-authoritative + `object_store` blobs + verify-only DPoP + axum LDP) — validating, not a reason to fork. But jeswr's is an explicit throwaway research spike (WAC absent, in-memory doubles, "do not deploy"), so there is nothing production-shaped to adopt. We build fresh — same idea, new mind — reusing Manas leaf crates for the stubbed parts (esp. WAC), with jeswr as an optional sounding board. |
 
 ## 5. Data Model
 
