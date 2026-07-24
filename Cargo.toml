@@ -11,6 +11,7 @@ name = "sparql-pod"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = "0.1.91"
 axum = "0.8.9"
 oxigraph = "0.5.9"
 thiserror = "2.0.19"

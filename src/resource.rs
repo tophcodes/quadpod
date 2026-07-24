@@ -1,109 +1,107 @@
 use crate::{
+    rdf::RdfError,
     space::{SpaceError, StorageSpace},
     store::{SparqlStore, StoreError},
 };
-use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::Triple;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ResourceError {
-    #[error("turtle parse error: {0}")]
-    Parse(String),
+    #[error("invalid resource IRI")]
+    InvalidIri,
+    #[error(transparent)]
+    Rdf(#[from] RdfError),
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error(transparent)]
-    InvalidIri(#[from] SpaceError),
 }
 
-/// Parse Turtle (resolved against `base_iri`) into a `\n`-separated block of
-/// N-Triples-syntax triples, suitable for embedding inside `INSERT DATA { GRAPH <g> { ... } }`.
-fn turtle_to_ntriples(turtle: &str, base_iri: &str) -> Result<String, ResourceError> {
-    let parser = RdfParser::from_format(RdfFormat::Turtle)
-        .with_base_iri(base_iri)
-        .map_err(|e| ResourceError::Parse(e.to_string()))?;
-
-    let mut out = String::new();
-    for quad in parser.for_slice(turtle) {
-        let quad = quad.map_err(|e| ResourceError::Parse(e.to_string()))?;
-        let triple = Triple {
-            subject: quad.subject,
-            predicate: quad.predicate,
-            object: quad.object,
-        };
-        out.push_str(&triple.to_string());
-        out.push_str(" .\n");
+impl From<SpaceError> for ResourceError {
+    fn from(_: SpaceError) -> Self {
+        ResourceError::InvalidIri
     }
-    Ok(out)
 }
 
-pub async fn put_rdf<S: SparqlStore>(
-    store: &S,
+pub async fn put_rdf(
+    store: &dyn SparqlStore,
     space: &StorageSpace,
     request_path: &str,
-    turtle: &str,
+    triples: &[Triple],
 ) -> Result<(), ResourceError> {
     let g = space.graph_iri(request_path)?;
-    let triples = turtle_to_ntriples(turtle, &g)?;
-    let update =
-        format!("DROP SILENT GRAPH <{g}>; INSERT DATA {{ GRAPH <{g}> {{ {triples} }} }}");
+    let mut body = String::new();
+    for t in triples {
+        body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
+    }
+    let update = format!("DROP SILENT GRAPH <{g}>; INSERT DATA {{ GRAPH <{g}> {{ {body} }} }}");
     store.update(&update).await?;
     Ok(())
 }
 
-pub async fn get_rdf<S: SparqlStore>(
-    store: &S,
+pub async fn get_rdf(
+    store: &dyn SparqlStore,
     space: &StorageSpace,
     request_path: &str,
-) -> Result<Option<String>, ResourceError> {
+) -> Result<Option<Vec<Triple>>, ResourceError> {
     let g = space.graph_iri(request_path)?;
     let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}");
-    let ttl = store.query_construct(&q).await?;
-    if ttl.trim().is_empty() {
+    let triples = store.query_triples(&q).await?;
+    if triples.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(ttl))
+        Ok(Some(triples))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{space::StorageSpace, store::OxigraphStore};
+    use crate::{rdf, space::StorageSpace, store::OxigraphStore};
+    use oxigraph::io::RdfFormat;
 
     fn space() -> StorageSpace {
         StorageSpace::new("https://pod.toph.so/").unwrap()
     }
 
     #[tokio::test]
-    async fn put_then_get_preserves_triples() {
+    async fn put_then_get_roundtrips_triples() {
         let store = OxigraphStore::in_memory().unwrap();
-        let sp = space();
-        let ttl = "<#it> <http://schema.org/name> \"Toph\" .";
-        put_rdf(&store, &sp, "/foo", ttl).await.unwrap();
-
-        let got = get_rdf(&store, &sp, "/foo").await.unwrap().expect("exists");
-        assert!(got.contains("schema.org/name"));
-        assert!(got.contains("Toph"));
+        let t = rdf::parse(
+            b"<#it> <http://schema.org/name> \"Toph\" .",
+            RdfFormat::Turtle,
+            "https://pod.toph.so/foo",
+        )
+        .unwrap();
+        put_rdf(&store, &space(), "/foo", &t).await.unwrap();
+        let got = get_rdf(&store, &space(), "/foo").await.unwrap().expect("exists");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].predicate.as_str(), "http://schema.org/name");
     }
 
     #[tokio::test]
     async fn put_replaces_not_appends() {
         let store = OxigraphStore::in_memory().unwrap();
-        let sp = space();
-        put_rdf(&store, &sp, "/foo", "<#it> <http://schema.org/name> \"A\" .")
-            .await
-            .unwrap();
-        put_rdf(&store, &sp, "/foo", "<#it> <http://schema.org/name> \"B\" .")
-            .await
-            .unwrap();
-        let got = get_rdf(&store, &sp, "/foo").await.unwrap().unwrap();
-        assert!(got.contains("\"B\""));
-        assert!(!got.contains("\"A\""));
+        let a = rdf::parse(
+            b"<#it> <http://schema.org/name> \"A\" .",
+            RdfFormat::Turtle,
+            "https://pod.toph.so/foo",
+        )
+        .unwrap();
+        let b = rdf::parse(
+            b"<#it> <http://schema.org/name> \"B\" .",
+            RdfFormat::Turtle,
+            "https://pod.toph.so/foo",
+        )
+        .unwrap();
+        put_rdf(&store, &space(), "/foo", &a).await.unwrap();
+        put_rdf(&store, &space(), "/foo", &b).await.unwrap();
+        let got = get_rdf(&store, &space(), "/foo").await.unwrap().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(matches!(&got[0].object, oxigraph::model::Term::Literal(l) if l.value() == "B"));
     }
 
     #[tokio::test]
-    async fn get_absent_resource_is_none() {
+    async fn get_absent_is_none() {
         let store = OxigraphStore::in_memory().unwrap();
         assert!(get_rdf(&store, &space(), "/nope").await.unwrap().is_none());
     }

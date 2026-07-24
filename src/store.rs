@@ -1,4 +1,4 @@
-use oxigraph::io::{RdfFormat, RdfSerializer};
+use oxigraph::model::Triple;
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use thiserror::Error;
@@ -9,15 +9,10 @@ pub enum StoreError {
     Backend(String),
 }
 
+#[async_trait::async_trait]
 pub trait SparqlStore: Send + Sync {
-    fn update(
-        &self,
-        sparql: &str,
-    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send;
-    fn query_construct(
-        &self,
-        sparql: &str,
-    ) -> impl std::future::Future<Output = Result<String, StoreError>> + Send;
+    async fn update(&self, sparql: &str) -> Result<(), StoreError>;
+    async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, StoreError>;
 }
 
 pub struct OxigraphStore {
@@ -32,6 +27,7 @@ impl OxigraphStore {
     }
 }
 
+#[async_trait::async_trait]
 impl SparqlStore for OxigraphStore {
     async fn update(&self, sparql: &str) -> Result<(), StoreError> {
         self.inner
@@ -39,7 +35,7 @@ impl SparqlStore for OxigraphStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn query_construct(&self, sparql: &str) -> Result<String, StoreError> {
+    async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, StoreError> {
         let results = SparqlEvaluator::new()
             .parse_query(sparql)
             .map_err(|e| StoreError::Backend(e.to_string()))?
@@ -49,18 +45,9 @@ impl SparqlStore for OxigraphStore {
         let QueryResults::Graph(triples) = results else {
             return Err(StoreError::Backend("expected CONSTRUCT/graph results".into()));
         };
-
-        let mut serializer = RdfSerializer::from_format(RdfFormat::Turtle).for_writer(Vec::new());
-        for triple in triples {
-            let triple = triple.map_err(|e| StoreError::Backend(e.to_string()))?;
-            serializer
-                .serialize_triple(&triple)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-        }
-        let buf = serializer
-            .finish()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        String::from_utf8(buf).map_err(|e| StoreError::Backend(e.to_string()))
+        triples
+            .map(|t| t.map_err(|e| StoreError::Backend(e.to_string())))
+            .collect()
     }
 }
 
@@ -69,36 +56,27 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn update_then_construct_roundtrips_a_triple() {
+    async fn update_then_query_triples_roundtrips() {
         let store = OxigraphStore::in_memory().unwrap();
-        store
-            .update(
-                "INSERT DATA { GRAPH <https://pod.toph.so/foo> { \
-                 <https://pod.toph.so/foo#it> <http://schema.org/name> \"Toph\" } }",
-            )
-            .await
-            .unwrap();
+        store.update(
+            "INSERT DATA { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#it> <http://schema.org/name> \"Toph\" } }",
+        ).await.unwrap();
 
-        let ttl = store
-            .query_construct(
-                "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <https://pod.toph.so/foo> { ?s ?p ?o } }",
-            )
-            .await
-            .unwrap();
+        let triples = store.query_triples(
+            "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <https://pod.toph.so/foo> { ?s ?p ?o } }",
+        ).await.unwrap();
 
-        assert!(ttl.contains("schema.org/name"));
-        assert!(ttl.contains("Toph"));
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].predicate.as_str(), "http://schema.org/name");
     }
 
     #[tokio::test]
-    async fn construct_of_absent_graph_is_empty() {
+    async fn query_of_absent_graph_is_empty() {
         let store = OxigraphStore::in_memory().unwrap();
-        let ttl = store
-            .query_construct(
-                "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <https://pod.toph.so/missing> { ?s ?p ?o } }",
-            )
-            .await
-            .unwrap();
-        assert!(!ttl.contains("schema.org"));
+        let triples = store.query_triples(
+            "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <https://pod.toph.so/missing> { ?s ?p ?o } }",
+        ).await.unwrap();
+        assert!(triples.is_empty());
     }
 }
