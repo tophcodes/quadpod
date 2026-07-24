@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
     http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
-use crate::{space::StorageSpace, store::SparqlStore, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
+use crate::{space::StorageSpace, store::SparqlStore, container, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
     rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}};
 
 #[derive(Clone)]
@@ -12,7 +12,10 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     // axum 0.8 wildcard capture syntax: "/{*path}" (NOT the old "/*path").
-    Router::new().route("/{*path}", get(handle_get).put(handle_put).delete(handle_delete)).with_state(state)
+    Router::new()
+        .route("/", get(handle_get_root).put(handle_put_root).delete(handle_delete_root))
+        .route("/{*path}", get(handle_get).put(handle_put).delete(handle_delete))
+        .with_state(state)
 }
 
 fn put_status(e: &ResourceError) -> StatusCode {
@@ -25,11 +28,18 @@ fn put_status(e: &ResourceError) -> StatusCode {
 async fn handle_put(
     State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap, body: Bytes,
 ) -> Response {
+    put_impl(st, format!("/{path}"), headers, body).await
+}
+
+async fn handle_put_root(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    put_impl(st, "/".to_string(), headers, body).await
+}
+
+async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Bytes) -> Response {
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(fmt) = format_for_content_type(ct) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     };
-    let req_path = format!("/{path}");
     let g = match st.space.graph_iri(&req_path) {
         Ok(g) => g,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -55,6 +65,12 @@ async fn handle_put(
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Task 4 will branch container paths here; for now, resource path only:
+    if !container::is_container_path(&req_path) {
+        if let Err(e) = container::ensure_ancestors(st.store.as_ref(), &st.space, &req_path).await {
+            return (put_status(&e), e.to_string()).into_response();
+        }
+    }
     match put_rdf(st.store.as_ref(), &st.space, &req_path, &triples).await {
         Ok(()) => (StatusCode::CREATED, [(header::LOCATION, g)]).into_response(),
         Err(e) => (put_status(&e), e.to_string()).into_response(),
@@ -64,11 +80,18 @@ async fn handle_put(
 async fn handle_get(
     State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap,
 ) -> Response {
+    get_impl(st, format!("/{path}"), headers).await
+}
+
+async fn handle_get_root(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    get_impl(st, "/".to_string(), headers).await
+}
+
+async fn get_impl(st: AppState, req_path: String, headers: HeaderMap) -> Response {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(fmt) = format_for_accept(accept) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
-    let req_path = format!("/{path}");
     match get_rdf(st.store.as_ref(), &st.space, &req_path).await {
         Ok(Some(triples)) => {
             let tag = etag(&triples);
@@ -91,9 +114,23 @@ async fn handle_get(
 }
 
 async fn handle_delete(State(st): State<AppState>, Path(path): Path<String>) -> Response {
-    let req_path = format!("/{path}");
+    delete_impl(st, format!("/{path}")).await
+}
+
+async fn handle_delete_root(State(st): State<AppState>) -> Response {
+    delete_impl(st, "/".to_string()).await
+}
+
+async fn delete_impl(st: AppState, req_path: String) -> Response {
     match delete_rdf(st.store.as_ref(), &st.space, &req_path).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            if let Some(parent) = container::parent_container(&req_path) {
+                if let Err(e) = container::remove_containment(st.store.as_ref(), &st.space, &parent, &req_path).await {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(ResourceError::InvalidIri) => StatusCode::BAD_REQUEST.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -275,5 +312,53 @@ mod tests {
         assert_eq!(app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
         let del2 = Request::builder().method("DELETE").uri("/foo").body(Body::empty()).unwrap();
         assert_eq!(app.oneshot(del2).await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn provisioned_app() -> axum::Router {
+        let store = Arc::new(OxigraphStore::in_memory().unwrap());
+        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+        crate::container::provision_root(store.as_ref(), &space).await.unwrap();
+        router(AppState { store, space })
+    }
+
+    #[tokio::test]
+    async fn put_deep_resource_creates_ancestor_containment() {
+        let app = provisioned_app().await;
+        let put = Request::builder().method("PUT").uri("/a/b/doc")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        // GET the parent container /a/b/ — it must list the doc via ldp:contains
+        let res = app.oneshot(Request::builder().method("GET").uri("/a/b/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        assert!(body.contains("ldp#contains"));
+        assert!(body.contains("https://pod.toph.so/a/b/doc"));
+    }
+
+    #[tokio::test]
+    async fn delete_resource_removes_containment() {
+        let app = provisioned_app().await;
+        let put = Request::builder().method("PUT").uri("/a/doc")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        app.clone().oneshot(put).await.unwrap();
+        let del = Request::builder().method("DELETE").uri("/a/doc").body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+        let res = app.oneshot(Request::builder().method("GET").uri("/a/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert!(!body_string(res).await.contains("https://pod.toph.so/a/doc"));
+    }
+
+    #[tokio::test]
+    async fn get_root_container_is_200() {
+        let app = provisioned_app().await;
+        let res = app.oneshot(Request::builder().method("GET").uri("/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_string(res).await.contains("ldp#BasicContainer"));
     }
 }
