@@ -91,6 +91,16 @@ pub async fn provision_root(
     ensure_container(store, space, "/").await
 }
 
+/// Sanitize a client-supplied `Slug` header into a safe child segment.
+/// Drops anything outside `[A-Za-z0-9._-]`; falls back to a fresh uuid v4
+/// if no slug was given or nothing survives sanitization.
+pub fn child_name(slug: Option<&str>) -> String {
+    let cleaned: String = slug.unwrap_or("").chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    if cleaned.is_empty() { uuid::Uuid::new_v4().to_string() } else { cleaned }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

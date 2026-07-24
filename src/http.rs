@@ -13,8 +13,8 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     // axum 0.8 wildcard capture syntax: "/{*path}" (NOT the old "/*path").
     Router::new()
-        .route("/", get(handle_get_root).put(handle_put_root).delete(handle_delete_root))
-        .route("/{*path}", get(handle_get).put(handle_put).delete(handle_delete))
+        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root))
+        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete))
         .with_state(state)
 }
 
@@ -98,6 +98,49 @@ async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Byte
         return (put_status(&e), e.to_string()).into_response();
     }
     match put_rdf(st.store.as_ref(), &st.space, &req_path, &triples).await {
+        Ok(()) => (StatusCode::CREATED, [(header::LOCATION, g)]).into_response(),
+        Err(e) => (put_status(&e), e.to_string()).into_response(),
+    }
+}
+
+async fn handle_post(
+    State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap, body: Bytes,
+) -> Response {
+    post_impl(st, format!("/{path}"), headers, body).await
+}
+
+async fn handle_post_root(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    post_impl(st, "/".to_string(), headers, body).await
+}
+
+async fn post_impl(st: AppState, container_path: String, headers: HeaderMap, body: Bytes) -> Response {
+    if !container::is_container_path(&container_path) {
+        return StatusCode::CONFLICT.into_response(); // POST target must be a container
+    }
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let Some(fmt) = format_for_content_type(ct) else {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    };
+    let slug = headers.get("slug").and_then(|v| v.to_str().ok());
+    // unique child path
+    let mut name = container::child_name(slug);
+    let mut child_path = format!("{container_path}{name}");
+    if matches!(get_rdf(st.store.as_ref(), &st.space, &child_path).await, Ok(Some(_))) {
+        name = format!("{name}-{}", uuid::Uuid::new_v4());
+        child_path = format!("{container_path}{name}");
+    }
+    let g = match st.space.graph_iri(&child_path) {
+        Ok(g) => g,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let triples = match parse(&body, fmt, &g) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    if let Err(e) = container::ensure_ancestors(st.store.as_ref(), &st.space, &child_path).await {
+        return (put_status(&e), e.to_string()).into_response();
+    }
+    match put_rdf(st.store.as_ref(), &st.space, &child_path, &triples).await {
         Ok(()) => (StatusCode::CREATED, [(header::LOCATION, g)]).into_response(),
         Err(e) => (put_status(&e), e.to_string()).into_response(),
     }
@@ -457,6 +500,42 @@ mod tests {
         let app = provisioned_app().await;
         let res = app.oneshot(Request::builder().method("DELETE").uri("/").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn post_with_slug_creates_named_child() {
+        let app = provisioned_app().await;
+        let post = Request::builder().method("POST").uri("/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "note")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        let res = app.clone().oneshot(post).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/box/note");
+        // the child is retrievable and the container lists it
+        let got = app.oneshot(Request::builder().method("GET").uri("/box/note").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_slug_collision_gets_distinct_url() {
+        let app = provisioned_app().await;
+        let mk = || Request::builder().method("POST").uri("/box/")
+            .header(header::CONTENT_TYPE, "text/turtle").header("slug", "note")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        let loc1 = app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+        let loc2 = app.oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+        assert_ne!(loc1, loc2);
+    }
+
+    #[tokio::test]
+    async fn post_to_non_container_is_conflict() {
+        let app = provisioned_app().await;
+        // /doc is a resource path (no trailing slash) → POST not allowed there
+        let post = Request::builder().method("POST").uri("/doc")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(app.oneshot(post).await.unwrap().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
