@@ -198,10 +198,7 @@ mod tests {
     async fn resolves_jwks_via_oidc_discovery_and_caches() {
         let idp = TestIdp::new();
         let (issuer, jwks_hits) = spawn_test_idp_server(&idp).await;
-        let resolver = HttpJwksResolver::with_policy(FetchPolicy {
-            allow_http: true,
-            allow_private_ips: true,
-        });
+        let resolver = HttpJwksResolver::with_policy(FetchPolicy::permissive());
 
         let jwks = resolver.resolve(&issuer).await.expect("resolve via HTTP");
         assert_eq!(jwks.keys.len(), 1);
@@ -214,10 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_host_is_unknown_issuer() {
-        let resolver = HttpJwksResolver::with_policy(FetchPolicy {
-            allow_http: true,
-            allow_private_ips: true,
-        });
+        let resolver = HttpJwksResolver::with_policy(FetchPolicy::permissive());
         // port 0 is never a listening server; this is a local-only failure,
         // not a real network call to an external host.
         assert!(matches!(

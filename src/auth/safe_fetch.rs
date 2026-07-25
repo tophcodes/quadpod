@@ -32,12 +32,28 @@ const MAX_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Controls which network destinations [`guarded_get`] will contact.
 /// `Default` is the production-safe posture: https-only, private IPs
-/// blocked. Tests that must hit a local (`127.0.0.1`) hermetic server
-/// construct a permissive policy explicitly.
+/// blocked. The permissive combination (both `true`) is only constructible
+/// via [`FetchPolicy::permissive`], which is `#[cfg(test)]`-gated: a
+/// production build cannot obtain anything but the safe default, so a
+/// future caller can't accidentally (or maliciously) bypass SSRF
+/// protection by hand-constructing a permissive policy.
 #[derive(Clone, Default)]
 pub struct FetchPolicy {
-    pub allow_http: bool,
-    pub allow_private_ips: bool,
+    allow_http: bool,
+    allow_private_ips: bool,
+}
+
+impl FetchPolicy {
+    /// Allow http and private/loopback IPs — for hermetic tests hitting a
+    /// local (`127.0.0.1`) test server. Unavailable outside `#[cfg(test)]`,
+    /// so this combination cannot exist in a release build.
+    #[cfg(test)]
+    pub fn permissive() -> Self {
+        Self {
+            allow_http: true,
+            allow_private_ips: true,
+        }
+    }
 }
 
 /// True if `ip` must never be reached by a fetch driven by
@@ -306,10 +322,7 @@ mod tests {
     async fn streamed_body_over_cap_is_rejected_without_full_buffering() {
         let url = spawn_oversized_chunked_server().await;
         let c = reqwest::Client::new();
-        let policy = FetchPolicy {
-            allow_http: true,
-            allow_private_ips: true,
-        };
+        let policy = FetchPolicy::permissive();
         let r = guarded_get(&c, &url, "text/plain", &policy).await;
         assert!(r.is_err(), "oversized streamed body must be rejected");
     }
@@ -356,10 +369,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let policy = FetchPolicy {
-            allow_http: true,
-            allow_private_ips: true,
-        };
+        let policy = FetchPolicy::permissive();
         let r = guarded_get(&c, &url, "text/plain", &policy).await;
         assert!(
             r.is_err(),

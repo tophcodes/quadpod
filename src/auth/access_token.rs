@@ -180,4 +180,59 @@ mod tests {
             Err(AuthError::BadSignature)
         ));
     }
+
+    /// Hand-build a compact JWS from a header/payload/signature segment,
+    /// bypassing josekit's signer entirely — this is how a forged,
+    /// non-ES256 token is constructed for the algorithm-confusion tests
+    /// below.
+    fn build_jws(header: &Value, payload: &Value, signature_segment: &str) -> String {
+        let encode = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+        format!(
+            "{}.{}.{}",
+            encode(header),
+            encode(payload),
+            signature_segment
+        )
+    }
+
+    fn forged_payload(webid: &str, jkt: &str) -> Value {
+        serde_json::json!({
+            "iss": "https://idp.example/",
+            "webid": webid,
+            "exp": 9_999_999_999i64,
+            "cnf": { "jkt": jkt },
+        })
+    }
+
+    /// `alg: none` with an empty signature segment is the classic
+    /// algorithm-confusion forgery: if the verifier trusted the header's
+    /// own `alg` claim, this would "verify" trivially since there's no
+    /// signature to check at all. `verify_access_token` pins ES256
+    /// regardless of what the header claims, so this must be rejected.
+    #[tokio::test]
+    async fn alg_none_forged_token_is_rejected() {
+        let (resolver, client, _idp) = setup();
+        let header = serde_json::json!({ "alg": "none", "typ": "JWT" });
+        let payload = forged_payload("https://alice.example/card#me", &client.jkt());
+        let forged = build_jws(&header, &payload, "");
+
+        assert!(verify_access_token(&forged, &resolver, 1_000).await.is_err());
+    }
+
+    /// An HS256-"signed" token (arbitrary signature bytes — the pinned
+    /// ES256 verifier must reject on the mismatched `alg` header before
+    /// ever attempting to check the signature) must also be rejected. This
+    /// is the other half of the algorithm-confusion boundary: a symmetric
+    /// alg can't be substituted for the asymmetric one the resolver's key
+    /// is for.
+    #[tokio::test]
+    async fn hs256_forged_token_is_rejected() {
+        let (resolver, client, _idp) = setup();
+        let header = serde_json::json!({ "alg": "HS256", "typ": "JWT" });
+        let payload = forged_payload("https://alice.example/card#me", &client.jkt());
+        let bogus_signature = URL_SAFE_NO_PAD.encode(b"not-a-real-hmac-signature");
+        let forged = build_jws(&header, &payload, &bogus_signature);
+
+        assert!(verify_access_token(&forged, &resolver, 1_000).await.is_err());
+    }
 }

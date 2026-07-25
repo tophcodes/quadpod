@@ -177,10 +177,7 @@ mod tests {
     }
 
     fn permissive_verifier() -> HttpWebIdIssuers {
-        HttpWebIdIssuers::with_policy(FetchPolicy {
-            allow_http: true,
-            allow_private_ips: true,
-        })
+        HttpWebIdIssuers::with_policy(FetchPolicy::permissive())
     }
 
     #[tokio::test]
@@ -230,5 +227,45 @@ mod tests {
             .authorizes("https://alice.example/card#me", "https://idp.example/")
             .await
             .unwrap());
+    }
+
+    /// A profile document that declares `solid:oidcIssuer` on the RIGHT
+    /// predicate/object but the WRONG subject (someone else's WebID, not
+    /// the one being queried) must not authorize the requested webid. This
+    /// proves the match enforces the subject binding too — not just that
+    /// the predicate and object happen to appear somewhere in the graph.
+    #[tokio::test]
+    async fn subject_mismatch_is_not_authorized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let webid = format!("http://{addr}/profile#me");
+
+        // Declares oidcIssuer for a DIFFERENT subject than the requested webid.
+        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+                   <https://other.example/card#someoneelse> solid:oidcIssuer <https://idp.example/> .\n"
+            .to_string();
+
+        let app = Router::new().route(
+            "/profile",
+            get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/turtle")],
+                    ttl.clone(),
+                )
+            }),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let verifier = permissive_verifier();
+        assert!(
+            !verifier
+                .authorizes(&webid, "https://idp.example/")
+                .await
+                .unwrap(),
+            "oidcIssuer triple on the WRONG subject must not authorize the requested webid"
+        );
     }
 }
