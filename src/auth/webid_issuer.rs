@@ -16,6 +16,7 @@
 //! `webid` claim is trusted, and fails closed on any doubt.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use oxigraph::io::RdfFormat;
@@ -98,10 +99,13 @@ impl HttpWebIdIssuers {
     }
 
     fn build(policy: FetchPolicy) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            policy,
-        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client with timeouts should always build");
+        Self { client, policy }
     }
 }
 

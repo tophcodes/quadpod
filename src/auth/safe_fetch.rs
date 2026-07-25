@@ -164,9 +164,19 @@ pub async fn guarded_get(
         .header(reqwest::header::ACCEPT, accept)
         .send()
         .await
-        .map_err(|e| AuthError::FetchBlocked(format!("request failed: {e}")))?
-        .error_for_status()
-        .map_err(|e| AuthError::FetchBlocked(format!("non-success status: {e}")))?;
+        .map_err(|e| AuthError::FetchBlocked(format!("request failed: {e}")))?;
+
+    // Only a 2xx is treated as a usable response. In particular this
+    // rejects 3xx redirects outright rather than parsing whatever body
+    // came with them: the client's redirect policy is `none()`, so a
+    // redirect response reaches here as-is instead of being transparently
+    // followed to an unvalidated (and possibly internal) target.
+    if !response.status().is_success() {
+        return Err(AuthError::FetchBlocked(format!(
+            "non-success status: {}",
+            response.status()
+        )));
+    }
 
     // Cheap fast-path: a declared size already over the cap is rejected
     // without reading any body at all.
@@ -302,5 +312,58 @@ mod tests {
         };
         let r = guarded_get(&c, &url, "text/plain", &policy).await;
         assert!(r.is_err(), "oversized streamed body must be rejected");
+    }
+
+    /// A malicious/compromised host (issuer or webid — both
+    /// attacker-influenced) that passes the initial IP check but then
+    /// 302-redirects to an internal address (e.g. `169.254.169.254`) must
+    /// not have that redirect transparently followed. This proves the
+    /// guard holds even when the client uses `Policy::none()`: the redirect
+    /// surfaces as a non-2xx status and is rejected, not chased.
+    async fn spawn_redirect_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\n\
+                      Location: http://169.254.169.254/secret\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        format!("http://{addr}/redirect-me")
+    }
+
+    #[tokio::test]
+    async fn redirect_to_forbidden_target_is_not_followed() {
+        let url = spawn_redirect_server().await;
+        // Mirrors the production client construction: redirects disabled.
+        let c = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let policy = FetchPolicy {
+            allow_http: true,
+            allow_private_ips: true,
+        };
+        let r = guarded_get(&c, &url, "text/plain", &policy).await;
+        assert!(
+            r.is_err(),
+            "a 3xx redirect must not be transparently followed to an unvalidated target"
+        );
     }
 }
