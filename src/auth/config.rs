@@ -1,5 +1,5 @@
 //! Authentication-time configuration: an optional trusted-issuer allowlist
-//! and (parsed here, enforced in a later task) an expected audience.
+//! and an expected audience, both enforced in [`super::authenticate`].
 
 use std::collections::HashSet;
 
@@ -13,8 +13,9 @@ use std::collections::HashSet;
 /// primary control. If `None`, any issuer is allowed to proceed to the
 /// WebID-issuer binding check (open federation).
 ///
-/// `expected_audience`: parsed and stored here; enforcement lands in a later
-/// task.
+/// `expected_audience`: if `Some(value)`, an access token whose (verified)
+/// `aud` claim does not contain `value` is rejected. If `None`, no audience
+/// check is performed (backward-compatible).
 #[derive(Clone, Default)]
 pub struct AuthConfig {
     pub trusted_issuers: Option<HashSet<String>>,

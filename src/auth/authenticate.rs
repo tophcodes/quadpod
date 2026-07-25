@@ -48,6 +48,13 @@ pub struct AuthDeps<'a> {
 /// over the WebID-issuer binding, which remains the primary control. If
 /// `trusted_issuers` is `None`, every issuer proceeds to that binding check
 /// (open federation).
+///
+/// After the access token's signature is verified, if `config.expected_audience`
+/// is `Some(value)`, `value` must appear in the token's (verified) `aud`
+/// claim or the request is rejected as [`AuthError::WrongAudience`] —
+/// defense-in-depth so a token minted for a different resource server isn't
+/// accepted here. If `expected_audience` is `None`, this check is skipped
+/// (backward-compatible).
 pub async fn authenticate(
     auth_header: Option<&str>,
     dpop_header: Option<&str>,
@@ -72,6 +79,12 @@ pub async fn authenticate(
     }
 
     let claims = verify_access_token(token, deps.resolver, now_unix).await?;
+
+    if let Some(expected) = &deps.config.expected_audience {
+        if !claims.audience.iter().any(|a| a == expected) {
+            return Err(AuthError::WrongAudience);
+        }
+    }
 
     if !deps
         .webid_verifier
@@ -235,5 +248,74 @@ mod tests {
         let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await;
         assert!(matches!(r, Err(crate::auth::AuthError::UntrustedIssuer)));
+    }
+
+    #[tokio::test]
+    async fn matching_audience_is_accepted_when_expected_set() {
+        let idp = TestIdp::new();
+        let client = TestClient::new();
+        let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+        let mut webids = StaticWebIdIssuers::new();
+        webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = AuthConfig {
+            expected_audience: Some("https://pod.toph.so/".to_string()),
+            ..Default::default()
+        };
+        let at = idp.mint_access_token_aud(
+            "https://alice.example/card#me",
+            &client.jkt(),
+            9_999_999_999,
+            &["solid", "https://pod.toph.so/"],
+        );
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-aud-ok");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+            "https://pod.toph.so/foo", deps, 1_010).await.unwrap();
+        assert_eq!(agent, Agent::WebId("https://alice.example/card#me".into()));
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_is_rejected_when_expected_set() {
+        let idp = TestIdp::new();
+        let client = TestClient::new();
+        let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+        let mut webids = StaticWebIdIssuers::new();
+        webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = AuthConfig {
+            expected_audience: Some("https://pod.toph.so/".to_string()),
+            ..Default::default()
+        };
+        let at = idp.mint_access_token_aud(
+            "https://alice.example/card#me",
+            &client.jkt(),
+            9_999_999_999,
+            &["https://other-rs.example/"],
+        );
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-aud-bad");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+            "https://pod.toph.so/foo", deps, 1_010).await;
+        assert!(matches!(r, Err(AuthError::WrongAudience)));
+    }
+
+    #[tokio::test]
+    async fn no_expected_audience_succeeds_regardless_of_token_aud() {
+        let idp = TestIdp::new();
+        let client = TestClient::new();
+        let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+        let mut webids = StaticWebIdIssuers::new();
+        webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = AuthConfig::default(); // expected_audience: None
+        let at = idp.mint_access_token_aud(
+            "https://alice.example/card#me",
+            &client.jkt(),
+            9_999_999_999,
+            &["https://some-other-rs.example/"],
+        );
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-aud-none");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+            "https://pod.toph.so/foo", deps, 1_010).await.unwrap();
+        assert_eq!(agent, Agent::WebId("https://alice.example/card#me".into()));
     }
 }

@@ -20,6 +20,7 @@ pub struct AccessClaims {
     pub webid: String,
     pub jkt: String,
     pub issuer: String,
+    pub audience: Vec<String>,
 }
 
 /// Verify `token`'s JWS signature against the issuer's published keys (via
@@ -91,11 +92,31 @@ pub async fn verify_access_token(
         .ok_or_else(|| AuthError::Malformed("missing iss claim".to_string()))?
         .to_string();
 
+    let audience = parse_audience(verified_payload.claim("aud"));
+
     Ok(AccessClaims {
         webid,
         jkt,
         issuer,
+        audience,
     })
+}
+
+/// Parse an `aud` claim value from a VERIFIED payload into a `Vec<String>`.
+/// Solid-OIDC access tokens carry `aud` as either a single JSON string or a
+/// JSON array of strings; a missing claim (or one of any other shape)
+/// yields an empty `Vec` rather than an error, since `aud` enforcement is
+/// optional (gated on `AuthConfig::expected_audience` in `authenticate`).
+fn parse_audience(claim: Option<&Value>) -> Vec<String> {
+    match claim {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Peek at a compact JWS's payload `iss` claim WITHOUT verifying the
@@ -166,6 +187,24 @@ mod tests {
         assert_eq!(claims.webid, "https://alice.example/card#me");
         assert_eq!(claims.jkt, jkt);
         assert_eq!(claims.issuer, "https://idp.example/");
+        assert!(claims.audience.is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_with_aud_array_yields_audience() {
+        let (resolver, client, idp) = setup();
+        let jkt = client.jkt();
+        let at = idp.mint_access_token_aud(
+            "https://alice.example/card#me",
+            &jkt,
+            9_999_999_999,
+            &["solid", "https://pod.toph.so/"],
+        );
+        let claims = verify_access_token(&at, &resolver, 1_000).await.unwrap();
+        assert_eq!(
+            claims.audience,
+            vec!["solid".to_string(), "https://pod.toph.so/".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -254,5 +293,18 @@ mod tests {
         let forged = build_jws(&header, &payload, &bogus_signature);
 
         assert!(verify_access_token(&forged, &resolver, 1_000).await.is_err());
+    }
+
+    #[test]
+    fn parse_audience_accepts_string_array_or_missing() {
+        assert_eq!(
+            parse_audience(Some(&serde_json::json!("solid"))),
+            vec!["solid".to_string()]
+        );
+        assert_eq!(
+            parse_audience(Some(&serde_json::json!(["solid", "https://rs.example/"]))),
+            vec!["solid".to_string(), "https://rs.example/".to_string()]
+        );
+        assert_eq!(parse_audience(None), Vec::<String>::new());
     }
 }

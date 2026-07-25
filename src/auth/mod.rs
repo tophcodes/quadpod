@@ -55,4 +55,6 @@ pub enum AuthError {
     IssuerNotAuthorized,
     #[error("issuer is not in the trusted-issuer allowlist")]
     UntrustedIssuer,
+    #[error("access token audience does not include the expected value")]
+    WrongAudience,
 }

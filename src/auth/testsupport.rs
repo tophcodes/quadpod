@@ -37,8 +37,22 @@ impl TestIdp {
     }
 
     /// Mint a DPoP-bound Solid-OIDC access token (compact JWS), signed by
-    /// this IdP's key, with `iss`/`sub`/`webid`/`exp`/`cnf.jkt` claims.
+    /// this IdP's key, with `iss`/`sub`/`webid`/`exp`/`cnf.jkt` claims (no
+    /// `aud` claim).
     pub fn mint_access_token(&self, webid: &str, dpop_jkt: &str, exp_unix: i64) -> String {
+        self.mint_access_token_aud(webid, dpop_jkt, exp_unix, &[])
+    }
+
+    /// Mint a DPoP-bound Solid-OIDC access token as [`Self::mint_access_token`]
+    /// does, plus an `aud` claim set to the JSON array `aud` (omitted
+    /// entirely when `aud` is empty, matching `mint_access_token`).
+    pub fn mint_access_token_aud(
+        &self,
+        webid: &str,
+        dpop_jkt: &str,
+        exp_unix: i64,
+        aud: &[&str],
+    ) -> String {
         let signer = ES256
             .signer_from_jwk(&self.private_jwk)
             .expect("build IdP signer");
@@ -61,6 +75,11 @@ impl TestIdp {
         payload
             .set_claim("cnf", Some(json!({ "jkt": dpop_jkt })))
             .expect("set cnf claim");
+        if !aud.is_empty() {
+            payload
+                .set_claim("aud", Some(json!(aud)))
+                .expect("set aud claim");
+        }
 
         jwt::encode_with_signer(&payload, &header, &signer).expect("sign access token")
     }
