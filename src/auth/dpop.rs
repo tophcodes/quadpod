@@ -12,7 +12,7 @@
 //! entirely. Fails closed: every verification error, or a `jkt` mismatch,
 //! is rejected.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -39,13 +39,16 @@ const FUTURE_SKEW_SECONDS: i64 = 5;
 ///
 /// This is process-lifetime, in-memory storage: a `jti` is only rejected as
 /// a replay within the single running process that first saw it (restarts
-/// or multiple replicas don't share this state), and the set grows
-/// unbounded for the process's lifetime (no eviction). Acceptable for v1;
-/// noted as a known limitation.
-static REPLAY_JTIS: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+/// or multiple replicas don't share this state) — a shared/persistent
+/// (e.g. Redis) store is still needed for multi-replica deployments; this
+/// remains single-instance only. Each entry is keyed by the `jti` hash and
+/// stores the `now_unix` at which it was recorded, so stale entries can be
+/// evicted (see `record_jti_or_reject_replay`) and the set stays bounded
+/// instead of growing for the process's lifetime.
+static REPLAY_JTIS: OnceLock<Mutex<HashMap<[u8; 32], i64>>> = OnceLock::new();
 
-fn replay_jtis() -> &'static Mutex<HashSet<[u8; 32]>> {
-    REPLAY_JTIS.get_or_init(|| Mutex::new(HashSet::new()))
+fn replay_jtis() -> &'static Mutex<HashMap<[u8; 32], i64>> {
+    REPLAY_JTIS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Hash a `jti` the same way `dpop-verifier` does internally (the SHA-256
@@ -62,8 +65,26 @@ fn hash_jti(jti: &str) -> [u8; 32] {
 /// so a proof rejected by any of those checks never consumes its `jti`, and
 /// only a fully-valid proof does. A *second* submission of that same valid
 /// proof is then rejected here as a replay.
-fn record_jti_or_reject_replay(jti: &str) -> Result<(), AuthError> {
-    if replay_jtis().lock().unwrap().insert(hash_jti(jti)) {
+///
+/// Before checking/inserting, evicts every entry recorded further back than
+/// the freshness window (`MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS`) from
+/// `now_unix`. This is safe because a `jti` can never be legitimately
+/// replayed *within* that window (this function rejects it), and *outside*
+/// the window `verify_dpop`'s own freshness check (Fix 1, above) already
+/// rejects the proof on `iat` staleness before we ever get here — so
+/// nothing that still needs replay protection is ever evicted, and the set
+/// stays bounded instead of growing for the process's lifetime. Note: this
+/// is still an in-process, single-instance store (see `REPLAY_JTIS`); a
+/// shared/persistent store (e.g. Redis) is required for multi-replica
+/// deployments, which is out of scope here.
+fn record_jti_or_reject_replay(jti: &str, now_unix: i64) -> Result<(), AuthError> {
+    let mut jtis = replay_jtis().lock().unwrap();
+    let cutoff = now_unix - (MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS);
+    jtis.retain(|_, recorded_at| *recorded_at >= cutoff);
+
+    let hash = hash_jti(jti);
+    if let std::collections::hash_map::Entry::Vacant(entry) = jtis.entry(hash) {
+        entry.insert(now_unix);
         Ok(())
     } else {
         Err(AuthError::DpopInvalid("dpop proof replayed".to_string()))
@@ -142,7 +163,7 @@ pub async fn verify_dpop(
     // Every check above has passed: only now do we consume the jti, so a
     // proof rejected by any earlier check leaves its jti reusable (see
     // `NoopReplayStore` and `record_jti_or_reject_replay`).
-    record_jti_or_reject_replay(&verified.jti)?;
+    record_jti_or_reject_replay(&verified.jti, now_unix)?;
 
     Ok(())
 }
@@ -152,8 +173,29 @@ mod tests {
     use super::*;
     use crate::auth::testsupport::TestClient;
 
+    /// Serializes tests that actually record a `jti` into the process-wide
+    /// `REPLAY_JTIS` store (i.e. reach a fully-valid `verify_dpop` call).
+    /// `cargo test` runs tests in parallel by default; those tests use
+    /// wildly different simulated `now_unix` values (some far in the
+    /// future, to exercise eviction), and a large `now_unix` in one test
+    /// would otherwise evict another concurrently-running test's
+    /// just-inserted, still-fresh entry out from under it. Tests that never
+    /// reach `record_jti_or_reject_replay` (rejected earlier by htu/htm,
+    /// freshness, or jkt binding) don't touch the shared store and don't
+    /// need this lock.
+    ///
+    /// Uses `tokio::sync::Mutex`, not `std::sync::Mutex`, because the guard
+    /// is held across `.await` points below (clippy's `await_holding_lock`
+    /// correctly flags a std lock there).
+    static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    fn test_lock() -> &'static tokio::sync::Mutex<()> {
+        TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[tokio::test]
     async fn valid_proof_matching_jkt_passes() {
+        let _guard = test_lock().lock().await;
         let client = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-a");
         assert!(verify_dpop(
@@ -257,6 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_of_valid_proof_is_rejected_but_rejected_proof_does_not_burn_jti() {
+        let _guard = test_lock().lock().await;
         let client = TestClient::new();
         // a proof that will FAIL the jkt binding (wrong expected_jkt) must NOT burn its jti
         let other = TestClient::new();
@@ -279,5 +322,25 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn replayed_jti_outside_window_is_allowed_again_and_set_stays_bounded() {
+        let _guard = test_lock().lock().await;
+        let client = crate::auth::testsupport::TestClient::new();
+        // first use at t=1000
+        let p1 = client.mint_dpop("https://pod.toph.so/a", "GET", 1_000, "jti-ttl");
+        assert!(verify_dpop(&p1, "https://pod.toph.so/a", "GET", &client.jkt(), 1_010)
+            .await
+            .is_ok());
+        // immediate replay (same jti, within window) → rejected
+        assert!(verify_dpop(&p1, "https://pod.toph.so/a", "GET", &client.jkt(), 1_010)
+            .await
+            .is_err());
+        // a NEW proof with the SAME jti but far in the future (past the eviction window) → allowed
+        let p2 = client.mint_dpop("https://pod.toph.so/a", "GET", 1_000_000, "jti-ttl");
+        assert!(verify_dpop(&p2, "https://pod.toph.so/a", "GET", &client.jkt(), 1_000_010)
+            .await
+            .is_ok());
     }
 }
