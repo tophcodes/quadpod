@@ -4,12 +4,14 @@
 //! Solid-OIDC access token) against an external IdP's published keys and
 //! attaches an [`Agent`] to the request. It never issues tokens itself.
 
+pub mod access_token;
 pub mod agent;
 pub mod jwks;
 
 #[cfg(test)]
 pub mod testsupport;
 
+pub use access_token::{verify_access_token, AccessClaims};
 pub use agent::Agent;
 pub use jwks::{Jwks, JwksResolver, StaticJwksResolver};
 

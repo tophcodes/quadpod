@@ -105,6 +105,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -352,7 +358,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ffe26542b84d85fc36fec8dfac45abf0d2f93c2d5ee9ffdebe3bb22a090d016"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "hmac",
  "p256",
  "rand_core 0.6.4",
@@ -829,7 +835,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a808e078330e6af222eb0044b71d4b1ff981bfef43e7bc8133a88234e0c86a0c"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "flate2",
  "openssl",
  "regex",
@@ -1708,6 +1714,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.23.0",
  "dpop-verifier",
  "hex",
  "http-body-util",
