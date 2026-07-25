@@ -30,7 +30,9 @@ fn media_type(ct: &str) -> &str {
 }
 
 pub fn format_for_content_type(ct: &str) -> Option<RdfFormat> {
-    match media_type(ct) {
+    // Media-type tokens are case-insensitive per RFC 9110 §8.3.1, so
+    // `Application/LD+JSON` or `TEXT/TURTLE` must match too.
+    match media_type(ct).to_ascii_lowercase().as_str() {
         "text/turtle" => Some(turtle()),
         "application/ld+json" => Some(jsonld()),
         "application/n-triples" => Some(ntriples()),
@@ -122,6 +124,12 @@ mod tests {
         assert!(format_for_content_type("application/ld+json").is_some());
         assert!(format_for_content_type("application/n-triples").is_some());
         assert!(format_for_content_type("application/json").is_none());
+    }
+
+    #[test]
+    fn content_type_matching_is_case_insensitive() {
+        assert!(format_for_content_type("Application/LD+JSON").is_some());
+        assert!(format_for_content_type("TEXT/TURTLE; charset=utf-8").is_some());
     }
 
     #[test]

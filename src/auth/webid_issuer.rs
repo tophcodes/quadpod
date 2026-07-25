@@ -147,7 +147,11 @@ impl WebIdIssuerVerifier for HttpWebIdIssuers {
 /// Compares two issuer strings ignoring a trailing slash: issuers are
 /// sometimes written with one and sometimes without, and both forms name
 /// the same issuer.
-fn issuer_matches(a: &str, b: &str) -> bool {
+///
+/// `pub(crate)` so [`super::authenticate`]'s issuer-allowlist check can
+/// reuse the exact same normalization instead of re-implementing it (and
+/// risking divergence).
+pub(crate) fn issuer_matches(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 

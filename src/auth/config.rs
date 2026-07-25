@@ -24,23 +24,42 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     /// Build from environment variables:
-    /// - `POD_TRUSTED_ISSUERS`: comma-separated issuer URLs. Unset ->
-    ///   `None` (open federation).
+    /// - `POD_TRUSTED_ISSUERS`: comma-separated issuer URLs. Unset, empty,
+    ///   or containing only blank/empty entries -> `None` (open federation).
     /// - `POD_EXPECTED_AUDIENCE`: a single audience value. Unset -> `None`.
     pub fn from_env() -> Self {
-        let trusted_issuers = std::env::var("POD_TRUSTED_ISSUERS").ok().map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        });
+        let trusted_issuers = parse_trusted(std::env::var("POD_TRUSTED_ISSUERS").ok());
         let expected_audience = std::env::var("POD_EXPECTED_AUDIENCE").ok();
         Self {
             trusted_issuers,
             expected_audience,
         }
     }
+}
+
+/// Parses `POD_TRUSTED_ISSUERS`'s raw value into the allowlist set.
+///
+/// An unset variable (`None`) means "not configured" -> `None` (open
+/// federation), which is unambiguous. But a SET variable that is empty, or
+/// whose entries are all blank after trimming (e.g. `""`, `","`, `" , "`),
+/// is almost certainly a misconfiguration (a blanked-out env var, a typo'd
+/// separator) rather than a deliberate "trust nobody" — and `Some(∅)` would
+/// make every issuer fail `set.contains(..)`, i.e. total auth lockout. So
+/// that case is also folded into `None` rather than `Some(HashSet::new())`.
+fn parse_trusted(raw: Option<String>) -> Option<HashSet<String>> {
+    raw.and_then(|raw| {
+        let set: HashSet<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if set.is_empty() {
+            None
+        } else {
+            Some(set)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -52,5 +71,27 @@ mod tests {
         let cfg = AuthConfig::default();
         assert!(cfg.trusted_issuers.is_none());
         assert!(cfg.expected_audience.is_none());
+    }
+
+    #[test]
+    fn unset_env_yields_none() {
+        assert_eq!(parse_trusted(None), None);
+    }
+
+    #[test]
+    fn empty_env_yields_none_not_empty_set() {
+        assert_eq!(parse_trusted(Some(String::new())), None);
+    }
+
+    #[test]
+    fn separators_only_env_yields_none() {
+        assert_eq!(parse_trusted(Some(",,".to_string())), None);
+        assert_eq!(parse_trusted(Some(" , , ".to_string())), None);
+    }
+
+    #[test]
+    fn populated_env_yields_trimmed_set() {
+        let expected: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        assert_eq!(parse_trusted(Some("a, b".to_string())), Some(expected));
     }
 }

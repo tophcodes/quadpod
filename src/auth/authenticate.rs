@@ -4,7 +4,7 @@ use super::access_token::{peek_untrusted_issuer, verify_access_token};
 use super::config::AuthConfig;
 use super::dpop::verify_dpop;
 use super::jwks::JwksResolver;
-use super::webid_issuer::WebIdIssuerVerifier;
+use super::webid_issuer::{issuer_matches, WebIdIssuerVerifier};
 use super::{Agent, AuthError};
 
 /// The trust-configuration collaborators [`authenticate`] verifies a
@@ -41,9 +41,11 @@ pub struct AuthDeps<'a> {
 ///
 /// Before any JWKS fetch, if `config.trusted_issuers` is `Some(set)` the
 /// token's `iss` (peeked WITHOUT signature verification, via
-/// [`peek_untrusted_issuer`]) must be a member of `set` or the request is
-/// rejected as [`AuthError::UntrustedIssuer`] — this untrusted peek is used
-/// ONLY to reject early, never to accept. This shrinks the SSRF surface (an
+/// [`peek_untrusted_issuer`]) must match a member of `set` — compared via
+/// [`issuer_matches`] (trailing-slash-insensitive, the same normalization
+/// used for the WebID-issuer binding) — or the request is rejected as
+/// [`AuthError::UntrustedIssuer`]. This untrusted peek is used ONLY to
+/// reject early, never to accept. This shrinks the SSRF surface (an
 /// untrusted issuer never triggers an outbound fetch) as defense-in-depth
 /// over the WebID-issuer binding, which remains the primary control. If
 /// `trusted_issuers` is `None`, every issuer proceeds to that binding check
@@ -73,7 +75,7 @@ pub async fn authenticate(
 
     if let Some(trusted) = &deps.config.trusted_issuers {
         let untrusted_iss = peek_untrusted_issuer(token)?;
-        if !trusted.contains(&untrusted_iss) {
+        if !trusted.iter().any(|t| issuer_matches(t, &untrusted_iss)) {
             return Err(AuthError::UntrustedIssuer);
         }
     }
@@ -248,6 +250,37 @@ mod tests {
         let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await;
         assert!(matches!(r, Err(crate::auth::AuthError::UntrustedIssuer)));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_issuer_without_trailing_slash_accepts_token_with_one() {
+        // `TestIdp` always sets `iss` to "https://idp.example/" (with a
+        // trailing slash). Configuring the allowlist WITHOUT one must still
+        // accept it — the allowlist match must use the same
+        // trailing-slash-insensitive normalization as the WebID-issuer
+        // binding, or a perfectly valid config locks everyone out.
+        let idp = TestIdp::new();
+        let client = TestClient::new();
+        let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+        let mut webids = StaticWebIdIssuers::new();
+        webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = AuthConfig {
+            trusted_issuers: Some(["https://idp.example".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let at = idp.mint_access_token(
+            "https://alice.example/card#me",
+            &client.jkt(),
+            9_999_999_999,
+        );
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-slash");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+            "https://pod.toph.so/foo", deps, 1_010).await;
+        assert!(
+            !matches!(r, Err(AuthError::UntrustedIssuer)),
+            "trailing-slash mismatch must not be treated as an untrusted issuer"
+        );
     }
 
     #[tokio::test]
