@@ -11,6 +11,7 @@ pub mod dpop;
 pub mod http_jwks;
 pub mod jwks;
 pub mod middleware;
+pub mod safe_fetch;
 
 #[cfg(test)]
 pub mod testsupport;
@@ -44,4 +45,6 @@ pub enum AuthError {
     Binding,
     #[error("no signing key available for this token")]
     MissingKey,
+    #[error("blocked outbound fetch: {0}")]
+    FetchBlocked(String),
 }

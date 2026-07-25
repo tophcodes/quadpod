@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use super::jwks::{Jwks, JwksResolver};
+use super::safe_fetch::{guarded_get, FetchPolicy};
 use super::AuthError;
 
 /// How long a resolved `Jwks` is trusted before this resolver re-fetches it
@@ -28,21 +29,37 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 pub struct HttpJwksResolver {
     client: reqwest::Client,
     cache: RwLock<HashMap<String, (Jwks, Instant)>>,
+    policy: FetchPolicy,
 }
 
 impl HttpJwksResolver {
+    /// Production constructor: fetches are SSRF-guarded with
+    /// [`FetchPolicy::default`] (https-only, private IPs blocked).
     pub fn new() -> Self {
+        Self::with_policy(FetchPolicy::default())
+    }
+
+    /// Construct with an explicit [`FetchPolicy`] — used by hermetic tests
+    /// that fetch from a local (`127.0.0.1`) test server and so must allow
+    /// http and private IPs.
+    pub fn with_policy(policy: FetchPolicy) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client with timeouts should always build");
         Self {
-            client: reqwest::Client::new(),
+            client,
             cache: RwLock::new(HashMap::new()),
+            policy,
         }
     }
 
-    /// Perform the OIDC-discovery + JWKS fetch, uncached. Any network
-    /// failure, non-2xx status, or unexpected JSON shape fails closed as
-    /// `AuthError::UnknownIssuer` — from the caller's point of view, an
-    /// issuer whose keys can't be resolved is exactly as unusable as one
-    /// that was never configured at all.
+    /// Perform the OIDC-discovery + JWKS fetch, uncached. Any SSRF-guard
+    /// rejection, network failure, non-2xx status, or unexpected JSON
+    /// shape fails closed as `AuthError::UnknownIssuer` — from the
+    /// caller's point of view, an issuer whose keys can't be resolved is
+    /// exactly as unusable as one that was never configured at all.
     async fn fetch(&self, issuer: &str) -> Result<Jwks, AuthError> {
         let discovery_url = if issuer.ends_with('/') {
             format!("{issuer}.well-known/openid-configuration")
@@ -50,31 +67,22 @@ impl HttpJwksResolver {
             format!("{issuer}/.well-known/openid-configuration")
         };
 
-        let discovery: Value = self
-            .client
-            .get(&discovery_url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|_| AuthError::UnknownIssuer)?
-            .json()
-            .await
-            .map_err(|_| AuthError::UnknownIssuer)?;
+        let discovery_body =
+            guarded_get(&self.client, &discovery_url, "application/json", &self.policy)
+                .await
+                .map_err(|_| AuthError::UnknownIssuer)?;
+        let discovery: Value =
+            serde_json::from_str(&discovery_body).map_err(|_| AuthError::UnknownIssuer)?;
         let jwks_uri = discovery
             .get("jwks_uri")
             .and_then(Value::as_str)
             .ok_or(AuthError::UnknownIssuer)?;
 
-        let jwks_doc: Value = self
-            .client
-            .get(jwks_uri)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|_| AuthError::UnknownIssuer)?
-            .json()
+        let jwks_body = guarded_get(&self.client, jwks_uri, "application/json", &self.policy)
             .await
             .map_err(|_| AuthError::UnknownIssuer)?;
+        let jwks_doc: Value =
+            serde_json::from_str(&jwks_body).map_err(|_| AuthError::UnknownIssuer)?;
         let keys_value = jwks_doc.get("keys").ok_or(AuthError::UnknownIssuer)?;
         let keys: Vec<Jwk> =
             serde_json::from_value(keys_value.clone()).map_err(|_| AuthError::UnknownIssuer)?;
@@ -182,7 +190,10 @@ mod tests {
     async fn resolves_jwks_via_oidc_discovery_and_caches() {
         let idp = TestIdp::new();
         let (issuer, jwks_hits) = spawn_test_idp_server(&idp).await;
-        let resolver = HttpJwksResolver::new();
+        let resolver = HttpJwksResolver::with_policy(FetchPolicy {
+            allow_http: true,
+            allow_private_ips: true,
+        });
 
         let jwks = resolver.resolve(&issuer).await.expect("resolve via HTTP");
         assert_eq!(jwks.keys.len(), 1);
@@ -195,7 +206,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_host_is_unknown_issuer() {
-        let resolver = HttpJwksResolver::new();
+        let resolver = HttpJwksResolver::with_policy(FetchPolicy {
+            allow_http: true,
+            allow_private_ips: true,
+        });
         // port 0 is never a listening server; this is a local-only failure,
         // not a real network call to an external host.
         assert!(matches!(
