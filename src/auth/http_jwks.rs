@@ -36,13 +36,20 @@ impl HttpJwksResolver {
     /// Production constructor: fetches are SSRF-guarded with
     /// [`FetchPolicy::default`] (https-only, private IPs blocked).
     pub fn new() -> Self {
-        Self::with_policy(FetchPolicy::default())
+        Self::build(FetchPolicy::default())
     }
 
     /// Construct with an explicit [`FetchPolicy`] — used by hermetic tests
     /// that fetch from a local (`127.0.0.1`) test server and so must allow
-    /// http and private IPs.
+    /// http and private IPs. Test-only: a permissive policy must be
+    /// unconstructable in a production build, so production code must go
+    /// through [`Self::new`].
+    #[cfg(test)]
     pub fn with_policy(policy: FetchPolicy) -> Self {
+        Self::build(policy)
+    }
+
+    fn build(policy: FetchPolicy) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))

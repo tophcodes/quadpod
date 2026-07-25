@@ -57,6 +57,25 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || is_cgnat(v4)
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped (`::ffff:a.b.c.d`) — the classic metadata-endpoint
+            // bypass: on a dual-stack host the kernel connects to the real
+            // IPv4 address, so this must be classified by the v4 rules, not
+            // treated as an opaque v6 address.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ip(IpAddr::V4(v4));
+            }
+            // IPv4-compatible (deprecated `::a.b.c.d` form): top 96 bits
+            // zero, excluding `::` and `::1` which are handled below.
+            let seg = v6.segments();
+            if seg[0..6] == [0, 0, 0, 0, 0, 0] && !(v6.is_loopback() || v6.is_unspecified()) {
+                let v4 = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                );
+                return is_forbidden_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback() || v6.is_unspecified() || is_unique_local(v6) || is_link_local_v6(v6)
         }
     }
@@ -140,7 +159,7 @@ pub async fn guarded_get(
         }
     }
 
-    let response = client
+    let mut response = client
         .get(parsed)
         .header(reqwest::header::ACCEPT, accept)
         .send()
@@ -149,6 +168,8 @@ pub async fn guarded_get(
         .error_for_status()
         .map_err(|e| AuthError::FetchBlocked(format!("non-success status: {e}")))?;
 
+    // Cheap fast-path: a declared size already over the cap is rejected
+    // without reading any body at all.
     if let Some(len) = response.content_length() {
         if len > MAX_BODY_BYTES as u64 {
             return Err(AuthError::FetchBlocked(
@@ -157,18 +178,25 @@ pub async fn guarded_get(
         }
     }
 
-    let body = response
-        .bytes()
+    // Read incrementally and bail as soon as the running total exceeds the
+    // cap, so a malicious/misbehaving server can't force this process to
+    // buffer an unbounded (or merely huge) body in memory before the size
+    // is checked — the server can lie about (or omit) `Content-Length`.
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| AuthError::FetchBlocked(format!("failed to read body: {e}")))?;
-
-    if body.len() > MAX_BODY_BYTES {
-        return Err(AuthError::FetchBlocked(
-            "response exceeds size cap".to_string(),
-        ));
+        .map_err(|e| AuthError::FetchBlocked(format!("failed to read body: {e}")))?
+    {
+        if buf.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(AuthError::FetchBlocked(
+                "response exceeds size cap".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(body.to_vec())
+    String::from_utf8(buf)
         .map_err(|_| AuthError::FetchBlocked("response was not valid UTF-8".to_string()))
 }
 
@@ -187,6 +215,28 @@ mod tests {
         assert!(!is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))) // public
     }
 
+    #[test]
+    fn ipv4_mapped_ipv6_is_forbidden() {
+        assert!(is_forbidden_ip(
+            "::ffff:169.254.169.254".parse::<IpAddr>().unwrap()
+        )); // metadata
+        assert!(is_forbidden_ip("::ffff:127.0.0.1".parse::<IpAddr>().unwrap())); // loopback
+        assert!(is_forbidden_ip("::ffff:10.0.0.1".parse::<IpAddr>().unwrap())); // private
+        assert!(!is_forbidden_ip(
+            "::ffff:93.184.216.34".parse::<IpAddr>().unwrap()
+        )); // public stays public
+    }
+
+    #[test]
+    fn ipv4_compatible_ipv6_is_forbidden() {
+        // deprecated `::a.b.c.d` form embedding a private address
+        assert!(is_forbidden_ip("::10.0.0.1".parse::<IpAddr>().unwrap()));
+        // `::` (unspecified) and `::1` (loopback) must still classify via
+        // their dedicated v6 checks, not be misread as embedding 0.0.0.0/0.0.0.1
+        assert!(is_forbidden_ip(Ipv6Addr::UNSPECIFIED.into()));
+        assert!(is_forbidden_ip(Ipv6Addr::LOCALHOST.into()));
+    }
+
     #[tokio::test]
     async fn rejects_http_scheme_by_default() {
         let c = reqwest::Client::new();
@@ -199,5 +249,58 @@ mod tests {
         let c = reqwest::Client::new();
         let r = guarded_get(&c, "https://127.0.0.1/x", "text/turtle", &FetchPolicy::default()).await;
         assert!(r.is_err());
+    }
+
+    /// A malicious/misbehaving server that streams a body over
+    /// `MAX_BODY_BYTES` via chunked transfer-encoding (deliberately no
+    /// `Content-Length`, so the cheap early-reject can't fire) must still be
+    /// rejected — proving the cap is enforced as bytes arrive, not only
+    /// after the whole body has been buffered.
+    async fn spawn_oversized_chunked_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            // Drain (and discard) the request before responding.
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            // MAX_BODY_BYTES is 1 MiB; send well over that across many
+            // chunks so the server is genuinely streaming, not buffering.
+            let chunk_data = vec![b'a'; 64 * 1024];
+            let total_chunks = (MAX_BODY_BYTES / chunk_data.len()) + 4;
+            for _ in 0..total_chunks {
+                let header = format!("{:x}\r\n", chunk_data.len());
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&chunk_data).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        format!("http://{addr}/big")
+    }
+
+    #[tokio::test]
+    async fn streamed_body_over_cap_is_rejected_without_full_buffering() {
+        let url = spawn_oversized_chunked_server().await;
+        let c = reqwest::Client::new();
+        let policy = FetchPolicy {
+            allow_http: true,
+            allow_private_ips: true,
+        };
+        let r = guarded_get(&c, &url, "text/plain", &policy).await;
+        assert!(r.is_err(), "oversized streamed body must be rejected");
     }
 }
