@@ -10,17 +10,16 @@
 //! (by default) and refusing to contact any resolved IP in a
 //! private/loopback/link-local/CGNAT range.
 //!
-//! Residual limitation (v1): this resolves the host once to check it,
-//! then hands the same URL to `reqwest` to connect, which resolves DNS
-//! again itself. A DNS-rebinding attacker (a name that answers with a
-//! public IP on the first lookup and a private one moments later) can
-//! race past this check. Closing that fully needs a custom
-//! resolver/connector that pins the checked IP for the actual connection;
-//! out of scope for this pass. The https-default + private-IP block
-//! still covers the common SSRF vectors (cloud metadata, internal
-//! services reachable by static IP/hostname, localhost).
+//! DNS-rebinding closed: [`resolve_allowed`] resolves the host once,
+//! validates every candidate address, and [`guarded_get`] then **pins**
+//! the connection to one of those already-validated addresses (via
+//! reqwest's per-client DNS override) instead of handing the bare
+//! hostname to `reqwest` and letting it re-resolve — which is what would
+//! let a name that answers with a public IP on the first lookup and a
+//! private one moments later race past the check.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use tokio::net::lookup_host;
 
@@ -29,6 +28,13 @@ use super::AuthError;
 /// Maximum response body accepted from a guarded fetch, to bound memory
 /// use against a malicious or misbehaving server.
 const MAX_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Connect/total timeouts for the pinned per-request client built inside
+/// [`guarded_get`]. Matches the values every production caller
+/// (`HttpJwksResolver`, `WebIdIssuerVerifier`) already configures on the
+/// client they pass in.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Controls which network destinations [`guarded_get`] will contact.
 /// `Default` is the production-safe posture: https-only, private IPs
@@ -113,13 +119,66 @@ fn is_link_local_v6(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
+/// Resolve `host` (IP literal used directly; hostname resolved via the
+/// system resolver against `port`) and validate every candidate address
+/// against [`is_forbidden_ip`] (skipped entirely when
+/// `policy.allow_private_ips`). Returns the resolved addresses so the
+/// caller can pin the actual connection to one of them, or an error if
+/// resolution fails, yields nothing, or (under the default policy) yields
+/// any forbidden address.
+pub(crate) async fn resolve_allowed(
+    host: &str,
+    port: u16,
+    policy: &FetchPolicy,
+) -> Result<Vec<SocketAddr>, AuthError> {
+    // `host_str()` brackets IPv6 literals (e.g. "[::1]"); strip that before
+    // trying to parse it as an IP so a literal resolves without a DNS
+    // round-trip.
+    let ip_literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>();
+
+    let resolved: Vec<SocketAddr> = match ip_literal {
+        Ok(ip) => vec![SocketAddr::new(ip, port)],
+        Err(_) => lookup_host((host, port))
+            .await
+            .map_err(|e| AuthError::FetchBlocked(format!("DNS resolution failed: {e}")))?
+            .collect(),
+    };
+
+    if resolved.is_empty() {
+        return Err(AuthError::FetchBlocked(
+            "host resolved to no addresses".to_string(),
+        ));
+    }
+
+    if !policy.allow_private_ips && resolved.iter().any(|addr| is_forbidden_ip(addr.ip())) {
+        return Err(AuthError::FetchBlocked(
+            "target resolves to a forbidden (private/loopback/link-local) IP".to_string(),
+        ));
+    }
+
+    Ok(resolved)
+}
+
 /// Fetch `url` with the `accept` header, refusing to run at all unless it
 /// passes `policy`: https-only (unless `allow_http`), and every IP the
 /// host resolves to must be a public address (unless `allow_private_ips`).
 /// Fails closed on any parse, resolution, network, status, size, or
 /// encoding error.
+///
+/// The connection is pinned to the exact validated address (via a
+/// per-request client built with reqwest's DNS override) rather than
+/// handing the hostname to `reqwest` to resolve again — closing the
+/// DNS-rebinding race where a name resolves to a public IP for this
+/// check and a private one for the real connection. The `_client`
+/// parameter is accepted for API stability but unused: pinning requires
+/// a fresh `ClientBuilder` per request (a built `reqwest::Client`'s DNS
+/// overrides can't be changed after construction), so the connection
+/// always goes out on a client built here, not the one passed in.
 pub async fn guarded_get(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
     accept: &str,
     policy: &FetchPolicy,
@@ -140,42 +199,28 @@ pub async fn guarded_get(
     let host = parsed
         .host_str()
         .ok_or_else(|| AuthError::FetchBlocked("URL has no host".to_string()))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| AuthError::FetchBlocked("URL has no port".to_string()))?;
 
-    if !policy.allow_private_ips {
-        // `host_str()` brackets IPv6 literals (e.g. "[::1]"); strip that
-        // before trying to parse it as an IP.
-        let ip_literal = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>();
+    let pinned_addr = *resolve_allowed(host, port, policy).await?.first().expect(
+        "resolve_allowed only returns Ok with a non-empty Vec (empty case is its own Err)",
+    );
 
-        let resolved_ips: Vec<IpAddr> = match ip_literal {
-            Ok(ip) => vec![ip],
-            Err(_) => {
-                let port = parsed
-                    .port_or_known_default()
-                    .ok_or_else(|| AuthError::FetchBlocked("URL has no port".to_string()))?;
-                lookup_host((host, port))
-                    .await
-                    .map_err(|e| AuthError::FetchBlocked(format!("DNS resolution failed: {e}")))?
-                    .map(|addr| addr.ip())
-                    .collect()
-            }
-        };
+    // Build a fresh client for this one request, pinned to the validated
+    // address: reqwest's DNS override is baked into a `Client` at build
+    // time, so there is no way to point an already-built client at a
+    // different address per call. The Host header + TLS SNI still use
+    // `host` (only the socket target is overridden).
+    let pinned_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(TOTAL_TIMEOUT)
+        .resolve(host, pinned_addr)
+        .build()
+        .map_err(|e| AuthError::FetchBlocked(format!("failed to build pinned client: {e}")))?;
 
-        if resolved_ips.is_empty() {
-            return Err(AuthError::FetchBlocked(
-                "host resolved to no addresses".to_string(),
-            ));
-        }
-        if resolved_ips.into_iter().any(is_forbidden_ip) {
-            return Err(AuthError::FetchBlocked(
-                "target resolves to a forbidden (private/loopback/link-local) IP".to_string(),
-            ));
-        }
-    }
-
-    let mut response = client
+    let mut response = pinned_client
         .get(parsed)
         .header(reqwest::header::ACCEPT, accept)
         .send()
@@ -261,6 +306,31 @@ mod tests {
         // their dedicated v6 checks, not be misread as embedding 0.0.0.0/0.0.0.1
         assert!(is_forbidden_ip(Ipv6Addr::UNSPECIFIED.into()));
         assert!(is_forbidden_ip(Ipv6Addr::LOCALHOST.into()));
+    }
+
+    #[tokio::test]
+    async fn resolve_allowed_rejects_forbidden_ip_literals_under_default_policy() {
+        let policy = FetchPolicy::default();
+        assert!(resolve_allowed("127.0.0.1", 443, &policy).await.is_err());
+        assert!(resolve_allowed("10.0.0.1", 443, &policy).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_allowed_permits_forbidden_ip_literal_under_permissive_policy() {
+        let policy = FetchPolicy::permissive();
+        let addrs = resolve_allowed("127.0.0.1", 8080, &policy).await.unwrap();
+        assert_eq!(addrs, vec![SocketAddr::from(([127, 0, 0, 1], 8080))]);
+    }
+
+    #[tokio::test]
+    async fn rejects_hostname_resolving_to_loopback() {
+        // Exercises the `lookup_host` branch (not the IP-literal
+        // fast-path): "localhost" resolves via the system resolver, not a
+        // network DNS query, so this stays hermetic.
+        let c = reqwest::Client::new();
+        let r = guarded_get(&c, "https://localhost/x", "text/turtle", &FetchPolicy::default())
+            .await;
+        assert!(r.is_err());
     }
 
     #[tokio::test]
