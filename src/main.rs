@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use sparql_pod::{auth::{HttpJwksResolver, HttpWebIdIssuers}, http::{AppState, router}, space::StorageSpace, store::OxigraphStore};
+use sparql_pod::{auth::{AuthConfig, HttpJwksResolver, HttpWebIdIssuers}, http::{AppState, router}, space::StorageSpace, store::OxigraphStore};
 
 #[tokio::main]
 async fn main() {
@@ -10,6 +10,7 @@ async fn main() {
         space: StorageSpace::new(base).expect("valid POD_BASE_URI (absolute, trailing slash)"),
         resolver: Arc::new(HttpJwksResolver::new()),
         webid_verifier: Arc::new(HttpWebIdIssuers::new()),
+        auth_config: Arc::new(AuthConfig::from_env()),
     };
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space)
         .await.expect("provision root container");

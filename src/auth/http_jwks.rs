@@ -24,11 +24,19 @@ use super::AuthError;
 /// from the issuer.
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// How long a discovery/JWKS FAILURE is remembered before this resolver
+/// will attempt to fetch the same issuer again. Short by design (unlike
+/// `CACHE_TTL`): this only exists to stop a flapping or hostile issuer from
+/// being re-probed on every single request, not to durably remember an
+/// issuer as bad.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
+
 /// An HTTP `JwksResolver` for production use: resolves an issuer's signing
 /// keys via OIDC discovery, caching the result per issuer for `CACHE_TTL`.
 pub struct HttpJwksResolver {
     client: reqwest::Client,
     cache: RwLock<HashMap<String, (Jwks, Instant)>>,
+    negative_cache: RwLock<HashMap<String, Instant>>,
     policy: FetchPolicy,
 }
 
@@ -59,6 +67,7 @@ impl HttpJwksResolver {
         Self {
             client,
             cache: RwLock::new(HashMap::new()),
+            negative_cache: RwLock::new(HashMap::new()),
             policy,
         }
     }
@@ -116,17 +125,34 @@ impl JwksResolver for HttpJwksResolver {
             }
         }
 
-        let jwks = self.fetch(issuer).await?;
-        self.cache.write().await.insert(
-            issuer.to_string(),
-            (
-                Jwks {
-                    keys: jwks.keys.clone(),
-                },
-                Instant::now(),
-            ),
-        );
-        Ok(jwks)
+        if let Some(failed_at) = self.negative_cache.read().await.get(issuer) {
+            if failed_at.elapsed() < NEGATIVE_CACHE_TTL {
+                return Err(AuthError::UnknownIssuer);
+            }
+        }
+
+        match self.fetch(issuer).await {
+            Ok(jwks) => {
+                self.cache.write().await.insert(
+                    issuer.to_string(),
+                    (
+                        Jwks {
+                            keys: jwks.keys.clone(),
+                        },
+                        Instant::now(),
+                    ),
+                );
+                self.negative_cache.write().await.remove(issuer);
+                Ok(jwks)
+            }
+            Err(e) => {
+                self.negative_cache
+                    .write()
+                    .await
+                    .insert(issuer.to_string(), Instant::now());
+                Err(e)
+            }
+        }
     }
 }
 
@@ -136,6 +162,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::extract::State;
+    use axum::http::StatusCode;
     use axum::routing::get;
     use axum::{Json, Router};
     use serde_json::json;
@@ -218,5 +245,53 @@ mod tests {
             resolver.resolve("http://127.0.0.1:0/").await,
             Err(AuthError::UnknownIssuer)
         ));
+    }
+
+    async fn failing_discovery_handler(
+        State(hits): State<Arc<AtomicUsize>>,
+    ) -> StatusCode {
+        hits.fetch_add(1, Ordering::SeqCst);
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    /// Spin up a discovery endpoint that always fails (500), counting how
+    /// many times it's hit.
+    async fn spawn_failing_discovery_server() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let issuer = format!("http://{addr}/");
+
+        let app = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(failing_discovery_handler).with_state(hits.clone()),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (issuer, hits)
+    }
+
+    #[tokio::test]
+    async fn resolution_failure_is_negatively_cached() {
+        let (issuer, hits) = spawn_failing_discovery_server().await;
+        let resolver = HttpJwksResolver::with_policy(FetchPolicy::permissive());
+
+        assert!(matches!(
+            resolver.resolve(&issuer).await,
+            Err(AuthError::UnknownIssuer)
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // A second resolve within the negative-cache TTL must be served
+        // from the negative cache, not re-probe the (still failing) server.
+        assert!(matches!(
+            resolver.resolve(&issuer).await,
+            Err(AuthError::UnknownIssuer)
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

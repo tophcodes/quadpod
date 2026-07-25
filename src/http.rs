@@ -2,7 +2,7 @@ use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
     http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use crate::{space::StorageSpace, store::SparqlStore, container, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
-    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}, auth::{JwksResolver, WebIdIssuerVerifier, auth_layer}};
+    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}, auth::{AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10,6 +10,7 @@ pub struct AppState {
     pub space: StorageSpace,
     pub resolver: Arc<dyn JwksResolver>,
     pub webid_verifier: Arc<dyn WebIdIssuerVerifier>,
+    pub auth_config: Arc<AuthConfig>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -265,6 +266,7 @@ mod tests {
             space: StorageSpace::new("https://pod.toph.so/").unwrap(),
             resolver: unused_resolver(),
             webid_verifier: unused_webid_verifier(),
+            auth_config: Arc::new(crate::auth::AuthConfig::default()),
         };
         router(state)
     }
@@ -433,7 +435,13 @@ mod tests {
         let store = Arc::new(OxigraphStore::in_memory().unwrap());
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space).await.unwrap();
-        router(AppState { store, space, resolver: unused_resolver(), webid_verifier: unused_webid_verifier() })
+        router(AppState {
+            store,
+            space,
+            resolver: unused_resolver(),
+            webid_verifier: unused_webid_verifier(),
+            auth_config: Arc::new(crate::auth::AuthConfig::default()),
+        })
     }
 
     #[tokio::test]

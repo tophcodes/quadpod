@@ -81,13 +81,17 @@ pub async fn auth_layer(State(st): State<AppState>, mut req: Request, next: Next
         .expect("system clock is after the Unix epoch")
         .as_secs() as i64;
 
+    let deps = super::AuthDeps {
+        resolver: st.resolver.as_ref(),
+        webid_verifier: st.webid_verifier.as_ref(),
+        config: st.auth_config.as_ref(),
+    };
     match authenticate(
         auth_header.as_deref(),
         dpop_header.as_deref(),
         &htm,
         &htu,
-        st.resolver.as_ref(),
-        st.webid_verifier.as_ref(),
+        deps,
         now_unix,
     )
     .await
@@ -152,6 +156,7 @@ mod tests {
             space: StorageSpace::new("https://pod.toph.so/").unwrap(),
             resolver,
             webid_verifier: Arc::new(crate::auth::webid_issuer::StaticWebIdIssuers::new()),
+            auth_config: Arc::new(crate::auth::AuthConfig::default()),
         };
         Router::new().route("/{*path}", get(whoami))
             .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))

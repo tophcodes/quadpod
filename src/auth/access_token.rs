@@ -98,6 +98,26 @@ pub async fn verify_access_token(
     })
 }
 
+/// Peek at a compact JWS's payload `iss` claim WITHOUT verifying the
+/// signature. This is the same untrusted peek `verify_access_token` performs
+/// internally to pick a JWKS/key; it is exposed here for callers (the
+/// trusted-issuer allowlist pre-check in `authenticate`) that need the raw
+/// `iss` BEFORE any fetch happens. The returned value must NEVER be used to
+/// accept a token — only ever to reject one early, since it is not yet
+/// backed by a verified signature.
+pub fn peek_untrusted_issuer(token: &str) -> Result<String, AuthError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    let [_header_part, payload_part, _signature_part] = parts[..] else {
+        return Err(AuthError::Malformed("not a compact JWS".to_string()));
+    };
+    let payload = decode_segment(payload_part)?;
+    payload
+        .get("iss")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AuthError::Malformed("missing iss claim".to_string()))
+}
+
 /// Base64url(no-pad)-decode and JSON-parse one JWS segment.
 fn decode_segment(segment: &str) -> Result<Value, AuthError> {
     let bytes = URL_SAFE_NO_PAD

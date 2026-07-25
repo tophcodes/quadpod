@@ -7,6 +7,7 @@
 pub mod access_token;
 pub mod agent;
 pub mod authenticate;
+pub mod config;
 pub mod dpop;
 pub mod http_jwks;
 pub mod jwks;
@@ -17,9 +18,10 @@ pub mod webid_issuer;
 #[cfg(test)]
 pub mod testsupport;
 
-pub use access_token::{verify_access_token, AccessClaims};
+pub use access_token::{peek_untrusted_issuer, verify_access_token, AccessClaims};
 pub use agent::Agent;
-pub use authenticate::authenticate;
+pub use authenticate::{authenticate, AuthDeps};
+pub use config::AuthConfig;
 pub use dpop::verify_dpop;
 pub use http_jwks::HttpJwksResolver;
 pub use jwks::{Jwks, JwksResolver, StaticJwksResolver};
@@ -51,4 +53,6 @@ pub enum AuthError {
     FetchBlocked(String),
     #[error("webid does not authorize this token's issuer")]
     IssuerNotAuthorized,
+    #[error("issuer is not in the trusted-issuer allowlist")]
+    UntrustedIssuer,
 }

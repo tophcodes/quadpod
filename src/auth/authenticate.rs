@@ -1,10 +1,24 @@
 //! Orchestrating credential verification into an [`Agent`] for a request.
 
-use super::access_token::verify_access_token;
+use super::access_token::{peek_untrusted_issuer, verify_access_token};
+use super::config::AuthConfig;
 use super::dpop::verify_dpop;
 use super::jwks::JwksResolver;
 use super::webid_issuer::WebIdIssuerVerifier;
 use super::{Agent, AuthError};
+
+/// The trust-configuration collaborators [`authenticate`] verifies a
+/// request's credentials against: the issuer's published keys, the
+/// WebID-issuer trust binding, and the (optional) issuer allowlist / audience
+/// config. Bundled into one struct (rather than three separate parameters)
+/// to keep `authenticate`'s argument count sane — these three are always
+/// supplied together by the caller (`AppState` in `http.rs`), unlike the
+/// per-request data (`auth_header`, `dpop_header`, `htm`, `htu`, `now_unix`).
+pub struct AuthDeps<'a> {
+    pub resolver: &'a dyn JwksResolver,
+    pub webid_verifier: &'a dyn WebIdIssuerVerifier,
+    pub config: &'a AuthConfig,
+}
 
 /// Authenticate a request from its `Authorization` and `DPoP` headers.
 ///
@@ -24,13 +38,22 @@ use super::{Agent, AuthError};
 /// the token's `cnf.jkt`. Any failure along the way is an error — this
 /// never falls back to `Public` once credentials were presented. Fails
 /// closed.
+///
+/// Before any JWKS fetch, if `config.trusted_issuers` is `Some(set)` the
+/// token's `iss` (peeked WITHOUT signature verification, via
+/// [`peek_untrusted_issuer`]) must be a member of `set` or the request is
+/// rejected as [`AuthError::UntrustedIssuer`] — this untrusted peek is used
+/// ONLY to reject early, never to accept. This shrinks the SSRF surface (an
+/// untrusted issuer never triggers an outbound fetch) as defense-in-depth
+/// over the WebID-issuer binding, which remains the primary control. If
+/// `trusted_issuers` is `None`, every issuer proceeds to that binding check
+/// (open federation).
 pub async fn authenticate(
     auth_header: Option<&str>,
     dpop_header: Option<&str>,
     htm: &str,
     htu: &str,
-    resolver: &dyn JwksResolver,
-    webid_verifier: &dyn WebIdIssuerVerifier,
+    deps: AuthDeps<'_>,
     now_unix: i64,
 ) -> Result<Agent, AuthError> {
     if auth_header.is_none() && dpop_header.is_none() {
@@ -41,9 +64,17 @@ pub async fn authenticate(
     let proof = dpop_header
         .ok_or_else(|| AuthError::DpopInvalid("missing DPoP proof header".to_string()))?;
 
-    let claims = verify_access_token(token, resolver, now_unix).await?;
+    if let Some(trusted) = &deps.config.trusted_issuers {
+        let untrusted_iss = peek_untrusted_issuer(token)?;
+        if !trusted.contains(&untrusted_iss) {
+            return Err(AuthError::UntrustedIssuer);
+        }
+    }
 
-    if !webid_verifier
+    let claims = verify_access_token(token, deps.resolver, now_unix).await?;
+
+    if !deps
+        .webid_verifier
         .authorizes(&claims.webid, &claims.issuer)
         .await?
     {
@@ -75,6 +106,7 @@ fn parse_dpop_scheme(auth_header: Option<&str>) -> Result<&str, AuthError> {
 mod tests {
     use super::*;
     use crate::auth::{
+        config::AuthConfig,
         jwks::StaticJwksResolver,
         testsupport::{TestClient, TestIdp},
         webid_issuer::StaticWebIdIssuers,
@@ -86,17 +118,11 @@ mod tests {
         let idp = TestIdp::new();
         let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
         let webids = StaticWebIdIssuers::new();
-        let agent = authenticate(
-            None,
-            None,
-            "GET",
-            "https://pod.toph.so/foo",
-            &resolver,
-            &webids,
-            1_000,
-        )
-        .await
-        .unwrap();
+        let cfg = AuthConfig::default();
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let agent = authenticate(None, None, "GET", "https://pod.toph.so/foo", deps, 1_000)
+            .await
+            .unwrap();
         assert_eq!(agent, Agent::Public);
     }
 
@@ -107,19 +133,20 @@ mod tests {
         let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
         let mut webids = StaticWebIdIssuers::new();
         webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = AuthConfig::default();
         let at = idp.mint_access_token(
             "https://alice.example/card#me",
             &client.jkt(),
             9_999_999_999,
         );
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-x");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
         let agent = authenticate(
             Some(&format!("DPoP {at}")),
             Some(&proof),
             "GET",
             "https://pod.toph.so/foo",
-            &resolver,
-            &webids,
+            deps,
             1_010,
         )
         .await
@@ -133,18 +160,19 @@ mod tests {
         let client = TestClient::new();
         let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
         let webids = StaticWebIdIssuers::new();
+        let cfg = AuthConfig::default();
         let at = idp.mint_access_token(
             "https://alice.example/card#me",
             &client.jkt(),
             9_999_999_999,
         );
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
         assert!(authenticate(
             Some(&format!("DPoP {at}")),
             None,
             "GET",
             "https://pod.toph.so/foo",
-            &resolver,
-            &webids,
+            deps,
             1_010,
         )
         .await
@@ -165,10 +193,12 @@ mod tests {
         // reject it.
         let resolver = crate::auth::jwks::StaticJwksResolver::new("https://idp.example/", idp.jwks());
         let webids = crate::auth::webid_issuer::StaticWebIdIssuers::new(); // empty → authorizes() = false
+        let cfg = AuthConfig::default();
         let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-imp");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
         let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
-            "https://pod.toph.so/foo", &resolver, &webids, 1_010).await;
+            "https://pod.toph.so/foo", deps, 1_010).await;
         assert!(matches!(r, Err(crate::auth::AuthError::IssuerNotAuthorized)));
     }
 
@@ -179,10 +209,31 @@ mod tests {
         let resolver = crate::auth::jwks::StaticJwksResolver::new("https://idp.example/", idp.jwks());
         let mut webids = crate::auth::webid_issuer::StaticWebIdIssuers::new();
         webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = AuthConfig::default();
         let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-ok2");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
         let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
-            "https://pod.toph.so/foo", &resolver, &webids, 1_010).await.unwrap();
+            "https://pod.toph.so/foo", deps, 1_010).await.unwrap();
         assert_eq!(agent, crate::auth::Agent::WebId("https://alice.example/card#me".into()));
+    }
+
+    #[tokio::test]
+    async fn issuer_not_in_allowlist_is_rejected_before_fetch() {
+        let idp = crate::auth::testsupport::TestIdp::new();
+        let client = crate::auth::testsupport::TestClient::new();
+        let resolver = crate::auth::jwks::StaticJwksResolver::new("https://idp.example/", idp.jwks());
+        let mut webids = crate::auth::webid_issuer::StaticWebIdIssuers::new();
+        webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = crate::auth::config::AuthConfig {
+            trusted_issuers: Some(["https://ONLY-this.example/".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-allow");
+        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+            "https://pod.toph.so/foo", deps, 1_010).await;
+        assert!(matches!(r, Err(crate::auth::AuthError::UntrustedIssuer)));
     }
 }
