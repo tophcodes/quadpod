@@ -549,3 +549,134 @@ let verified = verifier
 **Error type:** `dpop_verifier::DpopError` (via `thiserror`) has variants including `MalformedJws`, `InvalidAlg(String)`, `UnsupportedAlg(String)`, `InvalidSignature`, `BadJwk(&'static str)`, `HtmMismatch`, `HtuMismatch`, `MissingAth`/`AthMalformed`/`AthMismatch`, `FutureSkew`, `Stale`, `Replay`, `JtiTooLong`, plus nonce-related variants unused here. Task 3 should map all of these to `AuthError::DpopInvalid(String)` (via `.to_string()`) except perhaps surfacing `Replay`/`Stale` distinctly if useful for logging — the plan's `AuthError::DpopInvalid(String)` catch-all is adequate.
 
 **No other API-shape mismatches found** — `dpop-verifier` consumes a plain compact-JWS `&str` for the proof (no custom request/proof struct required), so it plugs directly into the `verify_dpop(proof: &str, ...)` signature already specified in Task 3 with no adaptation needed.
+
+---
+
+# Plan 4 Extension — closing the two Criticals from the Task-4 adversarial review
+
+The Task-4 review found (Critical) no WebID↔issuer trust binding → full impersonation, and (Critical) unauthenticated blind SSRF via the attacker-controlled `iss` fetch, plus (Important) `htu`/handler path-decoding divergence. These MUST land before the branch is safe to merge/enable. Tasks 5–7 close them.
+
+### Task 5: SSRF-hardened outbound fetcher (apply to JWKS resolver)
+
+**Files:**
+- Create: `src/auth/safe_fetch.rs`
+- Modify: `src/auth/http_jwks.rs` (route fetches through it), `src/auth/mod.rs`, `Cargo.toml` (ensure `reqwest` is `--no-default-features --features json,rustls-tls`; add nothing else)
+- Test: inline in `src/auth/safe_fetch.rs`
+
+**Interfaces:**
+- Produces:
+  - `#[derive(Clone)] pub struct FetchPolicy { pub allow_http: bool, pub allow_private_ips: bool }` with `impl Default` → both `false` (prod: https-only, block private IPs).
+  - `pub fn is_forbidden_ip(ip: std::net::IpAddr) -> bool` — true for loopback, unspecified, IPv4 private (10/8, 172.16/12, 192.168/16) + link-local (169.254/16, covers cloud metadata `169.254.169.254`) + shared/CGNAT (100.64/10), IPv6 loopback/unspecified/unique-local (`fc00::/7`)/link-local (`fe80::/10`).
+  - `pub async fn guarded_get(client: &reqwest::Client, url: &str, accept: &str, policy: &FetchPolicy) -> Result<String, AuthError>` — parse url; reject non-https unless `allow_http` (→ `AuthError::DpopInvalid`/a fetch-error variant); resolve the host (IP literal checked directly; hostname via `tokio::net::lookup_host`) and reject if ANY resolved IP `is_forbidden_ip` and `!allow_private_ips`; GET with the `accept` header (the `client` MUST be built with a connect + total timeout); cap the body (e.g. 1 MiB) and return it as `String`. Fail closed on every error.
+- Consumes: `AuthError`.
+- Note in comments: DNS-rebinding (resolve-then-connect race) is a residual v1 limitation; https-default + private-IP block covers the common SSRF vectors.
+
+- [ ] **Step 1: Failing tests** (unit — no real network needed for the block paths)
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn forbidden_ip_classification() {
+        assert!(is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(127,0,0,1))));      // loopback
+        assert!(is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(10,0,0,5))));       // private
+        assert!(is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(192,168,1,1))));    // private
+        assert!(is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(169,254,169,254))));// metadata
+        assert!(is_forbidden_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));           // ::1
+        assert!(!is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(93,184,216,34))))  // public
+    }
+
+    #[tokio::test]
+    async fn rejects_http_scheme_by_default() {
+        let c = reqwest::Client::new();
+        let r = guarded_get(&c, "http://example.com/x", "text/turtle", &FetchPolicy::default()).await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_loopback_target_by_default() {
+        let c = reqwest::Client::new();
+        let r = guarded_get(&c, "https://127.0.0.1/x", "text/turtle", &FetchPolicy::default()).await;
+        assert!(r.is_err());
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify failure** — `nix develop -c cargo test auth::safe_fetch` → FAIL.
+- [ ] **Step 3: Implement** `is_forbidden_ip` + `guarded_get` + `FetchPolicy`. Use `std::net::Ipv4Addr::{is_loopback,is_private,is_link_local,is_unspecified}` where available; add manual checks for CGNAT (100.64/10) and IPv6 ULA (`fc00::/7`).
+- [ ] **Step 4: Route `HttpJwksResolver` through `guarded_get`** — build its `reqwest::Client` with a timeout (e.g. `.timeout(Duration::from_secs(10)).connect_timeout(Duration::from_secs(5))`); hold a `FetchPolicy`. Its existing hermetic local-server tests must set a permissive policy (`allow_http: true, allow_private_ips: true`) since they hit `127.0.0.1`; production `new()` uses `FetchPolicy::default()`.
+- [ ] **Step 5: Run full suite** — `nix develop -c cargo test` → PASS; clippy clean; zero warnings.
+- [ ] **Step 6: Commit** — `feat: SSRF-hardened outbound fetcher (block private IPs, https-only, timeout)`
+
+### Task 6: WebID↔issuer trust binding (closes impersonation)
+
+**Files:**
+- Create: `src/auth/webid_issuer.rs`
+- Modify: `src/auth/authenticate.rs` (add the check), `src/auth/middleware.rs` + `src/http.rs` (`AppState` gains the verifier), `src/main.rs`, `src/auth/mod.rs`
+- Test: inline in `src/auth/webid_issuer.rs` + `authenticate.rs`
+
+**Interfaces:**
+- Produces:
+  - `pub const SOLID_OIDC_ISSUER: &str = "http://www.w3.org/ns/solid/terms#oidcIssuer";`
+  - `#[async_trait::async_trait] pub trait WebIdIssuerVerifier: Send + Sync { async fn authorizes(&self, webid: &str, issuer: &str) -> Result<bool, AuthError>; }`
+  - `pub struct StaticWebIdIssuers { map: HashMap<String, Vec<String>> }` (test impl: webid → allowed issuers) with `new`/`allow(webid, issuer)` + trait impl.
+  - `pub struct HttpWebIdIssuers { client, policy }` — `authorizes(webid, issuer)`: strip the fragment from `webid` to get the profile document URL; `guarded_get(Accept: text/turtle)`; `rdf::parse` the body (base = the document URL); return `true` iff the parsed triples contain `<webid> <SOLID_OIDC_ISSUER> <issuer>` (compare the object IRI to `issuer`, allowing a trailing-slash-insensitive match since issuers are sometimes written with/without a trailing `/`).
+  - `authenticate(...)` gains a `webid_verifier: &dyn WebIdIssuerVerifier` parameter; AFTER `verify_access_token` yields `claims`, call `webid_verifier.authorizes(&claims.webid, &claims.issuer)` — if `Ok(false)` → `Err(AuthError::IssuerNotAuthorized)` (add this variant); if `Err(e)` → propagate (fail closed). Only then proceed to `verify_dpop` and return `Agent::WebId`.
+  - `AppState` gains `pub webid_verifier: std::sync::Arc<dyn WebIdIssuerVerifier>`.
+- Consumes: `guarded_get`, `FetchPolicy` (Task 5), `rdf::parse`, `AuthError`, testsupport.
+
+- [ ] **Step 1: Failing tests** (authenticate.rs — the impersonation guard)
+
+```rust
+#[tokio::test]
+async fn issuer_not_authorized_by_webid_is_rejected() {
+    let idp = crate::auth::testsupport::TestIdp::new();
+    let client = crate::auth::testsupport::TestClient::new();
+    let resolver = crate::auth::jwks::StaticJwksResolver::new("https://attacker.example/", idp.jwks());
+    // attacker's IdP mints a token claiming alice's webid; alice's profile does NOT list attacker
+    let webids = crate::auth::webid_issuer::StaticWebIdIssuers::new(); // empty → authorizes() = false
+    let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
+    let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-imp");
+    let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+        "https://pod.toph.so/foo", &resolver, &webids, 1_010).await;
+    assert!(matches!(r, Err(crate::auth::AuthError::IssuerNotAuthorized)));
+}
+
+#[tokio::test]
+async fn issuer_authorized_by_webid_succeeds() {
+    let idp = crate::auth::testsupport::TestIdp::new();
+    let client = crate::auth::testsupport::TestClient::new();
+    let resolver = crate::auth::jwks::StaticJwksResolver::new("https://idp.example/", idp.jwks());
+    let mut webids = crate::auth::webid_issuer::StaticWebIdIssuers::new();
+    webids.allow("https://alice.example/card#me", "https://idp.example/");
+    let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
+    let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-ok2");
+    let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+        "https://pod.toph.so/foo", &resolver, &webids, 1_010).await.unwrap();
+    assert_eq!(agent, crate::auth::Agent::WebId("https://alice.example/card#me".into()));
+}
+```
+
+- [ ] **Step 2: Failing test** (webid_issuer.rs — HTTP impl parses `solid:oidcIssuer`) — spin a local axum server (permissive `FetchPolicy`) serving a Turtle profile with `<...#me> solid:oidcIssuer <...>`, assert `authorizes` is `true` for the listed issuer and `false` for another.
+- [ ] **Step 3: Run to verify failure** — `nix develop -c cargo test auth::` → FAIL (signature of `authenticate` changed; new types undefined).
+- [ ] **Step 4: Implement** `webid_issuer.rs` (both impls), add `IssuerNotAuthorized` to `AuthError`, thread `webid_verifier` through `authenticate` and the middleware (`AppState.webid_verifier`), update ALL `AppState`/`authenticate` call sites (main.rs, http.rs test helpers, prior authenticate tests). `main.rs` constructs `Arc::new(HttpWebIdIssuers::new())`.
+- [ ] **Step 5: Run full suite** — `nix develop -c cargo test` → PASS; clippy clean; zero warnings.
+- [ ] **Step 6: Commit** — `feat: WebID-issuer trust binding via solid:oidcIssuer (closes impersonation)`
+
+### Task 7: reconcile `htu` with the handler's decoded path (Important #3)
+
+**Files:** Modify `src/auth/middleware.rs`; Test: inline.
+
+**Interfaces:** no new API. The middleware currently derives `htu` from the raw `req.uri().path()`, while handlers read the axum-decoded `Path<String>`. Make the middleware percent-decode the path the same way (so the IRI the DPoP proof is validated against equals the IRI the handler operates on). Use `percent_encoding::percent_decode_str(path).decode_utf8()` (add `percent-encoding` dep) or axum's `RawPathParams`/the same decoding axum applies; on decode failure, fail closed (the request with creds → 401; without creds → the existing path still works).
+
+- [ ] **Step 1: Failing test** — a request to a percent-encoded container/resource path presents a DPoP proof whose `htu` uses the DECODED public URL; assert it authenticates (proving middleware and handler agree on the decoded path). Conversely a proof bound to the raw-encoded form is rejected. (Use the permissive/StaticWebIdIssuers + StaticJwksResolver harness.)
+- [ ] **Step 2: Run to verify failure.** **Step 3: Implement** the decode. **Step 4: Full suite green, clippy clean, zero warnings. Step 5: Commit** — `fix: derive DPoP htu from the decoded request path to match handlers`
+
+## Extension Self-Review
+- Critical (impersonation) → Task 6 (`WebIdIssuerVerifier` + `solid:oidcIssuer` check in `authenticate`, `IssuerNotAuthorized`). ✓
+- Critical (SSRF) → Task 5 (`guarded_get`: https-only default, private-IP block incl. metadata, timeout) applied to JWKS (Task 5) and WebID (Task 6) fetches. ✓
+- Important (htu path decode) → Task 7. ✓
+- Residual/deferred: DNS-rebinding (noted); JWKS/webid negative-cache + rate-limit (a follow-up hardening); a static trusted-issuer allowlist as defense-in-depth (optional, since Solid is open-federation and the `solid:oidcIssuer` binding is the spec-correct control).
