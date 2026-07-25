@@ -8,7 +8,9 @@ pub mod access_token;
 pub mod agent;
 pub mod authenticate;
 pub mod dpop;
+pub mod http_jwks;
 pub mod jwks;
+pub mod middleware;
 
 #[cfg(test)]
 pub mod testsupport;
@@ -17,7 +19,9 @@ pub use access_token::{verify_access_token, AccessClaims};
 pub use agent::Agent;
 pub use authenticate::authenticate;
 pub use dpop::verify_dpop;
+pub use http_jwks::HttpJwksResolver;
 pub use jwks::{Jwks, JwksResolver, StaticJwksResolver};
+pub use middleware::auth_layer;
 
 use thiserror::Error;
 

@@ -2,12 +2,13 @@ use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
     http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use crate::{space::StorageSpace, store::SparqlStore, container, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
-    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}};
+    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}, auth::{JwksResolver, auth_layer}};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn SparqlStore>,
     pub space: StorageSpace,
+    pub resolver: Arc<dyn JwksResolver>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -15,6 +16,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root))
         .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
         .with_state(state)
 }
 
@@ -241,12 +243,20 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
     use std::sync::Arc;
-    use crate::{space::StorageSpace, store::OxigraphStore};
+    use crate::{space::StorageSpace, store::OxigraphStore, auth::{Jwks, StaticJwksResolver}};
+
+    /// None of these handler tests send credentials, so the auth layer
+    /// always resolves them as `Agent::Public` without ever calling
+    /// `resolve` — any resolver works here.
+    fn unused_resolver() -> Arc<dyn crate::auth::JwksResolver> {
+        Arc::new(StaticJwksResolver::new("https://unused.example/", Jwks { keys: vec![] }))
+    }
 
     fn app() -> axum::Router {
         let state = AppState {
             store: Arc::new(OxigraphStore::in_memory().unwrap()),
             space: StorageSpace::new("https://pod.toph.so/").unwrap(),
+            resolver: unused_resolver(),
         };
         router(state)
     }
@@ -415,7 +425,7 @@ mod tests {
         let store = Arc::new(OxigraphStore::in_memory().unwrap());
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space).await.unwrap();
-        router(AppState { store, space })
+        router(AppState { store, space, resolver: unused_resolver() })
     }
 
     #[tokio::test]
