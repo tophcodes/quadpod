@@ -12,6 +12,7 @@ pub mod http_jwks;
 pub mod jwks;
 pub mod middleware;
 pub mod safe_fetch;
+pub mod webid_issuer;
 
 #[cfg(test)]
 pub mod testsupport;
@@ -23,6 +24,7 @@ pub use dpop::verify_dpop;
 pub use http_jwks::HttpJwksResolver;
 pub use jwks::{Jwks, JwksResolver, StaticJwksResolver};
 pub use middleware::auth_layer;
+pub use webid_issuer::{HttpWebIdIssuers, StaticWebIdIssuers, WebIdIssuerVerifier, SOLID_OIDC_ISSUER};
 
 use thiserror::Error;
 
@@ -47,4 +49,6 @@ pub enum AuthError {
     MissingKey,
     #[error("blocked outbound fetch: {0}")]
     FetchBlocked(String),
+    #[error("webid does not authorize this token's issuer")]
+    IssuerNotAuthorized,
 }

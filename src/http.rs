@@ -2,13 +2,14 @@ use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
     http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use crate::{space::StorageSpace, store::SparqlStore, container, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
-    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}, auth::{JwksResolver, auth_layer}};
+    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}, auth::{JwksResolver, WebIdIssuerVerifier, auth_layer}};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn SparqlStore>,
     pub space: StorageSpace,
     pub resolver: Arc<dyn JwksResolver>,
+    pub webid_verifier: Arc<dyn WebIdIssuerVerifier>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -252,11 +253,18 @@ mod tests {
         Arc::new(StaticJwksResolver::new("https://unused.example/", Jwks { keys: vec![] }))
     }
 
+    /// None of these handler tests send credentials either, so the webid
+    /// verifier is never called — any verifier works here.
+    fn unused_webid_verifier() -> Arc<dyn crate::auth::WebIdIssuerVerifier> {
+        Arc::new(crate::auth::StaticWebIdIssuers::new())
+    }
+
     fn app() -> axum::Router {
         let state = AppState {
             store: Arc::new(OxigraphStore::in_memory().unwrap()),
             space: StorageSpace::new("https://pod.toph.so/").unwrap(),
             resolver: unused_resolver(),
+            webid_verifier: unused_webid_verifier(),
         };
         router(state)
     }
@@ -425,7 +433,7 @@ mod tests {
         let store = Arc::new(OxigraphStore::in_memory().unwrap());
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space).await.unwrap();
-        router(AppState { store, space, resolver: unused_resolver() })
+        router(AppState { store, space, resolver: unused_resolver(), webid_verifier: unused_webid_verifier() })
     }
 
     #[tokio::test]

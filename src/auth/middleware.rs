@@ -55,6 +55,7 @@ pub async fn auth_layer(State(st): State<AppState>, mut req: Request, next: Next
         &htm,
         &htu,
         st.resolver.as_ref(),
+        st.webid_verifier.as_ref(),
         now_unix,
     )
     .await
@@ -86,6 +87,7 @@ mod tests {
             store: Arc::new(OxigraphStore::in_memory().unwrap()),
             space: StorageSpace::new("https://pod.toph.so/").unwrap(),
             resolver,
+            webid_verifier: Arc::new(crate::auth::webid_issuer::StaticWebIdIssuers::new()),
         };
         Router::new().route("/{*path}", get(whoami))
             .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
