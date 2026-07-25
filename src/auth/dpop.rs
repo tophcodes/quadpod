@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use dpop_verifier::{DpopError, DpopVerifier, ReplayContext, ReplayStore};
+use sha2::{Digest, Sha256};
 
 use super::AuthError;
 
@@ -47,19 +48,50 @@ fn replay_jtis() -> &'static Mutex<HashSet<[u8; 32]>> {
     REPLAY_JTIS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// A `ReplayStore` backed by the process-lifetime `REPLAY_JTIS` set above
-/// (rather than storage private to one call), so a `jti` replayed in a
-/// later, separate call to `verify_dpop` is actually detected.
-struct ProcessReplayStore;
+/// Hash a `jti` the same way `dpop-verifier` does internally (the SHA-256
+/// digest of the raw `jti` string; `dpop-verifier`'s `JTI_HASH_LENGTH` is 32
+/// bytes, which is the full SHA-256 output, so no truncation is lost here).
+fn hash_jti(jti: &str) -> [u8; 32] {
+    Sha256::digest(jti.as_bytes()).into()
+}
+
+/// Record `jti` as seen in the process-lifetime replay set.
+///
+/// Deliberately called by `verify_dpop` only after every other check
+/// (signature, htu/htm, freshness, `cnf.jkt` binding) has already passed —
+/// so a proof rejected by any of those checks never consumes its `jti`, and
+/// only a fully-valid proof does. A *second* submission of that same valid
+/// proof is then rejected here as a replay.
+fn record_jti_or_reject_replay(jti: &str) -> Result<(), AuthError> {
+    if replay_jtis().lock().unwrap().insert(hash_jti(jti)) {
+        Ok(())
+    } else {
+        Err(AuthError::DpopInvalid("dpop proof replayed".to_string()))
+    }
+}
+
+/// A `ReplayStore` that never records or rejects on replay, passed to
+/// `dpop-verifier`'s own `verify()` in place of the real replay store.
+///
+/// `dpop-verifier` checks replay *before* returning control to this module,
+/// i.e. before our own freshness (Fix 1) and `cnf.jkt` binding checks run.
+/// If those were given the real store directly, a proof that fails one of
+/// *our* later checks would still have permanently burned its `jti` inside
+/// `dpop-verifier` — letting an attacker who merely observes (or replays
+/// with a wrong key) a proof deny that `jti` to the legitimate client
+/// forever. Using this no-op store here means `dpop-verifier` never
+/// consumes a `jti`; the real, process-wide replay check happens in
+/// `record_jti_or_reject_replay`, called only once every check has passed.
+struct NoopReplayStore;
 
 #[async_trait]
-impl ReplayStore for ProcessReplayStore {
+impl ReplayStore for NoopReplayStore {
     async fn insert_once(
         &mut self,
-        jti_hash: [u8; 32],
+        _jti_hash: [u8; 32],
         _ctx: ReplayContext<'_>,
     ) -> Result<bool, DpopError> {
-        Ok(replay_jtis().lock().unwrap().insert(jti_hash))
+        Ok(true)
     }
 }
 
@@ -78,18 +110,23 @@ pub async fn verify_dpop(
         .with_max_age_seconds(DISABLE_INTERNAL_CLOCK_CHECK_SECONDS)
         .with_future_skew_seconds(DISABLE_INTERNAL_CLOCK_CHECK_SECONDS);
 
-    let mut store = ProcessReplayStore;
+    let mut store = NoopReplayStore;
     let verified = verifier
         .verify(&mut store, proof, htu, htm, None)
         .await
         .map_err(|e| AuthError::DpopInvalid(e.to_string()))?;
 
-    if verified.iat > now_unix + FUTURE_SKEW_SECONDS {
+    // `iat` comes from the proof's own JSON claims and is fully
+    // caller-controlled (e.g. `i64::MIN`), so these comparisons use
+    // saturating arithmetic rather than plain `+`/`-`: an extreme `iat`
+    // must be rejected as not-fresh, never overflow/panic (debug) or wrap
+    // around to look fresh (release).
+    if verified.iat.saturating_sub(now_unix) > FUTURE_SKEW_SECONDS {
         return Err(AuthError::DpopInvalid(
             "DPoP proof iat is too far in the future".to_string(),
         ));
     }
-    if now_unix - verified.iat > MAX_AGE_SECONDS {
+    if now_unix.saturating_sub(verified.iat) > MAX_AGE_SECONDS {
         return Err(AuthError::DpopInvalid(
             "DPoP proof iat is stale".to_string(),
         ));
@@ -101,6 +138,11 @@ pub async fn verify_dpop(
     if verified.jkt != expected_jkt {
         return Err(AuthError::Binding);
     }
+
+    // Every check above has passed: only now do we consume the jti, so a
+    // proof rejected by any earlier check leaves its jti reusable (see
+    // `NoopReplayStore` and `record_jti_or_reject_replay`).
+    record_jti_or_reject_replay(&verified.jti)?;
 
     Ok(())
 }
@@ -155,5 +197,87 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_proof_is_rejected() {
+        let client = TestClient::new();
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-stale");
+        // now far beyond MAX_AGE after iat
+        assert!(verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            9_999_999
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn future_proof_is_rejected() {
+        let client = TestClient::new();
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 5_000_000, "jti-future");
+        assert!(verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            1_000
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn extreme_iat_does_not_panic_and_is_rejected() {
+        // `TestClient::mint_dpop` goes through `josekit`'s registered-claim
+        // validation, which rejects *any* negative `iat` at mint time (not
+        // specific to this module) -- so an extreme-negative `iat` can't be
+        // minted here to reach `verify_dpop`. `now_unix` is exactly as
+        // caller-controlled as `iat` from the arithmetic's point of view
+        // (both are plain `i64` inputs to the two comparisons Fix 1
+        // rewrote), so this exercises the same overflow with an extreme
+        // `now_unix` instead: the *original* `verified.iat > now_unix +
+        // FUTURE_SKEW_SECONDS` formula overflows computing `i64::MAX + 5`
+        // and panics; Fix 1's `saturating_sub` does not.
+        let client = TestClient::new();
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-extreme");
+        assert!(verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            i64::MAX
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_of_valid_proof_is_rejected_but_rejected_proof_does_not_burn_jti() {
+        let client = TestClient::new();
+        // a proof that will FAIL the jkt binding (wrong expected_jkt) must NOT burn its jti
+        let other = TestClient::new();
+        let p_reject = client.mint_dpop("https://pod.toph.so/x", "GET", 1_000, "jti-shared");
+        assert!(
+            verify_dpop(&p_reject, "https://pod.toph.so/x", "GET", &other.jkt(), 1_010)
+                .await
+                .is_err()
+        );
+        // same jti now used by a VALID proof -> must SUCCEED (jti not burned by the rejected attempt)
+        let p_ok = client.mint_dpop("https://pod.toph.so/y", "GET", 1_000, "jti-shared");
+        assert!(
+            verify_dpop(&p_ok, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+                .await
+                .is_ok()
+        );
+        // replay the SAME valid proof/jti -> must be rejected
+        assert!(
+            verify_dpop(&p_ok, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+                .await
+                .is_err()
+        );
     }
 }
