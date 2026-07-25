@@ -6,6 +6,8 @@
 
 pub mod access_token;
 pub mod agent;
+pub mod authenticate;
+pub mod dpop;
 pub mod jwks;
 
 #[cfg(test)]
@@ -13,6 +15,8 @@ pub mod testsupport;
 
 pub use access_token::{verify_access_token, AccessClaims};
 pub use agent::Agent;
+pub use authenticate::authenticate;
+pub use dpop::verify_dpop;
 pub use jwks::{Jwks, JwksResolver, StaticJwksResolver};
 
 use thiserror::Error;
