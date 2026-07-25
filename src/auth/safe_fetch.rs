@@ -182,7 +182,7 @@ pub async fn guarded_get(
     url: &str,
     accept: &str,
     policy: &FetchPolicy,
-) -> Result<String, AuthError> {
+) -> Result<(String, Option<String>), AuthError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| AuthError::FetchBlocked(format!("invalid URL: {e}")))?;
 
@@ -239,6 +239,14 @@ pub async fn guarded_get(
         )));
     }
 
+    // Captured before the body is consumed below: the caller (e.g. WebID
+    // profile content negotiation) needs it to pick the right RDF parser.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     // Cheap fast-path: a declared size already over the cap is rejected
     // without reading any body at all.
     if let Some(len) = response.content_length() {
@@ -267,8 +275,10 @@ pub async fn guarded_get(
         buf.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(buf)
-        .map_err(|_| AuthError::FetchBlocked("response was not valid UTF-8".to_string()))
+    let body = String::from_utf8(buf)
+        .map_err(|_| AuthError::FetchBlocked("response was not valid UTF-8".to_string()))?;
+
+    Ok((body, content_type))
 }
 
 #[cfg(test)]

@@ -84,7 +84,7 @@ impl HttpJwksResolver {
             format!("{issuer}/.well-known/openid-configuration")
         };
 
-        let discovery_body =
+        let (discovery_body, _) =
             guarded_get(&self.client, &discovery_url, "application/json", &self.policy)
                 .await
                 .map_err(|_| AuthError::UnknownIssuer)?;
@@ -95,7 +95,7 @@ impl HttpJwksResolver {
             .and_then(Value::as_str)
             .ok_or(AuthError::UnknownIssuer)?;
 
-        let jwks_body = guarded_get(&self.client, jwks_uri, "application/json", &self.policy)
+        let (jwks_body, _) = guarded_get(&self.client, jwks_uri, "application/json", &self.policy)
             .await
             .map_err(|_| AuthError::UnknownIssuer)?;
         let jwks_doc: Value =

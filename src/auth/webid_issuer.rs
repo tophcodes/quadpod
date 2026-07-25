@@ -122,8 +122,18 @@ impl WebIdIssuerVerifier for HttpWebIdIssuers {
         // (`https://alice.example/card#me` -> `https://alice.example/card`).
         let doc_url = webid.split('#').next().unwrap_or(webid);
 
-        let body = guarded_get(&self.client, doc_url, "text/turtle", &self.policy).await?;
-        let triples = rdf::parse(body.as_bytes(), RdfFormat::Turtle, doc_url)
+        let (body, content_type) = guarded_get(
+            &self.client,
+            doc_url,
+            "text/turtle, application/ld+json;q=0.9",
+            &self.policy,
+        )
+        .await?;
+        let fmt = content_type
+            .as_deref()
+            .and_then(rdf::format_for_content_type)
+            .unwrap_or(RdfFormat::Turtle);
+        let triples = rdf::parse(body.as_bytes(), fmt, doc_url)
             .map_err(|e| AuthError::FetchBlocked(format!("invalid profile document: {e}")))?;
 
         Ok(triples.iter().any(|t| {
@@ -178,6 +188,47 @@ mod tests {
 
     fn permissive_verifier() -> HttpWebIdIssuers {
         HttpWebIdIssuers::with_policy(FetchPolicy::permissive())
+    }
+
+    /// Spin up a local profile-document server serving the SAME
+    /// `solid:oidcIssuer` declaration as [`spawn_profile_server`], but as
+    /// **JSON-LD** (expanded form) with `Content-Type: application/ld+json`
+    /// instead of Turtle — proving `authorizes` content-negotiates the
+    /// parse format rather than always assuming Turtle.
+    async fn spawn_jsonld_profile_server(issuer: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let webid = format!("http://{addr}/profile#me");
+
+        let jsonld = format!(
+            r#"[{{"@id": "{webid}", "http://www.w3.org/ns/solid/terms#oidcIssuer": [{{"@id": "{issuer}"}}]}}]"#
+        );
+
+        let app = Router::new().route(
+            "/profile",
+            get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/ld+json")],
+                    jsonld.clone(),
+                )
+            }),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        webid
+    }
+
+    #[tokio::test]
+    async fn jsonld_profile_with_listed_issuer_is_authorized() {
+        let webid = spawn_jsonld_profile_server("https://idp.example/").await;
+        let verifier = permissive_verifier();
+        assert!(verifier
+            .authorizes(&webid, "https://idp.example/")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
