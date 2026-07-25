@@ -2184,6 +2184,7 @@ dependencies = [
  "http-body-util",
  "josekit",
  "oxigraph",
+ "percent-encoding",
  "reqwest",
  "serde_json",
  "sha2 0.11.0",
