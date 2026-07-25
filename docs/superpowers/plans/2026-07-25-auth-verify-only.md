@@ -417,3 +417,135 @@ git commit -m "feat: axum auth middleware + cached HTTP JWKS resolver; attach Ag
 **Type consistency:** `Agent{Public,WebId}`, `AuthError` variants, `JwksResolver::resolve`, `Jwks{keys}`, `AccessClaims{webid,jkt,issuer}`, `verify_access_token(token, &dyn JwksResolver, now)`, `verify_dpop(proof, htu, htm, expected_jkt, now)`, `authenticate(auth_header, dpop_header, htm, htu, resolver, now)`, `AppState{store,space,resolver}`, `TestIdp`/`TestClient` minting signatures — consistent across Tasks 1–4. ✓
 
 **Security emphasis:** Every task's error paths fail closed; the test suites deliberately include negative cases (expired, wrong signing key, wrong htu, jkt binding mismatch, tampered signature, token-without-proof). The final whole-branch review MUST be adversarial and specifically probe: algorithm-confusion / `alg:none`, key-selection (does an attacker-supplied `kid` or embedded key ever get trusted for the access token?), missing `cnf.jkt` enforcement, htu/htm normalization mismatches, and replay across the process-lifetime store.
+
+---
+
+## Spike Results (2026-07-25)
+
+Scratch crate (`cargo new --lib auth-spike`; not committed) proved the full round-trip green with a single `#[tokio::test]`: generate IdP + client EC P-256 keys → mint access token (JWS, `cnf.jkt`) → verify against IdP public JWK, read claims → mint DPoP proof (embedded `jwk`, `htu`/`htm`/`iat`/`jti`) → verify with `dpop-verifier` → confirm proof-key thumbprint == access token's `cnf.jkt`. Also exercised: wrong-signer rejection, wrong-`htu` rejection (`DpopError::HtuMismatch`), and same-`jti` replay rejection (`DpopError::Replay`).
+
+**Resolved versions (from `Cargo.lock`, `cargo add` with no pin):**
+- `josekit = "0.10.3"` — license `MIT OR Apache-2.0`. **Must enable the `vendored` feature** (`josekit = { version = "0.10.3", features = ["vendored"] }`) — see blocker below.
+- `dpop-verifier = "4.4.0"` — license `MIT OR Apache-2.0`.
+- `async-trait = "0.1.91"` — required as a **direct** dependency (the `ReplayStore` trait impl needs the same proc-macro the trait was declared with; without it, `#[async_trait] impl ReplayStore for X` fails with `E0195 lifetime parameters ... do not match the trait declaration`).
+- `serde_json = "1.0.151"`, `tokio = "1.53.1"` (features `rt`, `macros`, `rt-multi-thread`).
+
+**Blocker/gotcha #1 — `josekit` needs vendored OpenSSL, not libclang.** Plain `cargo build`/`test` fails: `josekit` depends unconditionally on the `openssl` crate (for RSA/PSS support), which needs `pkg-config` + system OpenSSL dev headers — absent on a bare NixOS shell outside the flake dev shell. Fix: enable josekit's `vendored` feature, which builds OpenSSL from source (needs only a C compiler, already present) — no libclang/RocksDB-style dependency at all. **This must be added to `Cargo.toml` in Task 1**: `cargo add josekit --features vendored` (or edit the line after `cargo add josekit`).
+
+**Blocker/gotcha #2 — `JwtPayload::set_issued_at`/`set_expires_at` encode floats, `dpop-verifier` wants ints.** `josekit::jwt::JwtPayload::set_issued_at(&SystemTime)` (and `set_expires_at`) serialize the claim as a JSON **float** with fractional seconds (e.g. `"iat":1784986197.359083`). `dpop-verifier`'s internal `DpopClaims { iat: i64, .. }` (see `dpop_verifier::verify` source) fails strict `serde_json` deserialization of a float into an `i64` field, surfacing as the unhelpful `DpopError::MalformedJws` (looks like a signature/encoding problem, isn't). **Fix:** for the DPoP proof's `iat` (and, for consistency, the access token's `iat`/`exp` too), set the claim as a plain integer via `payload.set_claim("iat", Some(serde_json::json!(unix_ts)))`, never via `set_issued_at`/`set_expires_at`. Task 1/2/3 test-support minting (`TestIdp::mint_access_token`, `TestClient::mint_dpop`) MUST use integer claims for `iat`/`exp`, matching the `i64` unix-timestamp params already in their signatures.
+
+### josekit recipe (copy-pasteable)
+
+```rust
+use josekit::jwk::Jwk;
+use josekit::jwk::alg::ec::EcCurve;
+use josekit::jws::{JwsHeader, ES256};
+use josekit::jwt::{self, JwtPayload};
+use serde_json::json;
+
+// --- Generate an EC P-256 keypair; derive the public JWK ---
+let priv_jwk: Jwk = Jwk::generate_ec_key(EcCurve::P256)?;   // contains "d" (private)
+let pub_jwk: Jwk = priv_jwk.to_public_key()?;                // strips "d"
+
+// --- Extract raw x/y (base64url, no padding) — needed for the RFC 7638 thumbprint ---
+let x: String = pub_jwk.parameter("x").unwrap().as_str().unwrap().to_string();
+let y: String = pub_jwk.parameter("y").unwrap().as_str().unwrap().to_string();
+
+// --- RFC 7638 thumbprint: josekit 0.10.3 has NO `Jwk::thumbprint` method (verified absent
+// from the crate). Use dpop_verifier::thumbprint_ec_p256(x, y) instead (see below) — using the
+// SAME function on both the minting side and the verifying side guarantees agreement, and it's
+// already a transitive dependency once Task 3 adds dpop-verifier.
+let jkt: String = dpop_verifier::thumbprint_ec_p256(&x, &y)?; // 43-char base64url, no '='
+
+// --- Build a signer/verifier for ES256 from a JWK ---
+let signer = ES256.signer_from_jwk(&priv_jwk)?;   // impl JwsSigner
+let verifier = ES256.verifier_from_jwk(&pub_jwk)?; // impl JwsVerifier
+
+// --- Mint a JWS with custom claims, incl. nested `cnf` ---
+let mut header = JwsHeader::new();
+header.set_token_type("JWT");           // sets "typ": "JWT"
+
+let mut payload = JwtPayload::new();
+payload.set_issuer("https://idp.example/");        // "iss"
+payload.set_subject("https://alice.example/card#me"); // "sub"
+payload.set_claim("iat", Some(json!(iat_unix)))?;   // PLAIN INTEGER — see gotcha #2
+payload.set_claim("exp", Some(json!(exp_unix)))?;   // PLAIN INTEGER — see gotcha #2
+payload.set_claim("webid", Some(json!("https://alice.example/card#me")))?;
+payload.set_claim("cnf", Some(json!({ "jkt": jkt })))?; // nested object claim works directly
+
+let jws: String = jwt::encode_with_signer(&payload, &header, &signer)?; // 3-part compact JWS
+
+// --- Verify a JWS against a public JWK; read claims back ---
+let (verified_payload, verified_header) = jwt::decode_with_verifier(&jws, &verifier)?;
+// JoseError on: bad signature, wrong key, malformed input. Fails closed (Err), never silent.
+let webid: &str = verified_payload.claim("webid").unwrap().as_str().unwrap();
+let exp: i64 = verified_payload.claim("exp").unwrap().as_i64().unwrap();
+let jkt_claim: &str = verified_payload.claim("cnf").unwrap().get("jkt").unwrap().as_str().unwrap();
+// `verified_header` also available (e.g. `verified_header.key_id()` if the IdP's real JWKS uses `kid`
+// to pick the verifying key among several — this spike used a single-key resolver so didn't need it;
+// Task 2's kid-based key selection should be tested against a JwkSet with 2+ keys).
+
+// --- Mint a DPoP proof: header typ "dpop+jwt" + embedded PUBLIC jwk; claims htu/htm/iat/jti ---
+let dpop_signer = ES256.signer_from_jwk(&priv_jwk)?; // the CLIENT's key, not the IdP's
+let mut dpop_header = JwsHeader::new();
+dpop_header.set_token_type("dpop+jwt");   // "typ": "dpop+jwt" — dpop-verifier requires this exact value
+dpop_header.set_jwk(pub_jwk.clone());     // embeds {"kty","crv","x","y"} — MUST be the public key only
+
+let mut dpop_payload = JwtPayload::new();
+dpop_payload.set_claim("htu", Some(json!("https://pod.toph.so/foo")))?;
+dpop_payload.set_claim("htm", Some(json!("GET")))?;
+dpop_payload.set_claim("iat", Some(json!(iat_unix)))?; // PLAIN INTEGER — see gotcha #2
+dpop_payload.set_claim("jti", Some(json!("unique-id")))?;
+
+let dpop_proof: String = jwt::encode_with_signer(&dpop_payload, &dpop_header, &dpop_signer)?;
+```
+
+### dpop-verifier recipe (copy-pasteable)
+
+```rust
+use dpop_verifier::{DpopVerifier, DpopError, ReplayContext, ReplayStore};
+use async_trait::async_trait;
+use std::collections::HashSet;
+
+// --- Replay store: process-lifetime in-memory HashSet<[u8;32]> is sufficient for v1 ---
+struct MemoryStore(HashSet<[u8; 32]>);
+
+#[async_trait]
+impl ReplayStore for MemoryStore {
+    async fn insert_once(&mut self, jti_hash: [u8; 32], _ctx: ReplayContext<'_>)
+        -> Result<bool, DpopError>
+    {
+        Ok(self.0.insert(jti_hash)) // true = first time seen (OK); false = replay
+    }
+}
+
+// --- Construct + verify (builder pattern) ---
+let verifier = DpopVerifier::new()
+    .with_max_age_seconds(300)     // rejects DpopError::Stale if iat older than this
+    .with_future_skew_seconds(5);  // rejects DpopError::FutureSkew if iat too far ahead
+
+let mut store = MemoryStore(HashSet::new());
+let verified = verifier
+    .verify(
+        &mut store,
+        &dpop_proof,             // compact JWS string from the `DPoP` header
+        "https://pod.toph.so/foo", // expected_htu — the CONFIGURED public URL, not the socket
+        "GET",                    // expected_htm
+        None,                      // access_token: Some(at) binds `ath` (SHA-256 of the AT) —
+                                   // NOT needed for cnf.jkt checking; leave None unless also
+                                   // enforcing `ath` binding (Solid-OIDC doesn't require it).
+    )
+    .await?; // Result<VerifiedDpop, DpopError>
+
+// pub struct VerifiedDpop { pub jkt: String, pub jti: String, pub iat: i64 }
+```
+
+**What `dpop-verifier`'s `.verify()` checks internally** (from reading `dpop_verifier::verify::DpopVerifier::verify` source, v4.4.0): JWS structure (3 parts, valid base64url) → header `typ == "dpop+jwt"` → header `jwk` is EC/P-256 (or Ed25519 with `eddsa` feature) and contains **no** private `d` member (rejects `BadJwk` otherwise) → verifies the **proof's own signature** using the embedded public `jwk` → computes the proof key's RFC 7638 thumbprint (`jkt`) via its own `thumbprint_ec_p256` → decodes claims (`jti`, `iat`, `htm`, `htu`, optional `ath`, `nonce`) → `jti` length ≤ 512 → **`htm`/`htu` exact match** after normalization (case-insensitive scheme/host, default-port stripping, dot-segment removal, query/fragment stripping — but **path is case-sensitive**, confirmed by its own test `htu_path_case_mismatch_fails`) → optional `ath` binding if `access_token: Some(..)` passed → **freshness** (`iat` within `[now - max_age, now + future_skew]`, else `Stale`/`FutureSkew`) → optional nonce checks (`NonceMode`, unused here) → **replay** via the `ReplayStore` (`SHA-256(jti)` inserted; `false` return ⇒ `DpopError::Replay`).
+
+**Confirmed: `dpop-verifier` does NOT check `cnf.jkt` binding itself** — it has no concept of an access token's `cnf` claim at all (its only access-token-related feature is the separate, optional `ath` hash-binding check, which is a different mechanism). `VerifiedDpop.jkt` is simply the thumbprint of the key that signed the *proof*. **Task 3's `verify_dpop` MUST, after calling `.verify()`, separately compare `verified.jkt == expected_jkt` (the access token's `cnf.jkt`) and return `AuthError::Binding` on mismatch** — this is exactly the shape already specified in the Task 3 interface (`verify_dpop(proof, htu, htm, expected_jkt, now)`), so no interface change is needed, just confirmation the comparison is entirely our responsibility.
+
+**Replay store trait** (already shown above): `ReplayStore::insert_once(&mut self, jti_hash: [u8; 32], ctx: ReplayContext<'_>) -> Result<bool, DpopError>`, where `ReplayContext<'a> { jkt: Option<&'a str>, htm: Option<&'a str>, htu: Option<&'a str>, client_id: Option<&'a str>, iat: i64 }`. A `HashSet<[u8;32]>`-backed impl (shown above) is a fine v1 process-lifetime store, matching the plan's noted limitation.
+
+**Error type:** `dpop_verifier::DpopError` (via `thiserror`) has variants including `MalformedJws`, `InvalidAlg(String)`, `UnsupportedAlg(String)`, `InvalidSignature`, `BadJwk(&'static str)`, `HtmMismatch`, `HtuMismatch`, `MissingAth`/`AthMalformed`/`AthMismatch`, `FutureSkew`, `Stale`, `Replay`, `JtiTooLong`, plus nonce-related variants unused here. Task 3 should map all of these to `AuthError::DpopInvalid(String)` (via `.to_string()`) except perhaps surfacing `Replay`/`Stale` distinctly if useful for logging — the plan's `AuthError::DpopInvalid(String)` catch-all is adequate.
+
+**No other API-shape mismatches found** — `dpop-verifier` consumes a plain compact-JWS `&str` for the proof (no custom request/proof struct required), so it plugs directly into the `verify_dpop(proof: &str, ...)` signature already specified in Task 3 with no adaptation needed.
