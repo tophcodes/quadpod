@@ -1,0 +1,220 @@
+# WAC Enforcement (Plan 6) — Design
+
+**Date:** 2026-07-26
+**Status:** Approved design (pre-implementation)
+**Author:** Christopher Mühl (with Claude)
+**Parent spec:** [2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md) §8 (Access Control)
+
+## 1. Context
+
+Plans 1–5 built the LDP surface (CRUD, containers, conneg, ETags) and verify-only
+Solid-OIDC/DPoP authentication. The auth middleware **attaches** an `Agent` to each
+request; nothing reads it. Every request is therefore fully authorized: the pod is open.
+
+Plan 6 closes that. It implements WAC — the PRP (find the applicable ACL) and the PDP
+(decide from it) — and enforces the decision in every LDP handler. It resolves open
+risk #2 of the parent spec (is `manas_access_control` usable with our own PRP?) via a
+spike, and it decides the question Plan 3 deferred (does `.acl` show up in container
+listings?).
+
+## 2. Scope
+
+**In:**
+
+- WAC core without remote fetches: `acl:accessTo`, `acl:default` (inheritance),
+  `acl:agent`, `acl:agentClass` (`foaf:Agent`, `acl:AuthenticatedAgent`), modes
+  `acl:Read`/`acl:Write`/`acl:Append`/`acl:Control`.
+- PRP: ACL resolution with an upward container walk to the root fallback.
+- Enforcement in all existing LDP handlers, with WAC-correct status codes.
+- `.acl` as an addressable Solid resource, gated by `acl:Control`, excluded from
+  containment.
+- Root ACL provisioning from a configured owner WebID.
+- A `clap` command-line config layer (replacing ad-hoc `std::env::var` reads).
+
+**Out (deliberately):**
+
+- `acl:agentGroup` — resolving a group listing means fetching a (possibly remote)
+  document, i.e. new SSRF surface. Deferred until there is a use case.
+- `acl:origin` — only meaningful once CORS exists for browser apps; CORS is not yet
+  planned.
+- ACP. The PDP seam makes it a later plug-in, per parent spec §8.
+- `/sparql` read proxy enforcement — the endpoint does not exist yet.
+- N3-Patch — no PATCH handler exists yet; see §4.
+
+## 3. Modules & Data Model
+
+New module `src/wac/`, one responsibility per file:
+
+| File | Responsibility | Depends on |
+|---|---|---|
+| `wac/prp.rs` | ACL resolution: `effective_acl(store, space, path) -> Option<EffectiveAcl>` | store, space, container |
+| `wac/pdp.rs` | pure decision: `(ACL triples, agent, target, inherited?) -> AccessModes` | RDF types only |
+| `wac/guard.rs` | `authorize(store, space, agent, path, mode) -> Result<(), Response>` | prp + pdp |
+| `wac/mod.rs` | re-exports, `Mode` enum, `AccessModes` bitset | — |
+
+The PDP is a pure function with no store access. That makes it exhaustively
+table-testable, and it hides the spike outcome (rented `manas_access_control` vs. our
+own implementation) behind a single signature — see §7.
+
+**ACL location** (parent spec §5): the ACL for `<res>` lives in graph `<res>.acl`.
+So `/foo` → `/foo.acl`, container `/box/` → `/box/.acl`, root `/` → `/.acl`. It is a
+real Solid resource: addressable via GET/PUT, but access to it is decided by
+`acl:Control` on `<res>`, not by Read/Write on the ACL itself.
+
+**PRP walk** (WAC semantics, no blending): check `<res>.acl` for `acl:accessTo`
+authorizations first. If that graph does not exist, ascend to the parent container and
+evaluate its `.acl` for `acl:default` authorizations; continue up to `/.acl`.
+**The first ACL document found wins completely** — ancestor rules are not merged in.
+If no ACL document exists anywhere (not even `/.acl`): deny.
+
+**Containment:** `.acl` graphs are never recorded as `ldp:contains` children
+(excluded in `add_containment`/`remove_containment`), so they do not appear in
+container listings. This settles the question Plan 3 deferred.
+
+## 4. Enforcement Matrix & Status Codes
+
+One `authorize(...)` call at the top of each `*_impl` in `src/http.rs`, before any
+store access:
+
+| Verb | Target | Required modes |
+|---|---|---|
+| GET `<res>` | `<res>` | `Read` |
+| PUT `<res>` (exists) | `<res>` | `Write` |
+| PUT `<res>` (new) | `<res>` + parent container | `Write` on `<res>`, `Append` on parent |
+| POST `<container>/` | container | `Append` |
+| DELETE `<res>` | `<res>` + parent container | `Write` on both |
+| GET/PUT/DELETE `<res>.acl` | `<res>` | `Control` |
+
+`Write` subsumes `Append`. Create and delete mutate the parent container's containment
+triples, hence the check there too — without it, someone holding `Write` on a child
+could manipulate the container's listing.
+
+**Status codes:**
+
+- `Agent::Public` denied → **401** with `WWW-Authenticate: DPoP algs="ES256"`.
+  Tells the client that authenticating would help.
+- Authenticated agent denied → **403**.
+- **No 404 leak:** authorization runs before the existence check. Without read access
+  the response is 401/403 regardless of whether the resource exists — otherwise the
+  status code is an existence oracle for the whole namespace.
+
+The exists-vs-new distinction for PUT requires one store lookup. It runs **after** the
+parent container has been authorized, so it cannot become an oracle either.
+
+**PATCH** is absent from the matrix: N3-Patch does not exist yet. Whoever adds it must
+bring a guard; the route-coverage test (§6) fails if they forget.
+
+## 5. Configuration & Bootstrap
+
+**Config layer.** Configuration moves from scattered `std::env::var` calls to a `clap`
+derive struct. Each option is a flag with an environment-variable fallback
+(`#[arg(long, env = "POD_…")]`) — clap's built-in precedence (flag > env > default),
+no hand-written precedence logic:
+
+| Flag | Env fallback | Notes |
+|---|---|---|
+| `--base-uri` | `POD_BASE_URI` | absolute, trailing slash; validated at startup |
+| `--owner-webid` | `POD_OWNER_WEBID` | **required**, see below |
+| `--trusted-issuer` | `POD_TRUSTED_ISSUERS` | repeatable flag; replaces the comma-splitting in `auth/config.rs` |
+| `--expected-audience` | `POD_EXPECTED_AUDIENCE` | optional |
+| `--listen` | `POD_LISTEN` | socket address, default `127.0.0.1:3000` |
+
+Nothing in this config is a secret (base URI, owner WebID, issuer list, audience are
+all public information), so the "flags are visible in `ps`" objection does not apply.
+Flags buy startup validation, `--help` as documentation, and repeatable list values —
+a silently-ignored typo'd env var (`POD_BASE_URl`) becomes an explicit startup error.
+
+**Owner is required.** Without `--owner-webid` the server refuses to start. A pod with
+no known owner could only be all-open or all-closed after enforcement is switched on;
+both are wrong, so the process exits with a clear message instead.
+
+**Root provisioning.** `provision_root()` additionally creates `/.acl` when that graph
+is empty:
+
+```turtle
+<#owner> a acl:Authorization ;
+    acl:agent <OWNER_WEBID> ;
+    acl:accessTo </> ;
+    acl:default </> ;
+    acl:mode acl:Read, acl:Write, acl:Control .
+```
+
+`acl:default` makes this the fallback policy for the entire pod. An existing `/.acl`
+is **never** overwritten — otherwise every restart would roll back the owner's shares.
+
+**No owner bypass.** After provisioning, the ACL alone decides; the configured owner
+has no path around WAC. Deleting their own Control rule locks them out, exactly as in
+CSS/ESS. Two parallel authorization sources would be worse: contradictions between
+them stay invisible.
+
+## 6. Testing
+
+1. **PDP table** (pure function, no store): agent type × authorization triples ×
+   requested mode. Covers `acl:agent` match, `acl:AuthenticatedAgent` (matches
+   `Agent::WebId`, not `Public`), `foaf:Agent` (matches both), `Write` ⊃ `Append`,
+   `Control` in isolation, and the negatives: `acl:accessTo` naming a *different*
+   resource, `acl:default` without an inheritance context, an authorization with no
+   `acl:mode`.
+2. **PRP walk** (in-memory store): direct ACL beats ancestor; missing direct ACL
+   inherits from the nearest container; multi-level ascent `/a/b/c` → `/.acl`; the
+   first ACL found wins *completely* (ancestor rules do not add in); no ACL anywhere →
+   deny.
+3. **HTTP integration per verb:** for every row of §4, one allowed and one forbidden
+   case, plus the 401-vs-403 distinction, plus the no-404-leak property (a forbidden
+   request against an existing and a non-existent resource return the same code).
+4. **Route-coverage test:** iterate every registered method/path combination and send
+   each unauthorized. Anything other than 401/403 fails. This is the countermeasure to
+   the known weakness of per-handler guards — a future handler without a guard shows up
+   here, not in production.
+5. **`.acl` specifics:** `.acl` does not appear in `ldp:contains`; reading/writing an
+   ACL requires `Control`, not `Read`/`Write`; DELETE of `/.acl` is permitted
+   (WAC-conformant) and locks the pod down afterwards.
+
+## 7. Task Breakdown
+
+| Task | Content |
+|---|---|
+| 0 | **PDP spike:** call `manas_access_control::WacDecisionPoint` + `manas_space::SolidStorageSpace` for real, with our `StorageSpace`, a hand-built ACL graph and a WebID agent. Record exact API calls as a "Spike Results" section in the plan, as in Plan 4. |
+| 1 | `clap` config layer + `--owner-webid`, startup validation |
+| 2 | `wac/pdp.rs` — decision function (rented or own, per Task 0) + table tests |
+| 3 | `wac/prp.rs` — ACL path derivation, upward walk, `.acl` containment exclusion |
+| 4 | Root ACL provisioning |
+| 5 | `wac/guard.rs` + wiring into all handlers, status-code semantics |
+| 6 | `.acl` as an addressable resource (`Control` gate) + `Link: rel="acl"` header |
+| 7 | Route-coverage test + adversarial final review |
+
+**Spike fallback:** if Task 0 shows `manas_space` drags in `manas_repo` or forces its
+own URI/slot model onto our `StorageSpace`, the same decision logic goes into
+`pdp.rs` as a pure function — WAC core without agentGroup/origin is roughly 150–200
+lines. The signature of `pdp.rs` is identical either way, so no other task is affected.
+This keeps the blast radius of risk #2 inside a single file.
+
+As in Plans 4 and 5, the branch ends with an **adversarial whole-branch security
+review**, because this is a security boundary.
+
+## 8. Success Criteria
+
+- Under the default root ACL (owner-only), an agent with no credentials gets 401 on
+  every route and an authenticated non-owner gets 403. Granting `foaf:Agent` read
+  access in an ACL makes exactly that subtree publicly readable, and nothing else.
+- The owner can read/write every resource in the pod and can grant another WebID
+  read access to a subtree by writing one `.acl` — verified end-to-end over HTTP.
+- The first ACL found in the walk is authoritative; ancestor authorizations do not
+  leak in.
+- `.acl` resources are invisible in container listings and reachable only with
+  `acl:Control`.
+- The route-coverage test passes, i.e. no handler reaches the store unauthorized.
+- Existing tests (100 at the end of Plan 5) still pass, unchanged in meaning: the
+  auth boundary from Plans 4/5 is not weakened.
+
+## 9. Deferred / Follow-ups
+
+- `acl:agentGroup`, `acl:origin` (see §2).
+- Carried over from Plan 5: shared/Redis DPoP replay store, per-request-client
+  performance, `safe_fetch.rs` `.expect()` → `?`, negative-cache TTL-recovery test.
+- Carried over from Plan 2: RFC 7232 conformance gaps (`If-Match: *` on an existing
+  resource, `If-None-Match: *` on GET → 304, comma-separated ETag lists).
+- Carried over from Plan 3: POST to a non-container should arguably be 405 with an
+  `Allow` header rather than 409; empty-body PUT creates a dangling containment link
+  (symptom of the "empty graph = absent" model, needs a `urn:pod:sys:` presence
+  marker, due with blobs).
