@@ -35,7 +35,8 @@ fn acl_link(space: &StorageSpace, request_path: &str) -> Option<(header::HeaderN
 }
 
 /// Authorize `Append` on every ancestor container that creating `req_path`
-/// would observably change.
+/// would observably change. Called by `put_impl` (with the request path) and
+/// by `post_impl` (with the settled `child_path`).
 ///
 /// Creating a resource does not touch only its immediate parent:
 /// `container::ensure_ancestors` materializes every missing container above
@@ -1227,6 +1228,57 @@ mod tests {
                  <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
             ))).unwrap();
         assert_eq!(bob_app.oneshot(hijack).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // The POST side of `authorize_ancestors`' ACL exemption. On a PUT that
+    // exemption is reached only after `Control` on the ACL's subject was
+    // granted; POST must be no cheaper. Both slug shapes are pinned because
+    // they hit different subjects — `.acl` is the container's OWN access
+    // control document, `note.acl` a child's — and only the second would
+    // survive a regression that special-cased the container's name. Bob holds
+    // Append everywhere below `/` and Control nowhere, so neither may pass.
+    #[tokio::test]
+    async fn append_only_agent_cannot_post_an_acl_child_of_any_name() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let root_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
+        );
+        let put_root_acl = f.owner_request("PUT", "/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(root_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_root_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let post = |slug: &'static str| f.sign(
+                Request::builder().method("POST").uri("/inbox/"), bob, "POST", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", slug)
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+
+        // Sanity: Bob's Append really does let him POST an ordinary child.
+        assert_eq!(bob_app.clone().oneshot(post("note")).await.unwrap().status(), StatusCode::CREATED);
+
+        assert_eq!(bob_app.clone().oneshot(post(".acl")).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(bob_app.oneshot(post("note.acl")).await.unwrap().status(), StatusCode::FORBIDDEN);
+        for orphan in ["/inbox/.acl", "/inbox/note.acl"] {
+            assert!(
+                crate::resource::get_rdf(f.store.as_ref(), &f.space, orphan).await.unwrap().is_none(),
+                "{orphan} must not have been created by an append-only agent"
+            );
+        }
     }
 
     // Every other test in this file authenticates as OWNER, who holds every
