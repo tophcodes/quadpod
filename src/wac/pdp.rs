@@ -25,6 +25,9 @@ pub const ACL_APPEND: &str = "http://www.w3.org/ns/auth/acl#Append";
 pub const ACL_CONTROL: &str = "http://www.w3.org/ns/auth/acl#Control";
 pub const ACL_AUTHENTICATED_AGENT: &str =
     "http://www.w3.org/ns/auth/acl#AuthenticatedAgent";
+/// The rdf:type triple marking an authorization. Written by provisioning for
+/// interoperability, but `decide` intentionally does not require it — many
+/// real-world ACLs omit the type and rely on scope/agent/mode predicates alone.
 pub const ACL_AUTHORIZATION: &str = "http://www.w3.org/ns/auth/acl#Authorization";
 pub const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
 
@@ -136,6 +139,7 @@ mod tests {
         ));
         let m = decide(&a, &Agent::WebId(BOB.to_string()), FOO, false);
         assert!(!m.allows(Mode::Read));
+        assert!(!decide(&a, &Agent::Public, FOO, false).allows(Mode::Read));
     }
 
     #[test]
@@ -204,6 +208,7 @@ mod tests {
         assert!(m.allows(Mode::Control));
         assert!(!m.allows(Mode::Read));
         assert!(!m.allows(Mode::Write));
+        assert!(!m.allows(Mode::Append));
     }
 
     #[test]
@@ -232,5 +237,31 @@ mod tests {
     #[test]
     fn empty_acl_grants_nothing() {
         assert!(!decide(&[], &alice(), FOO, false).allows(Mode::Read));
+    }
+
+    // Authorizations are subject-scoped: an agent matched by one
+    // authorization must not inherit another's modes. Without the
+    // `t.subject == subject` filter, Alice would pick up Bob's Control here.
+    #[test]
+    fn modes_do_not_leak_across_authorizations() {
+        let a = acl(&format!(
+            "<#a> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <{FOO}> ; <{ACL_MODE}> <{ACL_READ}> .\n\
+             <#b> <{ACL_AGENT}> <{BOB}> ; <{ACL_ACCESS_TO}> <{FOO}> ; <{ACL_MODE}> <{ACL_CONTROL}> ."
+        ));
+        let m = decide(&a, &alice(), FOO, false);
+        assert!(m.allows(Mode::Read));
+        assert!(!m.allows(Mode::Control), "Bob's authorization must not grant Alice Control");
+    }
+
+    // The scope check is subject-scoped too: a matching agent's own
+    // authorization must carry the accessTo, not borrow it from another.
+    #[test]
+    fn scope_does_not_leak_across_authorizations() {
+        let a = acl(&format!(
+            "<#scoped> <{ACL_AGENT}> <{BOB}> ; <{ACL_ACCESS_TO}> <{FOO}> ; <{ACL_MODE}> <{ACL_READ}> .\n\
+             <#unscoped> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/other> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        ));
+        assert!(!decide(&a, &alice(), FOO, false).allows(Mode::Read));
     }
 }
