@@ -167,6 +167,31 @@ async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: 
         name = format!("{name}-{}", uuid::Uuid::new_v4());
         child_path = format!("{container_path}{name}");
     }
+    // The container's Append is not enough to authorize the CHILD: a `Slug`
+    // of `.acl` would otherwise let an append-only agent write the
+    // container's own access-control document and escalate to Control.
+    // Routing the settled child path through `authorize` also picks up the
+    // guard's `.acl` -> Control rewrite, so this cannot be forgotten again.
+    // Mode::Append (not Write) here: for an ordinary (non-.acl) child this
+    // must stay consistent with the container-level check above, or the
+    // append-only inbox pattern this design targets would break — every
+    // legitimate append-only POST would suddenly need Write on the child it
+    // creates. For a `.acl` child the guard ignores this argument entirely
+    // and substitutes Control, so the escalation is still blocked.
+    // The container's Append is not enough to authorize the CHILD: a `Slug`
+    // of `.acl` would otherwise let an append-only agent write the
+    // container's own access-control document and escalate to Control.
+    // Routing the settled child path through `authorize` also picks up the
+    // guard's `.acl` -> Control rewrite, so this cannot be forgotten again.
+    // Mode::Append (not Write) here: for an ordinary (non-.acl) child this
+    // must stay consistent with the container-level check above, or the
+    // append-only inbox pattern this design targets would break — every
+    // legitimate append-only POST would suddenly need Write on the child it
+    // creates. For a `.acl` child the guard ignores this argument entirely
+    // and substitutes Control, so the escalation is still blocked.
+    if let Err(res) = authorize(st.store.as_ref(), &st.space, &agent, &child_path, Mode::Append).await {
+        return res;
+    }
     let g = match st.space.graph_iri(&child_path) {
         Ok(g) => g,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -866,5 +891,66 @@ mod tests {
         let listing = body_string(f.app.oneshot(get).await.unwrap()).await;
         assert!(listing.contains("https://pod.toph.so/item"));
         assert!(!listing.contains("item.acl"));
+    }
+
+    // An agent with Append on a container must not be able to write that
+    // container's ACL by naming the child `.acl` — that would escalate
+    // append-only access to Control over the whole subtree.
+    #[tokio::test]
+    async fn append_only_agent_cannot_post_a_container_acl() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        // owner creates /inbox/, which starts with NO direct ACL of its own
+        // — it inherits from the root ACL. That inheritance matters: if
+        // Bob's grant lived directly at /inbox/.acl, that path would already
+        // exist and the Slug: .acl attack below would be deflected onto a
+        // uuid-suffixed name by the ordinary collision-avoidance branch,
+        // proving nothing. Granting Bob Append through the root ACL (via
+        // acl:default) keeps /inbox/.acl genuinely absent beforehand, so the
+        // hijack really does create — and thereby replace — the ACL that
+        // (until that moment) was inherited from the root.
+        let mk = f.owner_request("PUT", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+        let root_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
+        );
+        let put_root_acl = f.owner_request("PUT", "/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(root_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_root_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+
+        // Sanity check: Bob genuinely has (inherited) Append on the
+        // container — an innocuous POST must succeed. Otherwise a FORBIDDEN
+        // below would prove nothing about the escalation this test targets.
+        let sanity = f.sign(Request::builder().method("POST").uri("/inbox/"), bob, "POST", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "note")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(bob_app.clone().oneshot(sanity).await.unwrap().status(), StatusCode::CREATED);
+
+        // The attack: POST with Slug: .acl makes child_path == /inbox/.acl,
+        // exactly the ACL that governs /inbox/ itself. If unauthorized, Bob
+        // would gain Control over the container (and, via acl:default, its
+        // whole subtree) using only his Append grant.
+        let hijack = f.sign(Request::builder().method("POST").uri("/inbox/"), bob, "POST", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", ".acl")
+            .body(Body::from(format!(
+                "<#pwn> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/inbox/> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        assert_eq!(bob_app.oneshot(hijack).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 }
