@@ -132,11 +132,17 @@ convey:
   subtree down" but in fact restores the ancestor's wider `acl:default` rules. Container
   paths keep the empty-body create, where the server supplies the type triples itself.
 
-Known over-restriction, filed as a follow-up: writing `<res>.acl` under an
-already-existing container currently also demands `Append` on that container, although
-`add_containment` skips ACLs so nothing observable changes there. An agent holding only
-`acl:Control` through an ancestor's `acl:default` therefore cannot write ACLs. It fails
-closed and the pod owner is unaffected.
+**An ACL can only be created for a subject that already exists** (`404` otherwise, checked
+after authorization so it is never an existence oracle). Without this, an agent holding
+`acl:Control` through an ancestor's `acl:default` could write `/box/ghost.acl` for a
+`/box/ghost` that never existed, naming only themselves. Nearest-ACL-wins would make that
+document govern the path permanently: the owner could not delete it (needs `Control`),
+rewrite it (needs `Control`), or create the resource (needs `Write`), and revoking the
+delegation would not help. Updating an ACL that already exists stays possible regardless,
+so a stale one can always be repaired or removed.
+
+Consequence, accepted: rights can no longer be pre-granted on a path before the resource
+exists by writing its ACL first. Use `acl:default` on an existing ancestor for that.
 
 **Status codes:**
 
