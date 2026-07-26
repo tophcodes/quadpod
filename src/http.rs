@@ -444,6 +444,32 @@ mod tests {
     const OWNER: &str = "https://alice.example/card#me";
     const ISSUER: &str = "https://idp.example/";
 
+    // True while this thread's test is holding a live `Fixture`.
+    //
+    // The replay lock a `Fixture` takes is process-wide and NOT reentrant, so
+    // a second `fixture()` call inside one test would await a guard its own
+    // caller still holds — a silent hang rather than a failure. A bare
+    // `try_lock` cannot detect that: `cargo test` runs these tests in
+    // parallel, so the lock is legitimately contended almost all the time and
+    // `try_lock` fails for the innocent reason far more often than the guilty
+    // one. Re-entrancy is therefore tracked per test thread, where the two
+    // cases are distinguishable, and the mistake panics at once.
+    thread_local! {
+        static FIXTURE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Clears [`FIXTURE_HELD`] when the fixture goes away. A field rather than
+    /// a `Drop` impl on `Fixture` itself, because tests move `f.app` out of
+    /// the fixture and that partial move is only legal while `Fixture` has no
+    /// `Drop` of its own.
+    struct ReentrancyGuard;
+
+    impl Drop for ReentrancyGuard {
+        fn drop(&mut self) {
+            FIXTURE_HELD.with(|f| f.set(false));
+        }
+    }
+
     /// An app whose root ACL grants OWNER full control, plus the IdP and
     /// client needed to mint credentials for them. The store and space are
     /// kept so a second app can be built over the SAME data (see
@@ -462,9 +488,16 @@ mod tests {
         /// concurrently-running replay tests, which simulate `now_unix`
         /// near the epoch (see `auth::dpop::test_replay_lock`).
         _replay_guard: tokio::sync::MutexGuard<'static, ()>,
+        /// Releases this thread's re-entrancy flag (see [`FIXTURE_HELD`]).
+        _reentrancy: ReentrancyGuard,
     }
 
     async fn fixture() -> Fixture {
+        assert!(
+            !FIXTURE_HELD.with(|f| f.replace(true)),
+            "call fixture() once per test: it holds the process-wide DPoP replay lock \
+             for the fixture's lifetime, so a second call would deadlock"
+        );
         let _replay_guard = crate::auth::dpop::test_replay_lock().lock().await;
         let store: Arc<dyn crate::store::SparqlStore> =
             Arc::new(OxigraphStore::in_memory().unwrap());
@@ -484,7 +517,10 @@ mod tests {
             webid_verifier: Arc::new(issuers),
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
         };
-        Fixture { app: router(state), store, space, idp, client, _replay_guard }
+        Fixture {
+            app: router(state), store, space, idp, client, _replay_guard,
+            _reentrancy: ReentrancyGuard,
+        }
     }
 
     fn now_unix() -> i64 {
@@ -535,6 +571,17 @@ mod tests {
     async fn body_string(res: axum::response::Response) -> String {
         let b = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
         String::from_utf8_lossy(&b).into_owned()
+    }
+
+    // The failure mode the re-entrancy flag exists to prevent: before it, a
+    // second fixture() in one test awaited the process-wide replay lock its
+    // own caller was still holding and wedged CI with no output at all. The
+    // panic must arrive BEFORE that await, which is what this pins.
+    #[tokio::test]
+    #[should_panic(expected = "call fixture() once per test")]
+    async fn calling_fixture_twice_panics_instead_of_hanging() {
+        let _first = fixture().await;
+        let _second = fixture().await;
     }
 
     #[tokio::test]

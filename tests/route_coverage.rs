@@ -48,7 +48,11 @@ async fn no_route_serves_an_unauthenticated_request() {
         "/", "/seeded", "/seeded.acl", "/.acl", "/box/", "/box/child",
         "/does-not-exist", "/a/b/c",
     ];
-    let methods = ["GET", "PUT", "POST", "DELETE"];
+    // HEAD is served by the same handler axum's `get()` route installs, so it
+    // is guarded like GET — but this test exists to be structural, and a verb
+    // that reaches a handler belongs in the list whether or not it currently
+    // shares one. Only the status is asserted: a HEAD response has no body.
+    let methods = ["GET", "HEAD", "PUT", "POST", "DELETE"];
 
     for path in paths {
         for method in methods {

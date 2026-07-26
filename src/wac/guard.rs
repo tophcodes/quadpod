@@ -53,6 +53,13 @@ pub async fn authorize(
     let acl = match prp::effective_acl(store, space, &target).await {
         Ok(Some(acl)) => acl,
         Ok(None) => return Err(deny(agent)),
+        // Currently unreachable, and deliberately kept: `auth_layer::derive_htu`
+        // already rejects any request path whose `graph_iri` fails, and the
+        // only paths this function derives from it (`prp::acl_path`,
+        // `container::parent_container`) append or trim IRI-safe characters
+        // only. It stays as defence in depth — the day a caller reaches
+        // `authorize` by some other route, the failure must be a 400 rather
+        // than an accidental grant. Do not "clean it up".
         Err(crate::resource::ResourceError::InvalidIri) => {
             return Err(StatusCode::BAD_REQUEST.into_response())
         }
