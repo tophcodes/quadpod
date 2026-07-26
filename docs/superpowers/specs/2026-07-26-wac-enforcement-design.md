@@ -158,6 +158,14 @@ Consequences, accepted:
   under the delegated subtree. Inherent to the rule and strictly weaker than what
   `Control` already permits — that agent can grant itself `Read` and look.
 
+None of this makes `acl:Control` a bounded grant. Granting `acl:default acl:Control` on a
+container is an **irrevocable handover of every resource below it**: the delegate can write
+a direct ACL naming only themselves, nearest-ACL-wins then displaces the owner's inherited
+rules, and revoking the delegation afterwards changes nothing — the owner can no longer
+read, rewrite or delete that resource, nor delete the container above it while the resource
+is still a member. This is WAC `Control` semantics, and CSS and ESS behave identically.
+Delegate `Control` the way you would hand over a key, not the way you would share a folder.
+
 **Status codes:**
 
 - `Agent::Public` denied → **401** with `WWW-Authenticate: DPoP algs="ES256"`.
