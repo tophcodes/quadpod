@@ -345,6 +345,34 @@ async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: 
     if let Err(res) = authorize_ancestors(&st, &agent, &child_path).await {
         return res;
     }
+    // An ACL may only be CREATED for a subject that exists. Otherwise anyone
+    // holding `acl:Control` below a container can squat on a path that does
+    // not exist and never did: `<ghost>.acl` naming only themselves becomes,
+    // by nearest-ACL-wins, the document governing `<ghost>` — so the owner
+    // can no longer create it (no Write), rewrite that ACL or delete it (no
+    // Control), and deleting the container above does not reclaim it either,
+    // because an ACL is not a containment member. Revoking the squatter's
+    // delegation changes nothing. The path is bricked for everyone with no
+    // HTTP route left to repair it. `Control` over a resource that does not
+    // exist is not a grant anyone can meaningfully exercise, and requiring
+    // the subject matches how auxiliary resources behave elsewhere in Solid.
+    //
+    // Unlike `put_impl`, no update-vs-create distinction is needed here: the
+    // collision-avoidance branch above guarantees `child_path` never already
+    // exists as a graph, so it can never already exist as an ACL either —
+    // this is always a create.
+    //
+    // Placed AFTER every `authorize` call above, so an unauthorized caller is
+    // still answered 401/403 and never learns whether the subject exists.
+    if prp::is_acl_path(&child_path) {
+        let subject = prp::acl_subject_path(&child_path);
+        if !matches!(get_rdf(st.store.as_ref(), &st.space, &subject).await, Ok(Some(_))) {
+            return (
+                StatusCode::NOT_FOUND,
+                "an ACL cannot be created for a resource that does not exist",
+            ).into_response();
+        }
+    }
     let g = match st.space.graph_iri(&child_path) {
         Ok(g) => g,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -1720,6 +1748,128 @@ mod tests {
 
         let del_acl = f.owner_request("DELETE", "/box/doc.acl").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(del_acl).await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+
+    // The POST-side twin of `acl_for_a_resource_that_does_not_exist_is_refused`:
+    // the same squat is reachable with `POST` and a `Slug` of `ghost.acl` by an
+    // agent who holds `Append` on the container plus `Control` below it via
+    // `acl:default` — `post_impl` had no subject-existence check until now.
+    #[tokio::test]
+    async fn post_squat_acl_for_a_resource_that_does_not_exist_is_refused() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        // Bob gets Append on /box/ directly (so an ordinary POST works) and
+        // Control below it via acl:default (so his Control over /box/ghost,
+        // via inheritance, is genuine — the refusal must be about the
+        // subject's absence, not about him).
+        let box_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob-append> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> . \
+             <#bob-control> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_box_acl = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(box_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+
+        // Sanity: Bob's Append really does let him POST an ordinary child —
+        // otherwise a NOT_FOUND below would prove nothing about the squat
+        // this test targets. `acl:default` is needed too (not just
+        // `acl:accessTo`), because the SECOND `authorize` call in `post_impl`
+        // checks the settled child path, which has no ACL of its own and so
+        // reaches `/box/.acl` by inheritance.
+        let sanity = f.sign(Request::builder().method("POST").uri("/box/"), bob, "POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "note")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(bob_app.clone().oneshot(sanity).await.unwrap().status(), StatusCode::CREATED);
+
+        // The attack: POST with Slug: ghost.acl makes child_path ==
+        // /box/ghost.acl, for a /box/ghost that never existed.
+        let squat = f.sign(Request::builder().method("POST").uri("/box/"), bob, "POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "ghost.acl")
+            .body(Body::from(format!(
+                "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/ghost> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        let res = bob_app.oneshot(squat).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(res).await.contains("does not exist"));
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/box/ghost.acl").await.unwrap().is_none(),
+            "the squatted ACL must not have been stored"
+        );
+    }
+
+    // The counterweight: authoring an ACL over POST the ordinary way — for a
+    // child that does exist — must keep working, or the check above would
+    // have simply switched ACL authoring over POST off.
+    #[tokio::test]
+    async fn post_acl_for_an_existing_child_is_created() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let box_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob-append> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> . \
+             <#bob-control> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_box_acl = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(box_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+
+        // The subject must exist first — Bob's Append lets him create it.
+        let mk_doc = f.sign(Request::builder().method("POST").uri("/box/"), bob, "POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "doc")
+            .body(Body::from("<#it> <http://schema.org/name> \"doc\" .")).unwrap();
+        assert_eq!(bob_app.clone().oneshot(mk_doc).await.unwrap().status(), StatusCode::CREATED);
+
+        // /box/doc now exists, so POSTing its ACL with Slug: doc.acl must
+        // succeed on Bob's inherited Control alone.
+        let post_doc_acl = f.sign(Request::builder().method("POST").uri("/box/"), bob, "POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "doc.acl")
+            .body(Body::from(format!(
+                "<#x> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/doc> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> ."
+            ))).unwrap();
+        assert_eq!(bob_app.oneshot(post_doc_acl).await.unwrap().status(), StatusCode::CREATED);
     }
 
     // The other half of `authorize_ancestors`' exemption, and the one that
