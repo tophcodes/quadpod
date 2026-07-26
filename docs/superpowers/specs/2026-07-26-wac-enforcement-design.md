@@ -62,6 +62,22 @@ So `/foo` → `/foo.acl`, container `/box/` → `/box/.acl`, root `/` → `/.acl
 real Solid resource: addressable via GET/PUT, but access to it is decided by
 `acl:Control` on `<res>`, not by Read/Write on the ACL itself.
 
+**`.acl` is a reserved suffix, pod-wide.** Any request path ending in `.acl` is an
+access-control document, decided by `Control` on the path with the suffix stripped. Three
+consequences, all deliberate:
+
+- A user cannot create an ordinary resource named `notes.acl` without `acl:Control` on
+  `notes` — full `Read`+`Write` on the subtree is not enough. The suffix is server
+  namespace, not user namespace.
+- `wac::pdp::decide` deliberately does not require an explicit `a acl:Authorization` type
+  triple (real-world ACLs frequently omit it, and CSS accepts them without it). Every
+  subject in an `.acl` graph is therefore a candidate authorization.
+- **Migration note.** Plans 1–5 shipped an open pod with no enforcement. Any resource
+  named `*.acl` written during that period becomes live policy the moment this plan lands:
+  one containing unrelated data shadows the inherited ACL for its subject and denies
+  everyone including the owner; one that happens to carry `acl:` vocabulary grants for
+  real. Audit for `*.acl` resources before enabling enforcement on an existing pod.
+
 **PRP walk** (WAC semantics, no blending): check `<res>.acl` for `acl:accessTo`
 authorizations first. If that graph does not exist, ascend to the parent container and
 evaluate its `.acl` for `acl:default` authorizations; continue up to `/.acl`.
