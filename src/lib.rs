@@ -6,3 +6,4 @@ pub mod rdf;
 pub mod resource;
 pub mod space;
 pub mod store;
+pub mod wac;
