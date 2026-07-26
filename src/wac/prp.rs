@@ -16,6 +16,7 @@ use crate::{
 };
 
 /// The ACL that governs a resource, plus the context needed to evaluate it.
+#[derive(Debug)]
 pub struct EffectiveAcl {
     /// The ACL graph's triples.
     pub triples: Vec<Triple>,
@@ -127,6 +128,9 @@ mod tests {
         let acl = effective_acl(&store, &sp(), "/foo").await.unwrap().expect("found");
         assert!(!acl.inherited);
         assert_eq!(acl.governed_iri, "https://pod.toph.so/foo");
+        assert!(!acl.triples.is_empty(), "triples must be populated");
+        assert!(acl.triples.iter().any(|t| t.predicate.as_str() == ACL_MODE),
+            "triples must contain ACL_MODE");
     }
 
     #[tokio::test]
@@ -186,5 +190,20 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         write_acl(&store, "/foo", "<#it> <http://schema.org/name> \"Toph\" .").await;
         assert!(effective_acl(&store, &sp(), "/foo").await.unwrap().is_none());
+    }
+
+    // A container's own ACL must be governed by the container IRI WITH its
+    // trailing slash — `decide` compares that string exactly, so normalizing
+    // it away here would silently deny everything under the container.
+    #[tokio::test]
+    async fn direct_container_acl_keeps_the_trailing_slash() {
+        let store = OxigraphStore::in_memory().unwrap();
+        write_acl(&store, "/box/.acl", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        let acl = effective_acl(&store, &sp(), "/box/").await.unwrap().expect("found");
+        assert!(!acl.inherited);
+        assert_eq!(acl.governed_iri, "https://pod.toph.so/box/");
     }
 }
