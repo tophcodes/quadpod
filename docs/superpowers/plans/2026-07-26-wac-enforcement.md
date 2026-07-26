@@ -1981,3 +1981,138 @@ nix develop -c cargo build 2>&1 | grep -i warning   # must print nothing
 ```
 
 The 100 tests inherited from Plan 5 must stay green throughout. In Task 5 they gain credentials but not new expectations — an assertion that has to change there is a finding to report, not a fixup to apply.
+
+---
+
+## Spike Results (2026-07-26)
+
+**Verdict: build our own.** Criterion 4 ("`SolidStorageSpace` construction")
+lands in the *build own* column, and per Task 0's rule a single hit decides.
+
+The spike was real, not paper: `tests/spike_wac_pdp.rs` drove
+`WacDecisionPoint::resolve_grants` to a green `PASS` on three probes
+(agent grant, different-webid denial, `acl:default` inheritance) before being
+deleted. Everything below is measured, not guessed.
+
+### Criteria
+
+| Criterion | Measured | Column |
+|---|---|---|
+| Compiles on our toolchain | yes, ~20 s cold | **rent** |
+| Needs `manas_repo` | no — it is behind the off-by-default `impl-layered-repo` feature. `impl-pdp-wac` must be enabled explicitly (`cargo add --dev manas_access_control --features impl-pdp-wac`), otherwise `model::pdp::impl_::wac` does not exist | **rent** |
+| Term-model conversion | sophia 0.8 (`rdf_utils::model::term::ArcTerm`). 27 non-blank lines for a fully general `&[oxigraph::model::Triple] -> HashSet<[ArcTerm; 3]>`; ~10 if restricted to IRI terms. Under the ~30 line bar | **rent** |
+| `SolidStorageSpace` construction | the base URI *is* accepted verbatim, but the surrounding slot model is not — see below | **build own** |
+
+### Why criterion 4 fails
+
+`DefaultSolidStorageSpace::new(root_res_uri, description_res_uri, owner_id)`
+does take `https://pod.toph.so/` as-is (`SolidResourceUri` is
+`NormalAbsoluteHttpUri`, and our base parses). It also wants a
+*description-resource URI* — a concept our design has no equivalent for — and a
+`webid::WebId` owner, which Task 1 does give us.
+
+That is survivable. What is not: **`WacDecisionPoint` never accepts an ACL.**
+Its signature is
+
+```rust
+fn resolve_grants(
+    &self,
+    context: ResourceAccessContext<Self::Graph>,
+    acr_chain: SlotAcrChain<Self::StSpace, Self::Graph, Arc<Self::Graph>>,
+) -> ProbFuture<'static, AccessGrantResponse<Self::StSpace>>;
+```
+
+where `SlotAcrChain = BoxStream<'static, Result<SlotAcrChainItem<..>, Problem>>`
+and each item carries a `SolidResourceSlot` = slot-id (URI + `Arc<Space>`) ×
+`SolidResourceKind` × `Option<SlotRevLink>` × `SlotRelationType` drawn from
+manas' aux-policy model. The PDP walks that ancestor stream itself and decides
+`accessTo` vs `default` internally.
+
+This inverts Plan 6's design. Our `prp.rs` resolves an *effective* ACL plus an
+`inherited` flag and hands the pair to a pure, synchronous `decide`. Renting
+manas would mean `prp.rs` instead produces a lazy async stream of
+manas-shaped ancestor slots, every resource in the pod acquires a
+`SolidResourceKind`/`SlotRevLink` identity it does not otherwise need, and
+`decide` becomes `async fn(...) -> Result<_, dyn_problem::Problem>` — which
+propagates async + fallibility into `guard.rs` and every handler.
+Task 2's agreed signature would not survive.
+
+### Four further reasons, none of which the table captures
+
+1. **Semantic divergence, verified.** `WacEngine::gather_applicable_authorizations`
+   filters on `?s a acl:Authorization`. Task 2 explicitly specifies the opposite
+   ("we do not require an explicit `a acl:Authorization` type triple […] many
+   real ACLs omit the type"). The spike confirmed it: an ACL with
+   `acl:agent` + `acl:accessTo` + `acl:mode` but no type triple resolves to `{}`.
+   Renting means either accepting behaviour our own tests reject, or rewriting
+   ACLs on the way in.
+2. **Dependency weight.** `Cargo.lock` went 294 → 374 crates, and manas drags in
+   a second, end-of-life HTTP stack next to ours: `http 0.2.12`, `hyper 0.14.32`,
+   `tower 0.4.13` alongside `http 1.4.2`, `hyper 1.11.0`, `tower 0.5.3`. For a
+   ~150-line pure function.
+3. **Direct-dependency sprawl.** manas re-exports none of its RDF vocabulary, so
+   calling the API needs seven more *direct* deps kept in lockstep: `acp`,
+   `rdf_utils`, `rdf_vocabularies` (features `ns-acl,ns-acp,ns-rdf,ns-foaf`),
+   `sophia_api` **pinned to 0.8** — `cargo add sophia_api` resolves to 0.10 and
+   silently yields two mutually incompatible sophia versions — plus `futures`,
+   `webid`, `http_uri`.
+4. **Latent bug in the rented code.** `AgentMatchService` matches the request
+   against `acl:agent` in the context graph, but `AgentClassMatchService` tests
+   `acl:AuthenticatedAgent` against `acp:agent`. The caller must write the agent
+   under *both* predicates or authenticated/public rules silently misbehave.
+   Also, `acl:agentGroup` is commented out of `WacEngine::default()` — unimplemented.
+
+The crates are dormant at `0.1.0`. Owning ~150 lines we fully understand beats
+owning a 7-crate integration seam into unmaintained code.
+
+### For the record: the recipe that did work
+
+Kept only so a future reader does not have to redo the archaeology. Task 2
+should ignore it and implement `decide` directly.
+
+```rust
+type G = std::collections::HashSet<[rdf_utils::model::term::ArcTerm; 3]>;
+type Space = manas_space::impl_::DefaultSolidStorageSpace;
+
+// Space — note the invented description-resource URI.
+let space = Arc::new(DefaultSolidStorageSpace::new(
+    SolidResourceUri::try_new_from("https://pod.toph.so/")?,
+    SolidResourceUri::try_new_from("https://pod.toph.so/")?,
+    webid::WebId::try_from("https://alice.example/card#me")?,
+));
+
+// Access context — `MutableGraph::insert` needs UFCS, `HashSet::insert` shadows it.
+let subj = ArcTerm::Iri(IriRef::new(Arc::from("urn:ctx"))?);
+let mut cg: G = HashSet::new();
+MutableGraph::insert(&mut cg, &subj, ns::acp::target, target_term)?;
+MutableGraph::insert(&mut cg, &subj, ns::acl::agent, agent_term.clone())?;
+MutableGraph::insert(&mut cg, &subj, ns::acp::agent, agent_term)?; // both, see reason 4
+let ctx = ResourceAccessContext::try_from(DContext::new(HContext::try_new(subj)?, cg))?;
+
+// ACR chain — one item per ancestor, nearest first, root last (rev_link = None).
+let item = SlotAcrChainItem {
+    res_slot: SolidResourceSlot::try_new(
+        SolidResourceSlotId::new(space.clone(), target_uri.clone()),
+        SolidResourceKind::NonContainer,
+        Some(SlotRevLink { target: root_uri, rev_rel_type: SlotRelationType::Contains }),
+    )?,
+    acr: Some(DAccessControlResource::new(
+        HAccessControlResource::try_new(target_term)?,
+        Arc::new(acl_graph),
+    )),
+};
+let chain = futures::stream::iter(vec![Ok(item), Ok(root_item)]).boxed();
+
+// Decide.
+let pdp: WacDecisionPoint<Space, G> = WacDecisionPoint::default();
+let resp = pdp.resolve_grants(ctx, chain).await?;   // AccessGrantResponse<Space>
+// resp.access_grant_set : HashSet<HAccessMode<ArcTerm>>
+let has_read = resp.access_grant_set.iter().any(|m| Term::eq(m.as_term(), ns::acl::Read));
+```
+
+### Cleanup performed
+
+`tests/spike_wac_pdp.rs` deleted; `manas_access_control`, `manas_space`, `acp`,
+`rdf_utils`, `rdf_vocabularies`, `sophia_api`, `futures`, `webid`, `http_uri`
+removed from `[dev-dependencies]`. `Cargo.toml`/`Cargo.lock` are back to their
+pre-spike state.
