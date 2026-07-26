@@ -170,11 +170,16 @@ async fn handle_post_root(
 }
 
 async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: HeaderMap, body: Bytes) -> Response {
-    if !container::is_container_path(&container_path) {
-        return StatusCode::CONFLICT.into_response(); // POST target must be a container
-    }
+    // Authorize the target path FIRST, even though Append on a non-container
+    // is a meaningless grant in practice: the 409 below is derived from the
+    // request path alone, but no handler branch may answer before
+    // `authorize` runs, so an unauthorized caller never learns even that
+    // much about the path they probed.
     if let Err(res) = authorize(st.store.as_ref(), &st.space, &agent, &container_path, Mode::Append).await {
         return res;
+    }
+    if !container::is_container_path(&container_path) {
+        return StatusCode::CONFLICT.into_response(); // POST target must be a container
     }
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(fmt) = format_for_content_type(ct) else {
