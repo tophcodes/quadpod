@@ -175,12 +175,29 @@ async fn put_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderM
     // stay writable even if its subject has since gone, or a stale ACL could
     // never be repaired or replaced by the owner.
     //
+    // The subject-exists rule above has a gap of its own: `/box/.acl` exists
+    // once the container has one, so `/box/.acl.acl` would sail through it.
+    // But an ACL is governed by `acl:Control` on its subject, never by an ACL
+    // of its own (see `acl_link`) — so `authorize` rewrites Control-on-
+    // `/box/.acl.acl` to Control-on-`/box/.acl`, while `effective_acl` looks
+    // the OTHER way and finds `/box/.acl.acl` itself. Whoever names only
+    // themselves in it gets a document that governs itself, permanently:
+    // ordinary DELETE never cascades into it (it is not a containment
+    // member), and the chain repeats at `.acl.acl.acl` and beyond. So this
+    // is checked before the subject even needs to exist.
+    //
     // Placed AFTER every `authorize` call above, so an unauthorized caller is
     // still answered 401/403 and never learns whether the subject exists.
     if prp::is_acl_path(&req_path)
         && !matches!(get_rdf(st.store.as_ref(), &st.space, &req_path).await, Ok(Some(_)))
     {
         let subject = prp::acl_subject_path(&req_path);
+        if prp::is_acl_path(&subject) {
+            return (
+                StatusCode::NOT_FOUND,
+                "an ACL cannot have an ACL of its own",
+            ).into_response();
+        }
         if !matches!(get_rdf(st.store.as_ref(), &st.space, &subject).await, Ok(Some(_))) {
             return (
                 StatusCode::NOT_FOUND,
@@ -362,10 +379,20 @@ async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: 
     // exists as a graph, so it can never already exist as an ACL either —
     // this is always a create.
     //
+    // See `put_impl`'s mirror of this check for why an ACL subject that is
+    // itself an ACL path (`Slug: doc.acl.acl`) is refused before the subject
+    // is even checked for existence.
+    //
     // Placed AFTER every `authorize` call above, so an unauthorized caller is
     // still answered 401/403 and never learns whether the subject exists.
     if prp::is_acl_path(&child_path) {
         let subject = prp::acl_subject_path(&child_path);
+        if prp::is_acl_path(&subject) {
+            return (
+                StatusCode::NOT_FOUND,
+                "an ACL cannot have an ACL of its own",
+            ).into_response();
+        }
         if !matches!(get_rdf(st.store.as_ref(), &st.space, &subject).await, Ok(Some(_))) {
             return (
                 StatusCode::NOT_FOUND,
@@ -1750,6 +1777,56 @@ mod tests {
         assert_eq!(f.app.oneshot(del_acl).await.unwrap().status(), StatusCode::NO_CONTENT);
     }
 
+    // ACL-of-an-ACL: `/box/.acl` exists once the container has one, so the
+    // subject-exists check alone would let `/box/.acl.acl` through. Bob holds
+    // `acl:Control` on `/box/.acl` (inherited from `/box/.acl`'s own
+    // `acl:default`), which is exactly the Control the guard rewrites
+    // `.acl.acl` down to — so this is a genuine grant on the rewritten
+    // target, not an authorization failure. The refusal must come from the
+    // new structural check, not from `authorize`.
+    #[tokio::test]
+    async fn acl_of_an_acl_is_refused_over_put() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        // Bob gets Control on /box/.acl itself, delegated via /box/.acl's own
+        // acl:default — i.e. exactly the ancestor route the finding used.
+        let box_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_box_acl = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(box_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let squat = f.sign(Request::builder().method("PUT").uri("/box/.acl.acl"), bob, "PUT", "/box/.acl.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/.acl> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        let res = bob_app.oneshot(squat).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(res).await.contains("an ACL of its own"));
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/box/.acl.acl").await.unwrap().is_none(),
+            "the ACL-of-an-ACL must not have been stored"
+        );
+    }
+
     // The POST-side twin of `acl_for_a_resource_that_does_not_exist_is_refused`:
     // the same squat is reachable with `POST` and a `Slug` of `ghost.acl` by an
     // agent who holds `Append` on the container plus `Control` below it via
@@ -1816,6 +1893,56 @@ mod tests {
         assert!(
             crate::resource::get_rdf(f.store.as_ref(), &f.space, "/box/ghost.acl").await.unwrap().is_none(),
             "the squatted ACL must not have been stored"
+        );
+    }
+
+    // The POST-side twin of `acl_of_an_acl_is_refused_over_put`: the same
+    // squat, reached via `Slug: .acl.acl` on a POST into `/box/`.
+    #[tokio::test]
+    async fn acl_of_an_acl_is_refused_over_post() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        // Bob gets Append on /box/ directly (so an ordinary POST works) and
+        // Control on /box/.acl via its own acl:default (so his Control over
+        // the rewritten target is genuine).
+        let box_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob-append> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> . \
+             <#bob-control> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_box_acl = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(box_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let squat = f.sign(Request::builder().method("POST").uri("/box/"), bob, "POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", ".acl.acl")
+            .body(Body::from(format!(
+                "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/.acl> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        let res = bob_app.oneshot(squat).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(res).await.contains("an ACL of its own"));
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/box/.acl.acl").await.unwrap().is_none(),
+            "the ACL-of-an-ACL must not have been stored"
         );
     }
 
