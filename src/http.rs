@@ -291,6 +291,20 @@ async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: 
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // `resource::put_rdf` drops the graph and inserts nothing in its place, so
+    // an empty body would answer 201 Created for a child that does not
+    // exist — while the container's new `ldp:contains` link to it (added by
+    // `ensure_ancestors` below) survives, dangling forever: the child 404s,
+    // so a later DELETE never reaches `remove_containment`. Unlike
+    // `put_impl`, no container-path exemption applies here: `child_path` is
+    // always `container_path + name`, which never ends in `/`.
+    if triples.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "an empty RDF document cannot be stored: it would leave no resource behind. \
+             Use DELETE to remove a resource.",
+        ).into_response();
+    }
     if let Err(e) = container::ensure_ancestors(st.store.as_ref(), &st.space, &child_path).await {
         return (put_status(&e), e.to_string()).into_response();
     }
@@ -892,6 +906,39 @@ mod tests {
         let loc1 = f.app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
         let loc2 = f.app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
         assert_ne!(loc1, loc2);
+    }
+
+    // `resource::put_rdf` drops the graph and inserts nothing in its place,
+    // so an empty body would answer 201 Created for a child that has no
+    // content at all — while the container's ldp:contains link to it
+    // survives, dangling: the child 404s forever, so a later DELETE never
+    // reaches remove_containment. Confirms the listing is unaffected too.
+    #[tokio::test]
+    async fn post_empty_body_is_400_and_does_not_link_a_dangling_child() {
+        let f = fixture().await;
+        let mk = f.owner_request("PUT", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let post = f.owner_request("POST", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "note")
+            .body(Body::from("")).unwrap();
+        let res = f.app.clone().oneshot(post).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(res).await.contains("empty RDF document"));
+
+        let get = f.owner_request("GET", "/inbox/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
+        let body = body_string(res).await;
+        assert!(!body.contains("ldp#contains"), "a rejected POST must not have linked a child");
+
+        // The container the rejected POST would have targeted must remain
+        // deletable — a dangling containment link would make it 409 forever.
+        let del = f.owner_request("DELETE", "/inbox/").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
