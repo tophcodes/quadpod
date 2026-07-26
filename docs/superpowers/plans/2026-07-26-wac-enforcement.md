@@ -1451,6 +1451,56 @@ async fn delete_impl(st: AppState, agent: Agent, req_path: String) -> Response {
     // ... existing body unchanged
 ```
 
+**Cascade the ACL on delete** (added after the Task-3 review found the gap). Since Task 3 stopped recording `.acl` graphs as `ldp:contains` children, nothing keeps an ACL alive with its subject any more: `DELETE /foo` leaves `/foo.acl` behind, and a container holding only its own ACL now counts as empty, so `DELETE /box/` succeeds and orphans `/box/.acl`. Recreating the resource later resurrects that stale ACL — including any `acl:Control` it granted to an agent who should no longer have it. Deleting a resource must therefore delete its ACL, which is also what CSS and ESS do.
+
+In both `delete_impl` branches, after the successful `delete_rdf` of the target and before returning `204`, drop the ACL too:
+
+```rust
+    // The ACL is not a container member (wac::prp), so nothing else would
+    // ever reclaim it — and a resurrected resource must not inherit the
+    // authorizations of the one that was deleted.
+    if !prp::is_acl_path(&req_path) {
+        if let Err(e) = delete_rdf(st.store.as_ref(), &st.space, &prp::acl_path(&req_path)).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+```
+
+The `is_acl_path` guard stops `DELETE /foo.acl` from trying to delete `/foo.acl.acl`. Deleting an ACL on its own stays legal (it falls back to inherited authorizations) and is unaffected.
+
+Add this test alongside the others in Step 6 — it reads the store directly, so it uses the `store`/`space` fields the `Fixture` gains in Step 7:
+
+```rust
+    // An orphaned ACL would outlive its resource and be resurrected — with
+    // its old grants — the moment anyone recreates that path.
+    #[tokio::test]
+    async fn deleting_a_resource_deletes_its_acl() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/gone")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"g\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+        let acl_body = format!(
+            "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/gone> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_acl = f.owner_request("PUT", "/gone.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        f.app.clone().oneshot(put_acl).await.unwrap();
+
+        let del = f.owner_request("DELETE", "/gone").body(Body::empty()).unwrap();
+        assert_eq!(f.app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+        // The ACL graph must be gone from the store, not merely unreachable.
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/gone.acl").await.unwrap().is_none(),
+            "the deleted resource's ACL must not survive it"
+        );
+    }
+```
+
 - [ ] **Step 5: Update the existing handler tests to authenticate**
 
 Every test in `src/http.rs`'s test module currently sends no credentials and expects success — after this task they would all get 401, correctly. Give the test app a provisioned owner and send owner credentials.

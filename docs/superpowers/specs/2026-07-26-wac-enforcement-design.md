@@ -72,6 +72,13 @@ If no ACL document exists anywhere (not even `/.acl`): deny.
 (excluded in `add_containment`/`remove_containment`), so they do not appear in
 container listings. This settles the question Plan 3 deferred.
 
+**Lifecycle consequence:** because containment no longer ties an ACL to its subject,
+deleting a resource must explicitly delete its ACL. Otherwise `DELETE /foo` orphans
+`/foo.acl`, a container holding only its own ACL counts as empty and can be deleted out
+from under it, and recreating either path resurrects the old authorizations — including
+`acl:Control` for an agent who should no longer hold it. CSS and ESS cascade the same
+way.
+
 ## 4. Enforcement Matrix & Status Codes
 
 One `authorize(...)` call at the top of each `*_impl` in `src/http.rs`, before any
