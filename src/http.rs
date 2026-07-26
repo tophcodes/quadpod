@@ -23,6 +23,17 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The `Link: <…>; rel="acl"` header a Solid client uses to discover where a
+/// resource's ACL lives. `None` for ACL resources themselves — an ACL is
+/// governed by `acl:Control` on its subject, not by an ACL of its own.
+fn acl_link(space: &StorageSpace, request_path: &str) -> Option<(header::HeaderName, String)> {
+    if prp::is_acl_path(request_path) {
+        return None;
+    }
+    let iri = space.graph_iri(&prp::acl_path(request_path)).ok()?;
+    Some((header::LINK, format!("<{iri}>; rel=\"acl\"")))
+}
+
 fn put_status(e: &ResourceError) -> StatusCode {
     match e {
         ResourceError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -120,7 +131,12 @@ async fn put_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderM
         if let Err(e) = container::ensure_container(st.store.as_ref(), &st.space, &req_path).await {
             return (put_status(&e), e.to_string()).into_response();
         }
-        return (StatusCode::CREATED, [(header::LOCATION, g)]).into_response();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::LOCATION, g.parse().expect("graph iri is header-safe"));
+        if let Some((name, value)) = acl_link(&st.space, &req_path) {
+            headers.insert(name, value.parse().expect("acl link is header-safe"));
+        }
+        return (StatusCode::CREATED, headers).into_response();
     }
     // Note: ensure_ancestors and subsequent put_rdf are separate store updates and not transactional.
     // Accepted for single-user v1 per the plan's cross-graph-atomicity note.
@@ -128,7 +144,14 @@ async fn put_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderM
         return (put_status(&e), e.to_string()).into_response();
     }
     match put_rdf(st.store.as_ref(), &st.space, &req_path, &triples).await {
-        Ok(()) => (StatusCode::CREATED, [(header::LOCATION, g)]).into_response(),
+        Ok(()) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::LOCATION, g.parse().expect("graph iri is header-safe"));
+            if let Some((name, value)) = acl_link(&st.space, &req_path) {
+                headers.insert(name, value.parse().expect("acl link is header-safe"));
+            }
+            (StatusCode::CREATED, headers).into_response()
+        }
         Err(e) => (put_status(&e), e.to_string()).into_response(),
     }
 }
@@ -193,7 +216,14 @@ async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: 
         return (put_status(&e), e.to_string()).into_response();
     }
     match put_rdf(st.store.as_ref(), &st.space, &child_path, &triples).await {
-        Ok(()) => (StatusCode::CREATED, [(header::LOCATION, g)]).into_response(),
+        Ok(()) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::LOCATION, g.parse().expect("graph iri is header-safe"));
+            if let Some((name, value)) = acl_link(&st.space, &child_path) {
+                headers.insert(name, value.parse().expect("acl link is header-safe"));
+            }
+            (StatusCode::CREATED, headers).into_response()
+        }
         Err(e) => (put_status(&e), e.to_string()).into_response(),
     }
 }
@@ -226,11 +256,15 @@ async fn get_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderM
                 return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response();
             }
             match serialize(&triples, fmt) {
-                Ok(bytes) => (
-                    [(header::CONTENT_TYPE, fmt.media_type().to_string()), (header::ETAG, tag)],
-                    bytes,
-                )
-                    .into_response(),
+                Ok(bytes) => {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
+                    headers.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
+                    if let Some((name, value)) = acl_link(&st.space, &req_path) {
+                        headers.insert(name, value.parse().expect("acl link is header-safe"));
+                    }
+                    (headers, bytes).into_response()
+                }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
         }
@@ -1036,5 +1070,53 @@ mod tests {
             .header("slug", "note")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
         assert_eq!(bob_app.oneshot(post).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_advertises_the_acl_location() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+
+        let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        let link = res.headers().get(header::LINK).expect("Link header").to_str().unwrap().to_string();
+        assert!(link.contains("https://pod.toph.so/foo.acl"));
+        assert!(link.contains("rel=\"acl\""));
+    }
+
+    #[tokio::test]
+    async fn created_resource_advertises_the_acl_location() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        let res = f.app.oneshot(put).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(res.headers().get(header::LINK).unwrap().to_str().unwrap()
+            .contains("https://pod.toph.so/foo.acl"));
+    }
+
+    // An ACL resource does not advertise an ACL of its own — it is governed
+    // by acl:Control on its subject resource, and /foo.acl.acl never exists.
+    #[tokio::test]
+    async fn acl_resource_advertises_no_further_acl() {
+        let f = fixture().await;
+        let acl_body = format!(
+            "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_acl = f.owner_request("PUT", "/foo.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        f.app.clone().oneshot(put_acl).await.unwrap();
+
+        let get = f.owner_request("GET", "/foo.acl").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get(header::LINK).is_none());
     }
 }
