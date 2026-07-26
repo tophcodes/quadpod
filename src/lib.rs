@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod config;
 pub mod container;
 pub mod http;
 pub mod rdf;
