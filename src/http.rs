@@ -133,6 +133,21 @@ async fn put_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderM
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // `resource::put_rdf` drops the graph and inserts nothing in its place, so
+    // an empty body would answer 201 Created for a resource that does not
+    // exist. On an ACL that inverts its meaning: an owner PUTting an empty
+    // `<res>.acl` to revoke everything inherited below it gets a positive
+    // confirmation while `effective_acl` keeps walking up to the ancestor's
+    // acl:default rules — access WIDENED, not revoked. Containers are exempt:
+    // the server supplies their type triples itself, so an empty body is the
+    // ordinary way to create one.
+    if triples.is_empty() && !container::is_container_path(&req_path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "an empty RDF document cannot be stored: it would leave no resource behind. \
+             Use DELETE to remove a resource.",
+        ).into_response();
+    }
     if container::is_container_path(&req_path) {
         if container::body_sets_containment(&triples) {
             return StatusCode::CONFLICT.into_response();
@@ -1130,6 +1145,72 @@ mod tests {
             .header("slug", "note")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
         assert_eq!(bob_app.oneshot(post).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // An empty body means DROP-and-insert-nothing (resource::put_rdf), so a
+    // 201 would confirm a resource that isn't there. For an ACL that is the
+    // opposite of what the caller asked for: with /box/.acl gone, the walk
+    // resumes at the root ACL and its acl:default rules apply to the whole
+    // subtree again — a "revoke everything" that WIDENS access.
+    #[tokio::test]
+    async fn empty_body_put_on_a_resource_is_400_and_does_not_erase_an_acl() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> ."
+        );
+        let put_acl = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let wipe = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        let res = f.app.clone().oneshot(wipe).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(res).await.contains("empty RDF document"));
+
+        // The ACL that was in force must still be in force, byte for byte in
+        // effect: Bob keeps exactly the Read it granted him.
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/box/.acl").await.unwrap().is_some(),
+            "a rejected PUT must not have dropped the ACL graph"
+        );
+        let bob_app = f.app_also_trusting(bob);
+        let read = f.sign(Request::builder().method("GET").uri("/box/"), bob, "GET", "/box/")
+            .body(Body::empty()).unwrap();
+        assert_eq!(bob_app.clone().oneshot(read).await.unwrap().status(), StatusCode::OK);
+        let write = f.sign(Request::builder().method("PUT").uri("/box/note"), bob, "PUT", "/box/note")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(bob_app.oneshot(write).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // The exception that keeps LDP working: a container's type triples come
+    // from the server, so PUTting one with an empty body is legitimate.
+    #[tokio::test]
+    async fn empty_body_put_on_a_container_still_creates_it() {
+        let f = fixture().await;
+        let mk = f.owner_request("PUT", "/somecontainer/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+        let get = f.owner_request("GET", "/somecontainer/").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_string(res).await.contains("ldp#BasicContainer"));
     }
 
     // Creating /box/sub/file also CREATES /box/sub/ and writes a containment
