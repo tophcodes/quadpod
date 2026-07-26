@@ -2,6 +2,7 @@
 //! (`pdp`), and enforce that decision at the HTTP edge (`guard`).
 
 pub mod pdp;
+pub mod prp;
 
 /// A single WAC access mode, as requested by a handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

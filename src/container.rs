@@ -43,6 +43,12 @@ pub async fn ensure_container(
 pub async fn add_containment(
     store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
 ) -> Result<(), ResourceError> {
+    // ACLs are addressable resources but not container members: listing them
+    // as ldp:contains children would put server-managed access-control
+    // documents into every client's view of the container.
+    if crate::wac::prp::is_acl_path(child) {
+        return Ok(());
+    }
     let p = space.graph_iri(parent)?;
     let c = space.graph_iri(child)?;
     store.update(&format!(
@@ -54,6 +60,12 @@ pub async fn add_containment(
 pub async fn remove_containment(
     store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
 ) -> Result<(), ResourceError> {
+    // ACLs are addressable resources but not container members: listing them
+    // as ldp:contains children would put server-managed access-control
+    // documents into every client's view of the container.
+    if crate::wac::prp::is_acl_path(child) {
+        return Ok(());
+    }
     let p = space.graph_iri(parent)?;
     let c = space.graph_iri(child)?;
     store.update(&format!(
@@ -164,5 +176,19 @@ mod tests {
         assert_ne!(child_name(Some("..")), "..");
         assert_ne!(child_name(Some(".")), ".");
         assert_eq!(child_name(Some("photo")), "photo");
+    }
+
+    // ACLs are system resources: they are addressable, but they must never
+    // show up as ldp:contains children of their container (Plan 3 deferred
+    // this decision; Plan 6 settles it).
+    #[tokio::test]
+    async fn acl_children_are_not_recorded_as_containment() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let space = sp();
+        ensure_container(&store, &space, "/c/").await.unwrap();
+        add_containment(&store, &space, "/c/", "/c/x.acl").await.unwrap();
+        assert!(container_is_empty(&store, &space, "/c/").await.unwrap());
+        add_containment(&store, &space, "/c/", "/c/x").await.unwrap();
+        assert!(!container_is_empty(&store, &space, "/c/").await.unwrap());
     }
 }
