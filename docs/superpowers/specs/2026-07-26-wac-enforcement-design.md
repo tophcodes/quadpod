@@ -49,6 +49,7 @@ New module `src/wac/`, one responsibility per file:
 |---|---|---|
 | `wac/prp.rs` | ACL resolution: `effective_acl(store, space, path) -> Option<EffectiveAcl>` | store, space, container |
 | `wac/pdp.rs` | pure decision: `(ACL triples, agent, target, inherited?) -> AccessModes` | RDF types only |
+| `wac/provision.rs` | root ACL bootstrap for the configured owner (idempotent) | store, space |
 | `wac/guard.rs` | `authorize(store, space, agent, path, mode) -> Result<(), Response>` | prp + pdp |
 | `wac/mod.rs` | re-exports, `Mode` enum, `AccessModes` bitset | — |
 
@@ -98,8 +99,11 @@ could manipulate the container's listing.
   the response is 401/403 regardless of whether the resource exists — otherwise the
   status code is an existence oracle for the whole namespace.
 
-The exists-vs-new distinction for PUT requires one store lookup. It runs **after** the
-parent container has been authorized, so it cannot become an oracle either.
+The exists-vs-new distinction for PUT requires one store lookup. It runs **after**
+`Write` on the target has been granted, so it can never be an oracle: only a caller who
+may already write the resource learns whether it exists. The parent's `Append` check
+then follows, and only in the create case — demanding it for plain updates would be
+stricter than WAC.
 
 **PATCH** is absent from the matrix: N3-Patch does not exist yet. Whoever adds it must
 bring a guard; the route-coverage test (§6) fails if they forget.
