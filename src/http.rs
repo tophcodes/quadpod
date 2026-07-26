@@ -953,4 +953,99 @@ mod tests {
             ))).unwrap();
         assert_eq!(bob_app.oneshot(hijack).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
+
+    // Every other test in this file authenticates as OWNER, who holds every
+    // mode through the root ACL — so a test suite built only from those
+    // could never notice if put_impl's parent-Append check were deleted.
+    // Bob here holds Write on the (not yet existing) target resource
+    // directly, but nothing at all on its parent container, so creation
+    // must still be refused.
+    #[tokio::test]
+    async fn creating_a_resource_needs_append_on_the_parent_not_just_write_on_the_target() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        // Grant Bob Write on /newfile before it exists — an ACL resource is
+        // independent of whether its subject resource has been created yet.
+        let acl_body = format!(
+            "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/newfile> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Write> ."
+        );
+        let put_acl = f.owner_request("PUT", "/newfile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let create = f.sign(Request::builder().method("PUT").uri("/newfile"), bob, "PUT", "/newfile")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(bob_app.oneshot(create).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // Mirrors the put_impl case above: Bob holds Write directly on an
+    // EXISTING resource but nothing on its parent container, so deleting it
+    // (which rewrites the parent's containment triples) must still be
+    // refused.
+    #[tokio::test]
+    async fn deleting_a_resource_needs_write_on_the_parent_not_just_the_target() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let put = f.owner_request("PUT", "/target")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        let acl_body = format!(
+            "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/target> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Write> ."
+        );
+        let put_acl = f.owner_request("PUT", "/target.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let del = f.sign(Request::builder().method("DELETE").uri("/target"), bob, "DELETE", "/target")
+            .body(Body::empty()).unwrap();
+        assert_eq!(bob_app.oneshot(del).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // post_impl's container-level check requires Mode::Append specifically
+    // — Read must not be enough to POST. Bob is granted Read directly on the
+    // container (via acl:accessTo) and, separately, Append inherited BY ITS
+    // CHILDREN (via acl:default) so that if the container-level Append
+    // requirement were weakened to Read, the request would sail through
+    // this test's own child-level check too and the mutation would be
+    // caught turning FORBIDDEN into CREATED.
+    #[tokio::test]
+    async fn posting_into_a_container_needs_append_not_just_read() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/mailroom/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let acl_body = format!(
+            "<#bob-read> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/mailroom/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> . \
+             <#bob-append-children> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/mailroom/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
+        );
+        let put_acl = f.owner_request("PUT", "/mailroom/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let post = f.sign(Request::builder().method("POST").uri("/mailroom/"), bob, "POST", "/mailroom/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "note")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(bob_app.oneshot(post).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
 }
