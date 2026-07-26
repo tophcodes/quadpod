@@ -51,9 +51,29 @@ fn acl_link(space: &StorageSpace, request_path: &str) -> Option<(header::HeaderN
 ///
 /// Existence is only ever consulted AFTER `Append` on that same container was
 /// granted, so it can never become an existence oracle.
+///
+/// One exception, checked up front: an ACL target whose immediate parent
+/// already exists. `add_containment` never records an ACL as a container
+/// member, and `ensure_container` is a no-op on a container that already has
+/// its type triples — so `ensure_ancestors` performs literally no write at
+/// that level, and stops right there. Zero observable change means zero
+/// authorization is required, so this returns immediately without even
+/// entering the walk. Existence is peeked before any `authorize` call only
+/// in this one case; that is safe because `put_impl` has already required
+/// `Control` on the ACL's subject before calling this function at all, so it
+/// is not a fresh oracle for an agent who holds nothing here. When the
+/// parent does NOT exist, this falls through to the ordinary walk below,
+/// which authorizes and materializes it exactly as for any other path.
 async fn authorize_ancestors(
     st: &AppState, agent: &Agent, req_path: &str,
 ) -> Result<(), Response> {
+    if prp::is_acl_path(req_path) {
+        if let Some(parent) = container::parent_container(req_path) {
+            if matches!(get_rdf(st.store.as_ref(), &st.space, &parent).await, Ok(Some(_))) {
+                return Ok(());
+            }
+        }
+    }
     let mut child = req_path.to_string();
     while let Some(parent) = container::parent_container(&child) {
         authorize(st.store.as_ref(), &st.space, agent, &parent, Mode::Append).await?;
@@ -1367,6 +1387,63 @@ mod tests {
             crate::resource::get_rdf(f.store.as_ref(), &f.space, "/a/").await.unwrap().is_none(),
             "a refused PUT of a deep .acl must not have materialized the ancestor container it has no Append on"
         );
+    }
+
+    // The counterweight to THIS test above's counterweight: when the ACL's
+    // immediate parent already exists, creating the ACL is a zero-mutation
+    // event — `add_containment` never records an ACL as a container member,
+    // and `ensure_container` is a no-op on a container that already has its
+    // type triples. So an agent holding `acl:Control` on the ACL's subject
+    // (here, via `/box/.acl`'s own `acl:default`) and NOTHING else — in
+    // particular no `acl:Append` on `/box/` — must still be able to write
+    // that subject's ACL. Requiring `Append` here would refuse a legitimate
+    // "you may manage access below here" delegation for a request that
+    // never touches `/box/`'s containment triples at all.
+    #[tokio::test]
+    async fn acl_put_under_an_existing_container_needs_no_append_on_it() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let box_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_box_acl = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(box_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        // Sanity: Bob genuinely has no Append on /box/ — an ordinary POST
+        // must fail. Otherwise a CREATED below would prove nothing about the
+        // exemption this test targets.
+        let bob_app = f.app_also_trusting(bob);
+        let sanity = f.sign(Request::builder().method("POST").uri("/box/"), bob, "POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "note")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        assert_eq!(bob_app.clone().oneshot(sanity).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // /box/ already exists (created above), so writing /box/doc.acl is a
+        // zero-mutation event at the container level: Control on the subject
+        // (inherited via /box/.acl's acl:default) must be enough.
+        let put_doc_acl = f.sign(Request::builder().method("PUT").uri("/box/doc.acl"), bob, "PUT", "/box/doc.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<#x> <http://www.w3.org/ns/auth/acl#agent> <https://someone.example/#me> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/doc> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> .",
+            )).unwrap();
+        assert_eq!(bob_app.oneshot(put_doc_acl).await.unwrap().status(), StatusCode::CREATED);
     }
 
     // The counterweight to the test above: an agent holding Append on one
