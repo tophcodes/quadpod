@@ -62,6 +62,22 @@ So `/foo` → `/foo.acl`, container `/box/` → `/box/.acl`, root `/` → `/.acl
 real Solid resource: addressable via GET/PUT, but access to it is decided by
 `acl:Control` on `<res>`, not by Read/Write on the ACL itself.
 
+**`.acl` is a reserved suffix, pod-wide.** Any request path ending in `.acl` is an
+access-control document, decided by `Control` on the path with the suffix stripped. Three
+consequences, all deliberate:
+
+- A user cannot create an ordinary resource named `notes.acl` without `acl:Control` on
+  `notes` — full `Read`+`Write` on the subtree is not enough. The suffix is server
+  namespace, not user namespace.
+- `wac::pdp::decide` deliberately does not require an explicit `a acl:Authorization` type
+  triple (real-world ACLs frequently omit it, and CSS accepts them without it). Every
+  subject in an `.acl` graph is therefore a candidate authorization.
+- **Migration note.** Plans 1–5 shipped an open pod with no enforcement. Any resource
+  named `*.acl` written during that period becomes live policy the moment this plan lands:
+  one containing unrelated data shadows the inherited ACL for its subject and denies
+  everyone including the owner; one that happens to carry `acl:` vocabulary grants for
+  real. Audit for `*.acl` resources before enabling enforcement on an existing pod.
+
 **PRP walk** (WAC semantics, no blending): check `<res>.acl` for `acl:accessTo`
 authorizations first. If that graph does not exist, ascend to the parent container and
 evaluate its `.acl` for `acl:default` authorizations; continue up to `/.acl`.
@@ -71,6 +87,13 @@ If no ACL document exists anywhere (not even `/.acl`): deny.
 **Containment:** `.acl` graphs are never recorded as `ldp:contains` children
 (excluded in `add_containment`/`remove_containment`), so they do not appear in
 container listings. This settles the question Plan 3 deferred.
+
+**Lifecycle consequence:** because containment no longer ties an ACL to its subject,
+deleting a resource must explicitly delete its ACL. Otherwise `DELETE /foo` orphans
+`/foo.acl`, a container holding only its own ACL counts as empty and can be deleted out
+from under it, and recreating either path resurrects the old authorizations — including
+`acl:Control` for an agent who should no longer hold it. CSS and ESS cascade the same
+way.
 
 ## 4. Enforcement Matrix & Status Codes
 
@@ -89,6 +112,31 @@ store access:
 `Write` subsumes `Append`. Create and delete mutate the parent container's containment
 triples, hence the check there too — without it, someone holding `Write` on a child
 could manipulate the container's listing.
+
+Three refinements the implementation reviews forced, which the bare matrix above does not
+convey:
+
+- **The parent check is a chain, not a single level.** Creating a resource may materialize
+  several containers, and each one that is created — plus the first already-existing
+  ancestor, which gains a containment triple — needs `Append`. The walk stops there:
+  above that level the inserts are no-ops, so demanding rights there would break the
+  append-only inbox pattern (an agent with `Append` on `/inbox/` must not need anything
+  on `/`). This applies to ACL writes too, since `PUT /a/b/c.acl` can materialize `/a/`
+  and `/a/b/`.
+- **Deleting a resource that has its own ACL additionally requires `Control` on it**,
+  because the delete cascades to that ACL. Consequence, deliberate: an agent holding
+  `Write` but not `Control` cannot delete such a resource at all. Without the check, a
+  narrowing ACL would be removable by exactly the agent it was written to constrain.
+- **An empty RDF body is rejected with 400 on non-container paths.** Storing zero triples
+  would drop the graph while answering `201 Created` — for an ACL that reads as "lock this
+  subtree down" but in fact restores the ancestor's wider `acl:default` rules. Container
+  paths keep the empty-body create, where the server supplies the type triples itself.
+
+Known over-restriction, filed as a follow-up: writing `<res>.acl` under an
+already-existing container currently also demands `Append` on that container, although
+`add_containment` skips ACLs so nothing observable changes there. An agent holding only
+`acl:Control` through an ancestor's `acl:default` therefore cannot write ACLs. It fails
+closed and the pod owner is unaffected.
 
 **Status codes:**
 

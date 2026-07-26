@@ -1,7 +1,9 @@
 pub mod auth;
+pub mod config;
 pub mod container;
 pub mod http;
 pub mod rdf;
 pub mod resource;
 pub mod space;
 pub mod store;
+pub mod wac;

@@ -1,20 +1,36 @@
 use std::sync::Arc;
-use sparql_pod::{auth::{AuthConfig, HttpJwksResolver, HttpWebIdIssuers}, http::{AppState, router}, space::StorageSpace, store::OxigraphStore};
+use clap::Parser;
+use sparql_pod::{auth::{HttpJwksResolver, HttpWebIdIssuers}, config::Config,
+    http::{AppState, router}, store::OxigraphStore};
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let base = std::env::var("POD_BASE_URI").unwrap_or_else(|_| "http://localhost:3000/".into());
+    let cfg = Config::parse();
+    let space = match cfg.space() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("invalid --base-uri: {e}");
+            std::process::exit(2);
+        }
+    };
+    if cfg.validated_owner_webid().is_err() {
+        eprintln!("invalid --owner-webid: must be an absolute IRI");
+        std::process::exit(2);
+    }
     let state = AppState {
         store: Arc::new(OxigraphStore::in_memory().expect("store")),
-        space: StorageSpace::new(base).expect("valid POD_BASE_URI (absolute, trailing slash)"),
+        space,
         resolver: Arc::new(HttpJwksResolver::new()),
         webid_verifier: Arc::new(HttpWebIdIssuers::new()),
-        auth_config: Arc::new(AuthConfig::from_env()),
+        auth_config: Arc::new(cfg.auth_config()),
     };
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space)
         .await.expect("provision root container");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
-    tracing::info!("sparql-pod listening on 127.0.0.1:3000");
+    let owner = cfg.validated_owner_webid().expect("owner WebID validated above");
+    sparql_pod::wac::provision::provision_root_acl(state.store.as_ref(), &state.space, &owner)
+        .await.expect("provision root ACL");
+    let listener = tokio::net::TcpListener::bind(cfg.listen).await.unwrap();
+    tracing::info!("sparql-pod listening on {}", cfg.listen);
     axum::serve(listener, router(state)).await.unwrap();
 }

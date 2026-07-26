@@ -51,6 +51,28 @@ fn replay_jtis() -> &'static Mutex<HashMap<[u8; 32], i64>> {
     REPLAY_JTIS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Serializes tests that record a `jti` into the process-wide
+/// [`REPLAY_JTIS`] store. `cargo test` runs tests in parallel by default,
+/// and the tests that touch this store use wildly different `now_unix`
+/// values — this module's own use simulated times near `1_000` (and one far
+/// in the future, to exercise eviction), while `http`'s handler tests go
+/// through `auth_layer`, which uses the real wall clock. A large `now_unix`
+/// in one test evicts another concurrently-running test's just-inserted,
+/// still-fresh entry out from under it (see
+/// `record_jti_or_reject_replay`), so any test that both records a `jti`
+/// and depends on it staying recorded must hold this lock.
+///
+/// Uses `tokio::sync::Mutex`, not `std::sync::Mutex`, because the guard is
+/// held across `.await` points in those tests (clippy's
+/// `await_holding_lock` correctly flags a std lock there).
+#[cfg(test)]
+static TEST_REPLAY_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub fn test_replay_lock() -> &'static tokio::sync::Mutex<()> {
+    TEST_REPLAY_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Hash a `jti` the same way `dpop-verifier` does internally (the SHA-256
 /// digest of the raw `jti` string; `dpop-verifier`'s `JTI_HASH_LENGTH` is 32
 /// bytes, which is the full SHA-256 output, so no truncation is lost here).
@@ -174,23 +196,13 @@ mod tests {
     use crate::auth::testsupport::TestClient;
 
     /// Serializes tests that actually record a `jti` into the process-wide
-    /// `REPLAY_JTIS` store (i.e. reach a fully-valid `verify_dpop` call).
-    /// `cargo test` runs tests in parallel by default; those tests use
-    /// wildly different simulated `now_unix` values (some far in the
-    /// future, to exercise eviction), and a large `now_unix` in one test
-    /// would otherwise evict another concurrently-running test's
-    /// just-inserted, still-fresh entry out from under it. Tests that never
-    /// reach `record_jti_or_reject_replay` (rejected earlier by htu/htm,
-    /// freshness, or jkt binding) don't touch the shared store and don't
-    /// need this lock.
-    ///
-    /// Uses `tokio::sync::Mutex`, not `std::sync::Mutex`, because the guard
-    /// is held across `.await` points below (clippy's `await_holding_lock`
-    /// correctly flags a std lock there).
-    static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
+    /// `REPLAY_JTIS` store (i.e. reach a fully-valid `verify_dpop` call) —
+    /// see [`super::test_replay_lock`], which `http`'s handler tests share.
+    /// Tests that never reach `record_jti_or_reject_replay` (rejected
+    /// earlier by htu/htm, freshness, or jkt binding) don't touch the shared
+    /// store and don't need this lock.
     fn test_lock() -> &'static tokio::sync::Mutex<()> {
-        TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        super::test_replay_lock()
     }
 
     #[tokio::test]
