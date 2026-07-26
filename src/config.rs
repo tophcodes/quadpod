@@ -7,9 +7,14 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use oxigraph::model::NamedNode;
+use thiserror::Error;
 
 use crate::auth::AuthConfig;
 use crate::space::{SpaceError, StorageSpace};
+
+#[derive(Debug, Error, PartialEq)]
+#[error("owner WebID must be an absolute IRI")]
+pub struct InvalidOwnerWebId;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "sparql-pod", about = "A SPARQL-authoritative Solid pod")]
@@ -60,10 +65,10 @@ impl Config {
 
     /// The owner WebID, confirmed to be an absolute IRI. Provisioning
     /// interpolates it into SPARQL, so it must never be unvalidated.
-    pub fn validated_owner_webid(&self) -> Result<String, ()> {
+    pub fn validated_owner_webid(&self) -> Result<String, InvalidOwnerWebId> {
         NamedNode::new(&self.owner_webid)
             .map(|_| self.owner_webid.clone())
-            .map_err(|_| ())
+            .map_err(|_| InvalidOwnerWebId)
     }
 }
 
