@@ -1,8 +1,9 @@
 use std::sync::Arc;
-use axum::{Router, routing::get, extract::{State, Path}, body::Bytes,
+use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
     http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use crate::{space::StorageSpace, store::SparqlStore, container, resource::{put_rdf, get_rdf, delete_rdf, ResourceError},
-    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}, auth::{AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer}};
+    rdf::{format_for_content_type, format_for_accept, parse, serialize, etag}, auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
+    wac::{guard::authorize, prp, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,16 +31,39 @@ fn put_status(e: &ResourceError) -> StatusCode {
 }
 
 async fn handle_put(
-    State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap, body: Bytes,
+    State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
+    headers: HeaderMap, body: Bytes,
 ) -> Response {
-    put_impl(st, format!("/{path}"), headers, body).await
+    put_impl(st, agent, format!("/{path}"), headers, body).await
 }
 
-async fn handle_put_root(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    put_impl(st, "/".to_string(), headers, body).await
+async fn handle_put_root(
+    State(st): State<AppState>, Extension(agent): Extension<Agent>, headers: HeaderMap, body: Bytes,
+) -> Response {
+    put_impl(st, agent, "/".to_string(), headers, body).await
 }
 
-async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Bytes) -> Response {
+async fn put_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(res) = authorize(st.store.as_ref(), &st.space, &agent, &req_path, Mode::Write).await {
+        return res;
+    }
+    // Creating a resource changes its parent container's containment triples,
+    // so it additionally needs Append there. Existence is only consulted
+    // AFTER Write on the target was granted, so it can never become an
+    // existence oracle for an unauthorized caller. ACLs are not container
+    // members (see wac::prp), so they skip this check.
+    if !prp::is_acl_path(&req_path) {
+        let exists = matches!(get_rdf(st.store.as_ref(), &st.space, &req_path).await, Ok(Some(_)));
+        if !exists {
+            if let Some(parent) = container::parent_container(&req_path) {
+                if let Err(res) =
+                    authorize(st.store.as_ref(), &st.space, &agent, &parent, Mode::Append).await
+                {
+                    return res;
+                }
+            }
+        }
+    }
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(fmt) = format_for_content_type(ct) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
@@ -110,18 +134,24 @@ async fn put_impl(st: AppState, req_path: String, headers: HeaderMap, body: Byte
 }
 
 async fn handle_post(
-    State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap, body: Bytes,
+    State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
+    headers: HeaderMap, body: Bytes,
 ) -> Response {
-    post_impl(st, format!("/{path}"), headers, body).await
+    post_impl(st, agent, format!("/{path}"), headers, body).await
 }
 
-async fn handle_post_root(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    post_impl(st, "/".to_string(), headers, body).await
+async fn handle_post_root(
+    State(st): State<AppState>, Extension(agent): Extension<Agent>, headers: HeaderMap, body: Bytes,
+) -> Response {
+    post_impl(st, agent, "/".to_string(), headers, body).await
 }
 
-async fn post_impl(st: AppState, container_path: String, headers: HeaderMap, body: Bytes) -> Response {
+async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: HeaderMap, body: Bytes) -> Response {
     if !container::is_container_path(&container_path) {
         return StatusCode::CONFLICT.into_response(); // POST target must be a container
+    }
+    if let Err(res) = authorize(st.store.as_ref(), &st.space, &agent, &container_path, Mode::Append).await {
+        return res;
     }
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(fmt) = format_for_content_type(ct) else {
@@ -155,16 +185,22 @@ async fn post_impl(st: AppState, container_path: String, headers: HeaderMap, bod
 }
 
 async fn handle_get(
-    State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap,
+    State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
+    headers: HeaderMap,
 ) -> Response {
-    get_impl(st, format!("/{path}"), headers).await
+    get_impl(st, agent, format!("/{path}"), headers).await
 }
 
-async fn handle_get_root(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    get_impl(st, "/".to_string(), headers).await
+async fn handle_get_root(
+    State(st): State<AppState>, Extension(agent): Extension<Agent>, headers: HeaderMap,
+) -> Response {
+    get_impl(st, agent, "/".to_string(), headers).await
 }
 
-async fn get_impl(st: AppState, req_path: String, headers: HeaderMap) -> Response {
+async fn get_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderMap) -> Response {
+    if let Err(res) = authorize(st.store.as_ref(), &st.space, &agent, &req_path, Mode::Read).await {
+        return res;
+    }
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(fmt) = format_for_accept(accept) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
@@ -190,15 +226,31 @@ async fn get_impl(st: AppState, req_path: String, headers: HeaderMap) -> Respons
     }
 }
 
-async fn handle_delete(State(st): State<AppState>, Path(path): Path<String>) -> Response {
-    delete_impl(st, format!("/{path}")).await
+async fn handle_delete(
+    State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
+) -> Response {
+    delete_impl(st, agent, format!("/{path}")).await
 }
 
-async fn handle_delete_root(State(st): State<AppState>) -> Response {
-    delete_impl(st, "/".to_string()).await
+async fn handle_delete_root(
+    State(st): State<AppState>, Extension(agent): Extension<Agent>,
+) -> Response {
+    delete_impl(st, agent, "/".to_string()).await
 }
 
-async fn delete_impl(st: AppState, req_path: String) -> Response {
+async fn delete_impl(st: AppState, agent: Agent, req_path: String) -> Response {
+    if let Err(res) = authorize(st.store.as_ref(), &st.space, &agent, &req_path, Mode::Write).await {
+        return res;
+    }
+    if !prp::is_acl_path(&req_path) {
+        if let Some(parent) = container::parent_container(&req_path) {
+            if let Err(res) =
+                authorize(st.store.as_ref(), &st.space, &agent, &parent, Mode::Write).await
+            {
+                return res;
+            }
+        }
+    }
     if container::is_container_path(&req_path) {
         if req_path == "/" {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -221,12 +273,28 @@ async fn delete_impl(st: AppState, req_path: String) -> Response {
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         }
+        // The ACL is not a container member (wac::prp), so nothing else would
+        // ever reclaim it — and a resurrected resource must not inherit the
+        // authorizations of the one that was deleted.
+        if !prp::is_acl_path(&req_path) {
+            if let Err(e) = delete_rdf(st.store.as_ref(), &st.space, &prp::acl_path(&req_path)).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
         return StatusCode::NO_CONTENT.into_response();
     }
     match delete_rdf(st.store.as_ref(), &st.space, &req_path).await {
         Ok(true) => {
             if let Some(parent) = container::parent_container(&req_path) {
                 if let Err(e) = container::remove_containment(st.store.as_ref(), &st.space, &parent, &req_path).await {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
+            // The ACL is not a container member (wac::prp), so nothing else
+            // would ever reclaim it — and a resurrected resource must not
+            // inherit the authorizations of the one that was deleted.
+            if !prp::is_acl_path(&req_path) {
+                if let Err(e) = delete_rdf(st.store.as_ref(), &st.space, &prp::acl_path(&req_path)).await {
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             }
@@ -245,30 +313,100 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
     use std::sync::Arc;
-    use crate::{space::StorageSpace, store::OxigraphStore, auth::{Jwks, StaticJwksResolver}};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::{space::StorageSpace, store::OxigraphStore, auth::StaticJwksResolver};
+    use crate::auth::testsupport::{TestClient, TestIdp};
+    use crate::auth::StaticWebIdIssuers;
 
-    /// None of these handler tests send credentials, so the auth layer
-    /// always resolves them as `Agent::Public` without ever calling
-    /// `resolve` — any resolver works here.
-    fn unused_resolver() -> Arc<dyn crate::auth::JwksResolver> {
-        Arc::new(StaticJwksResolver::new("https://unused.example/", Jwks { keys: vec![] }))
+    const OWNER: &str = "https://alice.example/card#me";
+    const ISSUER: &str = "https://idp.example/";
+
+    /// An app whose root ACL grants OWNER full control, plus the IdP and
+    /// client needed to mint credentials for them. The store and space are
+    /// kept so a second app can be built over the SAME data (see
+    /// [`Fixture::app_also_trusting`]) and so tests can inspect the store
+    /// directly.
+    struct Fixture {
+        app: axum::Router,
+        store: Arc<dyn crate::store::SparqlStore>,
+        space: StorageSpace,
+        idp: TestIdp,
+        client: TestClient,
+        /// Held for the test's whole lifetime: these tests authenticate
+        /// through `auth_layer`, which records DPoP `jti`s into the
+        /// process-wide replay store using the REAL wall clock. That would
+        /// otherwise evict the still-fresh entries of `auth::dpop`'s
+        /// concurrently-running replay tests, which simulate `now_unix`
+        /// near the epoch (see `auth::dpop::test_replay_lock`).
+        _replay_guard: tokio::sync::MutexGuard<'static, ()>,
     }
 
-    /// None of these handler tests send credentials either, so the webid
-    /// verifier is never called — any verifier works here.
-    fn unused_webid_verifier() -> Arc<dyn crate::auth::WebIdIssuerVerifier> {
-        Arc::new(crate::auth::StaticWebIdIssuers::new())
-    }
+    async fn fixture() -> Fixture {
+        let _replay_guard = crate::auth::dpop::test_replay_lock().lock().await;
+        let store: Arc<dyn crate::store::SparqlStore> =
+            Arc::new(OxigraphStore::in_memory().unwrap());
+        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+        crate::container::provision_root(store.as_ref(), &space).await.unwrap();
+        crate::wac::provision::provision_root_acl(store.as_ref(), &space, OWNER).await.unwrap();
 
-    fn app() -> axum::Router {
+        let idp = TestIdp::new();
+        let client = TestClient::new();
+        let mut issuers = StaticWebIdIssuers::new();
+        issuers.allow(OWNER, ISSUER);
+
         let state = AppState {
-            store: Arc::new(OxigraphStore::in_memory().unwrap()),
-            space: StorageSpace::new("https://pod.toph.so/").unwrap(),
-            resolver: unused_resolver(),
-            webid_verifier: unused_webid_verifier(),
+            store: store.clone(),
+            space: space.clone(),
+            resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
+            webid_verifier: Arc::new(issuers),
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
         };
-        router(state)
+        Fixture { app: router(state), store, space, idp, client, _replay_guard }
+    }
+
+    fn now_unix() -> i64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    }
+
+    impl Fixture {
+        /// Add credentials for `webid` to a request builder. The DPoP proof's
+        /// `htu` must be the CONFIGURED base plus the path (never the socket),
+        /// and its `jti` must be unique — the replay store rejects reuse.
+        fn sign(
+            &self,
+            builder: axum::http::request::Builder,
+            webid: &str,
+            method: &str,
+            path: &str,
+        ) -> axum::http::request::Builder {
+            let at = self.idp.mint_access_token(webid, &self.client.jkt(), now_unix() + 3600);
+            let htu = format!("https://pod.toph.so{path}");
+            let jti = uuid::Uuid::new_v4().to_string();
+            let proof = self.client.mint_dpop(&htu, method, now_unix(), &jti);
+            builder
+                .header(header::AUTHORIZATION, format!("DPoP {at}"))
+                .header("dpop", proof)
+        }
+
+        /// A request authenticated as the pod owner.
+        fn owner_request(&self, method: &str, path: &str) -> axum::http::request::Builder {
+            let b = Request::builder().method(method).uri(path);
+            self.sign(b, OWNER, method, path)
+        }
+
+        /// A second app over the same store, authenticating `webid` as well.
+        fn app_also_trusting(&self, webid: &str) -> axum::Router {
+            let mut issuers = StaticWebIdIssuers::new();
+            issuers.allow(OWNER, ISSUER);
+            issuers.allow(webid, ISSUER);
+            router(AppState {
+                store: self.store.clone(),
+                space: self.space.clone(),
+                resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
+                webid_verifier: Arc::new(issuers),
+                auth_config: Arc::new(crate::auth::AuthConfig::default()),
+            })
+        }
     }
 
     async fn body_string(res: axum::response::Response) -> String {
@@ -278,17 +416,17 @@ mod tests {
 
     #[tokio::test]
     async fn put_turtle_then_get_jsonld_negotiates() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        let put_res = app.clone().oneshot(put).await.unwrap();
+        let put_res = f.app.clone().oneshot(put).await.unwrap();
         assert_eq!(put_res.status(), StatusCode::CREATED);
         assert_eq!(put_res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/foo");
 
-        let get = Request::builder().method("GET").uri("/foo")
+        let get = f.owner_request("GET", "/foo")
             .header(header::ACCEPT, "application/ld+json").body(Body::empty()).unwrap();
-        let res = app.oneshot(get).await.unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "application/ld+json");
         assert!(body_string(res).await.contains("schema.org/name"));
@@ -296,165 +434,164 @@ mod tests {
 
     #[tokio::test]
     async fn get_default_accept_is_turtle() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
-        let res = app.oneshot(Request::builder().method("GET").uri("/foo").body(Body::empty()).unwrap()).await.unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+        let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/turtle");
     }
 
     #[tokio::test]
     async fn get_unsupported_accept_is_406() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
-        let res = app.oneshot(Request::builder().method("GET").uri("/foo")
-            .header(header::ACCEPT, "image/png").body(Body::empty()).unwrap()).await.unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+        let get = f.owner_request("GET", "/foo")
+            .header(header::ACCEPT, "image/png").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
     }
 
     #[tokio::test]
     async fn put_unsupported_content_type_is_415() {
-        let res = app().oneshot(Request::builder().method("PUT").uri("/foo")
-            .header(header::CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap()).await.unwrap();
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap();
+        let res = f.app.oneshot(put).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
     async fn get_missing_is_404() {
-        let res = app().oneshot(Request::builder().method("GET").uri("/nope").body(Body::empty()).unwrap()).await.unwrap();
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/nope").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn iri_breaking_path_is_400() {
-        let res = app().oneshot(Request::builder().method("GET").uri("/foo%3E%20bar").body(Body::empty()).unwrap()).await.unwrap();
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/foo%3E%20bar").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn put_iri_breaking_path_is_400() {
-        let req = Request::builder().method("PUT").uri("/foo%3E%20bar")
+        let f = fixture().await;
+        let req = f.owner_request("PUT", "/foo%3E%20bar")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
-        assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn get_emits_etag_and_304_on_if_none_match() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
 
-        let res = app.clone().oneshot(Request::builder().method("GET").uri("/foo").body(Body::empty()).unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
         let etag = res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
 
-        let cond = Request::builder().method("GET").uri("/foo")
+        let cond = f.owner_request("GET", "/foo")
             .header(header::IF_NONE_MATCH, &etag).body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(cond).await.unwrap().status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(f.app.oneshot(cond).await.unwrap().status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]
     async fn put_if_match_mismatch_is_412() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
 
-        let stale = Request::builder().method("PUT").uri("/foo")
+        let stale = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .header(header::IF_MATCH, "\"deadbeef\"")
             .body(Body::from("<#it> <http://schema.org/name> \"X\" .")).unwrap();
-        assert_eq!(app.oneshot(stale).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(f.app.oneshot(stale).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
     async fn put_if_none_match_star_on_existing_is_412() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
 
-        let create_only = Request::builder().method("PUT").uri("/foo")
+        let create_only = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .header(header::IF_NONE_MATCH, "*")
             .body(Body::from("<#it> <http://schema.org/name> \"X\" .")).unwrap();
-        assert_eq!(app.oneshot(create_only).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(f.app.oneshot(create_only).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
     async fn put_if_match_matching_succeeds() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
         // read current etag
-        let res = app.clone().oneshot(Request::builder().method("GET").uri("/foo").body(Body::empty()).unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
         let etag = res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
         // conditional update with matching If-Match must succeed
-        let upd = Request::builder().method("PUT").uri("/foo")
+        let upd = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .header(header::IF_MATCH, &etag)
             .body(Body::from("<#it> <http://schema.org/name> \"New\" .")).unwrap();
-        assert_eq!(app.oneshot(upd).await.unwrap().status(), StatusCode::CREATED);
+        assert_eq!(f.app.oneshot(upd).await.unwrap().status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
     async fn put_if_none_match_star_on_absent_creates() {
-        let app = app();
-        let req = Request::builder().method("PUT").uri("/brand-new")
+        let f = fixture().await;
+        let req = f.owner_request("PUT", "/brand-new")
             .header(header::CONTENT_TYPE, "text/turtle")
             .header(header::IF_NONE_MATCH, "*")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
     async fn delete_existing_is_204_then_404() {
-        let app = app();
-        let put = Request::builder().method("PUT").uri("/foo")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
-        let del = Request::builder().method("DELETE").uri("/foo").body(Body::empty()).unwrap();
-        assert_eq!(app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
-        let del2 = Request::builder().method("DELETE").uri("/foo").body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(del2).await.unwrap().status(), StatusCode::NOT_FOUND);
-    }
-
-    async fn provisioned_app() -> axum::Router {
-        let store = Arc::new(OxigraphStore::in_memory().unwrap());
-        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
-        crate::container::provision_root(store.as_ref(), &space).await.unwrap();
-        router(AppState {
-            store,
-            space,
-            resolver: unused_resolver(),
-            webid_verifier: unused_webid_verifier(),
-            auth_config: Arc::new(crate::auth::AuthConfig::default()),
-        })
+        f.app.clone().oneshot(put).await.unwrap();
+        let del = f.owner_request("DELETE", "/foo").body(Body::empty()).unwrap();
+        assert_eq!(f.app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+        let del2 = f.owner_request("DELETE", "/foo").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(del2).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn put_deep_resource_creates_ancestor_containment() {
-        let app = provisioned_app().await;
-        let put = Request::builder().method("PUT").uri("/a/b/doc")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/a/b/doc")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
-        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
 
         // GET the parent container /a/b/ — it must list the doc via ldp:contains
-        let res = app.oneshot(Request::builder().method("GET").uri("/a/b/")
-            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/a/b/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_string(res).await;
         assert!(body.contains("ldp#contains"));
@@ -463,48 +600,51 @@ mod tests {
 
     #[tokio::test]
     async fn delete_resource_removes_containment() {
-        let app = provisioned_app().await;
-        let put = Request::builder().method("PUT").uri("/a/doc")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/a/doc")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
-        app.clone().oneshot(put).await.unwrap();
-        let del = Request::builder().method("DELETE").uri("/a/doc").body(Body::empty()).unwrap();
-        assert_eq!(app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+        f.app.clone().oneshot(put).await.unwrap();
+        let del = f.owner_request("DELETE", "/a/doc").body(Body::empty()).unwrap();
+        assert_eq!(f.app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
 
-        let res = app.oneshot(Request::builder().method("GET").uri("/a/")
-            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/a/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert!(!body_string(res).await.contains("https://pod.toph.so/a/doc"));
     }
 
     #[tokio::test]
     async fn get_root_container_is_200() {
-        let app = provisioned_app().await;
-        let res = app.oneshot(Request::builder().method("GET").uri("/")
-            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(body_string(res).await.contains("ldp#BasicContainer"));
     }
 
     #[tokio::test]
     async fn put_container_rejecting_client_containment_is_409() {
-        let app = provisioned_app().await;
-        let put = Request::builder().method("PUT").uri("/box/")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/box/")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(
                 "<https://pod.toph.so/box/> <http://www.w3.org/ns/ldp#contains> <https://pod.toph.so/box/x> .",
             )).unwrap();
-        assert_eq!(app.oneshot(put).await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(f.app.oneshot(put).await.unwrap().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn put_container_stores_user_triples_and_keeps_type() {
-        let app = provisioned_app().await;
-        let put = Request::builder().method("PUT").uri("/box/")
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/box/")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<https://pod.toph.so/box/> <http://purl.org/dc/terms/title> \"My Box\" .")).unwrap();
-        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
-        let res = app.oneshot(Request::builder().method("GET").uri("/box/")
-            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+        let get = f.owner_request("GET", "/box/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         let body = body_string(res).await;
         assert!(body.contains("My Box"));                 // user triple kept
         assert!(body.contains("ldp#BasicContainer"));     // server type re-asserted
@@ -512,79 +652,219 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonempty_container_is_409_empty_is_204() {
-        let app = provisioned_app().await;
+        let f = fixture().await;
         // create a child → parent /box/ becomes non-empty
-        app.clone().oneshot(Request::builder().method("PUT").uri("/box/doc")
+        let put = f.owner_request("PUT", "/box/doc")
             .header(header::CONTENT_TYPE, "text/turtle")
-            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
-        let del_full = Request::builder().method("DELETE").uri("/box/").body(Body::empty()).unwrap();
-        assert_eq!(app.clone().oneshot(del_full).await.unwrap().status(), StatusCode::CONFLICT);
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+        let del_full = f.owner_request("DELETE", "/box/").body(Body::empty()).unwrap();
+        assert_eq!(f.app.clone().oneshot(del_full).await.unwrap().status(), StatusCode::CONFLICT);
         // remove child, then container is deletable
-        app.clone().oneshot(Request::builder().method("DELETE").uri("/box/doc").body(Body::empty()).unwrap()).await.unwrap();
-        let del_empty = Request::builder().method("DELETE").uri("/box/").body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(del_empty).await.unwrap().status(), StatusCode::NO_CONTENT);
+        let del_child = f.owner_request("DELETE", "/box/doc").body(Body::empty()).unwrap();
+        f.app.clone().oneshot(del_child).await.unwrap();
+        let del_empty = f.owner_request("DELETE", "/box/").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(del_empty).await.unwrap().status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
     async fn delete_root_container_is_405() {
-        let app = provisioned_app().await;
-        let res = app.oneshot(Request::builder().method("DELETE").uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        let f = fixture().await;
+        let del = f.owner_request("DELETE", "/").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(del).await.unwrap();
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
     async fn post_with_slug_creates_named_child() {
-        let app = provisioned_app().await;
-        let post = Request::builder().method("POST").uri("/box/")
+        let f = fixture().await;
+        let post = f.owner_request("POST", "/box/")
             .header(header::CONTENT_TYPE, "text/turtle")
             .header("slug", "note")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
-        let res = app.clone().oneshot(post).await.unwrap();
+        let res = f.app.clone().oneshot(post).await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
         assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/box/note");
         // the child is retrievable and the container lists it
-        let got = app.oneshot(Request::builder().method("GET").uri("/box/note").body(Body::empty()).unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/box/note").body(Body::empty()).unwrap();
+        let got = f.app.oneshot(get).await.unwrap();
         assert_eq!(got.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn post_slug_collision_gets_distinct_url() {
-        let app = provisioned_app().await;
-        let mk = || Request::builder().method("POST").uri("/box/")
+        let f = fixture().await;
+        let mk = || f.owner_request("POST", "/box/")
             .header(header::CONTENT_TYPE, "text/turtle").header("slug", "note")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
-        let loc1 = app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
-        let loc2 = app.oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+        let loc1 = f.app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+        let loc2 = f.app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
         assert_ne!(loc1, loc2);
     }
 
     #[tokio::test]
     async fn post_to_non_container_is_conflict() {
-        let app = provisioned_app().await;
+        let f = fixture().await;
         // /doc is a resource path (no trailing slash) → POST not allowed there
-        let post = Request::builder().method("POST").uri("/doc")
+        let post = f.owner_request("POST", "/doc")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
-        assert_eq!(app.oneshot(post).await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(f.app.oneshot(post).await.unwrap().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn put_container_preserves_existing_containment() {
-        let app = provisioned_app().await;
+        let f = fixture().await;
         // create a child so /box/ is non-empty
-        app.clone().oneshot(Request::builder().method("PUT").uri("/box/doc")
+        let child = f.owner_request("PUT", "/box/doc")
             .header(header::CONTENT_TYPE, "text/turtle")
-            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        f.app.clone().oneshot(child).await.unwrap();
         // PUT the container itself with only user triples (no ldp:contains)
-        let put = Request::builder().method("PUT").uri("/box/")
+        let put = f.owner_request("PUT", "/box/")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<https://pod.toph.so/box/> <http://purl.org/dc/terms/title> \"Box\" .")).unwrap();
-        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
         // the child's containment link must survive
-        let res = app.oneshot(Request::builder().method("GET").uri("/box/")
-            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/box/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
         let body = body_string(res).await;
         assert!(body.contains("https://pod.toph.so/box/doc"));  // containment preserved
         assert!(body.contains("Box"));                           // user triple stored
+    }
+
+    #[tokio::test]
+    async fn anonymous_get_is_401_with_a_challenge() {
+        let f = fixture().await;
+        let res = f.app.oneshot(
+            Request::builder().method("GET").uri("/foo").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_some());
+    }
+
+    #[tokio::test]
+    async fn authenticated_stranger_is_403() {
+        let f = fixture().await;
+        // A verified WebID the root ACL says nothing about. It must be
+        // allowed through authentication (the issuer vouches for it) and
+        // stopped by authorization.
+        let stranger = "https://bob.example/card#me";
+        let stranger_app = f.app_also_trusting(stranger);
+        let req = f.sign(Request::builder().method("GET").uri("/foo"), stranger, "GET", "/foo")
+            .body(Body::empty()).unwrap();
+        assert_eq!(stranger_app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // The denial must not depend on whether the resource exists — otherwise
+    // the status code is an existence oracle for the whole namespace.
+    #[tokio::test]
+    async fn denial_does_not_reveal_existence() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/secret")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"s\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        let existing = f.app.clone().oneshot(
+            Request::builder().method("GET").uri("/secret").body(Body::empty()).unwrap()
+        ).await.unwrap().status();
+        let absent = f.app.oneshot(
+            Request::builder().method("GET").uri("/does-not-exist").body(Body::empty()).unwrap()
+        ).await.unwrap().status();
+        assert_eq!(existing, absent);
+        assert_eq!(existing, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn owner_can_grant_another_agent_read_via_an_acl() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let put = f.owner_request("PUT", "/shared")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"shared\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        let acl_body = format!(
+            "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/shared> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> ."
+        );
+        let put_acl = f.owner_request("PUT", "/shared.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        // Bob (a verified WebID) may now read it, but still may not write it.
+        let bob_app = f.app_also_trusting(bob);
+        let read = f.sign(Request::builder().method("GET").uri("/shared"), bob, "GET", "/shared")
+            .body(Body::empty()).unwrap();
+        assert_eq!(bob_app.clone().oneshot(read).await.unwrap().status(), StatusCode::OK);
+
+        let write = f.sign(Request::builder().method("PUT").uri("/shared"), bob, "PUT", "/shared")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"hijacked\" .")).unwrap();
+        assert_eq!(bob_app.clone().oneshot(write).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // Bob has Read on the resource but no Control, so its ACL stays hidden.
+        let read_acl = f.sign(Request::builder().method("GET").uri("/shared.acl"), bob, "GET", "/shared.acl")
+            .body(Body::empty()).unwrap();
+        assert_eq!(bob_app.oneshot(read_acl).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // An orphaned ACL would outlive its resource and be resurrected — with
+    // its old grants — the moment anyone recreates that path.
+    #[tokio::test]
+    async fn deleting_a_resource_deletes_its_acl() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/gone")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"g\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+        // Write is listed alongside Control deliberately: this direct ACL
+        // replaces the inherited root one entirely (nearest ACL wins), and
+        // Control alone would leave the owner unable to DELETE /gone at all.
+        let acl_body = format!(
+            "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/gone> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Write>, \
+             <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_acl = f.owner_request("PUT", "/gone.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        f.app.clone().oneshot(put_acl).await.unwrap();
+
+        let del = f.owner_request("DELETE", "/gone").body(Body::empty()).unwrap();
+        assert_eq!(f.app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+        // The ACL graph must be gone from the store, not merely unreachable.
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/gone.acl").await.unwrap().is_none(),
+            "the deleted resource's ACL must not survive it"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_is_not_listed_as_a_container_child() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/item")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"i\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+        let put_acl = f.owner_request("PUT", "/item.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/item> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        f.app.clone().oneshot(put_acl).await.unwrap();
+
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        let listing = body_string(f.app.oneshot(get).await.unwrap()).await;
+        assert!(listing.contains("https://pod.toph.so/item"));
+        assert!(!listing.contains("item.acl"));
     }
 }

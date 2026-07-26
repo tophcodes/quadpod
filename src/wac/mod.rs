@@ -1,6 +1,7 @@
 //! Web Access Control: resolve the applicable ACL (`prp`), decide from it
 //! (`pdp`), and enforce that decision at the HTTP edge (`guard`).
 
+pub mod guard;
 pub mod pdp;
 pub mod prp;
 pub mod provision;
