@@ -2067,6 +2067,17 @@ mod tests {
     // `/box/.acl.acl` directly, i.e. the document Bob wrote about himself.
     // That is precisely the case that matters — Bob passes the target check
     // on his own say-so and must still be stopped from touching `/`.
+    //
+    // No HTTP route can produce this orphan any more: `put_impl` (and
+    // `post_impl`) now refuse to create an ACL whose subject is itself an
+    // ACL path, and `/box/.acl.acl`'s subject is `/box/.acl` — see
+    // `acl_of_an_acl_is_refused_over_put`. So the squat is written directly
+    // at the store level below, the same way `acl_for_an_existing_resource_is_created`
+    // reaches past HTTP for store-only state. The guard this test pins
+    // (`authorize_ancestors`, exercised via the attack PUT further down)
+    // stays load-bearing defence-in-depth regardless: nothing here relies on
+    // that guard alone to keep this state unreachable, and it must still
+    // refuse to serve a write into it however the store ends up in this shape.
     #[tokio::test]
     async fn put_to_an_orphaned_acl_still_needs_append_on_what_it_materializes() {
         let f = fixture().await;
@@ -2094,18 +2105,21 @@ mod tests {
             .body(Body::from(box_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
 
-        // Bob exercises the delegation while it is live. Legitimate: /box/
-        // exists, so this writes nothing at the container level.
+        // The orphan-to-be, materialized directly at the store level (no HTTP
+        // route reaches it any more — see the comment above). This is the
+        // state Bob's delegation would have let him write over PUT before
+        // the fix: a document about `/box/.acl` naming only himself.
         let bob_app = f.app_also_trusting(bob);
         let squat_body = format!(
             "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/.acl> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let squat = f.sign(Request::builder().method("PUT").uri("/box/.acl.acl"), bob, "PUT", "/box/.acl.acl")
-            .header(header::CONTENT_TYPE, "text/turtle")
-            .body(Body::from(squat_body.clone())).unwrap();
-        assert_eq!(bob_app.clone().oneshot(squat).await.unwrap().status(), StatusCode::CREATED);
+        let squat_base = f.space.graph_iri("/box/.acl.acl").unwrap();
+        let squat_triples = crate::rdf::parse(
+            squat_body.as_bytes(), oxigraph::io::RdfFormat::Turtle, &squat_base,
+        ).unwrap();
+        put_rdf(f.store.as_ref(), &f.space, "/box/.acl.acl", &squat_triples).await.unwrap();
 
         // The owner tidies up. /box/ holds no ldp:contains members (ACLs
         // never are), so it is deleteable — and the delete revokes Bob's
