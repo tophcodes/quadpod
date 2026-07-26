@@ -141,8 +141,22 @@ rewrite it (needs `Control`), or create the resource (needs `Write`), and revoki
 delegation would not help. Updating an ACL that already exists stays possible regardless,
 so a stale one can always be repaired or removed.
 
-Consequence, accepted: rights can no longer be pre-granted on a path before the resource
-exists by writing its ACL first. Use `acl:default` on an existing ancestor for that.
+**An ACL cannot have an ACL of its own.** `<res>.acl.acl` is refused outright. Otherwise the
+subject-existence rule would be satisfiable one level up — `/box/.acl` does exist — and
+since `authorize("/box/.acl.acl")` resolves through `effective_acl("/box/.acl")` to that
+very document, its author would own it permanently: unremovable, uncascaded, invisible in
+listings, and extensible without limit (`.acl.acl.acl`, …). That would hand an agent
+holding no `Write` or `Append` anywhere an unbounded write primitive.
+
+Consequences, accepted:
+
+- Rights can no longer be pre-granted on a path before the resource exists by writing its
+  ACL first. Use `acl:default` on an existing ancestor instead.
+- `PUT /box/sub/.acl` for a container that does not exist yet is a `404`; it no longer
+  materializes `/box/sub/` as a side effect. Create the container first.
+- The `404` is a subject-existence oracle for an agent holding `Control` but not `Read`
+  under the delegated subtree. Inherent to the rule and strictly weaker than what
+  `Control` already permits — that agent can grant itself `Read` and look.
 
 **Status codes:**
 
