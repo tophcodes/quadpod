@@ -304,6 +304,24 @@ async fn delete_impl(st: AppState, agent: Agent, req_path: String) -> Response {
             }
         }
     }
+    // Deleting a resource cascades to its ACL (below), so the caller must be
+    // allowed to delete that ACL too — otherwise a narrowing ACL could be
+    // removed by someone holding only Write, and recreating the resource
+    // would restore the wider inherited rights it was written to revoke.
+    // `authorize` rewrites an .acl path to Control on its subject. The
+    // residual signal ("this resource has its own ACL") is only ever
+    // observable to a caller who already holds Write on it — strictly less
+    // than the Control the unguarded cascade used to hand them.
+    if !prp::is_acl_path(&req_path) {
+        let acl = prp::acl_path(&req_path);
+        if matches!(get_rdf(st.store.as_ref(), &st.space, &acl).await, Ok(Some(_))) {
+            if let Err(res) =
+                authorize(st.store.as_ref(), &st.space, &agent, &acl, Mode::Write).await
+            {
+                return res;
+            }
+        }
+    }
     if container::is_container_path(&req_path) {
         if req_path == "/" {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -1075,6 +1093,89 @@ mod tests {
             .header("slug", "note")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
         assert_eq!(bob_app.oneshot(post).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    // A narrowing ACL is WAC's ONLY mechanism for revoking rights that an
+    // ancestor hands down through acl:default. If deleting the resource also
+    // deleted that ACL, an agent holding merely Write could remove the
+    // narrowing, recreate the resource, and have `effective_acl` walk back up
+    // to the wider ancestor grant — escalating themselves to Control without
+    // ever being allowed to touch the ACL directly.
+    #[tokio::test]
+    async fn deleting_a_resource_needs_control_over_the_acl_it_would_cascade_into() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let put = f.owner_request("PUT", "/projects/audit-log")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"log\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        // /projects/ hands Bob Read+Write+CONTROL down to its children, and
+        // Read+Write on the container itself (so the parent-Write check on a
+        // DELETE below is satisfied and cannot be what refuses him).
+        let projects_acl = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/projects/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/projects/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob-here> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/projects/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write> . \
+             <#bob-below> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/projects/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_projects_acl = f.owner_request("PUT", "/projects/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(projects_acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_projects_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        // The narrowing ACL: on the log itself Bob may read and write, but
+        // NOT control. The nearest ACL wins completely, so this replaces the
+        // Control he would otherwise inherit from /projects/.acl.
+        let log_acl = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/projects/audit-log> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/projects/audit-log> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write> ."
+        );
+        let put_log_acl = f.owner_request("PUT", "/projects/audit-log.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(log_acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_log_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+
+        // Sanity: Bob really does hold Write on the log — he may edit it. A
+        // FORBIDDEN below would otherwise prove nothing.
+        let edit = f.sign(Request::builder().method("PUT").uri("/projects/audit-log"), bob, "PUT", "/projects/audit-log")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"edited\" .")).unwrap();
+        assert_eq!(bob_app.clone().oneshot(edit).await.unwrap().status(), StatusCode::CREATED);
+        // ...and that he cannot reach the narrowing ACL directly.
+        let touch_acl = f.sign(Request::builder().method("DELETE").uri("/projects/audit-log.acl"), bob, "DELETE", "/projects/audit-log.acl")
+            .body(Body::empty()).unwrap();
+        assert_eq!(bob_app.clone().oneshot(touch_acl).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // The attack: delete the resource so the cascade takes the ACL with it.
+        let del = f.sign(Request::builder().method("DELETE").uri("/projects/audit-log"), bob, "DELETE", "/projects/audit-log")
+            .body(Body::empty()).unwrap();
+        assert_eq!(bob_app.oneshot(del).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/projects/audit-log.acl").await.unwrap().is_some(),
+            "the narrowing ACL must survive a refused delete"
+        );
+
+        // The owner, who does hold Control there, is unaffected.
+        let owner_del = f.owner_request("DELETE", "/projects/audit-log").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(owner_del).await.unwrap().status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
