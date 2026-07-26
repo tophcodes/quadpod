@@ -3,6 +3,7 @@
 
 pub mod pdp;
 pub mod prp;
+pub mod provision;
 
 /// A single WAC access mode, as requested by a handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
