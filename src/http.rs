@@ -93,15 +93,17 @@ async fn put_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderM
     // — and, when the parent is missing too, every ancestor up to the first
     // one that already exists — so it additionally needs Append on each of
     // those (see `authorize_ancestors`). Existence is only consulted AFTER
-    // Write on the target was granted, so it can never become an existence
-    // oracle for an unauthorized caller. ACLs are not container members (see
-    // wac::prp), so they skip this check.
-    if !prp::is_acl_path(&req_path) {
-        let exists = matches!(get_rdf(st.store.as_ref(), &st.space, &req_path).await, Ok(Some(_)));
-        if !exists {
-            if let Err(res) = authorize_ancestors(&st, &agent, &req_path).await {
-                return res;
-            }
+    // Write (or, for an ACL path, Control on its subject) on the target was
+    // granted, so it can never become an existence oracle for an unauthorized
+    // caller. This runs for ACL paths too: an ACL is not itself a container
+    // member (see `wac::prp` / `container::add_containment`), but
+    // `container::ensure_ancestors` still materializes the SAME missing
+    // ancestor containers for `PUT /a/b/c.acl` as it would for
+    // `PUT /a/b/c` — Control on `c` says nothing about `a` or `a/b/`.
+    let exists = matches!(get_rdf(st.store.as_ref(), &st.space, &req_path).await, Ok(Some(_)));
+    if !exists {
+        if let Err(res) = authorize_ancestors(&st, &agent, &req_path).await {
+            return res;
         }
     }
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -1313,6 +1315,58 @@ mod tests {
             .body(Body::from("")).unwrap();
         assert_eq!(f.app.clone().oneshot(mk_sub).await.unwrap().status(), StatusCode::CREATED);
         assert_eq!(bob_app.oneshot(deep()).await.unwrap().status(), StatusCode::CREATED);
+    }
+
+    // The residual from the previous round: an ACL path is exempt from
+    // containment (an `.acl` is never listed via `ldp:contains`), but
+    // `ensure_ancestors` still materializes any missing ancestor containers
+    // for `PUT /a/b/c.acl` exactly as it would for `PUT /a/b/c`. Bob's grant
+    // here is `acl:Control` via the ROOT ACL's `acl:default` — inherited onto
+    // every descendant, `/a/`, `/a/b/`, and `/a/b/c` alike — and deliberately
+    // nothing else, so he has no `acl:Append` anywhere. That is enough to
+    // authorize writing `/a/b/c`'s ACL (the guard rewrites an ACL PUT to
+    // require Control on the subject, which Bob holds), but must NOT be
+    // enough to let his request silently create `/a/` and `/a/b/` and link
+    // them together — containers he holds no Append on.
+    #[tokio::test]
+    async fn deep_acl_put_needs_append_on_ancestors_it_materializes() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let root_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_root_acl = f.owner_request("PUT", "/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(root_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_root_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        // Neither ancestor exists yet: this is the case that matters, since
+        // an already-existing ancestor needs no fresh authorization.
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/a/").await.unwrap().is_none()
+        );
+
+        let bob_app = f.app_also_trusting(bob);
+        let put_acl = f.sign(Request::builder().method("PUT").uri("/a/b/c.acl"), bob, "PUT", "/a/b/c.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<#x> <http://www.w3.org/ns/auth/acl#agent> <https://someone.example/#me> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/a/b/c> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> .",
+            )).unwrap();
+        assert_eq!(bob_app.oneshot(put_acl).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/a/").await.unwrap().is_none(),
+            "a refused PUT of a deep .acl must not have materialized the ancestor container it has no Append on"
+        );
     }
 
     // The counterweight to the test above: an agent holding Append on one
