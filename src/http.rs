@@ -178,17 +178,6 @@ async fn post_impl(st: AppState, agent: Agent, container_path: String, headers: 
     // legitimate append-only POST would suddenly need Write on the child it
     // creates. For a `.acl` child the guard ignores this argument entirely
     // and substitutes Control, so the escalation is still blocked.
-    // The container's Append is not enough to authorize the CHILD: a `Slug`
-    // of `.acl` would otherwise let an append-only agent write the
-    // container's own access-control document and escalate to Control.
-    // Routing the settled child path through `authorize` also picks up the
-    // guard's `.acl` -> Control rewrite, so this cannot be forgotten again.
-    // Mode::Append (not Write) here: for an ordinary (non-.acl) child this
-    // must stay consistent with the container-level check above, or the
-    // append-only inbox pattern this design targets would break — every
-    // legitimate append-only POST would suddenly need Write on the child it
-    // creates. For a `.acl` child the guard ignores this argument entirely
-    // and substitutes Control, so the escalation is still blocked.
     if let Err(res) = authorize(st.store.as_ref(), &st.space, &agent, &child_path, Mode::Append).await {
         return res;
     }
