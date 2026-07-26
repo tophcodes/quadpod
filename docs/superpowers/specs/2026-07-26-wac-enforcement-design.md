@@ -113,6 +113,31 @@ store access:
 triples, hence the check there too — without it, someone holding `Write` on a child
 could manipulate the container's listing.
 
+Three refinements the implementation reviews forced, which the bare matrix above does not
+convey:
+
+- **The parent check is a chain, not a single level.** Creating a resource may materialize
+  several containers, and each one that is created — plus the first already-existing
+  ancestor, which gains a containment triple — needs `Append`. The walk stops there:
+  above that level the inserts are no-ops, so demanding rights there would break the
+  append-only inbox pattern (an agent with `Append` on `/inbox/` must not need anything
+  on `/`). This applies to ACL writes too, since `PUT /a/b/c.acl` can materialize `/a/`
+  and `/a/b/`.
+- **Deleting a resource that has its own ACL additionally requires `Control` on it**,
+  because the delete cascades to that ACL. Consequence, deliberate: an agent holding
+  `Write` but not `Control` cannot delete such a resource at all. Without the check, a
+  narrowing ACL would be removable by exactly the agent it was written to constrain.
+- **An empty RDF body is rejected with 400 on non-container paths.** Storing zero triples
+  would drop the graph while answering `201 Created` — for an ACL that reads as "lock this
+  subtree down" but in fact restores the ancestor's wider `acl:default` rules. Container
+  paths keep the empty-body create, where the server supplies the type triples itself.
+
+Known over-restriction, filed as a follow-up: writing `<res>.acl` under an
+already-existing container currently also demands `Append` on that container, although
+`add_containment` skips ACLs so nothing observable changes there. An agent holding only
+`acl:Control` through an ancestor's `acl:default` therefore cannot write ACLs. It fails
+closed and the pod owner is unaffected.
+
 **Status codes:**
 
 - `Agent::Public` denied → **401** with `WWW-Authenticate: DPoP algs="ES256"`.
