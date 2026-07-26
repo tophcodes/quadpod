@@ -158,6 +158,35 @@ async fn put_impl(st: AppState, agent: Agent, req_path: String, headers: HeaderM
     if let Err(res) = authorize_ancestors(&st, &agent, &req_path).await {
         return res;
     }
+    // An ACL may only be CREATED for a subject that exists. Otherwise anyone
+    // holding `acl:Control` below a container can squat on a path that does
+    // not exist and never did: `<ghost>.acl` naming only themselves becomes,
+    // by nearest-ACL-wins, the document governing `<ghost>` — so the owner
+    // can no longer create it (no Write), rewrite that ACL or delete it (no
+    // Control), and deleting the container above does not reclaim it either,
+    // because an ACL is not a containment member. Revoking the squatter's
+    // delegation changes nothing. The path is bricked for everyone with no
+    // HTTP route left to repair it. `Control` over a resource that does not
+    // exist is not a grant anyone can meaningfully exercise, and requiring
+    // the subject matches how auxiliary resources behave elsewhere in Solid.
+    //
+    // Scoped to creation deliberately: an ACL whose graph already exists must
+    // stay writable even if its subject has since gone, or a stale ACL could
+    // never be repaired or replaced by the owner.
+    //
+    // Placed AFTER every `authorize` call above, so an unauthorized caller is
+    // still answered 401/403 and never learns whether the subject exists.
+    if prp::is_acl_path(&req_path)
+        && !matches!(get_rdf(st.store.as_ref(), &st.space, &req_path).await, Ok(Some(_)))
+    {
+        let subject = prp::acl_subject_path(&req_path);
+        if !matches!(get_rdf(st.store.as_ref(), &st.space, &subject).await, Ok(Some(_))) {
+            return (
+                StatusCode::NOT_FOUND,
+                "an ACL cannot be created for a resource that does not exist",
+            ).into_response();
+        }
+    }
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(fmt) = format_for_content_type(ct) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
@@ -1210,14 +1239,24 @@ mod tests {
     async fn creating_a_resource_needs_append_on_the_parent_not_just_write_on_the_target() {
         let f = fixture().await;
         let bob = "https://bob.example/card#me";
-        // Grant Bob Write on /newfile before it exists — an ACL resource is
-        // independent of whether its subject resource has been created yet.
+        // Grant Bob Write on /newfile before it exists. That grant has to
+        // come from the ROOT ACL's `acl:default` — a direct /newfile.acl
+        // cannot be created for a resource that does not exist yet (see
+        // `acl_for_a_resource_that_does_not_exist_is_refused`). It also has
+        // to be `acl:default` only: Bob must end up with Write on the child
+        // and nothing whatsoever on `/` itself, which is exactly what
+        // omitting an `acl:accessTo </>` rule for him achieves.
         let acl_body = format!(
-            "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
-             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/newfile> ; \
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Write> ."
         );
-        let put_acl = f.owner_request("PUT", "/newfile.acl")
+        let put_acl = f.owner_request("PUT", "/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1512,6 +1551,14 @@ mod tests {
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
         assert_eq!(bob_app.clone().oneshot(sanity).await.unwrap().status(), StatusCode::FORBIDDEN);
 
+        // The subject has to exist before its ACL can be created; the owner
+        // makes it, which is the ordinary division of labour for a "you may
+        // manage access below here" delegation.
+        let mk_doc = f.owner_request("PUT", "/box/doc")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"doc\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk_doc).await.unwrap().status(), StatusCode::CREATED);
+
         // /box/ already exists (created above), so writing /box/doc.acl is a
         // zero-mutation event at the container level: Control on the subject
         // (inherited via /box/.acl's acl:default) must be enough.
@@ -1523,6 +1570,104 @@ mod tests {
                  <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> .",
             )).unwrap();
         assert_eq!(bob_app.oneshot(put_doc_acl).await.unwrap().status(), StatusCode::CREATED);
+    }
+
+    // ACL squatting: a `Control`-only delegate writes an ACL for a path that
+    // does not exist and never did, naming only themselves. Nearest-ACL-wins
+    // makes that document govern the ghost path permanently — the owner can
+    // no longer create it (no Write), rewrite or delete the ACL (no Control),
+    // and deleting the container above does not reclaim it, because an ACL is
+    // not a containment member. Revoking the delegation changes nothing. The
+    // path would be bricked for everyone with no HTTP route to repair it.
+    #[tokio::test]
+    async fn acl_for_a_resource_that_does_not_exist_is_refused() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        let mk = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let box_acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+               <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+             <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_box_acl = f.owner_request("PUT", "/box/.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(box_acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        // Bob's Control over /box/ghost is genuine (inherited via acl:default)
+        // — the refusal below is about the subject's absence, not about him.
+        let bob_app = f.app_also_trusting(bob);
+        let squat = f.sign(Request::builder().method("PUT").uri("/box/ghost.acl"), bob, "PUT", "/box/ghost.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/ghost> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        let res = bob_app.oneshot(squat).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(res).await.contains("does not exist"));
+        assert!(
+            crate::resource::get_rdf(f.store.as_ref(), &f.space, "/box/ghost.acl").await.unwrap().is_none(),
+            "the squatted ACL must not have been stored"
+        );
+
+        // ...and the path is still the owner's to use.
+        let owner_create = f.owner_request("PUT", "/box/ghost")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"mine\" .")).unwrap();
+        assert_eq!(f.app.oneshot(owner_create).await.unwrap().status(), StatusCode::CREATED);
+    }
+
+    // The counterweight: authoring an ACL the ordinary way — for a resource
+    // that exists — must keep working, or the check above would have simply
+    // switched ACL authoring off.
+    #[tokio::test]
+    async fn acl_for_an_existing_resource_is_created() {
+        let f = fixture().await;
+        let mk = f.owner_request("PUT", "/box/doc")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"doc\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+        let put_acl = f.owner_request("PUT", "/box/doc.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/doc> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                   <http://www.w3.org/ns/auth/acl#Write>, \
+                   <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        // The check is creation-only, so a STALE ACL stays repairable: an
+        // owner must always be able to rewrite (or delete) one whose subject
+        // has gone, whatever left it that way. The subject is removed at the
+        // store level here precisely because no HTTP route produces that
+        // state — DELETE cascades into the ACL — and the guarantee has to
+        // hold regardless.
+        delete_rdf(f.store.as_ref(), &f.space, "/box/doc").await.unwrap();
+        let rewrite = f.owner_request("PUT", "/box/doc.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/doc> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+            ))).unwrap();
+        assert_eq!(f.app.clone().oneshot(rewrite).await.unwrap().status(), StatusCode::CREATED);
+
+        let del_acl = f.owner_request("DELETE", "/box/doc.acl").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(del_acl).await.unwrap().status(), StatusCode::NO_CONTENT);
     }
 
     // The other half of `authorize_ancestors`' exemption, and the one that
@@ -1819,6 +1964,12 @@ mod tests {
     #[tokio::test]
     async fn acl_resource_advertises_no_further_acl() {
         let f = fixture().await;
+        // The subject must exist: an ACL is only creatable for a resource
+        // that does (see `acl_for_a_resource_that_does_not_exist_is_refused`).
+        let put_foo = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_foo).await.unwrap().status(), StatusCode::CREATED);
         let acl_body = format!(
             "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> ; \
