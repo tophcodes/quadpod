@@ -72,19 +72,43 @@ impl FetchPolicy {
     /// re-matched as a raw string on every lookup — into a normalized
     /// `(host, Option<port>)` pair. See [`parse_insecure_host_entry`] for
     /// the grammar. An entry that cannot be understood unambiguously
-    /// (empty, or ambiguous IPv6) is dropped rather than guessed at;
-    /// [`FetchPolicy::insecure_host_entries`] reports what actually made
-    /// it into the set, for logging.
+    /// (empty, ambiguous IPv6, or malformed) is dropped rather than guessed
+    /// at; [`FetchPolicy::insecure_host_entries`] reports what actually made
+    /// it into the set, for logging. Silently drops rejects — use
+    /// [`FetchPolicy::try_with_insecure_hosts`] when the caller must know
+    /// about them (a rejected entry is an operator mistake, not noise: see
+    /// `main.rs`, which refuses to start rather than run with fewer hosts
+    /// than the operator configured).
     pub fn with_insecure_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            insecure_hosts: std::sync::Arc::new(
-                hosts
-                    .into_iter()
-                    .filter_map(|entry| parse_insecure_host_entry(&entry))
-                    .collect(),
-            ),
-            ..Self::default()
-        }
+        Self::try_with_insecure_hosts(hosts).0
+    }
+
+    /// Same as [`FetchPolicy::with_insecure_hosts`], but also returns every
+    /// entry that could not be understood — in the order given — so the
+    /// caller can refuse to start instead of silently granting less than the
+    /// operator asked for. See [`insecure_host_rejection_hint`] for turning
+    /// a rejected entry into an operator-facing message.
+    pub fn try_with_insecure_hosts(
+        hosts: impl IntoIterator<Item = String>,
+    ) -> (Self, Vec<String>) {
+        let mut rejected = Vec::new();
+        let insecure_hosts = hosts
+            .into_iter()
+            .filter_map(|entry| match parse_insecure_host_entry(&entry) {
+                Some(pair) => Some(pair),
+                None => {
+                    rejected.push(entry);
+                    None
+                }
+            })
+            .collect();
+        (
+            Self {
+                insecure_hosts: std::sync::Arc::new(insecure_hosts),
+                ..Self::default()
+            },
+            rejected,
+        )
     }
 
     /// The entries actually understood after parsing and normalization —
@@ -210,11 +234,42 @@ fn parse_insecure_host_entry(entry: &str) -> Option<(String, Option<u16>)> {
 /// non-empty, and free of `/`, `:`, whitespace, and brackets. A `--allow-
 /// insecure-host` entry whose host portion fails this can never match a real
 /// URL host, so [`parse_insecure_host_entry`] rejects it rather than storing
-/// it inert.
+/// it inert (see Important 2 in `.superpowers/sdd/task-1-fixes-2.md`).
 fn is_valid_host_portion(host: &str) -> bool {
     !host.is_empty()
         && !host
             .contains(|c: char| c == '/' || c == ':' || c == '[' || c == ']' || c.is_whitespace())
+}
+
+/// A human-readable explanation of why a `--allow-insecure-host` /
+/// `POD_ALLOW_INSECURE_HOSTS` entry was rejected, and the form to use
+/// instead — for `main.rs` to print before refusing to start. `entry` must
+/// be exactly a string [`parse_insecure_host_entry`] returned `None` for;
+/// this does not re-check that it actually was rejected.
+///
+/// The ambiguous-IPv6 case (Important 1 in the original review) gets its
+/// own message naming the bracketed spelling explicitly, since that is the
+/// one fix that resolves it; every other rejection (empty host portion,
+/// scheme, path, whitespace, bracket, or out-of-range port folded into the
+/// host) gets a generic explanation of the grammar.
+pub fn insecure_host_rejection_hint(entry: &str) -> String {
+    if entry.parse::<Ipv6Addr>().is_ok() {
+        if let Some(idx) = entry.rfind(':') {
+            let (host, port_str) = (&entry[..idx], &entry[idx + 1..]);
+            if host.parse::<Ipv6Addr>().is_ok() && port_str.parse::<u16>().is_ok() {
+                return format!(
+                    "'{entry}' is ambiguous — it reads as both the whole IPv6 address and \
+                     `{host}` on port {port_str}; use the bracketed form '[{host}]:{port_str}' \
+                     instead"
+                );
+            }
+        }
+    }
+    format!(
+        "'{entry}' is not a valid --allow-insecure-host entry — use 'host' or 'host:port' with \
+         no scheme, path, whitespace, brackets (unless it's a bracketed IPv6 address), or \
+         out-of-range port"
+    )
 }
 
 /// Render a parsed entry back to display form, for the startup warning.
@@ -923,5 +978,47 @@ mod tests {
         assert_eq!(parse_insecure_host_entry("localhost/x"), None);
         assert_eq!(parse_insecure_host_entry("localhost:3001/"), None);
         assert_eq!(parse_insecure_host_entry("localhost:"), None);
+    }
+
+    // A rejected entry must be reported, not swallowed — and the entries
+    // that *were* understood must still work alongside it (main.rs's exit-2
+    // path depends on both halves of this).
+    #[test]
+    fn try_with_insecure_hosts_reports_rejects_and_keeps_understood_entries() {
+        let (policy, rejected) = FetchPolicy::try_with_insecure_hosts(
+            ["localhost:3001", "fd00::1:80", "localhost:99999"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(
+            rejected,
+            vec!["fd00::1:80".to_string(), "localhost:99999".to_string()]
+        );
+        assert_eq!(
+            policy.insecure_host_entries(),
+            vec!["localhost:3001".to_string()],
+            "the entry that parsed must still take effect alongside the rejects"
+        );
+    }
+
+    // The ambiguous-IPv6 case gets a hint naming the bracketed spelling
+    // explicitly — that is the one fix that resolves it, not a generic
+    // "malformed" message.
+    #[test]
+    fn rejection_hint_names_the_bracketed_form_for_ambiguous_ipv6() {
+        let hint = insecure_host_rejection_hint("fd00::1:80");
+        assert!(
+            hint.contains("[fd00::1]:80"),
+            "hint should name the bracketed fix, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn rejection_hint_is_generic_for_a_malformed_entry() {
+        let hint = insecure_host_rejection_hint("localhost:99999");
+        assert!(
+            hint.contains("host:port"),
+            "hint should describe the grammar, got: {hint}"
+        );
     }
 }

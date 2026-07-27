@@ -66,13 +66,15 @@ Entry form, exactly:
   is the *only* way to pair an IPv6 host with a port. An unbracketed `host:port`-looking
   spelling for IPv6 (e.g. `fd00::1:80`, which reads exactly like the address
   `fd00::1:80`) is ambiguous — a colon-delimited port suffix is indistinguishable from
-  another IPv6 group — and is **dropped entirely**, matching neither reading, rather than
-  guessed at. It will not appear in the startup warning, and it grants nothing. Use the
-  bracketed form.
-- **A malformed entry is dropped, not stored inert.** A scheme, a path, whitespace, or an
-  out-of-range port folded into the host — `http://localhost:3001`, `localhost/x`,
-  `localhost:3001/`, `localhost:99999` — can never match a real URL host, so it is rejected
-  outright rather than accepted and silently doing nothing.
+  another IPv6 group — and matches neither reading. The pod **refuses to start**, naming
+  the entry and the bracketed form to use instead (`[fd00::1]:80`).
+- **A non-canonical IPv6 spelling still works — it's normalized, not compared verbatim.**
+  `[0:0:0:0:0:0:0:1]` and `[fd00::0001]:80` are stored in the same canonical form `url`
+  itself produces for the request (`::1`, `fd00::1`), so they match.
+- **A malformed entry also refuses to start the pod, rather than being stored inert.** A
+  scheme, a path, whitespace, or an out-of-range port folded into the host — `http://
+  localhost:3001`, `localhost/x`, `localhost:3001/`, `localhost:99999` — can never match a
+  real URL host, so it is rejected outright, named at startup, with the entry printed.
 
 ### What it relaxes, for a listed host only
 

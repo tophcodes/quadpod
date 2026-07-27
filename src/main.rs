@@ -18,15 +18,31 @@ async fn main() {
         eprintln!("invalid --owner-webid: must be an absolute IRI");
         std::process::exit(2);
     }
-    let fetch_policy = cfg.fetch_policy();
+    let (fetch_policy, rejected_insecure_hosts) = cfg.try_fetch_policy();
+    if !rejected_insecure_hosts.is_empty() {
+        // An entry that reaches here is a non-blank string the operator
+        // typed (config.rs trims and drops empty/whitespace entries before
+        // parsing) that this process could not understand unambiguously —
+        // the same class of mistake as an invalid --base-uri or
+        // --owner-webid above. Refuse to start rather than silently grant
+        // fewer hosts than configured: a pod that starts clean here is
+        // indistinguishable from one started without the flag at all, and
+        // would fail every fetch to that host with a 401 the operator has
+        // nothing to grep for.
+        for entry in &rejected_insecure_hosts {
+            eprintln!(
+                "invalid --allow-insecure-host entry: {}",
+                sparql_pod::auth::safe_fetch::insecure_host_rejection_hint(entry)
+            );
+        }
+        std::process::exit(2);
+    }
     let understood_insecure_hosts = fetch_policy.insecure_host_entries();
     if !understood_insecure_hosts.is_empty() {
         // Loud on purpose: this is the operator relaxing an SSRF control.
         // For these hosts the pod will talk plain http and reach private
         // addresses on pre-authentication fetches. Logs what was actually
-        // understood after trimming/parsing, not the raw flag value — an
-        // entry that didn't parse (empty, or an ambiguous IPv6 spelling)
-        // does nothing, and must not appear here as if it did.
+        // understood after trimming/parsing, not the raw flag value.
         tracing::warn!(
             hosts = %understood_insecure_hosts.join(", "),
             "--allow-insecure-host: private-IP and https-only checks are waived for these hosts"
