@@ -39,6 +39,20 @@ pub fn sys_graph_iri(g: &impl GraphName) -> String {
     format!("urn:pod:sys:{}", g.graph_iri())
 }
 
+/// Render triples as N-Triples for interpolation into an `INSERT DATA` body.
+///
+/// Both write paths share this so their escaping cannot diverge: oxrdf's
+/// `Display` is what escapes quotes, newlines, control characters, language
+/// tags and datatypes, and a second copy of this loop would be the place a
+/// future change forgets.
+fn serialize_for_insert(triples: &[Triple]) -> String {
+    let mut body = String::new();
+    for t in triples {
+        body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
+    }
+    body
+}
+
 /// Replace a graph's contents and mark it present, in one update.
 pub async fn put_rdf(
     store: &dyn SparqlStore,
@@ -47,10 +61,7 @@ pub async fn put_rdf(
 ) -> Result<(), ResourceError> {
     let iri = g.graph_iri();
     let sys = sys_graph_iri(g);
-    let mut body = String::new();
-    for t in triples {
-        body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
-    }
+    let body = serialize_for_insert(triples);
     store
         .update(&format!(
             "DROP SILENT GRAPH <{iri}>; \
@@ -73,10 +84,7 @@ pub async fn insert_marked(
 ) -> Result<(), ResourceError> {
     let iri = g.graph_iri();
     let sys = sys_graph_iri(g);
-    let mut body = String::new();
-    for t in triples {
-        body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
-    }
+    let body = serialize_for_insert(triples);
     store
         .update(&format!(
             "INSERT DATA {{ GRAPH <{iri}> {{ {body} }} }}; \
@@ -123,6 +131,13 @@ pub async fn exists(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool,
 /// no-op — so content that somehow exists without a marker (which should
 /// never happen, but `!exists` must not make it permanent) is still
 /// reachable and removable.
+///
+/// The cost of that choice, stated plainly: the marker is read before the
+/// drops, so a `put_rdf` landing in between is destroyed while this call
+/// still returns `false` and its caller answers 404. That is the same
+/// read-then-write race the rest of this non-transactional layer carries,
+/// and it has no authorization consequence — but it is a real trade, not a
+/// free win.
 pub async fn delete_rdf(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool, ResourceError> {
     let existed = exists(store, g).await?;
     let iri = g.graph_iri();
