@@ -61,6 +61,31 @@ pub async fn put_rdf(
     Ok(())
 }
 
+/// Insert triples into a graph without replacing what is there, marking it
+/// present in the same update. This is the additive counterpart to
+/// [`put_rdf`]: containment and container type triples accumulate rather
+/// than replace, but must not be able to produce content without a
+/// presence marker.
+pub async fn insert_marked(
+    store: &dyn SparqlStore,
+    g: &impl GraphName,
+    triples: &[Triple],
+) -> Result<(), ResourceError> {
+    let iri = g.graph_iri();
+    let sys = sys_graph_iri(g);
+    let mut body = String::new();
+    for t in triples {
+        body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
+    }
+    store
+        .update(&format!(
+            "INSERT DATA {{ GRAPH <{iri}> {{ {body} }} }}; \
+             INSERT DATA {{ GRAPH <{sys}> {{ <{iri}> <{SYS_PRESENT}> true }} }}"
+        ))
+        .await?;
+    Ok(())
+}
+
 /// A graph's contents, or `None` if it does not exist. An existing graph with
 /// no triples yields `Some(vec![])`.
 pub async fn get_rdf(
@@ -79,6 +104,9 @@ pub async fn get_rdf(
     Ok(Some(triples))
 }
 
+/// Whether `g` is present. Reads the stored marker in the system graph
+/// rather than counting triples, so an empty-but-present graph still
+/// reports `true` and unmarked content still reports `false`.
 pub async fn exists(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool, ResourceError> {
     let iri = g.graph_iri();
     let sys = sys_graph_iri(g);
@@ -90,15 +118,18 @@ pub async fn exists(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool,
 }
 
 /// Delete a graph and its presence marker. Returns whether it existed.
+///
+/// The drops run unconditionally — `DROP SILENT` on an absent graph is a
+/// no-op — so content that somehow exists without a marker (which should
+/// never happen, but `!exists` must not make it permanent) is still
+/// reachable and removable.
 pub async fn delete_rdf(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool, ResourceError> {
     let existed = exists(store, g).await?;
-    if existed {
-        let iri = g.graph_iri();
-        let sys = sys_graph_iri(g);
-        store
-            .update(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>"))
-            .await?;
-    }
+    let iri = g.graph_iri();
+    let sys = sys_graph_iri(g);
+    store
+        .update(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>"))
+        .await?;
     Ok(existed)
 }
 
@@ -130,6 +161,7 @@ mod tests {
         put_rdf(&store, &foo, &t).await.unwrap();
         let got = get_rdf(&store, &foo).await.unwrap().expect("exists");
         assert_eq!(got.len(), 1);
+        assert_eq!(got[0].predicate.as_str(), "http://schema.org/name");
     }
 
     #[tokio::test]
@@ -193,5 +225,73 @@ mod tests {
         assert_eq!(get_rdf(&store, &foo).await.unwrap().unwrap().len(), 1);
         // and the marker is elsewhere
         assert!(sys_graph_iri(&foo).starts_with("urn:pod:sys:"));
+    }
+
+    #[tokio::test]
+    async fn insert_marked_accumulates_not_replaces() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        insert_marked(&store, &foo, &triples("<#a> <http://schema.org/name> \"A\" .", foo.graph_iri())).await.unwrap();
+        insert_marked(&store, &foo, &triples("<#b> <http://schema.org/name> \"B\" .", foo.graph_iri())).await.unwrap();
+        let got = get_rdf(&store, &foo).await.unwrap().unwrap();
+        assert_eq!(got.len(), 2, "second insert_marked should add, not replace");
+    }
+
+    #[tokio::test]
+    async fn insert_marked_writes_a_presence_marker() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        insert_marked(&store, &foo, &triples("<#it> <http://schema.org/name> \"x\" .", foo.graph_iri())).await.unwrap();
+        assert!(exists(&store, &foo).await.unwrap());
+        assert!(delete_rdf(&store, &foo).await.unwrap());
+        assert!(!exists(&store, &foo).await.unwrap());
+    }
+
+    // This state is not supposed to occur — every writer in this module goes
+    // through put_rdf/insert_marked, both of which write the marker in the
+    // same update as the content. This test pins the fail-closed answer in
+    // case it ever does: content with no marker reads as absent rather than
+    // being exposed.
+    #[tokio::test]
+    async fn triples_without_a_marker_read_as_absent_but_are_still_deletable() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let iri = foo.graph_iri();
+        store
+            .update(&format!(
+                "INSERT DATA {{ GRAPH <{iri}> {{ <{iri}> <http://schema.org/name> \"x\" }} }}"
+            ))
+            .await
+            .unwrap();
+
+        assert!(!exists(&store, &foo).await.unwrap(), "unmarked content must read as absent");
+        assert_eq!(get_rdf(&store, &foo).await.unwrap(), None);
+
+        // Finding 2: delete_rdf is unconditional, so orphaned content is
+        // still removable even though `existed` reports false.
+        assert!(!delete_rdf(&store, &foo).await.unwrap());
+        let remaining = store
+            .query_triples(&format!(
+                "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"
+            ))
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "delete_rdf should remove unmarked content too");
+    }
+
+    // The ASK is scoped to `GRAPH <urn:pod:sys:{iri}>`, which is what stops a
+    // user from forging someone else's presence by writing the marker
+    // triple into their own graph instead of the system graph.
+    #[tokio::test]
+    async fn presence_cannot_be_forged_via_the_user_graph() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let mine = res("/mine");
+        let other = res("/other");
+        let forged = triples(
+            &format!("<{}> <{SYS_PRESENT}> true .", other.graph_iri()),
+            mine.graph_iri(),
+        );
+        put_rdf(&store, &mine, &forged).await.unwrap();
+        assert!(!exists(&store, &other).await.unwrap());
     }
 }

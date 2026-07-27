@@ -93,4 +93,23 @@ mod tests {
         ).await.unwrap();
         assert!(triples.is_empty());
     }
+
+    #[tokio::test]
+    async fn ask_reports_true_and_false() {
+        let store = OxigraphStore::in_memory().unwrap();
+        store.update(
+            "INSERT DATA { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#it> <http://schema.org/name> \"Toph\" } }",
+        ).await.unwrap();
+
+        assert!(store.ask(
+            "ASK { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#it> <http://schema.org/name> \"Toph\" } }",
+        ).await.unwrap());
+
+        assert!(!store.ask(
+            "ASK { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#it> <http://schema.org/name> \"Nope\" } }",
+        ).await.unwrap());
+    }
 }
