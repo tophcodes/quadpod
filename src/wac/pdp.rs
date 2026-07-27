@@ -63,6 +63,54 @@ pub fn decide(acl: &[Triple], agent: &Agent, governed_iri: &str, inherited: bool
     granted
 }
 
+/// The stand-in agent used by [`grants_anything`] to probe for a rule that
+/// matches *any* authenticated WebID. It is a `urn:`, so it can never be a
+/// WebID a real request arrives with, and never one an ACL would name.
+const PROBE_AUTHENTICATED_AGENT: &str = "urn:sparql-pod:pdp:probe-authenticated-agent";
+
+/// Does `acl` grant **any** mode to **anyone** on `governed_iri`, under either
+/// scope predicate?
+///
+/// The question an ACL's author needs answered before their document takes
+/// effect: an ACL that grants nothing denies everything at and below its
+/// subject, deliberately (an empty ACL is "nothing is granted here", not
+/// "absent"), and it revokes the very `Control` that would let anyone remove
+/// it. The empty body is the obvious way to write one; the likelier one is a
+/// document full of triples that happen to match nobody — a typo in a WebID,
+/// the wrong predicate, an `acl:accessTo` naming a different IRI.
+///
+/// Answered by running [`decide`] itself over a candidate set, rather than by
+/// re-reading the triples, so there is exactly one implementation of what a
+/// grant is. The candidate set is complete by construction, because
+/// [`matches_agent`] can only say yes three ways:
+///
+/// - `acl:agentClass foaf:Agent` matches everyone, so [`Agent::Public`] finds it;
+/// - `acl:agentClass acl:AuthenticatedAgent` matches any WebID, so the
+///   synthetic [`PROBE_AUTHENTICATED_AGENT`] finds it;
+/// - `acl:agent <w>` matches exactly `w`, and every such `w` is an object of
+///   an `acl:agent` triple *in this document*, so enumerating those finds them
+///   all.
+///
+/// Both scopes are probed: an ACL that grants only through `acl:default` still
+/// grants, to its subject's descendants, and must not be reported as granting
+/// nothing.
+pub fn grants_anything(acl: &[Triple], governed_iri: &str) -> bool {
+    let mut candidates = vec![
+        Agent::Public,
+        Agent::WebId(PROBE_AUTHENTICATED_AGENT.to_string()),
+    ];
+    for t in acl.iter().filter(|t| t.predicate.as_str() == ACL_AGENT) {
+        if let Term::NamedNode(w) = &t.object {
+            candidates.push(Agent::WebId(w.as_str().to_string()));
+        }
+    }
+    candidates.iter().any(|agent| {
+        [false, true]
+            .into_iter()
+            .any(|inherited| decide(acl, agent, governed_iri, inherited) != AccessModes::default())
+    })
+}
+
 /// Every distinct subject in the ACL graph. We do not require an explicit
 /// `a acl:Authorization` type triple — WAC treats the scope/agent/mode
 /// predicates themselves as what makes an authorization, and many real ACLs
@@ -251,6 +299,91 @@ mod tests {
         let m = decide(&a, &alice(), FOO, false);
         assert!(m.allows(Mode::Read));
         assert!(!m.allows(Mode::Control), "Bob's authorization must not grant Alice Control");
+    }
+
+    // The obvious empty ACL, and the one that actually happens: a document
+    // full of triples that match nobody. Both grant nothing and must be
+    // reported as such.
+    #[test]
+    fn grants_anything_is_false_for_an_acl_that_matches_nobody() {
+        assert!(!grants_anything(&[], FOO), "an empty ACL grants nothing");
+
+        // `acl:accessTo` naming a different resource — the mistyped-IRI case.
+        let wrong_scope = acl(&format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/other> ; \
+             <{ACL_DEFAULT}> <https://pod.toph.so/other> ; <{ACL_MODE}> <{ACL_READ}> ."
+        ));
+        assert!(!grants_anything(&wrong_scope, FOO));
+
+        // Scope and agent right, but no mode at all.
+        let no_modes = acl(&format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <{FOO}> ; <{ACL_DEFAULT}> <{FOO}> ."
+        ));
+        assert!(!grants_anything(&no_modes, FOO));
+
+        // Scope and mode right, but no agent or agentClass names anyone.
+        let no_agent = acl(&format!(
+            "<#o> <{ACL_ACCESS_TO}> <{FOO}> ; <{ACL_DEFAULT}> <{FOO}> ; <{ACL_MODE}> <{ACL_READ}> ."
+        ));
+        assert!(!grants_anything(&no_agent, FOO));
+
+        // Triples that are simply not about access control at all.
+        let unrelated = acl("<#o> <http://schema.org/name> \"not an acl\" .");
+        assert!(!grants_anything(&unrelated, FOO));
+    }
+
+    // Each of the three ways `matches_agent` can say yes must be found by the
+    // probe set, under each scope predicate — otherwise a real grant would be
+    // reported as "grants nobody anything".
+    #[test]
+    fn grants_anything_finds_every_way_an_authorization_can_match() {
+        for scope in [ACL_ACCESS_TO, ACL_DEFAULT] {
+            for agent_clause in [
+                format!("<{ACL_AGENT}> <{ALICE}>"),
+                format!("<{ACL_AGENT_CLASS}> <{FOAF_AGENT}>"),
+                format!("<{ACL_AGENT_CLASS}> <{ACL_AUTHENTICATED_AGENT}>"),
+            ] {
+                let a = acl(&format!(
+                    "<#o> {agent_clause} ; <{scope}> <{FOO}> ; <{ACL_MODE}> <{ACL_READ}> ."
+                ));
+                assert!(
+                    grants_anything(&a, FOO),
+                    "{agent_clause} under {scope} is a grant"
+                );
+            }
+        }
+    }
+
+    // Any single mode counts — Control in particular, since a Control-only ACL
+    // is exactly the one that stays removable and must not be warned about.
+    #[test]
+    fn grants_anything_counts_every_mode() {
+        for mode in [ACL_READ, ACL_WRITE, ACL_APPEND, ACL_CONTROL] {
+            let a = acl(&format!(
+                "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <{FOO}> ; <{ACL_MODE}> <{mode}> ."
+            ));
+            assert!(grants_anything(&a, FOO), "{mode} alone is a grant");
+        }
+    }
+
+    // The synthetic probe WebID must not be reachable as a real grant: an ACL
+    // that names it explicitly is a genuine (if useless) grant, and one that
+    // does not must never be matched by it.
+    #[test]
+    fn the_probe_agent_only_finds_grants_that_are_really_there() {
+        let named_other = acl(&format!(
+            "<#o> <{ACL_AGENT}> <{BOB}> ; <{ACL_ACCESS_TO}> <{FOO}> ; <{ACL_MODE}> <{ACL_READ}> ."
+        ));
+        // Bob is enumerated from the document, so this is found — but it is
+        // found as Bob, not as the probe.
+        assert!(grants_anything(&named_other, FOO));
+        assert!(!decide(
+            &named_other,
+            &Agent::WebId(PROBE_AUTHENTICATED_AGENT.to_string()),
+            FOO,
+            false
+        )
+        .allows(Mode::Read));
     }
 
     // The scope check is subject-scoped too: a matching agent's own
