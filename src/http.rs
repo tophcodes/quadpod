@@ -769,6 +769,38 @@ mod tests {
         assert!(body_string(res).await.contains("ldp#BasicContainer"));
     }
 
+    // The trailing slash is exactly what `dpop-verifier`'s `normalize_htu`
+    // erases, so without `verify_dpop`'s own exact `htu` comparison this
+    // request would authenticate: the owner signs `PUT /.aux/acl/foo` and an
+    // on-path adversary re-delivers the identical bytes as
+    // `PUT /.aux/acl/foo/`, installing the body as the *container's* ACL,
+    // where none of its rules name the governed IRI — an empty ACL that beats
+    // every ancestor and locks the subtree out permanently. It must be a 401,
+    // from the middleware, before any handler sees it.
+    #[tokio::test]
+    async fn a_proof_for_a_resource_acl_cannot_write_the_container_acl() {
+        let f = fixture().await;
+        let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
+        let proof = f.client.mint_dpop(
+            "https://pod.toph.so/.aux/acl/foo",
+            "PUT",
+            now_unix(),
+            "jti-acl-trailing-slash",
+        );
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/.aux/acl/foo/")
+            .header(header::AUTHORIZATION, format!("DPoP {at}"))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("dpop", proof)
+            .body(Body::from(
+                "<#r> a <http://www.w3.org/ns/auth/acl#Authorization> ;\
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> .",
+            ))
+            .unwrap();
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn get_emits_etag_and_304_on_if_none_match() {
         let f = fixture().await;
