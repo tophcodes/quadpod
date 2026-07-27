@@ -85,6 +85,31 @@ pub async fn provision_root(
     ensure_container(store, root).await
 }
 
+/// Whether a `Link` header asks, per LDP §5.2.3.4, for the created resource to
+/// be a container.
+///
+/// Only the link *target* counts — a container IRI appearing in a parameter
+/// value says nothing — and the `rel` is a space-separated token list, so
+/// `type` has to be one of its tokens rather than the whole value. Splitting
+/// values on `,` is safe for what this reads: a comma inside a quoted
+/// parameter can only break a value into pieces that no longer parse as
+/// `<iri>; rel=type`, which is a false negative, never a false positive.
+pub fn type_link_requests_container(link: &str) -> bool {
+    link.split(',').any(|value| {
+        let value = value.trim();
+        let Some(rest) = value.strip_prefix('<') else { return false };
+        let Some((target, params)) = rest.split_once('>') else { return false };
+        if target != LDP_CONTAINER && target != LDP_BASIC_CONTAINER {
+            return false;
+        }
+        params.split(';').any(|p| match p.split_once('=') {
+            Some((name, v)) if name.trim().eq_ignore_ascii_case("rel") =>
+                v.trim().trim_matches('"').split_whitespace().any(|t| t == "type"),
+            _ => false,
+        })
+    })
+}
+
 /// Sanitize a client-supplied `Slug` header into a safe child segment.
 /// Drops anything outside `[A-Za-z0-9._-]`; falls back to a fresh uuid v4
 /// if no slug was given or nothing survives sanitization.
@@ -162,6 +187,32 @@ mod tests {
         assert!(g.iter().any(|t| t.predicate.as_str() == RDF_TYPE
             && matches!(&t.object, oxigraph::model::Term::NamedNode(n)
                 if n.as_str() == LDP_BASIC_CONTAINER)));
+    }
+
+    #[test]
+    fn type_link_recognizes_the_container_types() {
+        assert!(type_link_requests_container(
+            "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\""));
+        assert!(type_link_requests_container(
+            "<http://www.w3.org/ns/ldp#Container>; rel=type"));
+        // One value among several, and a multi-token rel.
+        assert!(type_link_requests_container(
+            "<https://example.org/a>; rel=\"describedby\", \
+             <http://www.w3.org/ns/ldp#BasicContainer>; rel=\"foo type\""));
+    }
+
+    #[test]
+    fn type_link_ignores_everything_that_does_not_ask_for_a_container() {
+        assert!(!type_link_requests_container(""));
+        // rel other than `type`
+        assert!(!type_link_requests_container(
+            "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"describedby\""));
+        // a type that is not a container
+        assert!(!type_link_requests_container(
+            "<http://www.w3.org/ns/ldp#Resource>; rel=\"type\""));
+        // the IRI must be the link target, not loose text
+        assert!(!type_link_requests_container(
+            "<https://example.org/x>; rel=\"type\"; title=\"http://www.w3.org/ns/ldp#Container\""));
     }
 
     #[test]

@@ -360,8 +360,14 @@ async fn name_is_taken(store: &dyn SparqlStore, child: &Target) -> bool {
     if matches!(exists(store, child).await, Ok(true)) {
         return true;
     }
-    let Target::Resource(r) = child else { return false };
-    match r.slash_counterpart() {
+    let subject = match child {
+        Target::Resource(r) => r,
+        // A `Link: rel="type"` can make the allocated child a container, and
+        // the pair rule reads the same from that side.
+        Target::Container(c) => c.as_resource(),
+        Target::Aux(_) => return false,
+    };
+    match subject.slash_counterpart() {
         Some(counterpart) => matches!(exists(store, &counterpart).await, Ok(true)),
         None => false,
     }
@@ -389,8 +395,18 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // always an ordinary resource — unless the server would have to allocate
     // it inside the reserved namespace (`Slug: .aux` at the root), which
     // `classify` refuses. A `Slug` can therefore never name an auxiliary.
+    //
+    // A `Link: rel="type"` naming a container asks for one, and under Solid
+    // §3.1 the trailing slash is the *only* thing that tells the two apart —
+    // so it is appended as a separate `suffix`, and the name it decorates
+    // stays a bare segment. Anything that has to vary the name varies that
+    // segment and re-applies the suffix; folding the slash into the name would
+    // put the retry *inside* the container instead of beside it.
+    let wants_container =
+        container::type_link_requests_container(header_str(&headers, header::LINK));
+    let suffix = if wants_container { "/" } else { "" };
     let name = container::child_name(slug);
-    let mut child = match classify(&st.space, &format!("{}{name}", parent.path())) {
+    let mut child = match classify(&st.space, &format!("{}{name}{suffix}", parent.path())) {
         Ok(t) => t,
         Err(status) => return status.into_response(),
     };
@@ -398,7 +414,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // transactional; a concurrent write landing between them could be missed.
     // Accepted for single-user v1.
     if name_is_taken(store, &child).await {
-        let unique = format!("{name}-{}", uuid::Uuid::new_v4());
+        let unique = format!("{name}-{}{suffix}", uuid::Uuid::new_v4());
         child = match classify(&st.space, &format!("{}{unique}", parent.path())) {
             Ok(t) => t,
             Err(status) => return status.into_response(),
@@ -417,6 +433,12 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Containment is server-managed, for a container POST asks for exactly as
+    // much as for one a PUT names — and refused before anything is written,
+    // for the same reason.
+    if matches!(child, Target::Container(_)) && container::body_sets_containment(&triples) {
+        return StatusCode::CONFLICT.into_response();
+    }
     // POSTing into a container that does not exist yet materializes it and
     // its missing ancestors, so those need authorizing too — the same single
     // traversal `put_impl` uses.
@@ -428,8 +450,22 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
             Ok(()) => created(&child),
             Err(e) => (put_status(&e), e.to_string()).into_response(),
         },
-        // Unreachable: see the `child_name` comment above.
-        Target::Container(_) | Target::Aux(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        // A freshly allocated name, so there are no members to preserve — the
+        // read-then-merge `put_impl` does for an existing container has
+        // nothing to read here.
+        Target::Container(c) => {
+            if let Err(e) = put_rdf(store, c, &triples).await {
+                return (put_status(&e), e.to_string()).into_response();
+            }
+            match container::ensure_container(store, c).await {
+                Ok(()) => created(&child),
+                Err(e) => (put_status(&e), e.to_string()).into_response(),
+            }
+        }
+        // Unreachable: a `Slug` can never name an auxiliary (see above), and
+        // the only other shape `classify` can return for a child path is the
+        // container the `Link` header asks for.
+        Target::Aux(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -1213,6 +1249,79 @@ mod tests {
         let loc1 = f.app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
         let loc2 = f.app.clone().oneshot(mk()).await.unwrap().headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
         assert_ne!(loc1, loc2);
+    }
+
+    // LDP §5.2.3.4: a POST whose `Link: rel="type"` names a container asks for
+    // a container, and Solid §3.1 makes the trailing slash the only thing that
+    // distinguishes the two — so the allocated name must carry it.
+    #[tokio::test]
+    async fn post_with_container_type_link_creates_a_container() {
+        let f = fixture().await;
+        let post = f.owner_request("POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "sub")
+            .header(header::LINK, "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"")
+            .body(Body::from("")).unwrap();
+        let res = f.app.clone().oneshot(post).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/box/sub/");
+
+        // It is a real container: typed, readable, and POSTable into.
+        let get = f.owner_request("GET", "/box/sub/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let got = f.app.clone().oneshot(get).await.unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        assert!(body_string(got).await.contains(container::LDP_BASIC_CONTAINER));
+
+        // And the parent lists it under its slash-terminated URL.
+        let list = f.owner_request("GET", "/box/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        assert!(body_string(f.app.oneshot(list).await.unwrap()).await
+            .contains("https://pod.toph.so/box/sub/"));
+    }
+
+    // A `Slug` is a hint, and §3.1 makes the other half of a slash pair as
+    // unavailable as the name itself — so a POSTed container whose name is
+    // held by an existing *resource* gets another name, not the `409` a
+    // client-named PUT would get. Same rule `name_is_taken` already applied in
+    // the other direction.
+    #[tokio::test]
+    async fn posted_container_avoids_a_name_its_slash_counterpart_holds() {
+        let f = fixture().await;
+        let mk_resource = f.owner_request("POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle").header("slug", "sub")
+            .body(Body::from("")).unwrap();
+        let res = f.app.clone().oneshot(mk_resource).await.unwrap();
+        assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/box/sub");
+
+        let post = f.owner_request("POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle").header("slug", "sub")
+            .header(header::LINK, "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"")
+            .body(Body::from("")).unwrap();
+        let res = f.app.oneshot(post).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let loc = res.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+        assert_ne!(loc, "https://pod.toph.so/box/sub/", "the counterpart is taken");
+        assert!(loc.ends_with('/'), "it is still a container: {loc}");
+    }
+
+    // Containment is server-managed on a POSTed container for the same reason
+    // it is on a PUT one.
+    #[tokio::test]
+    async fn posted_container_may_not_set_containment() {
+        let f = fixture().await;
+        let post = f.owner_request("POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle").header("slug", "sub")
+            .header(header::LINK, "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"")
+            .body(Body::from(
+                "<https://pod.toph.so/box/sub/> \
+                 <http://www.w3.org/ns/ldp#contains> <https://pod.toph.so/elsewhere> .",
+            )).unwrap();
+        let res = f.app.clone().oneshot(post).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        // and nothing was left behind
+        let get = f.owner_request("GET", "/box/sub/").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(get).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
     // This test used to assert a 400 with the reasoning that an empty body
