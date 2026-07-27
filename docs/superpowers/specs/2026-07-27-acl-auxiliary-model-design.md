@@ -101,16 +101,50 @@ and `content-type` in the system graph anyway.
 
 ### The ACL namespace
 
-The ACL of a resource lives under the reserved auxiliary prefix, not as a sibling:
+> **Revised 2026-07-27, after the first conformance run.** The original shape put the kind
+> in a leading segment (`/.aux/acl/box/`), which inherited the subject's trailing slash. Two
+> things came out of running the harness against it, and the second is the one that matters.
+>
+> First, the harness could not write such a URL: Jersey's `UriTemplate.normalize()` — a
+> broken reimplementation of RFC 3986's `remove_dot_segments`, three layers below the
+> harness's own code — drops the trailing empty segment when the path also contains a
+> dot-prefixed segment. That is a client bug (WAC forbids deriving the ACL URI by string
+> operations), and `@inrupt/solid-client` and `rdflib.js` both preserve the URL correctly.
+> On its own it would not justify a redesign.
+>
+> Second, and decisively: **the collision this shape was designed to avoid does not exist in
+> Solid.** Protocol §3.1 says *"If two URIs differ only in the trailing slash […] the other
+> URI MUST NOT correspond to another resource."* `/box` and `/box/` being distinct is LDP,
+> not Solid; CSS rejects the pair with a 409 and `specification-tests` ships
+> `slash-semantics-exclude.feature` for exactly this. So there was never a pair of ACLs to
+> keep apart, and the shape paid a real interop cost for a distinction the specification
+> forbids. No shipping server produces a slash-terminated ACL URL — the shape was
+> unexercised anywhere.
+
+The ACL of a resource lives under the reserved auxiliary prefix, with the kind as a
+**suffix**, so an auxiliary URL never ends in a slash:
 
 | Subject | ACL URL |
 |---|---|
-| `/` | `/.aux/acl/` |
-| `/foo` | `/.aux/acl/foo` |
-| `/box/` | `/.aux/acl/box/` |
-| `/a/b/c` | `/.aux/acl/a/b/c` |
+| `/` | `/.aux/.acl` |
+| `/foo` | `/.aux/foo.acl` |
+| `/box/` | `/.aux/box/.acl` |
+| `/a/b/c` | `/.aux/a/b/c.acl` |
 
-Both directions are total and mutually inverse: strip or prepend the two prefix segments.
+The rule is `/.aux` + the subject's path + `.` + the kind's name. Both directions stay total
+and mutually inverse: strip the prefix and the suffix, or prepend and append them.
+
+**The classification is still by prefix, and that is what matters.** The router decides
+"resource space or auxiliary space" from the first segment alone — one total function,
+evaluated once, which is the property the whole model rests on. The suffix only names the
+*kind* inside a space this server already owns entirely, so it is not the re-derived
+predicate the old `<res>.acl` design died of. It also matches how every other server ends an
+auxiliary URL (`.acl`, `.acr`, `.meta`), which is why no client normalization trips over it.
+
+**Trailing-slash pairs are refused.** Creating `/box` while `/box/` exists — or the reverse —
+answers `409`, per Protocol §3.1 and matching CSS. This is a rule about the resource space;
+the auxiliary space inherits it for free, because an auxiliary's identity now follows from
+its subject's.
 
 **Why a prefix rather than a suffix.** A reserved prefix is a total function over the path space, evaluated once by the router. A reserved suffix is a partial predicate that must be re-evaluated wherever a path is constructed — which is precisely how defects 1, 5, 6 and 7 arose. `/.aux` and `/.aux/acl` without a trailing slash are reserved as well (404), so the space is unambiguous.
 
