@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- **Build/test ONLY via the flake dev shell.** Bare `cargo` fails (oxigraph → bindgen → libclang). Every command: `nix develop -c cargo test`, `nix develop -c cargo clippy --all-targets`, `nix develop -c cargo build 2>&1 | grep -i warning` (must print nothing).
+- **Build/test ONLY via the flake dev shell.** Bare `cargo` fails (oxigraph → bindgen → libclang). Commands: `nix develop -c cargo test`, `nix develop -c cargo clippy --all-targets`, `nix develop -c cargo build 2>&1 | grep -i warning` (must print nothing).
+- **Tasks 1–6 verify module-wise, and that is a deliberate, user-approved exception.** The refactor goes bottom-up, so `src/http.rs` does not compile until Task 7 retypes it. For those tasks the gate is `nix develop -c cargo test --lib <module>::` for the modules the task touches — a failing `http::` compile is the expected state, not a regression, and a task reviewer must not treat it as one. From Task 7 onward the full suite, clippy and the zero-warning check are binding again. Six intermediate commits are therefore not independently green: `git bisect` across this range does not work, and that was accepted when the trade was made.
 - **NO `#[allow(...)]`.** No deprecated APIs. Clippy clean, zero build warnings.
 - **This is the authorization boundary.** Fail closed everywhere. A missing ACL, a store error, an unroutable path all deny.
 - **Do not weaken Plans 4/5.** `src/auth/**` is out of scope for behaviour changes; the identity boundary (ES256 pin, `cnf.jkt`, SSRF block, WebID-issuer binding, replay rejection) stays byte-equivalent except where a call site's types change.
