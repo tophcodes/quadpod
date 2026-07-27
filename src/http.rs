@@ -91,14 +91,24 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
 /// same string on the response, so the two can never drift.
 ///
 /// `acl_iri` is where the document now lives, `subject_iri` the resource it
-/// governs. `is_root` adds the recovery instruction, which only applies to the
-/// root: for any other subtree there is genuinely no way back, since removing
-/// the ACL needs the `Control` it just revoked from everyone.
-fn acl_grants_nothing_message(acl_iri: &str, subject_iri: &str, is_root: bool) -> String {
+/// governs. `is_container` decides whether the message claims a subtree: a
+/// container's ACL is inherited by everything under it, but a plain
+/// resource's ancestor chain never contains the resource itself, so its ACL
+/// governs exactly that one resource and nothing "below" it. `is_root` adds
+/// the recovery instruction, which only applies to the root: for any other
+/// subtree there is genuinely no way back, since removing the ACL needs the
+/// `Control` it just revoked from everyone.
+fn acl_grants_nothing_message(
+    acl_iri: &str,
+    subject_iri: &str,
+    is_container: bool,
+    is_root: bool,
+) -> String {
+    let scope = if is_container { " and everything below it" } else { "" };
     let mut m = format!(
         "The ACL at {acl_iri} grants no access to anyone, so every request for \
-         {subject_iri} and everything below it is now denied, including the Control \
-         needed to remove this ACL."
+         {subject_iri}{scope} is now denied, including the Control needed to \
+         remove this ACL."
     );
     if is_root {
         m.push_str(" Recovery requires restarting the server with --reset-root-acl.");
@@ -118,10 +128,17 @@ fn acl_grants_nothing_message(acl_iri: &str, subject_iri: &str, is_root: bool) -
 /// The authoritative channel is the log; this is the convenience copy, so an
 /// intermediary that strips it costs nothing.
 ///
-/// [`acl_grants_nothing_message`] is deliberately pure ASCII with no `"` in
-/// it, so the `quoted-string` this builds is always well-formed. Should that
-/// ever stop being true, the header is dropped rather than a malformed one
-/// sent — the log still carries the whole story.
+/// [`acl_grants_nothing_message`] interpolates IRIs, and RFC 3987 permits
+/// non-ASCII IRI characters, so the message is not guaranteed to be pure
+/// ASCII — only guaranteed to contain no `"` or `\`, which is what actually
+/// keeps the `quoted-string` this builds well-formed. `HeaderValue::from_str`
+/// accepts any byte `>= 32` except `127`, so a non-ASCII subject IRI becomes
+/// obs-text in the header value rather than being rejected: legal, if not
+/// always readable by a client that assumes ASCII. The `Option` return is for
+/// what actually can make `from_str` fail — a `"` or `\` that somehow reached
+/// this point despite the guard below, or a control byte below `32`. Should
+/// that ever happen, the header is dropped rather than a malformed one sent —
+/// the log still carries the whole story.
 fn warning_header(message: &str) -> Option<header::HeaderValue> {
     if message.contains(['"', '\\']) {
         return None;
@@ -137,8 +154,10 @@ fn warning_header(message: &str) -> Option<header::HeaderValue> {
 /// the `Control` that removing it would need. At the root that means the pod
 /// is locked out of itself and only `--reset-root-acl` gets back in; anywhere
 /// else there is no route back at all. Neither the empty body nor the far more
-/// likely near-miss (a typo in a WebID, the wrong predicate, an `acl:accessTo`
-/// naming something else) was signalled before this.
+/// likely near-miss (the wrong predicate, an `acl:accessTo` naming something
+/// else) was signalled before this — a typo in a WebID is not among the
+/// near-misses this catches: see [`pdp::grants_anything`]'s doc comment for
+/// why.
 ///
 /// The write is not refused. An ACL that locks its own subtree is a legitimate
 /// thing to want, and second-guessing a `PUT` that `aux::put` already accepted
@@ -166,7 +185,8 @@ fn warn_if_acl_grants_nothing(
         return res;
     }
     let is_root = subject_iri == space.root().graph_iri();
-    let message = acl_grants_nothing_message(aux.graph_iri(), subject_iri, is_root);
+    let is_container = aux.subject().as_container().is_some();
+    let message = acl_grants_nothing_message(aux.graph_iri(), subject_iri, is_container, is_root);
     tracing::warn!("{message}");
     if let Some(value) = warning_header(&message) {
         res.headers_mut().insert(header::WARNING, value);
@@ -1343,6 +1363,7 @@ mod tests {
         let expected = acl_grants_nothing_message(
             "https://pod.toph.so/.aux/acl/locked",
             "https://pod.toph.so/locked",
+            false, // "/locked" is a resource, not a container: no subtree to mention
             false,
         );
         assert_eq!(warning_of(&res), Some(format!("199 - \"{expected}\"")));
@@ -1407,7 +1428,6 @@ mod tests {
         let warning = warning_of(&res).expect("the root lockout must be warned about");
         assert!(warning.contains("--reset-root-acl"), "{warning}");
         assert!(warning.contains("https://pod.toph.so/.aux/acl/"), "{warning}");
-        assert!(warning.contains("https://pod.toph.so/"), "{warning}");
 
         // And it is really locked: the owner can no longer read their own pod.
         let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();

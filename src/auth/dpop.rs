@@ -202,24 +202,52 @@ fn verified_htu_claim(proof: &str) -> Result<String, AuthError> {
 /// from `path_segments()`, which yields no empty final segment) without
 /// discarding any of `dpop-verifier`'s own RFC-conformant tolerance.
 ///
-/// Within the path, the comparison is byte equality and nothing else — no
-/// dot-segment resolution, no empty-segment collapsing, no case folding, and
-/// **no percent-decoding**. Both sides are already the wire form: `expected`
-/// comes from `auth::middleware::derive_htu`, which is the configured base
-/// plus the raw request path, and a client signs the URL as it puts it on the
-/// wire (`/caf%C3%A9`, not `/café`). `Url::path` returns that wire form
-/// verbatim, so the two line up with no widening step at all.
+/// Within the path, the comparison is **not** raw byte equality: `Url::path`
+/// is the WHATWG-URL-Standard-normalized wire path, not the literal wire
+/// bytes. `Url::parse` runs that parsing to get there, and it resolves
+/// `.`/`..` segments (`/a/../b` → `/b`), maps a lone `\` to `/`, and — for a
+/// few bytes that are not valid unescaped IRI characters anyway (space, `<`,
+/// `>`, `"`, `{`, `}`, a backtick) — percent-encodes them if they appear raw.
+/// It still does no empty-segment collapsing and no case folding, and no
+/// *further* percent-decoding is layered on top of any of that: an escape
+/// neither side introduced is still compared verbatim, so `/a%41` and
+/// `/a%2541` remain different strings below (see the tests). Both sides are
+/// this normalized form: `expected` comes from `auth::middleware::derive_htu`,
+/// which is the configured base plus the raw request path, and a client signs
+/// the URL as it puts it on the wire (`/caf%C3%A9`, not `/café`); `Url::path`
+/// turns each side into its WHATWG form the same way, so the two still line up.
 ///
-/// Percent-decoding here used to be that widening step, and it was the whole
-/// defect. `derive_htu` returned the DECODED graph IRI, so this comparison had
-/// to decode to compensate — and decoding makes two distinct wire URLs
-/// interchangeable. A proof minted for `/a%41` (handlers: `/aA`) also verified
-/// against a request to `/a%2541` (handlers: `/a%41`), a *different* resource:
-/// both sides decoded to `/aA` and matched. An on-path adversary could
-/// therefore land a signed body — an ACL write, say — on a resource its client
-/// never addressed. Comparing the wire form closes that: `/a%41` and `/a%2541`
-/// are simply different strings. It costs nothing legitimate, because a client
-/// signing `/a%2541` for a request to `/a%2541` still matches exactly.
+/// Dot-segment resolution and the backslash mapping are the two ways this
+/// normalization could, in principle, make two distinct wire paths compare
+/// equal — and closing that off is not this function's job. It is closed one
+/// layer up, and the closure argument belongs here:
+///
+/// - A wire path containing a raw `.`/`..` segment, or an internal empty
+///   segment, is refused by
+///   [`crate::space::StorageSpace::is_normalization_stable`] at `resolve`
+///   time, before the store is ever touched.
+/// - A wire path containing a raw `\` — or any of the other bytes named
+///   above, or `^`, `|`, a lone backtick — is refused by `NamedNode::new`'s
+///   IRI validation, also invoked from `resolve`, with "Invalid IRI code
+///   point" (the same rejection `http::tests::iri_breaking_path_is_400`
+///   exercises for a raw `<` and space). This holds regardless of whether
+///   `Url::path` happens to percent-encode that particular byte or leaves it
+///   untouched — either way it never becomes part of a stored graph IRI.
+///
+/// So no request carrying one of these raw shapes ever names a stored
+/// resource, and there is no real graph IRI for the WHATWG-normalized form to
+/// be mistaken for a different one. This function's safety rests on both
+/// checks staying exactly as strict as they are: loosening
+/// `is_normalization_stable` or the IRI validation to accept any of these
+/// shapes as ordinary path content would reopen the re-targeting this
+/// comparison exists to close, even though nothing in this function would
+/// have changed.
+///
+/// None of this touches percent-escapes the client itself chose to send:
+/// those pass through `Url::path` unchanged, so a proof minted for `/a%41`
+/// still does not verify against a request to `/a%2541` — a *different*
+/// resource, per `derive_htu`'s doc comment — and a client signing `/a%2541`
+/// for a request to `/a%2541` still matches exactly.
 ///
 /// Either side failing to parse as a URL (the proof's claimed `htu` is
 /// attacker-controlled and need not be one) is treated as a mismatch, not a
