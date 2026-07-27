@@ -9,18 +9,12 @@ One command runs the official Solid conformance suite against this pod:
 No arguments, no manual steps, no state carried between runs. Everything it
 starts, it stops.
 
-## Current status: the run stops before any test executes
+## Current status
 
-The harness signs its DPoP proofs with **RS256** and this pod accepts only
-**ES256**, so the very first authenticated request — the `HEAD` the harness
-sends to discover the root container's ACL — is answered `401` and the harness
-gives up in `PREPARE SERVER`. **No report is produced yet.** The runner itself
-is complete and correct; see [the report](../.superpowers/sdd/task-2-report.md)
-for the evidence, including a replay of the harness's whole setup sequence with
-an ES256 proof, which the pod handles correctly at every step.
-
-Everything below describes what the runner does, which is what it will keep
-doing once the pod accepts the harness's proofs.
+The full suite runs and a report lands on disk. As of `ef49c5d`: **41 features,
+652 scenarios, 37 passed, 615 failed**. One gap — no non-RDF resources —
+accounts for 540 of those 615. The triage lives in
+[`docs/conformance-findings.md`](../docs/conformance-findings.md).
 
 ## What it starts
 
@@ -96,9 +90,24 @@ logic on the pod side at all.
 conformance/reports/report.html    the human-readable report
 conformance/reports/report.ttl     the same results as EARL, for diffing
 conformance/.run/harness.log       everything the harness printed
+conformance/.run/karate/           karate's own summary, incl. karate-summary-json.txt
 conformance/.run/pod.log           the pod's own log for the run
 conformance/.run/css.log           the IdP's log
 ```
+
+`karate-summary-json.txt` carries the per-feature pass/fail counts as JSON,
+which is a far quicker way to diff two runs than the 10 MB HTML.
+
+`/app/target` inside the harness container is bind-mounted to
+`conformance/.run/karate` for a reason worth knowing before you touch the
+docker invocation: karate writes its intermediate JSON to a **relative**
+`target/karate-reports/`, resolved against the container's working directory.
+That directory is `/app`, owned by uid 185, so under `--user $(id -u)` the
+write fails and the harness dies in `Results.of()` *before rendering the
+report* — the symptom is a stack trace and an empty `reports/`. The working
+directory cannot simply be moved either: the harness reads
+`config/application.yaml` relative to it too, and a `-w` elsewhere trades this
+failure for `Missing mandatory option: 'subjects'`.
 
 `reports/` and `.run/` are both wiped at the start of every run and both are
 git-ignored. `.run/harness.env` holds live client credentials for the run's

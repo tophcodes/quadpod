@@ -254,9 +254,19 @@ start_pod() {
 
 run_harness() {
     log "Running the conformance harness (protocol + web-access-control)"
-    mkdir -p "$REPORT_DIR"
+    mkdir -p "$REPORT_DIR" "$RUN_DIR/karate"
     # --user: the image runs as uid 185; without this the report lands
     # root-owned or not at all.
+    # -v .../karate:/app/target: karate writes its per-feature JSON and its
+    # run summary to a *relative* `target/karate-reports/`, resolved against
+    # the working directory. That directory is /app, owned by uid 185, so
+    # under --user the writes fail and the harness dies in Results.of()
+    # before it ever renders report.html. Giving it a writable /app/target is
+    # the whole fix. The cwd itself cannot move: the harness reads
+    # `config/application.yaml` — which names the subjects file, the
+    # manifests and the /data mapping — relative to the cwd too, so a `-w`
+    # elsewhere trades this failure for "Missing mandatory option: subjects".
+    # The intermediates are scratch, so they go to .run/, not to reports/.
     # --network=host: the harness must reach both localhost:3000 (pod) and
     # localhost:3001 (token endpoint, JWKS, WebID documents).
     # The bundled /data/test-subjects.ttl is replaced with ours; everything
@@ -267,6 +277,7 @@ run_harness() {
         --user "$(id -u):$(id -g)" \
         --env-file "$RUN_DIR/harness.env" \
         -v "$REPORT_DIR:/reports" \
+        -v "$RUN_DIR/karate:/app/target" \
         -v "$RUN_DIR/test-subjects.ttl:/data/test-subjects.ttl:ro" \
         "$HARNESS_IMAGE" \
         --output=/reports \
@@ -293,7 +304,7 @@ chmod 700 "$RUN_DIR"
 log "Cleaning up after any previous run"
 stop_pod
 stop_containers
-rm -rf "$REPORT_DIR"
+rm -rf "$REPORT_DIR" "$RUN_DIR/karate"
 rm -f "$RUN_DIR"/*.log "$RUN_DIR"/*.env "$RUN_DIR"/test-subjects.ttl \
     "$RUN_DIR"/createCredentials.js
 require_port "$CSS_PORT" "identity provider" CSS_PORT
