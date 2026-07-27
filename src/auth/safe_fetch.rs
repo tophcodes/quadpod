@@ -863,17 +863,22 @@ mod tests {
     // guessed at, so it must not permit `fd00::1:80` on any port.
     #[tokio::test]
     async fn an_ambiguous_ipv6_host_port_entry_does_not_alias_a_different_address() {
+        // The host form here must be the BRACKETED one, because that is what
+        // `guarded_get` passes: it forwards `Url::host_str()`, which brackets
+        // IPv6. Asking with the bare form would make this test pass on a
+        // build with the ambiguity check removed — the stored key would be
+        // `[fd00::1:80]` and a bare lookup would miss it for the wrong reason.
         let policy = named(&["fd00::1:80"]);
         assert!(
-            resolve_allowed("fd00::1:80", 22, &policy).await.is_err(),
+            resolve_allowed("[fd00::1:80]", 22, &policy).await.is_err(),
             "an ambiguous entry must not alias a different address"
         );
         assert!(
-            resolve_allowed("fd00::1:80", 6379, &policy).await.is_err(),
+            resolve_allowed("[fd00::1:80]", 6379, &policy).await.is_err(),
             "an ambiguous entry must not alias a different address on any port"
         );
         assert!(
-            resolve_allowed("fd00::1:80", 80, &policy).await.is_err(),
+            resolve_allowed("[fd00::1:80]", 80, &policy).await.is_err(),
             "an ambiguous entry must not alias a different address even on the port it names"
         );
     }
