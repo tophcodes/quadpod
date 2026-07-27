@@ -19,6 +19,20 @@ you the single name `.aux` at the root, and nothing else, ever.
 **One segment, not one per feature.** Every auxiliary kind lives inside `/.aux/`, so
 adding a kind later takes nothing away from you at that point.
 
+## `/box` and `/box/` are two names, and only one of them may exist
+
+Solid Protocol §3.1: *"If two URIs differ only in the trailing slash, and the server has
+associated a resource with one of them, then the other URI MUST NOT correspond to another
+resource."* This pod enforces it on every create: while `/box/` exists, `PUT /box` answers
+`409`, and while `/box` exists, `PUT /box/` answers `409`. The same applies to a container a
+deep write would materialize — `PUT /a/b` is refused while a resource `/a` exists, because
+serving it would create `/a/` beside it.
+
+Nothing is merged: the two URIs still name different things, and requesting the one that does
+not exist gives `404`, not a redirect. Delete the one that exists and the other name is free.
+A `POST` is unaffected — the server allocates the name there, so it simply picks another, as
+it does for any taken name.
+
 ## Auxiliary resources
 
 An auxiliary resource holds information *about* another resource — its subject. The content
@@ -34,16 +48,26 @@ part a client cannot enforce alone:
 
 | Kind | Path | Status | You may write it | Authorized by |
 |---|---|---|---|---|
-| access control (WAC) | `/.aux/acl/{subject}` | live | yes | `acl:Control` on the subject |
-| description / metadata | `/.aux/meta/{subject}` | reserved, candidate — not promised | yes, if implemented | `acl:Write` on the subject |
+| access control (WAC) | `/.aux/{subject}.acl` | live | yes | `acl:Control` on the subject |
+| description / metadata | `/.aux/{subject}.meta` | reserved, candidate — not promised | yes, if implemented | `acl:Write` on the subject |
 | anything else under `/.aux/` | — | reserved | no | — |
+
+An auxiliary URL is `/.aux`, then the subject's own path, then `.` and the kind's
+name. The kind is a **suffix**, so an auxiliary URL never ends in a slash — which is what
+every other Solid server produces (`.acl`, `.acr`, `.meta`) and the shape clients handle
+without damage:
 
 | Subject | Its ACL |
 |---|---|
-| `/` | `/.aux/acl/` |
-| `/foo` | `/.aux/acl/foo` |
-| `/box/` | `/.aux/acl/box/` |
-| `/a/b/c` | `/.aux/acl/a/b/c` |
+| `/` | `/.aux/.acl` |
+| `/foo` | `/.aux/foo.acl` |
+| `/box/` | `/.aux/box/.acl` |
+| `/a/b/c` | `/.aux/a/b/c.acl` |
+
+The reservation is still the leading segment and nothing else: `/foo.acl` and `/notes/x.meta`
+are ordinary resources of yours, because they do not begin with `/.aux`. A path under `/.aux/`
+that ends in no kind's name — `/.aux/foo`, `/.aux/bogus/x`, `/.aux/` itself — names nothing
+and answers `404`.
 
 The set of kinds is **closed and defined by the server**. You cannot introduce your own: what
 makes a resource auxiliary is behaviour the server enforces for you — the lifecycle binding,
@@ -65,7 +89,7 @@ receiving `404` is the normal answer for "no own policy here — you inherit, an
 to change that". The header has to be there before the resource is, or you could never create
 the first one.
 
-**An auxiliary is parsed with its own URL as base.** Inside `/.aux/acl/foo`, `<>` denotes the
+**An auxiliary is parsed with its own URL as base.** Inside `/.aux/foo.acl`, `<>` denotes the
 ACL document itself, *not* `/foo`. Name the subject explicitly — `</foo>` or its absolute
 IRI. This trips people up; it is the same rule other Solid servers use.
 

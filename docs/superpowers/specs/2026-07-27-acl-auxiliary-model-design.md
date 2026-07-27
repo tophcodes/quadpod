@@ -47,8 +47,8 @@ rules that already existed.
 
 | Kind | Path | Written by | Authorized by |
 |---|---|---|---|
-| `Acl` | `/.aux/acl/{subject}` | client | `Control` on the subject |
-| `Description` (candidate) | `/.aux/meta/{subject}` | client | `Write` on the subject |
+| `Acl` | `/.aux/{subject}.acl` | client | `Control` on the subject |
+| `Description` (candidate) | `/.aux/{subject}.meta` | client | `Write` on the subject |
 | system projection (later) | — | server only | read-only, see §12.4 |
 
 The auxiliary's **content is the user's data**; what the server contributes is the
@@ -74,7 +74,7 @@ Its real justification arrives with **blobs**: a PNG cannot carry triples, so us
 metadata (licence, caption, creator) needs a sidecar, while server-asserted facts (size,
 hash, content-type) go to the system graph. Both halves appear for the first time together
 there, split by authority. The blob plan decides whether that sidecar is a description
-resource; until then `/.aux/meta/` is reserved space, not a commitment.
+resource; until then the `.meta` name is reserved space, not a commitment.
 
 What is built now is the *shape*: `AuxKind`, one path table, one lifecycle. A second kind is
 then a variant plus one row in the authorization table, not a parallel subsystem — it
@@ -146,7 +146,7 @@ answers `409`, per Protocol §3.1 and matching CSS. This is a rule about the res
 the auxiliary space inherits it for free, because an auxiliary's identity now follows from
 its subject's.
 
-**Why a prefix rather than a suffix.** A reserved prefix is a total function over the path space, evaluated once by the router. A reserved suffix is a partial predicate that must be re-evaluated wherever a path is constructed — which is precisely how defects 1, 5, 6 and 7 arose. `/.aux` and `/.aux/acl` without a trailing slash are reserved as well (404), so the space is unambiguous.
+**Why a prefix rather than a suffix.** A reserved prefix is a total function over the path space, evaluated once by the router. A reserved suffix is a partial predicate that must be re-evaluated wherever a path is constructed — which is precisely how defects 1, 5, 6 and 7 arose. `/.aux`, `/.aux/` and any path under it ending in no kind's name are reserved as well (404), so the space is unambiguous. The kind's name is a suffix *inside* that prefix (see "The ACL namespace"), which changes nothing about the classification: it is read once, by the router, from the leading segment.
 
 **Conformance.** WAC constrains discovery, not URL shape: servers MUST advertise the ACL via `Link: rel="acl"`, clients MUST discover it that way, and clients **MUST NOT** derive it by string operations — WAC even permits the ACL to live on a different origin. The official conformance harness contains no `.acl` string in its sources; it reads the `Link` header and fails loudly when absent. CSS treats its `.acl` suffix as a swappable config value behind a pluggable strategy and ships `.acr` and `.meta` alongside; Trellis uses `?ext=acl`; Manas uses `<res>._aux/acl`; ESS hosts ACRs on a different service entirely. Four implementations, four shapes.
 
@@ -220,7 +220,7 @@ path carries a `Link` header for every implemented auxiliary kind, whether or no
 auxiliary has a representation — one header field, comma-separated:
 
 ```
-Link: <https://pod.toph.so/.aux/acl/foo>; rel="acl"
+Link: <https://pod.toph.so/.aux/foo.acl>; rel="acl"
 ```
 
 Emitting it only when the auxiliary exists would be a chicken-and-egg trap: a client must
@@ -260,7 +260,7 @@ own issue #90 leaves four cross-origin security questions unresolved. Not a trad
 making for an authorization decision.
 
 **Base IRI when parsing an auxiliary document.** An auxiliary is parsed with *its own* URL as
-base, like any other resource — so `<>` inside `/.aux/acl/foo` denotes the ACL document, not
+base, like any other resource — so `<>` inside `/.aux/foo.acl` denotes the ACL document, not
 `/foo`. Statements about the subject name it explicitly (`</foo>` or the absolute IRI). This
 matches CSS and is the least surprising rule, but it is a genuine trip hazard and belongs in
 the client-facing documentation.
@@ -290,7 +290,7 @@ Touches: `resource::{put_rdf, get_rdf, delete_rdf}`, `container::container_is_em
 
 **Materialization and authorization share a traversal.** A single function walks `ancestors()`, authorizing `Append` and creating containers as it goes, stopping at the first ancestor that already exists — because above that level nothing observable changes. The mirror pair `authorize_ancestors` / `ensure_ancestors` collapses into it. This is the post-mortem's B-lite, and it is mostly deletion.
 
-**The ACL walk is one query.** The candidate ACL graphs for `/a/b/c` are derivable from the path — `/.aux/acl/a/b/c`, `/.aux/acl/a/b/`, `/.aux/acl/a/`, `/.aux/acl/` — so the PRP asks for all of them in a single SPARQL query (`VALUES ?g { … } GRAPH ?g { … }`), ordered by depth, and takes the nearest non-empty one. One round trip instead of depth+1.
+**The ACL walk is one query.** The candidate ACL graphs for `/a/b/c` are derivable from the path — `/.aux/a/b/c.acl`, `/.aux/a/b/.acl`, `/.aux/a/.acl`, `/.aux/.acl` — so the PRP asks for all of them in a single SPARQL query (`VALUES ?g { … } GRAPH ?g { … }`), ordered by depth, and takes the nearest non-empty one. One round trip instead of depth+1.
 
 One ACL is one named graph, as today. A single shared ACL graph was considered and rejected: it turns `DROP GRAPH` into a subject-scoped `DELETE WHERE` (unsound for blank-node authorizations, and a bug there deletes other people's policy), turns `PUT` into a non-atomic diff on shared structure, and removes the isolation that makes the lifecycle binding in §6 a one-liner. Graph count is not a concern: only resources with an *own* policy have an ACL graph at all, and in a quad store a graph name is just the fourth term.
 
