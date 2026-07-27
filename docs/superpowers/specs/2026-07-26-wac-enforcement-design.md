@@ -1,9 +1,18 @@
 # WAC Enforcement (Plan 6) — Design
 
 **Date:** 2026-07-26
-**Status:** Approved design (pre-implementation)
+**Status:** Approved design (pre-implementation) — **partially superseded, see below**
 **Author:** Christopher Mühl (with Claude)
 **Parent spec:** [2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md) §8 (Access Control)
+
+> **Superseded by [2026-07-27-acl-auxiliary-model-design.md](2026-07-27-acl-auxiliary-model-design.md).**
+> This plan's `.acl` sibling layout and empty-body rules were replaced after seven
+> authorization defects, each found inside the fix for the previous one, traced to
+> one cause: the ACL was an ordinary resource distinguished by an `ends_with(".acl")`
+> predicate, so every call site had to re-derive the rules that made it special. The
+> auxiliary-model spec replaces that with a typed auxiliary URL (`AuxUrl`) under a
+> reserved `/.aux/` prefix. The specific passages this made stale are marked in place
+> below rather than deleted, so the reasoning that led here stays readable as history.
 
 ## 1. Context
 
@@ -57,10 +66,18 @@ The PDP is a pure function with no store access. That makes it exhaustively
 table-testable, and it hides the spike outcome (rented `manas_access_control` vs. our
 own implementation) behind a single signature — see §7.
 
-**ACL location** (parent spec §5): the ACL for `<res>` lives in graph `<res>.acl`.
-So `/foo` → `/foo.acl`, container `/box/` → `/box/.acl`, root `/` → `/.acl`. It is a
-real Solid resource: addressable via GET/PUT, but access to it is decided by
-`acl:Control` on `<res>`, not by Read/Write on the ACL itself.
+> **Superseded.** The paragraph below describes the `<res>.acl` sibling layout,
+> distinguished by an `ends_with(".acl")` check at every call site. That is not how
+> the system works now: the ACL is `<res>`'s auxiliary of kind `AuxKind::Acl`, a
+> distinct typed URL under the reserved `/.aux/` prefix, produced only by
+> `ResourceUrl::aux`/`StorageSpace::resolve` — see
+> [2026-07-27-acl-auxiliary-model-design.md](2026-07-27-acl-auxiliary-model-design.md).
+> Left in place as the record of what was tried first and why it didn't hold up.
+>
+> **ACL location** (parent spec §5): the ACL for `<res>` lives in graph `<res>.acl`.
+> So `/foo` → `/foo.acl`, container `/box/` → `/box/.acl`, root `/` → `/.acl`. It is a
+> real Solid resource: addressable via GET/PUT, but access to it is decided by
+> `acl:Control` on `<res>`, not by Read/Write on the ACL itself.
 
 **`.acl` is a reserved suffix, pod-wide.** Any request path ending in `.acl` is an
 access-control document, decided by `Control` on the path with the suffix stripped. Three
@@ -127,7 +144,14 @@ convey:
   because the delete cascades to that ACL. Consequence, deliberate: an agent holding
   `Write` but not `Control` cannot delete such a resource at all. Without the check, a
   narrowing ACL would be removable by exactly the agent it was written to constrain.
-- **An empty RDF body is rejected with 400 on non-container paths.** Storing zero triples
+- **Superseded.** The rule below predates the presence marker (`urn:pod:sys:<iri>`,
+  see [2026-07-27-acl-auxiliary-model-design.md](2026-07-27-acl-auxiliary-model-design.md)
+  §7 "Existence as a stored fact"): existence is no longer inferred from triple count,
+  so an empty body creates a real, empty, present resource — including an empty ACL,
+  which now correctly means "grant nothing" rather than "absent, fall back to the
+  ancestor" — instead of being refused with 400. Left in place as the record of the
+  problem the presence marker was built to solve.
+  **An empty RDF body is rejected with 400 on non-container paths.** Storing zero triples
   would drop the graph while answering `201 Created` — for an ACL that reads as "lock this
   subtree down" but in fact restores the ancestor's wider `acl:default` rules. Container
   paths keep the empty-body create, where the server supplies the type triples itself.
