@@ -42,6 +42,15 @@ pub struct Config {
     /// Address to bind. Plain HTTP — keep it behind the reverse proxy.
     #[arg(long, env = "POD_LISTEN", default_value = "127.0.0.1:3000")]
     pub listen: SocketAddr,
+
+    /// Overwrite the root ACL with the owner's default grant on startup,
+    /// even if one already exists. The only way back from a root ACL that
+    /// grants nobody (not even the owner) Control — see
+    /// `wac::provision::provision_root_acl`. Off by default: every other
+    /// start must leave an operator's or owner's own root ACL exactly as
+    /// they left it.
+    #[arg(long, env = "POD_RESET_ROOT_ACL")]
+    pub reset_root_acl: bool,
 }
 
 impl Config {

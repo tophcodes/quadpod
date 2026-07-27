@@ -28,8 +28,9 @@ async fn main() {
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
         .await.expect("provision root container");
     let owner = cfg.validated_owner_webid().expect("owner WebID validated above");
-    sparql_pod::wac::provision::provision_root_acl(state.store.as_ref(), &state.space, &owner)
-        .await.expect("provision root ACL");
+    sparql_pod::wac::provision::provision_root_acl(
+        state.store.as_ref(), &state.space, &owner, cfg.reset_root_acl,
+    ).await.expect("provision root ACL");
     let listener = tokio::net::TcpListener::bind(cfg.listen).await.unwrap();
     tracing::info!("sparql-pod listening on {}", cfg.listen);
     axum::serve(listener, router(state)).await.unwrap();

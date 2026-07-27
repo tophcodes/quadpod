@@ -518,7 +518,7 @@ mod tests {
             Arc::new(OxigraphStore::in_memory().unwrap());
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space.root()).await.unwrap();
-        crate::wac::provision::provision_root_acl(store.as_ref(), &space, OWNER).await.unwrap();
+        crate::wac::provision::provision_root_acl(store.as_ref(), &space, OWNER, false).await.unwrap();
 
         let idp = TestIdp::new();
         let client = TestClient::new();

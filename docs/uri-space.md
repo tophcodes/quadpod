@@ -75,6 +75,16 @@ public container is briefly public. There is no atomic "create with policy" oper
 Solid. Keep the window empty instead of trying to close it: create the container, set its
 ACL, then write into it. An empty container discloses nothing.
 
+**An empty ACL denies everything below it — deliberately, and there is no HTTP way back.**
+Existence is a stored fact independent of content: an ACL with zero triples still exists, still
+wins over whatever an ancestor would otherwise hand down, and grants nothing to anyone,
+including its own owner. `DELETE` on it needs `acl:Control`, which that same empty ACL just
+revoked from everyone — so at the root, an empty root ACL is terminal over HTTP: no request can
+remove it, and no request can replace it. The way out is the operator, not the API: restart the
+server with `--reset-root-acl` (or `POD_RESET_ROOT_ACL=1`), which overwrites the root ACL with
+the owner's default grant regardless of what is there. This only exists for the root; an emptied
+ACL anywhere else has no equivalent flag and is a real dead end for that subtree.
+
 ## `/.well-known/` belongs to the origin, not to the pod
 
 `/.well-known/` is defined by RFC 8615 as a place the *host* provides. The pod stores
