@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn derive_htu_agrees_with_the_graph_iri_for_unescaped_paths() {
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
-        for path in ["/", "/foo", "/box/", "/a/b/c", "/.aux/acl/", "/.aux/acl/foo",
-                     "/.aux/acl/box/", "/.auxiliary"] {
+        for path in ["/", "/foo", "/box/", "/a/b/c", "/.aux/.acl", "/.aux/foo.acl",
+                     "/.aux/box/.acl", "/.auxiliary"] {
             let target = space.resolve(path).expect("resolvable");
             assert_eq!(derive_htu(&space, path), target.graph_iri(), "htu for {path}");
             assert_eq!(derive_htu(&space, path), format!("https://pod.toph.so{path}"));

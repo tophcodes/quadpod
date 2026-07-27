@@ -395,3 +395,207 @@ For Tasks 2 and 3 the evidence is the harness report itself, and the runner must
 
 - It does not add non-RDF/blob support, which the research names as the single largest blocker to the WAC manifest. That is its own plan, and this one's findings document is what should justify its priority.
 - It does not put the harness in CI. Worth doing once the run is reproducible; the second run in Task 2 Step 2 is the evidence for that, not a substitute.
+
+---
+
+## Spike Results (2026-07-27)
+
+**Verdict: all four questions are YES. The plan is viable as written.** A CSS
+client-credentials token satisfies every check this pod performs. Proven not by
+inspection but by running a real token through the *production* code path:
+`auth::authenticate` with `HttpJwksResolver` + `HttpWebIdIssuers` (the only
+substitution being `FetchPolicy::permissive()` in place of the
+`--allow-insecure-host` policy Task 1 adds) returned
+`Agent::WebId("http://localhost:3001/alice/profile/card#me")` for a live CSS
+token, a live DPoP proof, and a live profile fetch. The probe was a temporary
+test, run and then reverted; the repository is unchanged by this task.
+
+### The recipe
+
+CSS version: **`@solid/community-server@7.2.0`** (npm `latest` on 2026-07-27;
+`next` is `8.0.0-alpha.3`, untested here). Node v22.22.3.
+
+```bash
+mkdir -p /tmp/conformance-spike && cd /tmp/conformance-spike
+npx --yes @solid/community-server@7.2.0 -p 3001 -c @css:config/default.json -f ./data &
+# ready when this returns 200:
+until curl -sf -o /dev/null http://localhost:3001/; do sleep 2; done
+```
+
+Credentials — the harness's own `createCredentials.js` works **unmodified**
+against CSS 7.2.0's account API (version `0.5`). It registers alice and bob,
+creates their pods, and prints exactly the four env lines the CTH wants:
+
+```bash
+# NOTE: the script lives in solid-contrib/specification-tests, NOT in
+# solid-contrib/conformance-test-harness (see "Research correction" below).
+curl -sS -o createCredentials.js \
+  https://raw.githubusercontent.com/solid-contrib/specification-tests/main/createCredentials.js
+node createCredentials.js http://localhost:3001/
+```
+
+Observed output (values change per run; the *order of the two users is not
+deterministic* — the script runs both `outputCredentials` calls concurrently, so
+Task 2 must parse by key, never by line number):
+
+```
+USERS_ALICE_CLIENTID=token_9a22fd71-29e0-49bc-a23c-3b46fb00a920
+USERS_ALICE_CLIENTSECRET=939ce2dd…35535913f
+USERS_BOB_CLIENTID=token_8826b9a1-8151-4355-bdd0-d5bdf035e38c
+USERS_BOB_CLIENTSECRET=e218c5f1…047d97d45
+```
+
+WebIDs issued: `http://localhost:3001/alice/profile/card#me` and
+`http://localhost:3001/bob/profile/card#me`.
+
+Token exchange (what `createCredentials.js` does *not* do — the harness does it
+internally; reproduced here to get a specimen). `POST` to the discovered
+`token_endpoint` `http://localhost:3001/.oidc/token` with
+`grant_type=client_credentials&scope=webid`, HTTP Basic auth over
+**URL-encoded** id and secret, and a `DPoP` proof whose `htu` is the token
+endpoint and `htm` is `POST`. Discovery (`/.well-known/openid-configuration`)
+advertises `client_credentials` in `grant_types_supported` and
+`client_secret_basic` in `token_endpoint_auth_methods_supported`. The response
+is `{"access_token": "…", "expires_in": 600, "token_type": "DPoP"}`.
+
+### Specimen access token
+
+Header (`cut -d. -f1 token | tr '_-' '/+' | base64 -d`):
+
+```json
+{"alg":"ES256","typ":"at+jwt","kid":"0Bgk2ZjgQJqUmIYOvqCr6LL5CkFHweTpT7YQyRAfy5M"}
+```
+
+Payload (`cut -d. -f2 token | tr '_-' '/+' | base64 -d`), verbatim:
+
+```json
+{"webid":"http://localhost:3001/alice/profile/card#me","jti":"_i6OMT8BWUPxGgAQa7qCd","sub":"token_9a22fd71-29e0-49bc-a23c-3b46fb00a920","iat":1785167501,"exp":1785168101,"client_id":"token_9a22fd71-29e0-49bc-a23c-3b46fb00a920","iss":"http://localhost:3001/","aud":"solid","cnf":{"jkt":"b1E83VAMsxCGg85mcY6CNg7gktdJ-ZeXxBztNIqxyFo"}}
+```
+
+### The four answers
+
+**1. `webid` claim — YES.**
+Observed: `"webid": "http://localhost:3001/alice/profile/card#me"`, exactly the
+WebID `createCredentials.js` reported for the pod it created.
+
+Correction to the question as written: `access_token.rs:77-81` reads `webid` and
+has **no `sub` fallback** — a missing `webid` is
+`AuthError::Malformed("missing webid claim")`. That is fine here: CSS sets
+`webid` on client-credentials tokens, and its `sub` is the *client id*
+(`token_9a22fd71-…`), not a WebID, so a `sub` fallback would have been actively
+wrong.
+
+**2. `iss` — YES.**
+Observed: `"iss": "http://localhost:3001/"` — with trailing slash, scheme `http`,
+host `localhost`, port `3001`.
+
+Correction to the question as written: the allowlist comparison
+(`authenticate.rs:76-81` → `webid_issuer.rs:154-156`,
+`a.trim_end_matches('/') == b.trim_end_matches('/')`) is trailing-slash
+insensitive but **case-SENSITIVE**. Verified both directions against the live
+token: `--trusted-issuer http://localhost:3001` (no slash) authenticates;
+`HTTP://LocalHost:3001/` is rejected with `AuthError::UntrustedIssuer`. So Task 2
+must pass the issuer in the same case CSS emits it. Either
+`--trusted-issuer http://localhost:3001/` or `…:3001` works.
+
+**3. The WebID document — YES.** This is the one that could have sunk the plan;
+it does not.
+
+`GET http://localhost:3001/alice/profile/card` (the fragment-stripped document,
+which is what `webid_issuer.rs:123` derives) answers **200** directly — no
+redirect, which matters because `guarded_get` refuses 3xx. With the pod's exact
+`Accept: text/turtle, application/ld+json;q=0.9` it returns `Content-Type:
+text/turtle`:
+
+```turtle
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+@prefix solid: <http://www.w3.org/ns/solid/terms#>.
+@prefix pim: <http://www.w3.org/ns/pim/space#>.
+
+<>
+    a foaf:PersonalProfileDocument;
+    foaf:maker <http://localhost:3001/alice/profile/card#me>;
+    foaf:primaryTopic <http://localhost:3001/alice/profile/card#me>.
+
+<http://localhost:3001/alice/profile/card#me>
+
+    solid:oidcIssuer <http://localhost:3001/>;
+
+    a foaf:Person.
+```
+
+With `Accept: application/ld+json` it returns `Content-Type: application/ld+json`
+and expanded JSON-LD carrying the same statement as a node reference (`@id`, not
+a string literal):
+
+```json
+{
+  "@id": "http://localhost:3001/alice/profile/card#me",
+  "http://www.w3.org/ns/solid/terms#oidcIssuer": [
+    { "@id": "http://localhost:3001/" }
+  ],
+  "@type": [ "http://xmlns.com/foaf/0.1/Person" ]
+}
+```
+
+Every requirement of `HttpWebIdIssuers::authorizes` holds:
+- subject is the **exact** WebID `http://localhost:3001/alice/profile/card#me`
+  (written absolute in the Turtle, so no base-resolution risk);
+- predicate is `http://www.w3.org/ns/solid/terms#oidcIssuer`;
+- object is an **IRI node** (`<…>` in Turtle, `{"@id": …}` in JSON-LD) — not a
+  literal, which is what the pod requires;
+- the object string is `http://localhost:3001/`, **byte-identical** to the
+  token's `iss`. No trailing-slash and no case difference to absorb — the
+  normalization is not even load-bearing here.
+
+Confirmed against the production verifier, not just by eye: `HttpWebIdIssuers`
+(fetch + content-type-negotiated parse + NamedNode match) returned `true` for
+(`…/card#me`, `http://localhost:3001/`) and `false` for a different issuer.
+
+**4. `cnf.jkt` — YES.**
+Observed: `"cnf": {"jkt": "b1E83VAMsxCGg85mcY6CNg7gktdJ-ZeXxBztNIqxyFo"}`, equal
+to the RFC 7638 SHA-256 thumbprint of the ES256 key that signed the DPoP proof
+sent to the token endpoint. `token_type` is `DPoP`, and CSS's
+`dpop_signing_alg_values_supported` includes `ES256`. `verify_dpop`'s
+`verified.jkt != expected_jkt` check passed against a proof minted for the pod's
+own `htu`.
+
+### Facts Tasks 1 and 2 need that fell out of this
+
+- **`aud` is the string `"solid"`**, not a pod URL. If Task 2 sets
+  `--expected-audience` at all it must be `solid`; setting it to the pod's base
+  URI would reject every request. Leaving it unset is also fine.
+- **CSS signs access tokens with ES256** (`/.oidc/jwks` publishes a single
+  `EC`/`P-256`/`alg: ES256` key with a `kid`, and the token header carries that
+  `kid`). This matters because `verify_access_token` pins ES256 regardless of the
+  header's `alg` — an RS256-signing IdP would have failed here. CSS does not.
+- **`--allow-insecure-host` must name `localhost:3001`**, not `127.0.0.1:3001`.
+  All three URLs the pod fetches use the literal host `localhost`:
+  `http://localhost:3001/.well-known/openid-configuration`,
+  `http://localhost:3001/.oidc/jwks`, and
+  `http://localhost:3001/alice/profile/card`. `permits_insecure` matches on the
+  host string as written in the URL, before resolution. One entry covers all
+  three.
+- **Access tokens live 600 s.** The harness re-mints from client credentials, so
+  this is not a constraint on run length — but a runner that mints one token up
+  front and reuses it would break on any run longer than ten minutes.
+- **The profile has no `pim:storage`.** CSS 7.2.0's pod template only emits it
+  when `linkStorage` is set, and the account-API pod creation used here does not
+  set it. This confirms rather than contradicts the plan's existing constraint:
+  `TEST_CONTAINER` must be an absolute pod URL so the harness never calls
+  `findStorage()`.
+- CSS's own root ACL grants public read (`WAC-Allow: user="read",public="read"`
+  on the profile), so the pod's unauthenticated profile fetch works without any
+  credential.
+
+### Research correction
+
+`.superpowers/sdd/conformance-suite-research.md` places `createCredentials.js` at
+`specification-tests/createCredentials.js` **inside**
+`solid-contrib/conformance-test-harness`. That path does not exist: the harness
+repo's root has no `specification-tests/` directory. The script is at the root of
+the *separate* repository `solid-contrib/specification-tests`
+(`https://raw.githubusercontent.com/solid-contrib/specification-tests/main/createCredentials.js`),
+which is also where `run.sh`, `application.yaml`, `test-subjects.ttl`,
+`protocol/` and `web-access-control/` live. Task 2 should fix that file when it
+reads it.

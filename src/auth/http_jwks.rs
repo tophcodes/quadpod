@@ -41,10 +41,11 @@ pub struct HttpJwksResolver {
 }
 
 impl HttpJwksResolver {
-    /// Production constructor: fetches are SSRF-guarded with
-    /// [`FetchPolicy::default`] (https-only, private IPs blocked).
-    pub fn new() -> Self {
-        Self::build(FetchPolicy::default())
+    /// Production constructor: fetches are SSRF-guarded with the policy the
+    /// operator configured — [`FetchPolicy::default`] (https-only, private
+    /// IPs blocked) unless they named hosts via `--allow-insecure-host`.
+    pub fn new(policy: FetchPolicy) -> Self {
+        Self::build(policy)
     }
 
     /// Construct with an explicit [`FetchPolicy`] — used by hermetic tests
@@ -105,12 +106,6 @@ impl HttpJwksResolver {
             serde_json::from_value(keys_value.clone()).map_err(|_| AuthError::UnknownIssuer)?;
 
         Ok(Jwks { keys })
-    }
-}
-
-impl Default for HttpJwksResolver {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

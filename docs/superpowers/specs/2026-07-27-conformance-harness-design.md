@@ -106,7 +106,7 @@ precisely the gap this plan exists to close.
 because two things the CSS script does are unnecessary here:
 
 - **No ACL bootstrap.** The CSS script does `curl -X PUT $SUT/.acl`. Here that would be an
-  ordinary resource write that silently achieves nothing — ACLs live at `/.aux/acl/{path}` and
+  ordinary resource write that silently achieves nothing — ACLs live at `/.aux/{path}.acl` and
   are discovered through the `Link` header. The pod provisions its root ACL for
   `--owner-webid` at boot with the identical grant, so there is nothing to bootstrap.
 - **No cookie harvesting or WebID seeding.** Client credentials replace both.

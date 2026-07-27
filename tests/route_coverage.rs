@@ -61,7 +61,7 @@ async fn app() -> axum::Router {
 #[tokio::test]
 async fn no_route_serves_an_unauthenticated_request() {
     let paths = [
-        "/", "/seeded", "/.aux/acl/seeded", "/.aux/acl/", "/box/", "/box/child",
+        "/", "/seeded", "/.aux/seeded.acl", "/.aux/.acl", "/box/", "/box/child",
         "/does-not-exist", "/a/b/c",
     ];
     // HEAD is served by the same handler axum's `get()` route installs, so it
@@ -95,7 +95,7 @@ async fn no_route_serves_an_unauthenticated_request() {
 /// does.
 #[tokio::test]
 async fn the_unallocated_reserved_namespace_serves_nothing_either() {
-    let paths = ["/.aux", "/.aux/", "/.aux/bogus/x", "/.aux/acl/.aux/acl/seeded"];
+    let paths = ["/.aux", "/.aux/", "/.aux/bogus/x", "/.aux/.aux/seeded.acl.acl"];
     let methods = ["GET", "HEAD", "PUT", "POST", "DELETE"];
 
     for path in paths {

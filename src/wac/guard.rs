@@ -21,7 +21,16 @@ use super::{pdp, prp, Mode};
 /// The challenge sent with a 401, telling a client which credential the pod
 /// accepts. `Bearer` is deliberately absent: Plan 4 verifies DPoP-bound
 /// tokens only.
-const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256\"";
+///
+/// `algs` is RFC 9449 §5.1's space-delimited list of the JWS algorithms the
+/// pod will verify a proof under, and it must stay an accurate description of
+/// [`crate::auth::dpop::verify_dpop`]: a client that reads this header picks
+/// its proof algorithm from it, so advertising one the pod rejects sends
+/// honest clients into a 401 loop, and omitting one it accepts turns away
+/// clients that could have authenticated. ES256 comes from `dpop-verifier`,
+/// RS256 from the pod's own path; EdDSA is absent because `dpop-verifier`'s
+/// `eddsa` feature is not enabled here.
+const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256 RS256\"";
 
 /// Deny in the way that tells the caller the truth without leaking anything:
 /// an anonymous caller learns that credentials would help (401), a verified
@@ -36,6 +45,53 @@ fn deny(agent: &Agent) -> Response {
             .into_response(),
         Agent::WebId(_) => StatusCode::FORBIDDEN.into_response(),
     }
+}
+
+/// The `409` body a create is refused with when it would produce the other
+/// half of a trailing-slash pair.
+const SLASH_PAIR_MESSAGE: &str =
+    "another resource already exists whose URI differs from this one only in the trailing slash";
+
+/// Solid Protocol §3.1: "If two URIs differ only in the trailing slash, and
+/// the server has associated a resource with one of them, then the other URI
+/// MUST NOT correspond to another resource."
+///
+/// So every create asks whether its counterpart is already taken and refuses
+/// rather than producing the pair. The pair stays *addressable* — `/box` and
+/// `/box/` remain two names this pod resolves and distinguishes — but only one
+/// of them may exist at a time. Nothing merges: the rule forbids the pair, it
+/// does not make one URI mean the other.
+///
+/// Callers run this only after authorizing every level of the write (see
+/// [`authorize_and_materialize`], its only caller): a caller denied on the
+/// target itself, or on any ancestor the write would touch, never reaches
+/// this check and so learns nothing about the counterpart from it — the
+/// mistake `put_impl`'s conditional-request branch already avoids by sitting
+/// after `authorize`.
+///
+/// That does not close the oracle for the counterpart's *own* ACL, which
+/// this check never consults: a caller authorized to write `/box` by some
+/// unrelated, inherited rule, but who holds no access at all under `/box/`'s
+/// own, narrower ACL, still learns from a `409` that `/box/` exists — where a
+/// direct request to `/box/` would have answered `403` without confirming
+/// anything. That residual is inherent to enforcing Protocol §3.1 at all:
+/// the rule turns on whether the *other* URI names a resource, so answering
+/// it has to consult that resource's existence, not its ACL. Community Solid
+/// Server discloses the same way, for the same reason.
+async fn refuse_slash_pair(
+    store: &dyn SparqlStore,
+    created: &ResourceUrl,
+) -> Result<(), Response> {
+    let Some(counterpart) = created.slash_counterpart() else {
+        return Ok(()); // the root: its counterpart is the empty path, no URL
+    };
+    let taken = resource::exists(store, &counterpart)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    if taken {
+        return Err((StatusCode::CONFLICT, SLASH_PAIR_MESSAGE).into_response());
+    }
+    Ok(())
 }
 
 /// The mode required to access an auxiliary of this kind, whatever `mode` the
@@ -111,6 +167,11 @@ pub async fn authorize(
 /// without ever revealing whether the subject exists, exactly as it does
 /// today — only a caller who clears every ancestor gets as far as learning
 /// that the subject itself does not.
+///
+/// This is also where Solid Protocol §3.1 is enforced ([`refuse_slash_pair`]):
+/// the set of URLs a write brings into existence is decided here and nowhere
+/// else, so this is the only place that can refuse to create either half of a
+/// trailing-slash pair without a second, driftable derivation of the same set.
 pub async fn authorize_and_materialize(
     store: &dyn SparqlStore,
     agent: &Agent,
@@ -139,6 +200,15 @@ pub async fn authorize_and_materialize(
         false
     };
 
+    // Every URL this write would bring into existence — the target, when it is
+    // not there yet, and each container the walk below would materialize. It
+    // is what Protocol §3.1 is checked against, once the whole chain has been
+    // authorized.
+    let mut creations: Vec<ResourceUrl> = Vec::new();
+    if is_member {
+        creations.push(subject.clone());
+    }
+
     // The IRI to record as a member at the next level up. It starts as the
     // target and becomes each container this walk creates.
     let mut child_iri = target.graph_iri().to_string();
@@ -156,6 +226,7 @@ pub async fn authorize_and_materialize(
         if existed {
             break;
         }
+        creations.push(ancestor.as_resource().clone());
         child_iri = ancestor.graph_iri().to_string();
         record_child = true;
     }
@@ -171,6 +242,17 @@ pub async fn authorize_and_materialize(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
     {
         return Err((StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response());
+    }
+
+    // Protocol §3.1, applied to everything this write would create — the
+    // target and the containers above it alike, since a deep create is the
+    // other way the forbidden pair could come into being (`PUT /a/b` beside an
+    // existing resource `/a` would otherwise materialize the container `/a/`
+    // next to it). Deliberately after the whole chain is authorized, for the
+    // same reason as the check above: a caller who is going to be refused for
+    // an ancestor must be refused without learning what else exists.
+    for created in &creations {
+        refuse_slash_pair(store, created).await?;
     }
 
     for (ancestor, child_iri) in plan {
@@ -316,7 +398,7 @@ mod tests {
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        let target = sp().resolve("/.aux/acl/foo").unwrap();
+        let target = sp().resolve("/.aux/foo.acl").unwrap();
         assert_eq!(
             status(authorize(&store, &alice(), &target, Mode::Read).await),
             Some(StatusCode::FORBIDDEN)
@@ -330,7 +412,7 @@ mod tests {
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
              <{ACL_MODE}> <{ACL_CONTROL}> ."
         )).await;
-        let target = sp().resolve("/.aux/acl/foo").unwrap();
+        let target = sp().resolve("/.aux/foo.acl").unwrap();
         assert!(authorize(&store, &alice(), &target, Mode::Read).await.is_ok());
         assert!(authorize(&store, &alice(), &target, Mode::Write).await.is_ok());
     }
@@ -419,7 +501,7 @@ mod tests {
             "<#bob> <{ACL_AGENT}> <{BOB}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
              <{ACL_MODE}> <{ACL_CONTROL}> ."
         )).await;
-        let target = sp().resolve("/.aux/acl/box/doc").unwrap();
+        let target = sp().resolve("/.aux/box/doc.acl").unwrap();
         assert!(authorize_and_materialize(&store, &bob(), &target).await.is_ok(),
             "Control alone must suffice when nothing is materialized");
     }

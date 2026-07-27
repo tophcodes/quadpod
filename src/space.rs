@@ -84,8 +84,8 @@ pub enum AuxKind {
 impl AuxKind {
     pub const ALL: &'static [AuxKind] = &[AuxKind::Acl];
 
-    /// The path segment under `/.aux/`.
-    pub fn segment(self) -> &'static str {
+    /// This kind's name, which an auxiliary URL carries as its suffix.
+    pub fn name(self) -> &'static str {
         match self {
             AuxKind::Acl => "acl",
         }
@@ -98,8 +98,23 @@ impl AuxKind {
         }
     }
 
-    fn from_segment(segment: &str) -> Option<Self> {
-        AuxKind::ALL.iter().copied().find(|k| k.segment() == segment)
+    /// What an auxiliary URL of this kind ends in: `.` plus the kind's name.
+    fn suffix(self) -> String {
+        format!(".{}", self.name())
+    }
+
+    /// Split a path inside the reserved namespace into the kind it names and
+    /// the subject path that remains. The inverse of appending [`suffix`].
+    ///
+    /// No two kinds' suffixes may be suffixes of one another, or this split
+    /// would be ambiguous. Guaranteed by `aux_kind_names_are_well_formed`'s
+    /// no-dot rule on every name — see its doc comment for why that alone
+    /// is enough.
+    fn split_suffix(rest: &str) -> Option<(Self, &str)> {
+        AuxKind::ALL
+            .iter()
+            .copied()
+            .find_map(|k| rest.strip_suffix(&k.suffix()).map(|subject| (k, subject)))
     }
 }
 
@@ -172,12 +187,56 @@ impl ResourceUrl {
         &self.path
     }
 
-    /// This resource's auxiliary of the given kind. Total: every resource has
-    /// an auxiliary URL whether or not that auxiliary has a representation.
+    /// This resource's auxiliary of the given kind: `/.aux`, this resource's
+    /// own path, and the kind's name as a suffix. Total — every resource has
+    /// an auxiliary URL whether or not that auxiliary has a representation —
+    /// and inverted by [`AuxUrl::subject`].
+    ///
+    /// The kind is a suffix rather than a leading segment so that an auxiliary
+    /// URL never ends in `/`, which is the shape every other Solid server
+    /// produces (`.acl`, `.acr`, `.meta`) and the one clients normalize
+    /// without damage. Classification is unaffected: the router still decides
+    /// resource-space-or-auxiliary-space from the first segment alone.
     pub fn aux(&self, kind: AuxKind) -> AuxUrl {
         let base = self.iri.strip_suffix(&self.path).expect("iri ends with path");
-        let iri = format!("{base}/{AUX_SEGMENT}/{}{}", kind.segment(), self.path);
+        let iri = format!("{base}/{AUX_SEGMENT}{}{}", self.path, kind.suffix());
         AuxUrl { kind, subject: self.clone(), iri }
+    }
+
+    /// The other half of this URL's trailing-slash pair — `/box/` for `/box`,
+    /// `/box` for `/box/` — or `None` for the root, whose counterpart would be
+    /// the empty path and is no URL in this space at all.
+    ///
+    /// Solid Protocol §3.1: "If two URIs differ only in the trailing slash,
+    /// and the server has associated a resource with one of them, then the
+    /// other URI MUST NOT correspond to another resource." The pair stays
+    /// *addressable* — `/box` and `/box/` are still two names, one of which
+    /// may exist — so this derivation is what a create consults, not a
+    /// canonicalization of one onto the other.
+    ///
+    /// Unlike `resource()`, this mints the `ResourceUrl` directly rather than
+    /// re-running `NamedNode::new` on the result — which is exactly what the
+    /// module header says the private constructors exist to prevent going
+    /// unexamined. It is safe here: `self.iri` was already validated by
+    /// whichever constructor produced `self`, and adding or removing a
+    /// single trailing `/` is the only byte-level change made to it — it
+    /// cannot turn a valid IRI into an invalid one (and the root, the one
+    /// path whose counterpart would be the empty string, is handled above by
+    /// returning `None` before an IRI is built at all). The `debug_assert!`
+    /// pins that argument rather than leaving it asserted only in prose.
+    pub fn slash_counterpart(&self) -> Option<ResourceUrl> {
+        let path = match self.path.strip_suffix('/') {
+            Some("") => return None, // the root
+            Some(stripped) => stripped.to_string(),
+            None => format!("{}/", self.path),
+        };
+        let base = self.iri.strip_suffix(&self.path).expect("iri ends with path");
+        let iri = format!("{base}{path}");
+        debug_assert!(
+            NamedNode::new(&iri).is_ok(),
+            "slash_counterpart must preserve IRI validity: {iri}"
+        );
+        Some(ResourceUrl { iri, path })
     }
 
     pub fn as_container(&self) -> Option<ContainerUrl> {
@@ -274,22 +333,35 @@ impl StorageSpace {
             return Err(SpaceError::NotNormalized);
         }
         if let Some(rest) = self.reserved_remainder(request_path) {
-            let Some(rest) = rest.strip_prefix('/') else {
-                return Err(SpaceError::Reserved); // "/.aux"
+            // `rest` is everything after `/.aux`: "" for `/.aux` itself,
+            // otherwise a path starting with `/`. Stripping the kind's suffix
+            // inverts `ResourceUrl::aux` exactly — `/.aux/box/.acl` yields
+            // `/box/`, `/.aux/.acl` yields `/`. A path under `/.aux` that ends
+            // in no kind's suffix (including `/.aux` and `/.aux/` themselves)
+            // names no auxiliary and is reserved, not data.
+            let Some((kind, subject_path)) = AuxKind::split_suffix(rest) else {
+                return Err(SpaceError::Reserved);
             };
-            let Some((segment, subject_rest)) = rest.split_once('/') else {
-                return Err(SpaceError::Reserved); // "/.aux/" or "/.aux/acl"
-            };
-            let kind = AuxKind::from_segment(segment).ok_or(SpaceError::Reserved)?;
-            let subject_path = format!("/{subject_rest}");
             // An auxiliary has no auxiliary — `AuxUrl` cannot build one, and the
             // path space must not name one either. Without this, the subject of
-            // `/.aux/acl/.aux/acl/foo` would be a plain resource whose IRI is the
-            // ACL graph of `/foo`, and authorization would derive from it.
-            if self.reserved_remainder(&subject_path).is_some() {
+            // `/.aux/.aux/foo.acl.acl` would be a plain resource whose IRI is the
+            // ACL graph of `/foo`, and authorization would derive from it. The
+            // check is on the *decoded subject*, so it refuses every nesting
+            // depth: each strip peels one suffix, and the subject that remains
+            // still begins with the reserved segment.
+            if self.reserved_remainder(subject_path).is_some() {
                 return Err(SpaceError::Reserved);
             }
-            let subject = self.resource(&subject_path)?;
+            // The subject is derived by removing a suffix, so — unlike the old
+            // shape, where it was a suffix of the request path — it can be a
+            // path this pod would refuse in its own right: `/.aux/..acl` names
+            // the subject `/.`, which `dpop-verifier`'s `htu` normalization
+            // would resolve to something else entirely. An auxiliary may only
+            // name a subject the resource space itself accepts.
+            if !Self::is_normalization_stable(subject_path) {
+                return Err(SpaceError::NotNormalized);
+            }
+            let subject = self.resource(subject_path)?;
             let aux = subject.aux(kind);
             NamedNode::new(&aux.iri).map_err(|_| SpaceError::InvalidResourceIri)?;
             return Ok(Target::Aux(aux));
@@ -390,8 +462,8 @@ mod tests {
         assert!(matches!(s.resolve("/foo").unwrap(), Target::Resource(_)));
         assert!(matches!(s.resolve("/box/").unwrap(), Target::Container(_)));
         assert!(matches!(s.resolve("/").unwrap(), Target::Container(_)));
-        assert!(matches!(s.resolve("/.aux/acl/foo").unwrap(), Target::Aux(_)));
-        assert!(matches!(s.resolve("/.aux/acl/").unwrap(), Target::Aux(_)));
+        assert!(matches!(s.resolve("/.aux/foo.acl").unwrap(), Target::Aux(_)));
+        assert!(matches!(s.resolve("/.aux/.acl").unwrap(), Target::Aux(_)));
     }
 
     // A dot is only special as the whole first segment `.aux`. Everything
@@ -402,7 +474,7 @@ mod tests {
         assert!(matches!(s.resolve("/.hidden").unwrap(), Target::Resource(_)));
         assert!(matches!(s.resolve("/.config/x").unwrap(), Target::Resource(_)));
         assert!(matches!(s.resolve("/box/.aux").unwrap(), Target::Resource(_)));
-        assert!(matches!(s.resolve("/box/.aux/acl").unwrap(), Target::Resource(_)));
+        assert!(matches!(s.resolve("/box/.aux/x.acl").unwrap(), Target::Resource(_)));
         // The reserved name is the whole segment, never a prefix of a longer one.
         assert!(matches!(s.resolve("/.auxiliary").unwrap(), Target::Resource(_)));
         assert!(matches!(s.resolve("/.auxiliary/x").unwrap(), Target::Resource(_)));
@@ -433,33 +505,74 @@ mod tests {
         assert_eq!(s.resolve("/.aux"), Err(SpaceError::Reserved));
         assert_eq!(s.resolve("/.aux/"), Err(SpaceError::Reserved));
         assert_eq!(s.resolve("/.aux/bogus/x"), Err(SpaceError::Reserved));
-        assert_eq!(s.resolve("/.aux/acl"), Err(SpaceError::Reserved)); // no subject
+        assert_eq!(s.resolve("/.aux/acl"), Err(SpaceError::Reserved)); // no `.` before it
+        assert_eq!(s.resolve("/.aux/foo"), Err(SpaceError::Reserved)); // no kind named
+        assert_eq!(s.resolve("/.aux/foo.bogus"), Err(SpaceError::Reserved));
+    }
+
+    // The subject is what remains after the suffix comes off, so it can be a
+    // path the resource space would refuse in its own right. `/.aux/..acl`
+    // would name the subject `/.`, and `/.aux/...acl` the subject `/..` —
+    // both shapes `dpop-verifier`'s `htu` normalization resolves elsewhere,
+    // and both are refused for the auxiliary exactly as they are for the
+    // resource.
+    #[test]
+    fn an_auxiliary_may_not_name_a_subject_normalization_would_alias() {
+        let s = sp();
+        assert_eq!(s.resolve("/.aux/..acl"), Err(SpaceError::NotNormalized));
+        assert_eq!(s.resolve("/.aux/...acl"), Err(SpaceError::NotNormalized));
+        assert_eq!(s.resolve("/.aux/box/..acl"), Err(SpaceError::NotNormalized));
+        // ...while a dot-prefixed name that is not a dot-segment is ordinary,
+        // and so is its ACL.
+        assert!(matches!(s.resolve("/.aux/.hidden.acl").unwrap(), Target::Aux(_)));
     }
 
     // `AuxUrl` has no `aux()`, so no auxiliary-of-an-auxiliary can be built.
-    // The path space must not offer one either.
+    // The path space must not offer one either — at any nesting depth.
     #[test]
     fn an_auxiliary_is_never_the_subject_of_an_auxiliary() {
         let s = sp();
-        assert_eq!(s.resolve("/.aux/acl/.aux/acl/foo"), Err(SpaceError::Reserved));
-        assert_eq!(s.resolve("/.aux/acl/.aux/"), Err(SpaceError::Reserved));
-        assert_eq!(s.resolve("/.aux/acl/.aux"), Err(SpaceError::Reserved));
+        // The exact URL `foo`'s ACL's ACL would have, and every deeper nesting.
+        assert_eq!(s.resolve("/.aux/.aux/foo.acl.acl"), Err(SpaceError::Reserved));
+        assert_eq!(s.resolve("/.aux/.aux/.aux/foo.acl.acl.acl"), Err(SpaceError::Reserved));
+        assert_eq!(
+            s.resolve("/.aux/.aux/.aux/.aux/foo.acl.acl.acl.acl"),
+            Err(SpaceError::Reserved)
+        );
+        // The container root's, and the ones an attacker would reach for by
+        // pasting the old shape or half of it.
+        assert_eq!(s.resolve("/.aux/.aux/box/.acl.acl"), Err(SpaceError::Reserved));
+        assert_eq!(s.resolve("/.aux/.aux/.acl.acl"), Err(SpaceError::Reserved));
+        assert_eq!(s.resolve("/.aux/.aux/foo.acl"), Err(SpaceError::Reserved));
+        assert_eq!(s.resolve("/.aux/.aux.acl"), Err(SpaceError::Reserved));
         // A `.aux` segment that is not the subject's first is ordinary, so it
         // has an ACL like any other resource.
-        assert!(matches!(s.resolve("/.aux/acl/box/.aux").unwrap(), Target::Aux(_)));
+        assert!(matches!(s.resolve("/.aux/box/.aux.acl").unwrap(), Target::Aux(_)));
     }
 
+    // Both directions are total and mutually inverse: a subject's auxiliary
+    // URL resolves back to that same subject, and to the same `AuxUrl`.
     #[test]
     fn aux_and_subject_are_mutual_inverses() {
         let s = sp();
-        for path in ["/", "/foo", "/box/", "/a/b/c"] {
+        for path in ["/", "/foo", "/box/", "/a/b/c", "/foo.acl", "/.hidden", "/.auxiliary"] {
             let (Target::Resource(r) | Target::Container(ContainerUrl(r))) = s.resolve(path).unwrap()
             else { panic!("{path} should be a resource or container") };
-            let aux = r.aux(AuxKind::Acl);
-            assert_eq!(aux.subject().path(), path, "round trip for {path}");
+            for kind in AuxKind::ALL {
+                let aux = r.aux(*kind);
+                assert_eq!(aux.subject().path(), path, "round trip for {path}");
+                let request_path =
+                    aux.graph_iri().strip_prefix("https://pod.toph.so").expect("built from base");
+                let Target::Aux(decoded) = s.resolve(request_path).unwrap() else {
+                    panic!("{request_path} should resolve back to an auxiliary")
+                };
+                assert_eq!(decoded, aux, "resolve must invert aux() for {path}");
+            }
         }
     }
 
+    // The documented table, and the property that matters about it: no
+    // auxiliary URL ends in a slash, whatever its subject looks like.
     #[test]
     fn aux_urls_have_the_documented_shape() {
         let s = sp();
@@ -468,20 +581,50 @@ mod tests {
             Target::Container(c) => c.as_resource().aux(AuxKind::Acl),
             Target::Aux(_) => panic!("not a subject"),
         };
-        assert_eq!(acl_of("/").graph_iri(), "https://pod.toph.so/.aux/acl/");
-        assert_eq!(acl_of("/foo").graph_iri(), "https://pod.toph.so/.aux/acl/foo");
-        assert_eq!(acl_of("/box/").graph_iri(), "https://pod.toph.so/.aux/acl/box/");
-        assert_eq!(acl_of("/a/b/c").graph_iri(), "https://pod.toph.so/.aux/acl/a/b/c");
+        assert_eq!(acl_of("/").graph_iri(), "https://pod.toph.so/.aux/.acl");
+        assert_eq!(acl_of("/foo").graph_iri(), "https://pod.toph.so/.aux/foo.acl");
+        assert_eq!(acl_of("/box/").graph_iri(), "https://pod.toph.so/.aux/box/.acl");
+        assert_eq!(acl_of("/a/b/c").graph_iri(), "https://pod.toph.so/.aux/a/b/c.acl");
+        for path in ["/", "/foo", "/box/", "/a/b/c", "/a/b/c/"] {
+            for kind in AuxKind::ALL {
+                let iri = match s.resolve(path).unwrap() {
+                    Target::Resource(r) => r.aux(*kind),
+                    Target::Container(c) => c.as_resource().aux(*kind),
+                    Target::Aux(_) => panic!("not a subject"),
+                }
+                .graph_iri()
+                .to_string();
+                assert!(!iri.ends_with('/'), "{iri} ends in a slash");
+            }
+        }
     }
 
     // The direction an attacker controls: decode an `AuxUrl` from a request
-    // path, rather than building one from a subject via `aux()`.
+    // path, rather than building one from a subject via `aux()`. Every row of
+    // the table above, read back.
     #[test]
     fn resolve_decodes_aux_urls_from_the_request_path() {
         let s = sp();
-        let Target::Aux(aux) = s.resolve("/.aux/acl/box/").unwrap() else { panic!() };
-        assert_eq!(aux.subject().path(), "/box/");
-        assert_eq!(aux.graph_iri(), "https://pod.toph.so/.aux/acl/box/");
+        for (path, subject) in [
+            ("/.aux/.acl", "/"),
+            ("/.aux/foo.acl", "/foo"),
+            ("/.aux/box/.acl", "/box/"),
+            ("/.aux/a/b/c.acl", "/a/b/c"),
+            // A subject whose own name ends in `.acl` is ordinary data, and
+            // its ACL is a different URL again.
+            ("/.aux/foo.acl.acl", "/foo.acl"),
+        ] {
+            let Target::Aux(aux) = s.resolve(path).unwrap() else {
+                panic!("{path} should be an auxiliary")
+            };
+            assert_eq!(aux.subject().path(), subject, "subject of {path}");
+            assert_eq!(aux.kind(), AuxKind::Acl);
+            assert_eq!(
+                aux.graph_iri(),
+                format!("https://pod.toph.so{path}"),
+                "the decoded URL must be the one requested"
+            );
+        }
     }
 
     // The chain a create actually mutates: nearest first, root last.
@@ -504,21 +647,51 @@ mod tests {
     // Pins `AuxKind`'s invariants so a new variant can't silently misbehave:
     // the `match` is exhaustive over the enum, so forgetting to add the
     // variant here — and to `ALL` — is a compile error, not a silent gap in
-    // routing or `Link` headers. Each kind's segment must also be non-empty
-    // and slash-free (`resolve` splits on the first `/`, so two kinds could
-    // otherwise collide) and IRI-safe (it is interpolated into a graph IRI).
+    // routing or `Link` headers. Each kind's name must also be non-empty and
+    // slash-free (a `/` would make the suffix span segments and the split
+    // ambiguous) and IRI-safe (it is interpolated into a graph IRI).
+    //
+    // The no-dot rule is also what keeps `split_suffix` unambiguous as more
+    // kinds are added, with no separate test needed for it: every suffix is
+    // `"." + name`, and a name here contains no `.`, so the only `.` in a
+    // suffix is its own leading one. One suffix can therefore never be a
+    // suffix of a different one — that would require the shorter suffix's
+    // leading `.` to land on some OTHER `.` inside the longer one, and there
+    // is no such character to land on.
     #[test]
-    fn aux_kind_segments_are_well_formed() {
+    fn aux_kind_names_are_well_formed() {
         for kind in AuxKind::ALL {
             match kind {
                 AuxKind::Acl => {}
             }
-            let segment = kind.segment();
-            assert!(!segment.is_empty(), "{kind:?} has an empty segment");
-            assert!(!segment.contains('/'), "{kind:?}'s segment contains '/'");
-            let iri = format!("https://pod.toph.so/.aux/{segment}/x");
-            assert!(NamedNode::new(&iri).is_ok(), "{kind:?}'s segment is not IRI-safe");
+            let name = kind.name();
+            assert!(!name.is_empty(), "{kind:?} has an empty name");
+            assert!(!name.contains('/'), "{kind:?}'s name contains '/'");
+            assert!(!name.contains('.'), "{kind:?}'s name contains '.'");
+            let iri = format!("https://pod.toph.so/.aux/x{}", kind.suffix());
+            assert!(NamedNode::new(&iri).is_ok(), "{kind:?}'s name is not IRI-safe");
         }
+    }
+
+    // The pair Protocol §3.1 forbids from co-existing. Both directions, and
+    // the root — whose counterpart would be the empty path, which is no URL.
+    #[test]
+    fn slash_counterpart_is_the_other_half_of_the_pair() {
+        let s = sp();
+        let res = |p: &str| match s.resolve(p).unwrap() {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource().clone(),
+            Target::Aux(_) => panic!("not a resource path"),
+        };
+        for (path, other) in [("/foo", "/foo/"), ("/box/", "/box"), ("/a/b/c", "/a/b/c/")] {
+            let counterpart = res(path).slash_counterpart().expect("has a counterpart");
+            assert_eq!(counterpart.path(), other);
+            assert_eq!(counterpart.graph_iri(), format!("https://pod.toph.so{other}"));
+            // ...and it is an involution: the counterpart's counterpart is
+            // the original, so neither half is privileged.
+            assert_eq!(counterpart.slash_counterpart().as_ref(), Some(&res(path)));
+        }
+        assert_eq!(res("/").slash_counterpart(), None, "the root has no counterpart");
     }
 
     // The aliasing `dpop-verifier::normalize_htu` performs (drop empty

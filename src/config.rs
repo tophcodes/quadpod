@@ -40,6 +40,15 @@ pub struct Config {
     #[arg(long, env = "POD_EXPECTED_AUDIENCE")]
     pub expected_audience: Option<String>,
 
+    /// A host the operator vouches for: the private-IP filter and the
+    /// https-only rule do not apply to it. Repeatable. `host` opens every
+    /// port on that host; `host:port` opens only that port. Everything else
+    /// — redirect refusal, IP pinning, body cap, timeout — still applies.
+    /// Pair it with `--trusted-issuer` so an untrusted issuer is rejected
+    /// before any fetch is attempted.
+    #[arg(long = "allow-insecure-host", env = "POD_ALLOW_INSECURE_HOSTS", value_delimiter = ',')]
+    pub allow_insecure_hosts: Vec<String>,
+
     /// Address to bind. Plain HTTP — keep it behind the reverse proxy.
     #[arg(long, env = "POD_LISTEN", default_value = "127.0.0.1:3000")]
     pub listen: SocketAddr,
@@ -75,6 +84,36 @@ impl Config {
             trusted_issuers: if set.is_empty() { None } else { Some(set) },
             expected_audience: self.expected_audience.clone(),
         }
+    }
+
+    /// The outbound-fetch posture for this process: the SSRF-safe default
+    /// plus whatever hosts the operator named on the command line. Entries
+    /// are trimmed and empty ones dropped before parsing, mirroring
+    /// `auth_config()`'s treatment of `trusted_issuers` — a comma-separated
+    /// env value like `"localhost:3001, css.local,,"` must not leave
+    /// whitespace- or empty-string entries in the set that can never match
+    /// a URL host.
+    pub fn fetch_policy(&self) -> crate::auth::safe_fetch::FetchPolicy {
+        self.try_fetch_policy().0
+    }
+
+    /// Same as [`Config::fetch_policy`], but also returns every entry that
+    /// could not be understood — for `main.rs`, which must refuse to start
+    /// rather than run with fewer hosts than the operator configured. Since
+    /// entries are trimmed and empty ones dropped right here (same
+    /// `.map(str::trim).filter(|s| !s.is_empty())` as above), any rejected
+    /// entry reaching `main.rs` was a real, non-blank string the operator
+    /// typed — not comma-separated-list noise.
+    pub fn try_fetch_policy(
+        &self,
+    ) -> (crate::auth::safe_fetch::FetchPolicy, Vec<String>) {
+        crate::auth::safe_fetch::FetchPolicy::try_with_insecure_hosts(
+            self.allow_insecure_hosts
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        )
     }
 
     pub fn space(&self) -> Result<StorageSpace, SpaceError> {
@@ -151,6 +190,61 @@ mod tests {
         assert_eq!(
             c.validated_owner_webid().unwrap(),
             "https://alice.example/card#me"
+        );
+    }
+
+    #[test]
+    fn insecure_hosts_are_repeatable_and_default_empty() {
+        let c = parse(&["--owner-webid", "https://alice.example/card#me"]).unwrap();
+        assert!(c.allow_insecure_hosts.is_empty());
+
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--allow-insecure-host", "localhost:3001",
+            "--allow-insecure-host", "css.local",
+        ]).unwrap();
+        assert_eq!(c.allow_insecure_hosts, vec!["localhost:3001", "css.local"]);
+    }
+
+    // The comma-separated env form (`POD_ALLOW_INSECURE_HOSTS=a, b,,`) is what the docs
+    // advertise, and clap's `value_delimiter` does not trim or drop what it splits: a
+    // whitespace- or empty-string entry must not survive into the working fetch policy, and
+    // the startup warning (built from `insecure_host_entries()`) must not confirm a setting
+    // that does nothing — mirrors `auth_config()`'s `.map(str::trim).filter(|s|
+    // !s.is_empty())` treatment of `trusted_issuers`.
+    #[test]
+    fn fetch_policy_trims_and_drops_empty_insecure_host_entries() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--allow-insecure-host", "localhost:3001, css.local,,",
+        ]).unwrap();
+        assert_eq!(
+            c.allow_insecure_hosts,
+            vec!["localhost:3001", " css.local", "", ""],
+            "clap's value_delimiter itself does not trim or filter"
+        );
+        assert_eq!(
+            c.fetch_policy().insecure_host_entries(),
+            vec!["css.local".to_string(), "localhost:3001".to_string()],
+            "the built policy must reflect only the entries actually understood"
+        );
+    }
+
+    // A malformed or ambiguous entry must be reported by `try_fetch_policy`,
+    // not silently dropped — `main.rs` uses this to refuse to start rather
+    // than run with fewer hosts than the operator configured.
+    #[test]
+    fn try_fetch_policy_reports_entries_it_could_not_understand() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--allow-insecure-host", "localhost:3001,localhost:99999",
+        ]).unwrap();
+        let (policy, rejected) = c.try_fetch_policy();
+        assert_eq!(rejected, vec!["localhost:99999".to_string()]);
+        assert_eq!(
+            policy.insecure_host_entries(),
+            vec!["localhost:3001".to_string()],
+            "the understood entry must still take effect alongside the reject"
         );
     }
 

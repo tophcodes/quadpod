@@ -278,6 +278,12 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     //
     // Deliberately after the body checks: a 415 or an unparseable body must
     // not leave containers behind for a resource that was never created.
+    //
+    // This is also where a create that Solid Protocol §3.1 forbids is refused
+    // with a `409` — `PUT /box` while `/box/` exists, or the reverse. That
+    // rule belongs to the same one traversal, because the set of URLs it
+    // applies to is the set of URLs this call would create; there is no
+    // separate check here that could drift from it.
     if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
         return with_aux_links(res, &target);
     }
@@ -341,6 +347,26 @@ async fn handle_post_root(
     }
 }
 
+/// Whether a name a `POST` would allocate is already spoken for — by a
+/// resource of its own, or by the other half of its trailing-slash pair,
+/// which Protocol §3.1 forbids it from coming to exist beside.
+///
+/// A `Slug` is a hint, so a taken name is answered by picking another rather
+/// than by the `409` a client-named `PUT` gets: the counterpart is exactly as
+/// unavailable as the name itself, and for the same reason. Store errors read
+/// as "not taken" here, as the direct existence check always has — the write
+/// that follows is what reports them.
+async fn name_is_taken(store: &dyn SparqlStore, child: &Target) -> bool {
+    if matches!(exists(store, child).await, Ok(true)) {
+        return true;
+    }
+    let Target::Resource(r) = child else { return false };
+    match r.slash_counterpart() {
+        Some(counterpart) => matches!(exists(store, &counterpart).await, Ok(true)),
+        None => false,
+    }
+}
+
 async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let store = st.store.as_ref();
     // Authorize the target FIRST, even though Append on a non-container is a
@@ -371,7 +397,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // Note: this existence check followed by the write below is not
     // transactional; a concurrent write landing between them could be missed.
     // Accepted for single-user v1.
-    if matches!(exists(store, &child).await, Ok(true)) {
+    if name_is_taken(store, &child).await {
         let unique = format!("{name}-{}", uuid::Uuid::new_v4());
         child = match classify(&st.space, &format!("{}{unique}", parent.path())) {
             Ok(t) => t,
@@ -886,40 +912,49 @@ mod tests {
 
     // The trailing slash is exactly what `dpop-verifier`'s `normalize_htu`
     // erases, so without `verify_dpop`'s own exact `htu` comparison this
-    // request would authenticate: the owner signs `PUT /.aux/acl/foo` and an
-    // on-path adversary re-delivers the identical bytes as
-    // `PUT /.aux/acl/foo/`, installing the body as the *container's* ACL,
-    // where none of its rules name the governed IRI — an empty ACL that beats
-    // every ancestor and locks the subtree out permanently. It must be a 401,
+    // request would authenticate: the owner signs `PUT /foo` and an on-path
+    // adversary re-delivers the identical bytes as `PUT /foo/`, installing
+    // the body as the *container* of the same name — a different resource
+    // from the one the client addressed and authorized. It must be a 401,
     // from the middleware, before any handler sees it.
+    //
+    // This used to be pinned against an auxiliary pair
+    // (`PUT /.aux/foo.acl` re-delivered as `PUT /.aux/foo/.acl`), but the
+    // auxiliary URL shape changed: the kind is now a suffix, so those two
+    // paths' segment lists (`[".aux","foo.acl"]` vs `[".aux","foo",".acl"]`)
+    // differ in a non-empty segment, not an empty one — `normalize_htu`
+    // never treats them as equal, so an ordinary `htu` mismatch already
+    // answers 401 without this tightening. Worse, appending the slash
+    // directly (`/.aux/foo.acl` -> `/.aux/foo.acl/`) *does* still collapse
+    // under `normalize_htu`, but `/.aux/foo.acl/` ends in no kind's suffix,
+    // so it resolves to `Reserved` -> 404 regardless of what `verify_dpop`
+    // decides. Both are a real improvement, and both are why this
+    // regression now has to live in the resource space instead.
     #[tokio::test]
-    async fn a_proof_for_a_resource_acl_cannot_write_the_container_acl() {
+    async fn a_proof_for_a_resource_cannot_write_its_container_counterpart() {
         let f = fixture().await;
         let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
         let proof = f.client.mint_dpop(
-            "https://pod.toph.so/.aux/acl/foo",
+            "https://pod.toph.so/foo",
             "PUT",
             now_unix(),
-            "jti-acl-trailing-slash",
+            "jti-resource-trailing-slash",
         );
         let req = Request::builder()
             .method("PUT")
-            .uri("/.aux/acl/foo/")
+            .uri("/foo/")
             .header(header::AUTHORIZATION, format!("DPoP {at}"))
             .header(header::CONTENT_TYPE, "text/turtle")
             .header("dpop", proof)
-            .body(Body::from(
-                "<#r> a <http://www.w3.org/ns/auth/acl#Authorization> ;\
-                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> .",
-            ))
+            .body(Body::from(""))
             .unwrap();
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
 
     // The same re-targeting, through a percent-escape instead of a trailing
-    // slash. The owner signs `PUT /.aux/acl/a%41` — whose subject the handlers
+    // slash. The owner signs `PUT /.aux/a%41.acl` — whose subject the handlers
     // read as `/aA` — and an on-path adversary re-delivers the identical bytes
-    // as `PUT /.aux/acl/a%2541`, whose subject is `/a%41`, a DIFFERENT
+    // as `PUT /.aux/a%2541.acl`, whose subject is `/a%41`, a DIFFERENT
     // resource. While `htu` was the percent-DECODED graph IRI and the exact
     // comparison decoded both sides, the two collapsed to the same string and
     // this authenticated. It must be a 401, from the middleware.
@@ -928,14 +963,14 @@ mod tests {
         let f = fixture().await;
         let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
         let proof = f.client.mint_dpop(
-            "https://pod.toph.so/.aux/acl/a%41",
+            "https://pod.toph.so/.aux/a%41.acl",
             "PUT",
             now_unix(),
             "jti-acl-double-escape",
         );
         let req = Request::builder()
             .method("PUT")
-            .uri("/.aux/acl/a%2541")
+            .uri("/.aux/a%2541.acl")
             .header(header::AUTHORIZATION, format!("DPoP {at}"))
             .header(header::CONTENT_TYPE, "text/turtle")
             .header("dpop", proof)
@@ -1309,7 +1344,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/shared> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/shared")
+        let put_acl = f.owner_request("PUT", "/.aux/shared.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1326,7 +1361,7 @@ mod tests {
         assert_eq!(bob_app.clone().oneshot(write).await.unwrap().status(), StatusCode::FORBIDDEN);
 
         // Bob has Read on the resource but no Control, so its ACL stays hidden.
-        let read_acl = f.sign(Request::builder().method("GET").uri("/.aux/acl/shared"), bob, "GET", "/.aux/acl/shared")
+        let read_acl = f.sign(Request::builder().method("GET").uri("/.aux/shared.acl"), bob, "GET", "/.aux/shared.acl")
             .body(Body::empty()).unwrap();
         assert_eq!(bob_app.oneshot(read_acl).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
@@ -1340,7 +1375,7 @@ mod tests {
 
     /// Write `body` as the ACL of `subject_path` and return the response.
     async fn put_acl(f: &Fixture, subject_path: &str, body: &str) -> axum::response::Response {
-        let path = format!("/.aux/acl{subject_path}");
+        let path = format!("/.aux{subject_path}.acl");
         let req = f.owner_request("PUT", &path)
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(body.to_owned())).unwrap();
@@ -1361,7 +1396,7 @@ mod tests {
         let res = put_acl(&f, "/locked", "").await;
         assert_eq!(res.status(), StatusCode::CREATED);
         let expected = acl_grants_nothing_message(
-            "https://pod.toph.so/.aux/acl/locked",
+            "https://pod.toph.so/.aux/locked.acl",
             "https://pod.toph.so/locked",
             false, // "/locked" is a resource, not a container: no subtree to mention
             false,
@@ -1427,7 +1462,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CREATED);
         let warning = warning_of(&res).expect("the root lockout must be warned about");
         assert!(warning.contains("--reset-root-acl"), "{warning}");
-        assert!(warning.contains("https://pod.toph.so/.aux/acl/"), "{warning}");
+        assert!(warning.contains("https://pod.toph.so/.aux/.acl"), "{warning}");
 
         // And it is really locked: the owner can no longer read their own pod.
         let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
@@ -1452,7 +1487,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Write>, \
              <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/gone")
+        let put_acl = f.owner_request("PUT", "/.aux/gone.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         f.app.clone().oneshot(put_acl).await.unwrap();
@@ -1462,7 +1497,7 @@ mod tests {
 
         // The ACL graph must be gone from the store, not merely unreachable.
         assert!(
-            f.stored("/.aux/acl/gone").await.is_none(),
+            f.stored("/.aux/gone.acl").await.is_none(),
             "the deleted resource's ACL must not survive it"
         );
     }
@@ -1474,7 +1509,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"i\" .")).unwrap();
         f.app.clone().oneshot(put).await.unwrap();
-        let put_acl = f.owner_request("PUT", "/.aux/acl/item")
+        let put_acl = f.owner_request("PUT", "/.aux/item.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(format!(
                 "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
@@ -1520,7 +1555,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
         );
-        let put_root_acl = f.owner_request("PUT", "/.aux/acl/")
+        let put_root_acl = f.owner_request("PUT", "/.aux/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(root_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_root_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1544,10 +1579,10 @@ mod tests {
         // The container's real access-control document was never touched: it
         // still does not exist, and Bob — who now owns a child literally
         // named `.acl` — still holds no Control over `/inbox/`.
-        assert!(f.stored("/.aux/acl/inbox/").await.is_none(),
+        assert!(f.stored("/.aux/inbox/.acl").await.is_none(),
             "a Slug must not have been able to reach the reserved namespace");
         let hijack = f.sign(
-                Request::builder().method("PUT").uri("/.aux/acl/inbox/"), bob, "PUT", "/.aux/acl/inbox/")
+                Request::builder().method("PUT").uri("/.aux/inbox/.acl"), bob, "PUT", "/.aux/inbox/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(format!(
                 "<#pwn> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
@@ -1568,7 +1603,7 @@ mod tests {
         let f = fixture().await;
         let bob = "https://bob.example/card#me";
         // Grant Bob Write on /newfile before it exists. That grant has to
-        // come from the ROOT ACL's `acl:default` — a direct /newfile.acl
+        // come from the ROOT ACL's `acl:default` — a direct /.aux/newfile.acl
         // cannot be created for a resource that does not exist yet (see
         // `acl_for_a_resource_that_does_not_exist_is_refused`). It also has
         // to be `acl:default` only: Bob must end up with Write on the child
@@ -1584,7 +1619,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Write> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/")
+        let put_acl = f.owner_request("PUT", "/.aux/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1614,7 +1649,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/target> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Write> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/target")
+        let put_acl = f.owner_request("PUT", "/.aux/target.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1649,7 +1684,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/mailroom/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/mailroom/")
+        let put_acl = f.owner_request("PUT", "/.aux/mailroom/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1687,12 +1722,12 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/box/")
+        let put_acl = f.owner_request("PUT", "/.aux/box/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
 
-        let wipe = f.owner_request("PUT", "/.aux/acl/box/")
+        let wipe = f.owner_request("PUT", "/.aux/box/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("")).unwrap();
         assert_eq!(f.app.clone().oneshot(wipe).await.unwrap().status(), StatusCode::CREATED);
@@ -1701,7 +1736,7 @@ mod tests {
         // here" — so the walk stops at it and the root's acl:default rules
         // never come back into play.
         assert_eq!(
-            f.stored("/.aux/acl/box/").await,
+            f.stored("/.aux/box/.acl").await,
             Some(Vec::new()),
             "the emptied ACL must exist and grant nothing"
         );
@@ -1765,7 +1800,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
                <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Append> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/box/")
+        let put_acl = f.owner_request("PUT", "/.aux/box/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1797,7 +1832,7 @@ mod tests {
     // The residual from the previous round: an ACL is exempt from containment
     // (it is never listed via `ldp:contains`), but `authorize_and_materialize`
     // still materializes any missing ancestor containers for
-    // `PUT /.aux/acl/a/b/c` exactly as it would for `PUT /a/b/c`. Bob's grant
+    // `PUT /.aux/a/b/c.acl` exactly as it would for `PUT /a/b/c`. Bob's grant
     // here is `acl:Control` via the ROOT ACL's `acl:default` — inherited onto
     // every descendant, `/a/`, `/a/b/`, and `/a/b/c` alike — and deliberately
     // nothing else, so he has no `acl:Append` anywhere. That is enough to
@@ -1819,7 +1854,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_root_acl = f.owner_request("PUT", "/.aux/acl/")
+        let put_root_acl = f.owner_request("PUT", "/.aux/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(root_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_root_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1831,7 +1866,7 @@ mod tests {
         );
 
         let bob_app = f.app_also_trusting(bob);
-        let put_acl = f.sign(Request::builder().method("PUT").uri("/.aux/acl/a/b/c"), bob, "PUT", "/.aux/acl/a/b/c")
+        let put_acl = f.sign(Request::builder().method("PUT").uri("/.aux/a/b/c.acl"), bob, "PUT", "/.aux/a/b/c.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(
                 "<#x> <http://www.w3.org/ns/auth/acl#agent> <https://someone.example/#me> ; \
@@ -1853,7 +1888,7 @@ mod tests {
     // variant, a property of the type rather than something `add_containment`
     // has to notice at runtime), and `ensure_container` is a no-op on a
     // container that already has its type triples. So an agent holding
-    // `acl:Control` on the ACL's subject (here, via `/.aux/acl/box/`'s own
+    // `acl:Control` on the ACL's subject (here, via `/.aux/box/.acl`'s own
     // `acl:default`) and NOTHING else — in particular no `acl:Append` on
     // `/box/` — must still be able to write
     // that subject's ACL. Requiring `Append` here would refuse a legitimate
@@ -1878,7 +1913,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_box_acl = f.owner_request("PUT", "/.aux/acl/box/")
+        let put_box_acl = f.owner_request("PUT", "/.aux/box/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(box_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1901,10 +1936,10 @@ mod tests {
             .body(Body::from("<#it> <http://schema.org/name> \"doc\" .")).unwrap();
         assert_eq!(f.app.clone().oneshot(mk_doc).await.unwrap().status(), StatusCode::CREATED);
 
-        // /box/ already exists (created above), so writing /box/doc.acl is a
-        // zero-mutation event at the container level: Control on the subject
-        // (inherited via /box/.acl's acl:default) must be enough.
-        let put_doc_acl = f.sign(Request::builder().method("PUT").uri("/.aux/acl/box/doc"), bob, "PUT", "/.aux/acl/box/doc")
+        // /box/ already exists (created above), so writing /.aux/box/doc.acl is
+        // a zero-mutation event at the container level: Control on the subject
+        // (inherited via /.aux/box/.acl's acl:default) must be enough.
+        let put_doc_acl = f.sign(Request::builder().method("PUT").uri("/.aux/box/doc.acl"), bob, "PUT", "/.aux/box/doc.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(
                 "<#x> <http://www.w3.org/ns/auth/acl#agent> <https://someone.example/#me> ; \
@@ -1940,7 +1975,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_box_acl = f.owner_request("PUT", "/.aux/acl/box/")
+        let put_box_acl = f.owner_request("PUT", "/.aux/box/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(box_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -1948,7 +1983,7 @@ mod tests {
         // Bob's Control over /box/ghost is genuine (inherited via acl:default)
         // — the refusal below is about the subject's absence, not about him.
         let bob_app = f.app_also_trusting(bob);
-        let squat = f.sign(Request::builder().method("PUT").uri("/.aux/acl/box/ghost"), bob, "PUT", "/.aux/acl/box/ghost")
+        let squat = f.sign(Request::builder().method("PUT").uri("/.aux/box/ghost.acl"), bob, "PUT", "/.aux/box/ghost.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(format!(
                 "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
@@ -1959,7 +1994,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert!(body_string(res).await.contains("does not exist"));
         assert!(
-            f.stored("/.aux/acl/box/ghost").await.is_none(),
+            f.stored("/.aux/box/ghost.acl").await.is_none(),
             "the squatted ACL must not have been stored"
         );
 
@@ -1981,7 +2016,7 @@ mod tests {
     #[tokio::test]
     async fn acl_for_a_deep_resource_that_does_not_exist_creates_no_ancestors() {
         let f = fixture().await;
-        let put_acl = f.owner_request("PUT", "/.aux/acl/a/b/c")
+        let put_acl = f.owner_request("PUT", "/.aux/a/b/c.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(format!(
                 "<#x> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
@@ -2008,7 +2043,7 @@ mod tests {
             .body(Body::from("<#it> <http://schema.org/name> \"doc\" .")).unwrap();
         assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
 
-        let put_acl = f.owner_request("PUT", "/.aux/acl/box/doc")
+        let put_acl = f.owner_request("PUT", "/.aux/box/doc.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(format!(
                 "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
@@ -2036,7 +2071,7 @@ mod tests {
             doc.graph_iri(), crate::resource::sys_graph_iri(&doc),
         )).await.unwrap();
 
-        let del_acl = f.owner_request("DELETE", "/.aux/acl/box/doc").body(Body::empty()).unwrap();
+        let del_acl = f.owner_request("DELETE", "/.aux/box/doc.acl").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(del_acl).await.unwrap().status(), StatusCode::NO_CONTENT);
     }
 
@@ -2057,8 +2092,9 @@ mod tests {
             .body(Body::from("")).unwrap();
         assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
 
-        // Bob gets Control on /box/.acl itself, delegated via /box/.acl's own
-        // acl:default — i.e. exactly the ancestor route the finding used.
+        // Bob gets Control on /.aux/box/.acl itself, delegated via that same
+        // document's own acl:default — i.e. exactly the ancestor route the
+        // finding used.
         let box_acl_body = format!(
             "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
@@ -2069,25 +2105,25 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_box_acl = f.owner_request("PUT", "/.aux/acl/box/")
+        let put_box_acl = f.owner_request("PUT", "/.aux/box/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(box_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
 
         let bob_app = f.app_also_trusting(bob);
-        let squat = f.sign(Request::builder().method("PUT").uri("/.aux/acl/.aux/acl/box/"), bob, "PUT", "/.aux/acl/.aux/acl/box/")
+        let squat = f.sign(Request::builder().method("PUT").uri("/.aux/.aux/box/.acl.acl"), bob, "PUT", "/.aux/.aux/box/.acl.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(format!(
                 "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
-                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/.acl> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/.aux/box/.acl> ; \
                  <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
             ))).unwrap();
         let res = bob_app.oneshot(squat).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         // Not addressable at all, so there is nothing to read back either.
-        assert!(f.space.resolve("/.aux/acl/.aux/acl/box/").is_err(),
+        assert!(f.space.resolve("/.aux/.aux/box/.acl.acl").is_err(),
             "an auxiliary must never be the subject of an auxiliary");
-        let read = f.owner_request("GET", "/.aux/acl/.aux/acl/box/").body(Body::empty()).unwrap();
+        let read = f.owner_request("GET", "/.aux/.aux/box/.acl.acl").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(read).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
@@ -2110,7 +2146,7 @@ mod tests {
 
         // The owner holds Control on every subject here, so these are
         // authorized requests that are refused on their shape alone.
-        for path in ["/.aux/acl/", "/.aux/acl/box/"] {
+        for path in ["/.aux/.acl", "/.aux/box/.acl"] {
             let post = f.owner_request("POST", path)
                 .header(header::CONTENT_TYPE, "text/turtle")
                 .header("slug", "doc")
@@ -2129,7 +2165,7 @@ mod tests {
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
         assert_eq!(f.app.clone().oneshot(post).await.unwrap().status(), StatusCode::NOT_FOUND);
 
-        assert!(f.stored("/.aux/acl/box/doc").await.is_none(),
+        assert!(f.stored("/.aux/box/doc.acl").await.is_none(),
             "no auxiliary may have been created");
     }
 
@@ -2164,7 +2200,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
                <http://www.w3.org/ns/auth/acl#Write> ."
         );
-        let put_doc_acl = f.owner_request("PUT", "/.aux/acl/box/doc")
+        let put_doc_acl = f.owner_request("PUT", "/.aux/box/doc.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(doc_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_doc_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -2227,7 +2263,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/box/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_box_acl = f.owner_request("PUT", "/.aux/acl/box/")
+        let put_box_acl = f.owner_request("PUT", "/.aux/box/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(box_acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -2242,7 +2278,7 @@ mod tests {
                <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> ."
         );
         let put_doc_acl = f.sign(
-                Request::builder().method("PUT").uri("/.aux/acl/box/doc"), bob, "PUT", "/.aux/acl/box/doc")
+                Request::builder().method("PUT").uri("/.aux/box/doc.acl"), bob, "PUT", "/.aux/box/doc.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(squat_body.clone())).unwrap();
         assert_eq!(bob_app.clone().oneshot(put_doc_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -2264,11 +2300,11 @@ mod tests {
         let del = f.owner_request("DELETE", "/box/").body(Body::empty()).unwrap();
         assert_eq!(f.app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
         assert!(
-            f.stored("/.aux/acl/box/").await.is_none(),
+            f.stored("/.aux/box/.acl").await.is_none(),
             "deleting the container must have revoked the delegation"
         );
         assert!(
-            f.stored("/.aux/acl/box/doc").await.is_some(),
+            f.stored("/.aux/box/doc.acl").await.is_some(),
             "the orphaned auxiliary survives — that is the premise of this test"
         );
         assert!(
@@ -2280,14 +2316,14 @@ mod tests {
         // subject, so he really does pass the check on the target itself. A
         // FORBIDDEN below would otherwise prove nothing.
         let read = f.sign(
-                Request::builder().method("GET").uri("/.aux/acl/box/doc"), bob, "GET", "/.aux/acl/box/doc")
+                Request::builder().method("GET").uri("/.aux/box/doc.acl"), bob, "GET", "/.aux/box/doc.acl")
             .body(Body::empty()).unwrap();
         assert_eq!(bob_app.clone().oneshot(read).await.unwrap().status(), StatusCode::OK);
 
         // The attack: Bob holds nothing on / or /box/ any more. Serving this
         // would recreate /box/ and write </> ldp:contains </box/>.
         let attack = f.sign(
-                Request::builder().method("PUT").uri("/.aux/acl/box/doc"), bob, "PUT", "/.aux/acl/box/doc")
+                Request::builder().method("PUT").uri("/.aux/box/doc.acl"), bob, "PUT", "/.aux/box/doc.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(squat_body)).unwrap();
         assert_eq!(bob_app.oneshot(attack).await.unwrap().status(), StatusCode::FORBIDDEN);
@@ -2324,7 +2360,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/inbox/> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/inbox/")
+        let put_acl = f.owner_request("PUT", "/.aux/inbox/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -2370,14 +2406,14 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
                <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_projects_acl = f.owner_request("PUT", "/.aux/acl/projects/")
+        let put_projects_acl = f.owner_request("PUT", "/.aux/projects/.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(projects_acl)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_projects_acl).await.unwrap().status(), StatusCode::CREATED);
 
         // The narrowing ACL: on the log itself Bob may read and write, but
         // NOT control. The nearest ACL wins completely, so this replaces the
-        // Control he would otherwise inherit from /projects/.acl.
+        // Control he would otherwise inherit from /.aux/projects/.acl.
         let log_acl = format!(
             "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/projects/audit-log> ; \
@@ -2388,7 +2424,7 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
                <http://www.w3.org/ns/auth/acl#Write> ."
         );
-        let put_log_acl = f.owner_request("PUT", "/.aux/acl/projects/audit-log")
+        let put_log_acl = f.owner_request("PUT", "/.aux/projects/audit-log.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(log_acl)).unwrap();
         assert_eq!(f.app.clone().oneshot(put_log_acl).await.unwrap().status(), StatusCode::CREATED);
@@ -2402,7 +2438,7 @@ mod tests {
             .body(Body::from("<#it> <http://schema.org/name> \"edited\" .")).unwrap();
         assert_eq!(bob_app.clone().oneshot(edit).await.unwrap().status(), StatusCode::CREATED);
         // ...and that he cannot reach the narrowing ACL directly.
-        let touch_acl = f.sign(Request::builder().method("DELETE").uri("/.aux/acl/projects/audit-log"), bob, "DELETE", "/.aux/acl/projects/audit-log")
+        let touch_acl = f.sign(Request::builder().method("DELETE").uri("/.aux/projects/audit-log.acl"), bob, "DELETE", "/.aux/projects/audit-log.acl")
             .body(Body::empty()).unwrap();
         assert_eq!(bob_app.clone().oneshot(touch_acl).await.unwrap().status(), StatusCode::FORBIDDEN);
 
@@ -2411,7 +2447,7 @@ mod tests {
             .body(Body::empty()).unwrap();
         assert_eq!(bob_app.oneshot(del).await.unwrap().status(), StatusCode::FORBIDDEN);
         assert!(
-            f.stored("/.aux/acl/projects/audit-log").await.is_some(),
+            f.stored("/.aux/projects/audit-log.acl").await.is_some(),
             "the narrowing ACL must survive a refused delete"
         );
 
@@ -2431,7 +2467,7 @@ mod tests {
         let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
         let res = f.app.oneshot(get).await.unwrap();
         let link = res.headers().get(header::LINK).expect("Link header").to_str().unwrap().to_string();
-        assert!(link.contains("https://pod.toph.so/.aux/acl/foo"));
+        assert!(link.contains("https://pod.toph.so/.aux/foo.acl"));
         assert!(link.contains("rel=\"acl\""));
     }
 
@@ -2444,11 +2480,12 @@ mod tests {
         let res = f.app.oneshot(put).await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
         assert!(res.headers().get(header::LINK).unwrap().to_str().unwrap()
-            .contains("https://pod.toph.so/.aux/acl/foo"));
+            .contains("https://pod.toph.so/.aux/foo.acl"));
     }
 
     // An ACL resource does not advertise an ACL of its own — it is governed
-    // by acl:Control on its subject resource, and /foo.acl.acl never exists.
+    // by acl:Control on its subject resource, and /.aux/.aux/foo.acl.acl
+    // never exists.
     #[tokio::test]
     async fn acl_resource_advertises_no_further_acl() {
         let f = fixture().await;
@@ -2463,12 +2500,12 @@ mod tests {
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> ; \
              <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
         );
-        let put_acl = f.owner_request("PUT", "/.aux/acl/foo")
+        let put_acl = f.owner_request("PUT", "/.aux/foo.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(acl_body)).unwrap();
         f.app.clone().oneshot(put_acl).await.unwrap();
 
-        let get = f.owner_request("GET", "/.aux/acl/foo").body(Body::empty()).unwrap();
+        let get = f.owner_request("GET", "/.aux/foo.acl").body(Body::empty()).unwrap();
         let res = f.app.oneshot(get).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.headers().get(header::LINK).is_none());
@@ -2483,12 +2520,12 @@ mod tests {
         let put = f.owner_request("PUT", "/foo").header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
         assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
-        assert!(f.stored("/.aux/acl/foo").await.is_none(), "no ACL of its own yet");
+        assert!(f.stored("/.aux/foo.acl").await.is_none(), "no ACL of its own yet");
 
         let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
         let res = f.app.oneshot(get).await.unwrap();
         let link = res.headers().get(header::LINK).unwrap().to_str().unwrap().to_string();
-        assert!(link.contains("/.aux/acl/foo"), "{link}");
+        assert!(link.contains("/.aux/foo.acl"), "{link}");
     }
 
     // SolidOS string-derives `<url>.acl` when this header is missing, and in
@@ -2519,12 +2556,123 @@ mod tests {
         let mk = f.owner_request("PUT", "/locked/").header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("")).unwrap();
         assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
-        let acl = f.owner_request("PUT", "/.aux/acl/locked/")
+        let acl = f.owner_request("PUT", "/.aux/locked/.acl")
             .header(header::CONTENT_TYPE, "text/turtle").body(Body::from("")).unwrap();
         assert_eq!(f.app.clone().oneshot(acl).await.unwrap().status(), StatusCode::CREATED);
 
         let get = f.owner_request("GET", "/locked/").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(get).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `PUT path` as the owner, with a body that suits a container or a
+    /// resource alike.
+    async fn owner_put(f: &Fixture, path: &str) -> StatusCode {
+        let req = f.owner_request("PUT", path)
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        f.app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    // Solid Protocol §3.1: "If two URIs differ only in the trailing slash […]
+    // the other URI MUST NOT correspond to another resource." Both orders,
+    // because neither half of the pair is privileged — a container may not
+    // appear beside a resource any more than the reverse.
+    #[tokio::test]
+    async fn a_trailing_slash_pair_is_refused_in_both_orders() {
+        let f = fixture().await;
+        assert_eq!(owner_put(&f, "/box/").await, StatusCode::CREATED);
+        assert_eq!(owner_put(&f, "/box").await, StatusCode::CONFLICT,
+            "a resource must not appear beside the container of the same name");
+
+        assert_eq!(owner_put(&f, "/doc").await, StatusCode::CREATED);
+        assert_eq!(owner_put(&f, "/doc/").await, StatusCode::CONFLICT,
+            "a container must not appear beside the resource of the same name");
+
+        // The refusal is a refusal: nothing was written either way.
+        assert!(f.stored("/box").await.is_none());
+        assert!(f.stored("/doc/").await.is_none());
+    }
+
+    // The counterweight: the rule forbids the PAIR, not either half of it. A
+    // container and a resource of the same name each remain perfectly ordinary
+    // on their own, and overwriting one is not "creating its counterpart".
+    #[tokio::test]
+    async fn either_half_alone_still_creates_and_is_still_writable() {
+        let f = fixture().await;
+        assert_eq!(owner_put(&f, "/box/").await, StatusCode::CREATED);
+        assert_eq!(owner_put(&f, "/box/").await, StatusCode::CREATED, "overwrite");
+        assert_eq!(owner_put(&f, "/plain").await, StatusCode::CREATED);
+        assert_eq!(owner_put(&f, "/plain").await, StatusCode::CREATED, "overwrite");
+
+        // ...and once the counterpart is gone, the name is free again.
+        let del = f.owner_request("DELETE", "/plain").body(Body::empty()).unwrap();
+        assert_eq!(f.app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(owner_put(&f, "/plain/").await, StatusCode::CREATED);
+    }
+
+    // The 409 depends on whether some OTHER resource exists, so answering it
+    // before the denial would turn it into an existence oracle for the whole
+    // namespace — the same trap `denial_does_not_reveal_existence` pins for
+    // the target itself. Authorization runs first; the pair check never does.
+    #[tokio::test]
+    async fn the_slash_pair_conflict_is_not_an_existence_oracle() {
+        let f = fixture().await;
+        assert_eq!(owner_put(&f, "/box/").await, StatusCode::CREATED);
+
+        // Anonymous: 401, exactly as for a path where no pair exists at all.
+        let anon = |path: &'static str| Request::builder().method("PUT").uri(path)
+            .header(header::CONTENT_TYPE, "text/turtle").body(Body::empty()).unwrap();
+        assert_eq!(f.app.clone().oneshot(anon("/box")).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED);
+        assert_eq!(f.app.clone().oneshot(anon("/no-pair-here")).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED);
+
+        // A verified stranger: 403, and again indistinguishable.
+        let bob = "https://bob.example/card#me";
+        let bob_app = f.app_also_trusting(bob);
+        let signed = |path: &'static str| f
+            .sign(Request::builder().method("PUT").uri(path), bob, "PUT", path)
+            .header(header::CONTENT_TYPE, "text/turtle").body(Body::empty()).unwrap();
+        assert_eq!(bob_app.clone().oneshot(signed("/box")).await.unwrap().status(),
+            StatusCode::FORBIDDEN);
+        assert_eq!(bob_app.oneshot(signed("/no-pair-here")).await.unwrap().status(),
+            StatusCode::FORBIDDEN);
+    }
+
+    // The other way the forbidden pair could be built: not by naming the
+    // counterpart, but by making the ancestor walk materialize it. `/a` is an
+    // ordinary resource; `PUT /a/b` would create the container `/a/` beside
+    // it. The refusal has to come from the walk, since no handler-level check
+    // on the target would see this at all.
+    #[tokio::test]
+    async fn materializing_an_ancestor_cannot_build_the_pair_either() {
+        let f = fixture().await;
+        assert_eq!(owner_put(&f, "/a").await, StatusCode::CREATED);
+        assert_eq!(owner_put(&f, "/a/b").await, StatusCode::CONFLICT);
+        assert!(f.stored("/a/").await.is_none(),
+            "the refused create must not have materialized the container");
+        assert!(f.stored("/a/b").await.is_none());
+    }
+
+    // A `Slug` is a hint, so a name whose counterpart is taken is treated the
+    // way a taken name always has been — the server picks another — rather
+    // than failing a request that never named that URL in the first place.
+    #[tokio::test]
+    async fn post_allocates_around_a_taken_counterpart() {
+        let f = fixture().await;
+        assert_eq!(owner_put(&f, "/inbox/").await, StatusCode::CREATED);
+        assert_eq!(owner_put(&f, "/inbox/note/").await, StatusCode::CREATED);
+
+        let post = f.owner_request("POST", "/inbox/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "note")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        let res = f.app.clone().oneshot(post).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let location = res.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+        assert_ne!(location, "https://pod.toph.so/inbox/note",
+            "the container /inbox/note/ already owns that name");
+        assert!(location.starts_with("https://pod.toph.so/inbox/note-"), "{location}");
     }
 
     // The reserved namespace is server-understood, not storage: a path in it

@@ -11,7 +11,7 @@
 //! deleted) root ACL is worse: existence is a stored marker independent of
 //! triple count (see `resource::exists`), so an empty ACL still exists, still
 //! wins over the ancestor fallback it would otherwise have, and grants
-//! Control to nobody — not even the owner. `DELETE /.aux/acl/` needs Control
+//! Control to nobody — not even the owner. `DELETE /.aux/.acl` needs Control
 //! on `/`, which that same empty ACL just revoked from everyone, so there is
 //! no HTTP route back and restarting the server does not re-provision either:
 //! the existence check below is what makes provisioning idempotent, and it
