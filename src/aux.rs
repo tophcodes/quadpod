@@ -58,11 +58,14 @@ fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
 ///
 /// The write is guarded inside the update (see [`conditional_put_update`]);
 /// the `exists` call afterwards only decides what the caller is told. It runs
-/// *after* the update on purpose: if the subject is deleted mid-flight the
-/// guard suppresses the write and this reports `SubjectMissing`, so the
-/// caller answers 404 rather than `Ok(())` for an ACL that was never stored.
-/// Claiming success for an unwritten policy document is the dangerous
-/// direction — the client would believe the path is protected.
+/// *after* the update on purpose, and it asks about the **auxiliary**, not
+/// the subject — the question the return value actually answers is "did my
+/// write land", and only that phrasing survives every interleaving. Asking
+/// about the subject would report `Ok(())` when a subject was deleted and
+/// recreated around the guarded update: nothing was written, yet the client
+/// would believe the path is protected while nearest-ACL-wins quietly hands
+/// it the ancestor's rules. Claiming success for an unwritten policy
+/// document is the dangerous direction.
 pub async fn put(
     store: &dyn SparqlStore,
     aux: &AuxUrl,
@@ -72,7 +75,7 @@ pub async fn put(
         .update(&conditional_put_update(aux, triples))
         .await
         .map_err(ResourceError::from)?;
-    if !exists(store, aux.subject()).await? {
+    if !exists(store, aux).await? {
         return Err(AuxError::SubjectMissing);
     }
     Ok(())
