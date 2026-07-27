@@ -40,17 +40,23 @@ issuer is `http://localhost:3001/`, the entry must be `localhost:3001`. `127.0.0
 will not match it, even though the name resolves there.
 
 Each entry is parsed once, at startup, into a host and an optional port — not re-matched
-as a raw string on every fetch. That matters for IPv6: naively splitting `host:port` on
-the last colon breaks as soon as the host itself contains colons, and — worse — the wrong
-fallback (treating the whole string as one opaque token) let one entry alias a completely
-different, unlisted address. Both failure modes are closed by the rules below.
+as a raw string on every fetch. The host portion is parsed by handing it to the same URL
+library (`url`, via `reqwest::Url`) that will parse the target of the actual fetch, instead
+of re-deriving that normalization by hand: whatever canonical form `url` produces for a
+request is exactly what gets stored, so the two cannot disagree. Concretely, that means an
+entry's host is accepted and stored **in whatever form a real request to it would
+normalize to** — lowercased, IDNA/punycoded, percent-decoded, with an IPv4 literal written
+as `127.1`, `0x7f.1`, or a bare decimal (`2130706433`) collapsed to dotted-quad, and an
+IPv6 address compressed per RFC 5952 — including an IPv4-mapped address
+(`::ffff:127.0.0.1`), which is stored as `::ffff:7f00:1` (the WHATWG serializer's hex-group
+form), never the dotted-quad form. You do not need to pre-normalize an entry by hand; write
+it however you'd write the URL's host, and it will match.
 
-Entry form, exactly:
+Entry form:
 
-- **Lowercase.** The URL's host is compared after the URL parser has lowercased it, so
-  `LocalHost:3001` never matches. Write entries lowercase.
-- **No scheme, no path, no trailing slash** — `localhost:3001`, not
-  `http://localhost:3001/`.
+- **No scheme, no path, no credentials, no query, no fragment** — `localhost:3001`, not
+  `http://localhost:3001/`, `user@localhost:3001`, `localhost:3001/x`,
+  `localhost:3001?q=1`, or `localhost:3001#frag`. Any of these is rejected outright.
 - **Default ports are explicit.** A URL with no port is compared against the scheme's
   default, so `http://css.local/` matches the entry `css.local:80` (or the bare
   `css.local`), not `css.local:3001`.
@@ -60,21 +66,26 @@ Entry form, exactly:
   it costs an operator an hour if they don't know about it, so: don't write the trailing
   dot, and don't expect the entry to grow one for you.
 - **IPv6 host, no port: unbracketed** — `fd00::1` or `::1`, matching every port on that
-  address. The brackets a URL requires (`http://[::1]:3001/`) are stripped before the
-  comparison, so the bare, unbracketed form is what you write.
+  address. Internally this is bracketed and canonicalized before being stored (matching
+  what a URL to that address produces), but you write it bare.
 - **IPv6 host with a port: bracketed, `[host]:port`** — `[fd00::1]:80`, `[::1]:3001`. This
   is the *only* way to pair an IPv6 host with a port. An unbracketed `host:port`-looking
   spelling for IPv6 (e.g. `fd00::1:80`, which reads exactly like the address
   `fd00::1:80`) is ambiguous — a colon-delimited port suffix is indistinguishable from
   another IPv6 group — and matches neither reading. The pod **refuses to start**, naming
   the entry and the bracketed form to use instead (`[fd00::1]:80`).
-- **A non-canonical IPv6 spelling still works — it's normalized, not compared verbatim.**
-  `[0:0:0:0:0:0:0:1]` and `[fd00::0001]:80` are stored in the same canonical form `url`
-  itself produces for the request (`::1`, `fd00::1`), so they match.
+- **A non-canonical spelling still works — it's normalized, not compared verbatim.** This
+  is no longer just an IPv6 courtesy: `[0:0:0:0:0:0:0:1]` and `[fd00::0001]:80` are
+  IPv6-canonicalized (`::1`, `fd00::1`); `127.1:3001`, `0x7f.1:3001`, `2130706433:3001`, and
+  `127.0.0.01:3001` are all IPv4-canonicalized to `127.0.0.1:3001`; `%6Cocalhost` is
+  percent-decoded to `localhost`; and an internationalized hostname (`bücher.example`) is
+  punycoded (`xn--bcher-kva.example`) — all matching what `url` produces for the same
+  request, since that is the same library doing both.
 - **A malformed entry also refuses to start the pod, rather than being stored inert.** A
-  scheme, a path, whitespace, or an out-of-range port folded into the host — `http://
-  localhost:3001`, `localhost/x`, `localhost:3001/`, `localhost:99999` — can never match a
-  real URL host, so it is rejected outright, named at startup, with the entry printed.
+  scheme, a path, credentials, a query, a fragment, whitespace, or an out-of-range port
+  folded into the host — `http://localhost:3001`, `localhost/x`, `localhost:3001/`,
+  `localhost:99999` — can never match a real URL host, so it is rejected outright, named at
+  startup, with the entry printed.
 
 ### What it relaxes, for a listed host only
 

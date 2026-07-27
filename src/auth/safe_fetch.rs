@@ -136,12 +136,14 @@ impl FetchPolicy {
         }
     }
 
-    /// Whether this exact host (and port) is on the operator's list.
+    /// Whether this exact host (and port) is on the operator's list. `host`
+    /// must already be in the form `url`'s `host_str()` produces (bracketed
+    /// for IPv6, e.g. `"[::1]"`) — the same form [`parse_insecure_host_entry`]
+    /// stores, since both come from the same parser. No further
+    /// normalization happens here: that is precisely the coupling this
+    /// module used to maintain by hand and now does not.
     fn permits_insecure(&self, host: &str, port: u16) -> bool {
-        let host = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_lowercase();
+        let host = host.to_string();
         self.insecure_hosts.contains(&(host.clone(), None))
             || self.insecure_hosts.contains(&(host, Some(port)))
     }
@@ -152,93 +154,105 @@ impl FetchPolicy {
 /// this host". Returns `None` for an entry that cannot be understood
 /// unambiguously — it is dropped from the set rather than guessed at.
 ///
-/// Grammar:
+/// Host normalization is delegated entirely to `reqwest::Url` — the same
+/// parser that produces the host again at lookup time (see
+/// [`guarded_get`]) — rather than re-derived here. That is the point of this
+/// function: agreement between what is stored and what is looked up is
+/// structural (both come from `url`'s `host_str()`), not something this
+/// module has to keep in sync by hand. Concretely, the entry (or its host
+/// portion) is parsed as `http://<authority>/`, which subsumes rejecting a
+/// scheme, a path, credentials, a query, or a fragment folded into the host
+/// — `url` already refuses all of those — and canonicalizes whatever is left
+/// exactly as it would for a real request: lowercased, IDNA/punycoded,
+/// %-decoded, IPv4 alternate notations (`127.1`, `0x7f.1`, `2130706433`)
+/// collapsed to dotted-quad, and IPv6 compressed per RFC 5952 — including
+/// IPv4-mapped addresses (`::ffff:127.0.0.1`), which `url`'s serializer
+/// renders as `::ffff:7f00:1`, *not* the dotted-quad form
+/// [`Ipv6Addr`]'s `Display` used to produce. The returned host is exactly
+/// what `url` would give for the request this entry is meant to unblock —
+/// bracketed for IPv6, matching [`guarded_get`]'s `host_str()`, so
+/// `permits_insecure` needs no bracket-handling of its own either.
 ///
-/// - **Bracketed IPv6**, `[addr]` or `[addr]:port` — the unambiguous way to
-///   name an IPv6 host, with or without a port. `addr` must itself parse as
-///   an [`Ipv6Addr`]; a malformed bracketed entry is dropped.
-/// - A bare entry that parses as a whole [`Ipv6Addr`] (e.g. `fd00::1`) is a
-///   host with no port restriction — every colon in it is part of the
-///   address, never a port separator, so it is never split.
-/// - A bare entry that is *simultaneously* a valid whole `Ipv6Addr` **and**
-///   has a `host:port` reading whose `host` portion is *also* a valid
-///   `Ipv6Addr` (e.g. `fd00::1:80`, which is at once the address
-///   `fd00::1:80` and the pair `fd00::1` + port `80`) is ambiguous and is
-///   dropped entirely: guessing "whole address" would silently grant an
-///   unnamed address every port, and guessing "split" would silently drop
-///   the address actually typed. There is no safe default, so the entry
-///   contributes nothing — the bracketed form must be used instead.
-/// - Otherwise, split on the last colon: `host:port` (hostnames, IPv4
-///   literals) if the tail parses as a `u16`, else a bare host with no
-///   port.
-/// - A host portion (whether alone or before a `:port`) containing `/`,
-///   `:`, whitespace, or a bracket is rejected outright rather than stored:
-///   these are exactly the mistakes a scheme, a path, or a fat-fingered
-///   out-of-range port produce (`http://localhost:3001`, `localhost/x`,
-///   `localhost:99999`), and none of them can ever match a URL host — so an
-///   entry shaped like one is unambiguously a mistake, not a host.
+/// The only two things decided here rather than by `url`:
 ///
-/// The returned IPv6 host is stored in **canonical form** (via
-/// [`Ipv6Addr`]'s `Display`, e.g. `0:0:0:0:0:0:0:1` becomes `::1`), matching
-/// what `url` (and so [`guarded_get`]'s `host_str()`) produces for the same
-/// address — lowercasing alone is not enough, since `url` also compresses
-/// and abbreviates IPv6 addresses, and a non-canonical stored spelling would
-/// never equal the canonical one `permits_insecure` looks up. Non-IPv6 hosts
-/// are only de-bracketed (never applicable) and lowercased.
+/// - **The ambiguity pre-check.** An unbracketed entry that parses as a
+///   whole [`Ipv6Addr`] (e.g. `fd00::1`) *and* also has a `host:port`
+///   reading whose host portion is itself a valid `Ipv6Addr` (e.g.
+///   `fd00::1:80`, at once the address `fd00::1:80` and the pair `fd00::1` +
+///   port `80`) must be rejected before any delegation: guessing "whole
+///   address" would silently grant an unnamed address every port, and
+///   guessing "split" would silently drop the address actually typed. `url`
+///   cannot make this call for us — fed either reading it would happily
+///   parse one of them — so this runs first, on the raw entry.
+/// - **Whether a port was named, and which one.** A bare decimal integer has
+///   no equivalent of the host's case/punycode/IPv6-compression drift, so
+///   parsing it here does not reintroduce the defect class — but reading it
+///   back via `Url::port()` would: that accessor returns `None` whenever the
+///   port equals the scheme's default (80, since the authority is always
+///   wrapped as `http://` for parsing), so an explicit `:80` would silently
+///   become "every port" instead of "port 80 only". The port is therefore
+///   parsed once here, from the same substring `url` will also validate,
+///   and used directly instead of read back from the parsed `Url`.
+///
+/// A bare whole IPv6 address (confirmed non-ambiguous above) is bracketed
+/// before delegation, since `url` refuses an unbracketed IPv6 host in an
+/// authority outright — that is a syntax rule of the URL standard, not
+/// something this function is guessing at.
 fn parse_insecure_host_entry(entry: &str) -> Option<(String, Option<u16>)> {
     let entry = entry.trim();
     if entry.is_empty() {
         return None;
     }
 
-    if let Some(rest) = entry.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let addr: Ipv6Addr = rest[..close].parse().ok()?;
-        return match &rest[close + 1..] {
-            "" => Some((addr.to_string(), None)),
-            tail => {
-                let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
-                Some((addr.to_string(), Some(port)))
-            }
-        };
-    }
-
-    if let Ok(addr) = entry.parse::<Ipv6Addr>() {
+    if entry.parse::<Ipv6Addr>().is_ok() {
         let ambiguous = entry.rfind(':').is_some_and(|idx| {
             let (host, port_str) = (&entry[..idx], &entry[idx + 1..]);
             host.parse::<Ipv6Addr>().is_ok() && port_str.parse::<u16>().is_ok()
         });
-        return if ambiguous {
-            None
-        } else {
-            Some((addr.to_string(), None))
-        };
-    }
-
-    if let Some(idx) = entry.rfind(':') {
-        let (host, port_str) = (&entry[..idx], &entry[idx + 1..]);
-        if !is_valid_host_portion(host) {
+        if ambiguous {
             return None;
         }
-        return port_str.parse::<u16>().ok().map(|port| (host.to_lowercase(), Some(port)));
     }
 
-    if is_valid_host_portion(entry) {
-        Some((entry.to_lowercase(), None))
+    let (authority, port): (String, Option<u16>) = if let Some(rest) = entry.strip_prefix('[') {
+        // Bracketed IPv6, with or without a port: already valid URL
+        // authority syntax, so hand the entry to `url` unchanged.
+        let close = rest.find(']')?;
+        match &rest[close + 1..] {
+            "" => (entry.to_string(), None),
+            tail => {
+                let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
+                (entry.to_string(), Some(port))
+            }
+        }
+    } else if entry.parse::<Ipv6Addr>().is_ok() {
+        // Bare whole IPv6 address, already confirmed non-ambiguous above:
+        // bracket it ourselves since `url` requires brackets for an IPv6
+        // host. Never has a port syntactically — every colon in it is part
+        // of the address.
+        (format!("[{entry}]"), None)
+    } else if let Some(idx) = entry.rfind(':') {
+        // Hostname or IPv4 literal with a `:port` suffix. The tail must
+        // parse as a port on its own terms: an empty or out-of-range tail
+        // (`localhost:`, `localhost:99999`) is rejected here rather than
+        // falling through to "the whole thing is a bare host".
+        let port = entry[idx + 1..].parse::<u16>().ok()?;
+        (entry.to_string(), Some(port))
     } else {
-        None
-    }
-}
+        (entry.to_string(), None)
+    };
 
-/// True for a host portion that could plausibly appear in a URL's authority:
-/// non-empty, and free of `/`, `:`, whitespace, and brackets. A `--allow-
-/// insecure-host` entry whose host portion fails this can never match a real
-/// URL host, so [`parse_insecure_host_entry`] rejects it rather than storing
-/// it inert (see Important 2 in `.superpowers/sdd/task-1-fixes-2.md`).
-fn is_valid_host_portion(host: &str) -> bool {
-    !host.is_empty()
-        && !host
-            .contains(|c: char| c == '/' || c == ':' || c == '[' || c == ']' || c.is_whitespace())
+    let u = reqwest::Url::parse(&format!("http://{authority}/")).ok()?;
+    if u.path() != "/"
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+    {
+        return None;
+    }
+    let host = u.host_str()?.to_string();
+    Some((host, port))
 }
 
 /// A human-readable explanation of why a `--allow-insecure-host` /
@@ -273,17 +287,15 @@ pub fn insecure_host_rejection_hint(entry: &str) -> String {
 }
 
 /// Render a parsed entry back to display form, for the startup warning.
-/// Brackets the host if it contains a colon (IPv6), so the result is
-/// itself a valid re-parseable entry in the grammar above.
+/// `host` is already in the exact form `permits_insecure` matches against
+/// (bracketed for IPv6, since that is what `url`'s `host_str()` produces),
+/// so no further bracketing is needed here — unlike before this change,
+/// this is the same string the matcher will actually use, not a
+/// re-derived one.
 fn display_insecure_host_entry(host: &str, port: Option<u16>) -> String {
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
     match port {
         Some(port) => format!("{host}:{port}"),
-        None => host,
+        None => host.to_string(),
     }
 }
 
@@ -869,12 +881,15 @@ mod tests {
     // The bracketed form is the unambiguous way to pair an IPv6 host with a
     // port — it must actually work (Minor 5 in the review: it was silently
     // inert before this fix) and must stay port-scoped like any other
-    // `host:port` entry.
+    // `host:port` entry. `resolve_allowed` is called with the bracketed host
+    // here because that is what its only production caller (`guarded_get`)
+    // always passes — `host_str()` brackets IPv6 — and storage now matches
+    // that form exactly rather than de-bracketing at lookup time.
     #[tokio::test]
     async fn bracketed_ipv6_entry_is_port_scoped() {
         let policy = named(&["[::1]:3001"]);
-        assert!(resolve_allowed("::1", 3001, &policy).await.is_ok());
-        assert!(resolve_allowed("::1", 9999, &policy).await.is_err());
+        assert!(resolve_allowed("[::1]", 3001, &policy).await.is_ok());
+        assert!(resolve_allowed("[::1]", 9999, &policy).await.is_err());
     }
 
     // A bare (unbracketed) IPv6 address with no trailing ambiguity opens
@@ -882,8 +897,8 @@ mod tests {
     #[tokio::test]
     async fn bare_ipv6_entry_opens_every_port_on_it() {
         let policy = named(&["fd00::1"]);
-        assert!(resolve_allowed("fd00::1", 80, &policy).await.is_ok());
-        assert!(resolve_allowed("fd00::1", 9999, &policy).await.is_ok());
+        assert!(resolve_allowed("[fd00::1]", 80, &policy).await.is_ok());
+        assert!(resolve_allowed("[fd00::1]", 9999, &policy).await.is_ok());
     }
 
     // `url` canonicalizes IPv6 hosts (RFC 5952: compressed, lowercase) —
@@ -897,7 +912,7 @@ mod tests {
         assert_eq!(url.host_str(), Some("[::1]"), "sanity: url compresses this address");
         let policy = named(&["[0:0:0:0:0:0:0:1]:3001"]);
         assert!(
-            resolve_allowed("::1", 3001, &policy).await.is_ok(),
+            resolve_allowed("[::1]", 3001, &policy).await.is_ok(),
             "a non-canonical entry must match the canonical host url produces"
         );
     }
@@ -908,9 +923,132 @@ mod tests {
         assert_eq!(url.host_str(), Some("[fd00::1]"), "sanity: url drops the leading zeros");
         let policy = named(&["[fd00::0001]:80"]);
         assert!(
-            resolve_allowed("fd00::1", 80, &policy).await.is_ok(),
+            resolve_allowed("[fd00::1]", 80, &policy).await.is_ok(),
             "a non-canonical entry must match the canonical host url produces"
         );
+    }
+
+    // Task 1, round 3: the table of entries that the pre-delegation parser
+    // understood, stored, and reported as active in the startup warning, but
+    // which matched nothing at lookup time because the hand-rolled
+    // normalization here disagreed with what `url` computes for the request
+    // — the exact operator-diagnosability failure the two previous rounds
+    // were meant to close, now hiding in entries that *pass* validation
+    // instead of the ones that fail it. Each case below asserts the stored
+    // host equals `url`'s host for the matching request, derived in the test
+    // (never hardcoded) so a future re-drift fails this assertion instead of
+    // silently reintroducing the class.
+    #[test]
+    fn ipv4_mapped_ipv6_entry_matches_the_host_url_produces() {
+        let expected = reqwest::Url::parse("https://[::ffff:127.0.0.1]:8080/x").unwrap();
+        let (host, port) = parse_insecure_host_entry("[::ffff:127.0.0.1]:8080")
+            .expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, expected.port_or_known_default());
+    }
+
+    #[test]
+    fn expanded_ipv4_mapped_ipv6_entry_matches_the_host_url_produces() {
+        let expected = reqwest::Url::parse("https://[0:0:0:0:0:ffff:7f00:1]:8080/x").unwrap();
+        let (host, port) = parse_insecure_host_entry("[0:0:0:0:0:ffff:7f00:1]:8080")
+            .expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, expected.port_or_known_default());
+        // The specific defect being closed: `Ipv6Addr::Display` renders an
+        // IPv4-mapped address in dotted-quad form (`::ffff:127.0.0.1`); the
+        // WHATWG serializer `url` uses never does. IPv4-mapped IPv6 is the
+        // one family this module singles out as an SSRF bypass class (see
+        // `is_forbidden_ip`'s `to_ipv4_mapped` branch), so disagreeing here
+        // was the worst place for the drift to hide.
+        assert_eq!(host, "[::ffff:7f00:1]");
+    }
+
+    #[test]
+    fn idn_hostname_entry_matches_the_punycode_host_url_produces() {
+        let expected = reqwest::Url::parse("https://b\u{fc}cher.example/x").unwrap();
+        let (host, port) = parse_insecure_host_entry("b\u{fc}cher.example").expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, None, "a bare host entry still opens every port");
+    }
+
+    #[test]
+    fn percent_encoded_hostname_entry_matches_the_decoded_host_url_produces() {
+        let expected = reqwest::Url::parse("https://%6Cocalhost/x").unwrap();
+        let (host, port) = parse_insecure_host_entry("%6Cocalhost").expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn shorthand_ipv4_entry_matches_the_dotted_quad_host_url_produces() {
+        let expected = reqwest::Url::parse("https://127.1:3001/x").unwrap();
+        let (host, port) = parse_insecure_host_entry("127.1:3001").expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, expected.port_or_known_default());
+    }
+
+    #[test]
+    fn hex_ipv4_entry_matches_the_dotted_quad_host_url_produces() {
+        let expected = reqwest::Url::parse("https://0x7f.1:3001/x").unwrap();
+        let (host, port) = parse_insecure_host_entry("0x7f.1:3001").expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, expected.port_or_known_default());
+    }
+
+    #[test]
+    fn decimal_ipv4_entry_matches_the_dotted_quad_host_url_produces() {
+        let expected = reqwest::Url::parse("https://2130706433:3001/x").unwrap();
+        let (host, port) =
+            parse_insecure_host_entry("2130706433:3001").expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, expected.port_or_known_default());
+    }
+
+    #[test]
+    fn leading_zero_ipv4_entry_matches_the_dotted_quad_host_url_produces() {
+        let expected = reqwest::Url::parse("https://127.0.0.01:3001/x").unwrap();
+        let (host, port) =
+            parse_insecure_host_entry("127.0.0.01:3001").expect("must now be understood");
+        assert_eq!(host, expected.host_str().unwrap());
+        assert_eq!(port, expected.port_or_known_default());
+    }
+
+    // End-to-end proof (not just the parser) for the IP-literal rows above —
+    // these never need a real DNS lookup, so they can go through
+    // `resolve_allowed` hermetically, the same way the existing canonical-
+    // IPv6 tests do. The hostname rows (IDN, percent-encoded) are
+    // deliberately left at the parser level above: `bücher.example` is an
+    // RFC 2606 reserved (`.example`) name that will never resolve, so
+    // routing it through a real DNS lookup here would make the test flaky
+    // or network-dependent instead of proving the fix.
+    #[tokio::test]
+    async fn ipv4_mapped_ipv6_entry_is_reachable_end_to_end() {
+        let policy = named(&["[::ffff:127.0.0.1]:8080"]);
+        assert!(resolve_allowed("[::ffff:7f00:1]", 8080, &policy).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shorthand_ipv4_entry_is_reachable_end_to_end() {
+        let policy = named(&["127.1:3001"]);
+        assert!(resolve_allowed("127.0.0.1", 3001, &policy).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn hex_ipv4_entry_is_reachable_end_to_end() {
+        let policy = named(&["0x7f.1:3001"]);
+        assert!(resolve_allowed("127.0.0.1", 3001, &policy).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn decimal_ipv4_entry_is_reachable_end_to_end() {
+        let policy = named(&["2130706433:3001"]);
+        assert!(resolve_allowed("127.0.0.1", 3001, &policy).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn leading_zero_ipv4_entry_is_reachable_end_to_end() {
+        let policy = named(&["127.0.0.01:3001"]);
+        assert!(resolve_allowed("127.0.0.1", 3001, &policy).await.is_ok());
     }
 
     // Whitespace and empty entries (the comma-separated env form can
