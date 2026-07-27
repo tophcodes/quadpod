@@ -8,7 +8,7 @@
 
 use crate::{
     rdf::RdfError,
-    space::{GraphName, SpaceError},
+    space::{DirectlyDeletable, DirectlyWritable, GraphName, SpaceError},
     store::{SparqlStore, StoreError},
 };
 use oxigraph::model::Triple;
@@ -56,7 +56,7 @@ pub(crate) fn serialize_for_insert(triples: &[Triple]) -> String {
 /// Replace a graph's contents and mark it present, in one update.
 pub async fn put_rdf(
     store: &dyn SparqlStore,
-    g: &impl GraphName,
+    g: &impl DirectlyWritable,
     triples: &[Triple],
 ) -> Result<(), ResourceError> {
     let iri = g.graph_iri();
@@ -79,7 +79,7 @@ pub async fn put_rdf(
 /// presence marker.
 pub async fn insert_marked(
     store: &dyn SparqlStore,
-    g: &impl GraphName,
+    g: &impl DirectlyWritable,
     triples: &[Triple],
 ) -> Result<(), ResourceError> {
     let iri = g.graph_iri();
@@ -138,7 +138,10 @@ pub async fn exists(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool,
 /// read-then-write race the rest of this non-transactional layer carries,
 /// and it has no authorization consequence — but it is a real trade, not a
 /// free win.
-pub async fn delete_rdf(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool, ResourceError> {
+pub async fn delete_rdf(
+    store: &dyn SparqlStore,
+    g: &impl DirectlyDeletable,
+) -> Result<bool, ResourceError> {
     let existed = exists(store, g).await?;
     let iri = g.graph_iri();
     let sys = sys_graph_iri(g);
@@ -151,7 +154,7 @@ pub async fn delete_rdf(store: &dyn SparqlStore, g: &impl GraphName) -> Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rdf, space::{StorageSpace, Target}, store::OxigraphStore};
+    use crate::{rdf, space::{AuxKind, AuxUrl, ResourceUrl, StorageSpace, Target}, store::OxigraphStore};
     use oxigraph::io::RdfFormat;
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
@@ -166,6 +169,18 @@ mod tests {
 
     fn triples(turtle: &str, base: &str) -> Vec<Triple> {
         rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, base).unwrap()
+    }
+
+    /// An existing subject with an auxiliary written for it. `delete_rdf` is
+    /// bounded to auxiliaries — a subject is deleted by `aux::delete_subject`,
+    /// which cascades — so the deletion tests below exercise it on one, built
+    /// through the only API that can create one.
+    async fn subject_with_acl(store: &OxigraphStore, subject: &ResourceUrl, turtle: &str) -> AuxUrl {
+        put_rdf(store, subject, &[]).await.unwrap();
+        let acl = subject.aux(AuxKind::Acl);
+        let t = triples(turtle, acl.graph_iri());
+        crate::aux::put(store, &acl, &t).await.unwrap();
+        acl
     }
 
     #[tokio::test]
@@ -211,24 +226,23 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_content_and_presence() {
         let store = OxigraphStore::in_memory().unwrap();
-        let foo = res("/foo");
-        put_rdf(&store, &foo, &triples("<#it> <http://schema.org/name> \"x\" .", foo.graph_iri())).await.unwrap();
+        let acl = subject_with_acl(&store, &res("/foo"), "<#it> <http://schema.org/name> \"x\" .").await;
 
-        assert!(delete_rdf(&store, &foo).await.unwrap());
-        assert!(!exists(&store, &foo).await.unwrap());
-        assert_eq!(get_rdf(&store, &foo).await.unwrap(), None);
-        assert!(!delete_rdf(&store, &foo).await.unwrap(), "already gone");
+        assert!(delete_rdf(&store, &acl).await.unwrap());
+        assert!(!exists(&store, &acl).await.unwrap());
+        assert_eq!(get_rdf(&store, &acl).await.unwrap(), None);
+        assert!(!delete_rdf(&store, &acl).await.unwrap(), "already gone");
     }
 
-    // An empty resource must be deletable too — otherwise it would be
+    // An empty graph must be deletable too — otherwise it would be
     // unreachable state: exists, but no way to remove it.
     #[tokio::test]
-    async fn an_empty_resource_can_be_deleted() {
+    async fn an_empty_graph_can_be_deleted() {
         let store = OxigraphStore::in_memory().unwrap();
-        let empty = res("/empty");
-        put_rdf(&store, &empty, &[]).await.unwrap();
-        assert!(delete_rdf(&store, &empty).await.unwrap());
-        assert!(!exists(&store, &empty).await.unwrap());
+        let acl = subject_with_acl(&store, &res("/empty"), "").await;
+        assert!(exists(&store, &acl).await.unwrap());
+        assert!(delete_rdf(&store, &acl).await.unwrap());
+        assert!(!exists(&store, &acl).await.unwrap());
     }
 
     #[tokio::test]
@@ -258,7 +272,8 @@ mod tests {
         let foo = res("/foo");
         insert_marked(&store, &foo, &triples("<#it> <http://schema.org/name> \"x\" .", foo.graph_iri())).await.unwrap();
         assert!(exists(&store, &foo).await.unwrap());
-        assert!(delete_rdf(&store, &foo).await.unwrap());
+        // A resource is removed by the cascade, not by `delete_rdf`.
+        assert!(crate::aux::delete_subject(&store, &foo).await.unwrap());
         assert!(!exists(&store, &foo).await.unwrap());
     }
 
@@ -270,8 +285,8 @@ mod tests {
     #[tokio::test]
     async fn triples_without_a_marker_read_as_absent_but_are_still_deletable() {
         let store = OxigraphStore::in_memory().unwrap();
-        let foo = res("/foo");
-        let iri = foo.graph_iri();
+        let acl = res("/foo").aux(AuxKind::Acl);
+        let iri = acl.graph_iri();
         store
             .update(&format!(
                 "INSERT DATA {{ GRAPH <{iri}> {{ <{iri}> <http://schema.org/name> \"x\" }} }}"
@@ -279,12 +294,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!exists(&store, &foo).await.unwrap(), "unmarked content must read as absent");
-        assert_eq!(get_rdf(&store, &foo).await.unwrap(), None);
+        assert!(!exists(&store, &acl).await.unwrap(), "unmarked content must read as absent");
+        assert_eq!(get_rdf(&store, &acl).await.unwrap(), None);
 
-        // Finding 2: delete_rdf is unconditional, so orphaned content is
-        // still removable even though `existed` reports false.
-        assert!(!delete_rdf(&store, &foo).await.unwrap());
+        // delete_rdf is unconditional, so orphaned content is still removable
+        // even though `existed` reports false.
+        assert!(!delete_rdf(&store, &acl).await.unwrap());
         let remaining = store
             .query_triples(&format!(
                 "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"

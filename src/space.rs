@@ -40,6 +40,36 @@ pub trait GraphName: sealed::Sealed {
     fn graph_iri(&self) -> &str;
 }
 
+/// A graph that may be written straight to the store, because nothing has to
+/// be true of anything else first. Sealed through [`GraphName`].
+///
+/// Not [`AuxUrl`]: an auxiliary may only be written for a subject that
+/// exists, and that condition is part of the write itself — see `aux::put`,
+/// which carries it inside the update. A direct `resource::put_rdf` would
+/// plant a policy document on a path that was never created, and
+/// nearest-ACL-wins would then make it permanent and unremovable. That is the
+/// defect this bound exists to make uncompilable; `aux::` being a convention
+/// was not enough.
+///
+/// Not [`Target`]: a `Target` has not yet been decided into resource-or-
+/// auxiliary, so it cannot say which lifecycle rule applies. Match on it
+/// first — the arm you land in carries the right bound.
+pub trait DirectlyWritable: GraphName {}
+
+/// A graph that may be deleted on its own, taking nothing else with it.
+/// Sealed through [`GraphName`].
+///
+/// Only [`AuxUrl`]: removing an auxiliary is a complete operation — the path
+/// falls back to inherited policy, which is exactly what its absence means.
+///
+/// Not [`ResourceUrl`]/[`ContainerUrl`]: deleting a subject must take every
+/// auxiliary with it, or a recreated path resurrects the old grants. The
+/// cascade is `aux::delete_subject`, and this bound is what stops a caller
+/// from reaching past it with `resource::delete_rdf`.
+///
+/// Not [`Target`]: same reason as [`DirectlyWritable`].
+pub trait DirectlyDeletable: GraphName {}
+
 /// A kind of auxiliary resource. Closed and server-defined: a kind exists
 /// only if the server enforces its lifecycle, listing exclusion and
 /// authorization derivation. This enum is the single source of truth for
@@ -129,6 +159,11 @@ impl GraphName for Target {
         }
     }
 }
+
+impl DirectlyWritable for ResourceUrl {}
+impl DirectlyWritable for ContainerUrl {}
+
+impl DirectlyDeletable for AuxUrl {}
 
 impl ResourceUrl {
     pub fn path(&self) -> &str {
