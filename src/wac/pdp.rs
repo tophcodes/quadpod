@@ -157,6 +157,14 @@ fn has_object(acl: &[Triple], subject: &NamedOrBlankNode, predicate: &str, objec
 /// `acl:agent <webid>` matches that WebID exactly; `acl:agentClass foaf:Agent`
 /// matches everyone including the public; `acl:agentClass acl:AuthenticatedAgent`
 /// matches any verified WebID but never the public.
+///
+/// **If you add a form here, add it to [`names_someone`] too.** That function
+/// answers "could this authorization match *anybody*", which is this function
+/// existentially quantified over the agent — a correspondence the compiler
+/// does not enforce. Forgetting it does not misdecide access (`decide` stays
+/// the only authority), but it makes `grants_anything` report "grants
+/// nothing" for an ACL that does grant, i.e. a spurious warning on a write
+/// that was in fact effective.
 fn matches_agent(acl: &[Triple], subject: &NamedOrBlankNode, agent: &Agent) -> bool {
     if has_object(acl, subject, ACL_AGENT_CLASS, FOAF_AGENT) {
         return true;
