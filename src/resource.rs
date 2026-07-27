@@ -39,13 +39,13 @@ pub fn sys_graph_iri(g: &impl GraphName) -> String {
     format!("urn:pod:sys:{}", g.graph_iri())
 }
 
-/// Render triples as N-Triples for interpolation into an `INSERT DATA` body.
+/// Render triples as N-Triples for interpolation into an `INSERT` body.
 ///
-/// Both write paths share this so their escaping cannot diverge: oxrdf's
+/// Every write path shares this so their escaping cannot diverge: oxrdf's
 /// `Display` is what escapes quotes, newlines, control characters, language
 /// tags and datatypes, and a second copy of this loop would be the place a
 /// future change forgets.
-fn serialize_for_insert(triples: &[Triple]) -> String {
+pub(crate) fn serialize_for_insert(triples: &[Triple]) -> String {
     let mut body = String::new();
     for t in triples {
         body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
