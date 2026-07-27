@@ -1585,6 +1585,33 @@ mod tests {
         assert_eq!(f.app.oneshot(owner_create).await.unwrap().status(), StatusCode::CREATED);
     }
 
+    // Finding 2: the same refusal, but for a subject whose ancestors don't
+    // exist either. Before the existence check inside
+    // `authorize_and_materialize` (see its doc comment), `aux::put` was the
+    // only thing that ever said no here — and by the time it ran,
+    // `authorize_and_materialize` had already created and linked `/a/` and
+    // `/a/b/` for a write that was always going to be refused. A 404 that
+    // mutates the store either way, but silently so: the caller is told
+    // nothing happened.
+    #[tokio::test]
+    async fn acl_for_a_deep_resource_that_does_not_exist_creates_no_ancestors() {
+        let f = fixture().await;
+        let put_acl = f.owner_request("PUT", "/.aux/acl/a/b/c")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#x> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/a/b/c> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> ."
+            ))).unwrap();
+        let res = f.app.clone().oneshot(put_acl).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        assert!(f.stored("/a/").await.is_none(),
+            "the 404 must not have materialized /a/");
+        assert!(f.stored("/a/b/").await.is_none(),
+            "the 404 must not have materialized /a/b/");
+    }
+
     // The counterweight: authoring an ACL the ordinary way — for a resource
     // that exists — must keep working, or the check above would have simply
     // switched ACL authoring off.

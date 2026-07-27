@@ -86,6 +86,19 @@ pub async fn authorize(
 /// subtree there and then be refused, leaving containers they were never
 /// allowed to make. Two loops, one derivation — the plan the second loop
 /// applies is the plan the first one authorized, level for level.
+///
+/// For an `Aux` target there is a third possibility besides "authorized" and
+/// "refused for an ancestor": every ancestor authorizes fine, yet the target
+/// is still doomed, because this walk never creates the aux's own subject
+/// (only the ancestor *containers* count as `may_be_member`, never the
+/// subject itself) — and `aux::put` refuses to write an auxiliary for a
+/// subject that does not exist. Left unchecked, that refusal would arrive
+/// only after the plan below had already materialized every ancestor for a
+/// write that could never succeed. The check runs after the decide loop, not
+/// before it: an ancestor-Append denial must still win and answer `Forbidden`
+/// without ever revealing whether the subject exists, exactly as it does
+/// today — only a caller who clears every ancestor gets as far as learning
+/// that the subject itself does not.
 pub async fn authorize_and_materialize(
     store: &dyn SparqlStore,
     agent: &Agent,
@@ -133,6 +146,23 @@ pub async fn authorize_and_materialize(
         }
         child_iri = ancestor.graph_iri().to_string();
         record_child = true;
+    }
+
+    // See the doc comment above: every ancestor is authorized at this point,
+    // but an `Aux` target's own subject was never among them, so a missing
+    // subject is caught here — before the plan below materializes anything —
+    // rather than later inside `aux::put`, after the ancestors it would have
+    // no further use for are already created and linked.
+    if matches!(target, Target::Aux(_))
+        && !resource::exists(store, subject)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "an auxiliary resource cannot be created for a resource that does not exist",
+        )
+            .into_response());
     }
 
     for (ancestor, child_iri) in plan {
