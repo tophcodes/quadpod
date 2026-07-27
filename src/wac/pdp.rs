@@ -10,9 +10,7 @@ use oxigraph::model::{NamedOrBlankNode, Term, Triple};
 
 use crate::auth::Agent;
 
-use super::AccessModes;
-#[cfg(test)]
-use super::Mode;
+use super::{AccessModes, Mode};
 
 pub const ACL_AGENT: &str = "http://www.w3.org/ns/auth/acl#agent";
 pub const ACL_AGENT_CLASS: &str = "http://www.w3.org/ns/auth/acl#agentClass";
@@ -30,6 +28,22 @@ pub const ACL_AUTHENTICATED_AGENT: &str =
 /// real-world ACLs omit the type and rely on scope/agent/mode predicates alone.
 pub const ACL_AUTHORIZATION: &str = "http://www.w3.org/ns/auth/acl#Authorization";
 pub const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
+
+/// The one definition of "a recognized WAC access mode": which `acl:mode`
+/// object IRIs count, and which [`Mode`] each one is. [`decide`] uses this to
+/// know WHICH mode a triple grants; [`has_recognized_mode`] uses it to know
+/// only THAT one does, for [`grants_anything`]. Any other object of
+/// `acl:mode` — an unrecognized IRI, or a non-IRI term — is silently ignored
+/// by both, exactly as it always was.
+fn recognized_mode(mode_iri: &str) -> Option<Mode> {
+    match mode_iri {
+        ACL_READ => Some(Mode::Read),
+        ACL_WRITE => Some(Mode::Write),
+        ACL_APPEND => Some(Mode::Append),
+        ACL_CONTROL => Some(Mode::Control),
+        _ => None,
+    }
+}
 
 /// Which modes `agent` holds on `governed_iri`, according to `acl`.
 ///
@@ -50,23 +64,18 @@ pub fn decide(acl: &[Triple], agent: &Agent, governed_iri: &str, inherited: bool
         }
         for t in acl.iter().filter(|t| t.subject == subject && t.predicate.as_str() == ACL_MODE) {
             if let Term::NamedNode(m) = &t.object {
-                match m.as_str() {
-                    ACL_READ => granted.read = true,
-                    ACL_WRITE => granted.write = true,
-                    ACL_APPEND => granted.append = true,
-                    ACL_CONTROL => granted.control = true,
-                    _ => {}
+                match recognized_mode(m.as_str()) {
+                    Some(Mode::Read) => granted.read = true,
+                    Some(Mode::Write) => granted.write = true,
+                    Some(Mode::Append) => granted.append = true,
+                    Some(Mode::Control) => granted.control = true,
+                    None => {}
                 }
             }
         }
     }
     granted
 }
-
-/// The stand-in agent used by [`grants_anything`] to probe for a rule that
-/// matches *any* authenticated WebID. It is a `urn:`, so it can never be a
-/// WebID a real request arrives with, and never one an ACL would name.
-const PROBE_AUTHENTICATED_AGENT: &str = "urn:sparql-pod:pdp:probe-authenticated-agent";
 
 /// Does `acl` grant **any** mode to **anyone** on `governed_iri`, under either
 /// scope predicate?
@@ -75,39 +84,46 @@ const PROBE_AUTHENTICATED_AGENT: &str = "urn:sparql-pod:pdp:probe-authenticated-
 /// effect: an ACL that grants nothing denies everything at and below its
 /// subject, deliberately (an empty ACL is "nothing is granted here", not
 /// "absent"), and it revokes the very `Control` that would let anyone remove
-/// it. The empty body is the obvious way to write one; the likelier one is a
-/// document full of triples that happen to match nobody — a typo in a WebID,
-/// the wrong predicate, an `acl:accessTo` naming a different IRI.
+/// it. The empty document is the obvious way to write one; the likelier one
+/// is a document full of triples that happen to match nobody — the wrong
+/// predicate, or an `acl:accessTo` naming a different IRI. (Not a typo in a
+/// WebID: [`names_someone`] treats any `acl:agent` object as naming *someone*,
+/// so a misspelled WebID with an otherwise-correct scope and mode is a
+/// genuine, if useless, grant to that spelling — reported as granting
+/// something, not as granting nothing. Catching that needs a different
+/// question — "does this ACL still grant `Control` to the agent writing it?"
+/// — which is out of scope here.)
 ///
-/// Answered by running [`decide`] itself over a candidate set, rather than by
-/// re-reading the triples, so there is exactly one implementation of what a
-/// grant is. The candidate set is complete by construction, because
-/// [`matches_agent`] can only say yes three ways:
+/// Answered in one pass over the ACL's distinct subjects, asking of each:
+/// does it have a scope triple naming `governed_iri` (`acl:accessTo` or
+/// `acl:default` — either counts, since a grant reached only through
+/// `acl:default` still denies nothing), an agent-matching triple of any of
+/// the three recognized forms ([`names_someone`] — the existential version of
+/// the same three predicates [`matches_agent`] checks for one specific
+/// agent), and at least one [`recognized_mode`] ([`has_recognized_mode`], the
+/// same definition [`decide`] uses to assign modes) — all three on the SAME
+/// subject, since an authorization is subject-scoped and a scope triple on
+/// one must not be paired with a mode on another.
 ///
-/// - `acl:agentClass foaf:Agent` matches everyone, so [`Agent::Public`] finds it;
-/// - `acl:agentClass acl:AuthenticatedAgent` matches any WebID, so the
-///   synthetic [`PROBE_AUTHENTICATED_AGENT`] finds it;
-/// - `acl:agent <w>` matches exactly `w`, and every such `w` is an object of
-///   an `acl:agent` triple *in this document*, so enumerating those finds them
-///   all.
-///
-/// Both scopes are probed: an ACL that grants only through `acl:default` still
-/// grants, to its subject's descendants, and must not be reported as granting
-/// nothing.
+/// This replaced probing [`decide`] once per candidate agent — `Public`, a
+/// synthetic authenticated-agent probe, and every `acl:agent` object in the
+/// document, undeduplicated — under both scopes. That was a denial of
+/// service waiting to happen: an ACL is attacker-supplied (anyone holding
+/// `Control` on a resource can `PUT` its ACL), so a ~2 MB document — axum's
+/// default body limit — of `acl:agent` triples with distinct subjects and no
+/// `acl:mode` made `.any()` probe every one of them, each probe itself
+/// `O(subjects × triples)`, for on the order of 10¹³ comparisons in a
+/// synchronous loop with no `await` — a hang triggered by the exact feature
+/// meant to warn about a self-denying ACL. Asking the question directly is
+/// one pass over the subjects instead: `O(subjects × triples)` total, the
+/// same order as a single `decide` call, with no multiplication by how many
+/// agents the document happens to mention.
 pub fn grants_anything(acl: &[Triple], governed_iri: &str) -> bool {
-    let mut candidates = vec![
-        Agent::Public,
-        Agent::WebId(PROBE_AUTHENTICATED_AGENT.to_string()),
-    ];
-    for t in acl.iter().filter(|t| t.predicate.as_str() == ACL_AGENT) {
-        if let Term::NamedNode(w) = &t.object {
-            candidates.push(Agent::WebId(w.as_str().to_string()));
-        }
-    }
-    candidates.iter().any(|agent| {
-        [false, true]
-            .into_iter()
-            .any(|inherited| decide(acl, agent, governed_iri, inherited) != AccessModes::default())
+    authorization_subjects(acl).into_iter().any(|subject| {
+        (has_object(acl, &subject, ACL_ACCESS_TO, governed_iri)
+            || has_object(acl, &subject, ACL_DEFAULT, governed_iri))
+            && names_someone(acl, &subject)
+            && has_recognized_mode(acl, &subject)
     })
 }
 
@@ -115,10 +131,15 @@ pub fn grants_anything(acl: &[Triple], governed_iri: &str) -> bool {
 /// `a acl:Authorization` type triple — WAC treats the scope/agent/mode
 /// predicates themselves as what makes an authorization, and many real ACLs
 /// omit the type.
+///
+/// Dedupes with a `HashSet` rather than `Vec::contains`: the ACL is
+/// attacker-supplied (see [`grants_anything`]'s doc comment), so a document
+/// with thousands of distinct subjects must not make this quadratic.
 fn authorization_subjects(acl: &[Triple]) -> Vec<NamedOrBlankNode> {
+    let mut seen = std::collections::HashSet::new();
     let mut out: Vec<NamedOrBlankNode> = Vec::new();
     for t in acl {
-        if !out.contains(&t.subject) {
+        if seen.insert(t.subject.clone()) {
             out.push(t.subject.clone());
         }
     }
@@ -149,6 +170,35 @@ fn matches_agent(acl: &[Triple], subject: &NamedOrBlankNode, agent: &Agent) -> b
     }
 }
 
+/// Whether `subject`'s agent clauses would match **some** agent, existentially
+/// — what [`grants_anything`] needs, as opposed to [`matches_agent`]'s "does
+/// this ONE agent match", which [`decide`] needs. The same three predicates,
+/// read the same way: `acl:agentClass foaf:Agent` and `acl:agentClass
+/// acl:AuthenticatedAgent` match unconditionally (everyone, respectively any
+/// authenticated WebID), and an `acl:agent` triple matches whatever WebID its
+/// object names — so the mere existence of one such triple, whatever its
+/// object, is exactly the existential form of `matches_agent`'s third case.
+fn names_someone(acl: &[Triple], subject: &NamedOrBlankNode) -> bool {
+    has_object(acl, subject, ACL_AGENT_CLASS, FOAF_AGENT)
+        || has_object(acl, subject, ACL_AGENT_CLASS, ACL_AUTHENTICATED_AGENT)
+        || acl.iter().any(|t| {
+            t.subject == *subject
+                && t.predicate.as_str() == ACL_AGENT
+                && matches!(t.object, Term::NamedNode(_))
+        })
+}
+
+/// Whether `subject` has at least one `acl:mode` triple whose object is a
+/// [`recognized_mode`] — the same notion [`decide`] uses to decide WHICH mode
+/// a triple grants, here only asked THAT one is granted.
+fn has_recognized_mode(acl: &[Triple], subject: &NamedOrBlankNode) -> bool {
+    acl.iter().any(|t| {
+        t.subject == *subject
+            && t.predicate.as_str() == ACL_MODE
+            && matches!(&t.object, Term::NamedNode(m) if recognized_mode(m.as_str()).is_some())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +209,15 @@ mod tests {
     const BOB: &str = "https://bob.example/card#me";
     const FOO: &str = "https://pod.toph.so/foo";
     const BOX_: &str = "https://pod.toph.so/box/";
+
+    /// A synthetic WebID, never one a real request arrives with and never
+    /// one an ACL would name (a `urn:` in a private namespace). Used only
+    /// here, to pin that `acl:agentClass acl:AuthenticatedAgent` matches ANY
+    /// WebID via `decide` directly, not just ones an ACL happens to name —
+    /// see `the_probe_agent_only_finds_grants_that_are_really_there`.
+    /// `grants_anything` no longer probes with a stand-in like this; see its
+    /// own doc comment for what replaced probing.
+    const PROBE_AUTHENTICATED_AGENT: &str = "urn:sparql-pod:pdp:probe-authenticated-agent";
 
     fn acl(turtle: &str) -> Vec<Triple> {
         rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, "https://pod.toph.so/foo.acl")
@@ -364,6 +423,27 @@ mod tests {
             ));
             assert!(grants_anything(&a, FOO), "{mode} alone is a grant");
         }
+    }
+
+    // What used to be pathological: `grants_anything` used to probe `decide`
+    // once per distinct `acl:agent` object in the document, undeduplicated,
+    // each probe itself `O(subjects × triples)` — so a document with this
+    // many distinct-subject `acl:agent` triples and no `acl:mode` (the case
+    // that never lets `.any()` short-circuit) drove that towards the 10¹³
+    // comparisons the DoS finding describes. The one-pass replacement is
+    // `O(subjects × triples)` total, so this must simply finish, fast, in a
+    // single test — no timing assertion, the wall-clock speed of the test
+    // suite itself is the check.
+    #[test]
+    fn grants_anything_stays_fast_on_a_large_ungranted_acl() {
+        let mut turtle = String::new();
+        for i in 0..3000 {
+            turtle.push_str(&format!(
+                "<#s{i}> <{ACL_AGENT}> <https://webid.example/{i}> .\n"
+            ));
+        }
+        let a = acl(&turtle);
+        assert!(!grants_anything(&a, FOO), "no subject here ever names a mode");
     }
 
     // The synthetic probe WebID must not be reachable as a real grant: an ACL
