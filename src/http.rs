@@ -76,13 +76,12 @@ fn aux_links(target: &Target) -> Option<String> {
 /// is where a client mid-create-flow needs them most: SolidOS string-derives
 /// `<url>.acl` exactly when this header is absent, and would then write its
 /// policy to a path this pod treats as ordinary data.
-///
-/// A header value that cannot be built (a non-ASCII IRI) is dropped rather
-/// than raised: the advertisement is advisory, and failing to build it must
-/// not turn a refusal into something else.
 fn with_aux_links(mut res: Response, target: &Target) -> Response {
-    if let Some(value) = aux_links(target).and_then(|v| v.parse().ok()) {
-        res.headers_mut().insert(header::LINK, value);
+    if let Some(value) = aux_links(target) {
+        res.headers_mut().insert(
+            header::LINK,
+            value.parse().expect("aux link value is header-safe"),
+        );
     }
     res
 }
@@ -333,7 +332,10 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Ok(Some(triples)) => {
             let tag = etag(&triples);
             if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
-                return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response();
+                return with_aux_links(
+                    (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response(),
+                    &target,
+                );
             }
             match serialize(&triples, fmt) {
                 Ok(bytes) => {
