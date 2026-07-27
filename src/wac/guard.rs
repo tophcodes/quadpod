@@ -325,7 +325,7 @@ mod tests {
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        let target = sp().resolve("/.aux/acl/foo").unwrap();
+        let target = sp().resolve("/.aux/foo.acl").unwrap();
         assert_eq!(
             status(authorize(&store, &alice(), &target, Mode::Read).await),
             Some(StatusCode::FORBIDDEN)
@@ -339,7 +339,7 @@ mod tests {
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
              <{ACL_MODE}> <{ACL_CONTROL}> ."
         )).await;
-        let target = sp().resolve("/.aux/acl/foo").unwrap();
+        let target = sp().resolve("/.aux/foo.acl").unwrap();
         assert!(authorize(&store, &alice(), &target, Mode::Read).await.is_ok());
         assert!(authorize(&store, &alice(), &target, Mode::Write).await.is_ok());
     }
@@ -428,7 +428,7 @@ mod tests {
             "<#bob> <{ACL_AGENT}> <{BOB}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
              <{ACL_MODE}> <{ACL_CONTROL}> ."
         )).await;
-        let target = sp().resolve("/.aux/acl/box/doc").unwrap();
+        let target = sp().resolve("/.aux/box/doc.acl").unwrap();
         assert!(authorize_and_materialize(&store, &bob(), &target).await.is_ok(),
             "Control alone must suffice when nothing is materialized");
     }
