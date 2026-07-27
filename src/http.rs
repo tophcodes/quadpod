@@ -912,32 +912,41 @@ mod tests {
 
     // The trailing slash is exactly what `dpop-verifier`'s `normalize_htu`
     // erases, so without `verify_dpop`'s own exact `htu` comparison this
-    // request would authenticate: the owner signs `PUT /.aux/foo.acl` and an
-    // on-path adversary re-delivers the identical bytes as
-    // `PUT /.aux/foo/.acl`, installing the body as the *container's* ACL,
-    // where none of its rules name the governed IRI — an empty ACL that beats
-    // every ancestor and locks the subtree out permanently. It must be a 401,
+    // request would authenticate: the owner signs `PUT /foo` and an on-path
+    // adversary re-delivers the identical bytes as `PUT /foo/`, installing
+    // the body as the *container* of the same name — a different resource
+    // from the one the client addressed and authorized. It must be a 401,
     // from the middleware, before any handler sees it.
+    //
+    // This used to be pinned against an auxiliary pair
+    // (`PUT /.aux/foo.acl` re-delivered as `PUT /.aux/foo/.acl`), but the
+    // auxiliary URL shape changed: the kind is now a suffix, so those two
+    // paths' segment lists (`[".aux","foo.acl"]` vs `[".aux","foo",".acl"]`)
+    // differ in a non-empty segment, not an empty one — `normalize_htu`
+    // never treats them as equal, so an ordinary `htu` mismatch already
+    // answers 401 without this tightening. Worse, appending the slash
+    // directly (`/.aux/foo.acl` -> `/.aux/foo.acl/`) *does* still collapse
+    // under `normalize_htu`, but `/.aux/foo.acl/` ends in no kind's suffix,
+    // so it resolves to `Reserved` -> 404 regardless of what `verify_dpop`
+    // decides. Both are a real improvement, and both are why this
+    // regression now has to live in the resource space instead.
     #[tokio::test]
-    async fn a_proof_for_a_resource_acl_cannot_write_the_container_acl() {
+    async fn a_proof_for_a_resource_cannot_write_its_container_counterpart() {
         let f = fixture().await;
         let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
         let proof = f.client.mint_dpop(
-            "https://pod.toph.so/.aux/foo.acl",
+            "https://pod.toph.so/foo",
             "PUT",
             now_unix(),
-            "jti-acl-trailing-slash",
+            "jti-resource-trailing-slash",
         );
         let req = Request::builder()
             .method("PUT")
-            .uri("/.aux/foo/.acl")
+            .uri("/foo/")
             .header(header::AUTHORIZATION, format!("DPoP {at}"))
             .header(header::CONTENT_TYPE, "text/turtle")
             .header("dpop", proof)
-            .body(Body::from(
-                "<#r> a <http://www.w3.org/ns/auth/acl#Authorization> ;\
-                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> .",
-            ))
+            .body(Body::from(""))
             .unwrap();
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
