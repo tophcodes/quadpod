@@ -11,12 +11,15 @@
 //! the graph causes re-provisioning on the next start, providing a recovery
 //! escape hatch.
 
+use oxigraph::io::RdfFormat;
 use oxigraph::model::NamedNode;
 
 use crate::{
-    container::RDF_TYPE,
-    resource::{get_rdf, ResourceError},
-    space::StorageSpace,
+    aux::{self, AuxError},
+    container::ensure_container,
+    rdf,
+    resource::{exists, ResourceError},
+    space::{AuxKind, GraphName, StorageSpace},
     store::SparqlStore,
 };
 
@@ -26,37 +29,49 @@ use super::pdp::{
 };
 
 /// Write the root ACL granting `owner_webid` Read/Write/Control over the
-/// whole pod, unless `/.acl` already has content. Idempotent, and safe to
-/// call on every start.
+/// whole pod, unless the root's ACL auxiliary already has content. Idempotent,
+/// and safe to call on every start.
+///
+/// `aux::put` refuses to write an auxiliary whose subject does not exist, and
+/// the root ACL's subject is the root container — so this ensures the root
+/// container first rather than trusting the caller to have done so. `main.rs`
+/// already calls `provision_root` before this, but a caller that got the
+/// order wrong must not silently produce an unreachable pod.
 pub async fn provision_root_acl(
     store: &dyn SparqlStore,
     space: &StorageSpace,
     owner_webid: &str,
 ) -> Result<(), ResourceError> {
-    // Validated because it is interpolated into SPARQL below.
+    // Validated because it is interpolated into Turtle below.
     NamedNode::new(owner_webid).map_err(|_| ResourceError::InvalidIri)?;
 
-    if get_rdf(store, space, "/.acl").await?.is_some() {
+    let root = space.root();
+    let acl = root.as_resource().aux(AuxKind::Acl);
+    if exists(store, &acl).await? {
         return Ok(());
     }
-    let acl_graph = space.graph_iri("/.acl")?;
-    let root = space.graph_iri("/")?;
-    let subject = format!("{acl_graph}#owner");
-    NamedNode::new(&subject).map_err(|_| ResourceError::InvalidIri)?;
 
-    store
-        .update(&format!(
-            "INSERT DATA {{ GRAPH <{acl_graph}> {{ \
-             <{subject}> <{RDF_TYPE}> <{ACL_AUTHORIZATION}> . \
-             <{subject}> <{ACL_AGENT}> <{owner_webid}> . \
-             <{subject}> <{ACL_ACCESS_TO}> <{root}> . \
-             <{subject}> <{ACL_DEFAULT}> <{root}> . \
-             <{subject}> <{ACL_MODE}> <{ACL_READ}> . \
-             <{subject}> <{ACL_MODE}> <{ACL_WRITE}> . \
-             <{subject}> <{ACL_MODE}> <{ACL_CONTROL}> }} }}"
-        ))
-        .await?;
-    Ok(())
+    ensure_container(store, &root).await?;
+
+    let root_iri = root.graph_iri();
+    let turtle = format!(
+        "<#owner> a <{ACL_AUTHORIZATION}> ; \
+         <{ACL_AGENT}> <{owner_webid}> ; \
+         <{ACL_ACCESS_TO}> <{root_iri}> ; \
+         <{ACL_DEFAULT}> <{root_iri}> ; \
+         <{ACL_MODE}> <{ACL_READ}>, <{ACL_WRITE}>, <{ACL_CONTROL}> ."
+    );
+    let triples = rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, acl.graph_iri())?;
+
+    match aux::put(store, &acl, &triples).await {
+        Ok(()) => Ok(()),
+        Err(AuxError::Resource(e)) => Err(e),
+        // Unreachable: the root container was just ensured to exist above,
+        // and provisioning runs at startup, not concurrently with a delete.
+        Err(AuxError::SubjectMissing) => {
+            unreachable!("the root container was just ensured to exist")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -64,18 +79,31 @@ mod tests {
     use super::*;
     use crate::wac::pdp::{decide, ACL_AGENT_CLASS, FOAF_AGENT};
     use crate::wac::Mode;
-    use crate::{auth::Agent, store::OxigraphStore, wac::prp::effective_acl};
+    use crate::{
+        auth::Agent,
+        space::{ResourceUrl, Target},
+        store::OxigraphStore,
+        wac::prp::effective_acl,
+    };
 
     const OWNER: &str = "https://alice.example/card#me";
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
+
+    fn res(path: &str) -> ResourceUrl {
+        match sp().resolve(path).unwrap() {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource().clone(),
+            Target::Aux(_) => panic!("not a resource path"),
+        }
+    }
 
     #[tokio::test]
     async fn provisioned_root_acl_grants_the_owner_full_control() {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER).await.unwrap();
 
-        let acl = effective_acl(&store, &sp(), "/").await.unwrap().expect("root acl");
+        let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("root acl");
         let owner = Agent::WebId(OWNER.to_string());
         let direct = decide(&acl.triples, &owner, &acl.governed_iri, acl.inherited);
         assert!(direct.allows(Mode::Read));
@@ -89,7 +117,7 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER).await.unwrap();
 
-        let acl = effective_acl(&store, &sp(), "/a/b/c").await.unwrap().expect("inherited");
+        let acl = effective_acl(&store, &res("/a/b/c")).await.unwrap().expect("inherited");
         assert!(acl.inherited);
         let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, true);
         assert!(m.allows(Mode::Write));
@@ -100,7 +128,7 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER).await.unwrap();
 
-        let acl = effective_acl(&store, &sp(), "/foo").await.unwrap().expect("inherited");
+        let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("inherited");
         let stranger = Agent::WebId("https://bob.example/card#me".to_string());
         let stranger_decision = decide(&acl.triples, &stranger, &acl.governed_iri, true);
         assert!(!stranger_decision.allows(Mode::Read));
@@ -121,7 +149,7 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER).await.unwrap();
         // simulate the owner editing their ACL: grant the public read
-        let g = sp().graph_iri("/.acl").unwrap();
+        let g = sp().root().as_resource().aux(AuxKind::Acl).graph_iri().to_string();
         store.update(&format!(
             "INSERT DATA {{ GRAPH <{g}> {{ <{g}#public> \
              <{ACL_AGENT_CLASS}> <{FOAF_AGENT}> ; \
@@ -131,7 +159,7 @@ mod tests {
 
         provision_root_acl(&store, &sp(), OWNER).await.unwrap(); // restart
 
-        let acl = effective_acl(&store, &sp(), "/foo").await.unwrap().expect("acl");
+        let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("acl");
         assert!(decide(&acl.triples, &Agent::Public, &acl.governed_iri, true).allows(Mode::Read),
             "the owner's edit must survive re-provisioning");
     }
@@ -144,7 +172,7 @@ mod tests {
     async fn provisioning_does_not_resurrect_a_removed_owner_rule() {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER).await.unwrap();
-        let g = sp().graph_iri("/.acl").unwrap();
+        let g = sp().root().as_resource().aux(AuxKind::Acl).graph_iri().to_string();
         // the owner hands control to a successor, then removes their own rule
         store.update(&format!(
             "INSERT DATA {{ GRAPH <{g}> {{ <{g}#successor> \
@@ -158,7 +186,7 @@ mod tests {
 
         provision_root_acl(&store, &sp(), OWNER).await.unwrap(); // restart
 
-        let acl = effective_acl(&store, &sp(), "/").await.unwrap().expect("acl");
+        let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("acl");
         let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, acl.inherited);
         assert!(!m.allows(Mode::Control), "a removed owner rule must not be re-provisioned");
         assert!(!m.allows(Mode::Read));
@@ -172,6 +200,6 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         let err = provision_root_acl(&store, &sp(), "not an iri> } ; DROP ALL ; #").await;
         assert!(matches!(err, Err(ResourceError::InvalidIri)));
-        assert!(effective_acl(&store, &sp(), "/").await.unwrap().is_none());
+        assert!(effective_acl(&store, sp().root().as_resource()).await.unwrap().is_none());
     }
 }

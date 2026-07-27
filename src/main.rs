@@ -25,7 +25,7 @@ async fn main() {
         webid_verifier: Arc::new(HttpWebIdIssuers::new()),
         auth_config: Arc::new(cfg.auth_config()),
     };
-    sparql_pod::container::provision_root(state.store.as_ref(), &state.space)
+    sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
         .await.expect("provision root container");
     let owner = cfg.validated_owner_webid().expect("owner WebID validated above");
     sparql_pod::wac::provision::provision_root_acl(state.store.as_ref(), &state.space, &owner)
