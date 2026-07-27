@@ -75,12 +75,28 @@ public container is briefly public. There is no atomic "create with policy" oper
 Solid. Keep the window empty instead of trying to close it: create the container, set its
 ACL, then write into it. An empty container discloses nothing.
 
+**An empty ACL denies everything below it — deliberately, and there is no HTTP way back.**
+Existence is a stored fact independent of content: an ACL with zero triples still exists, still
+wins over whatever an ancestor would otherwise hand down, and grants nothing to anyone,
+including its own owner. `DELETE` on it needs `acl:Control`, which that same empty ACL just
+revoked from everyone — so at the root, an empty root ACL is terminal over HTTP: no request can
+remove it, and no request can replace it. The way out is the operator, not the API: restart the
+server with `--reset-root-acl` (or `POD_RESET_ROOT_ACL=1` or `POD_RESET_ROOT_ACL=true`), which
+overwrites the root ACL with the owner's default grant regardless of what is there. **This is a
+wholesale overwrite, not a merge:** it destroys every rule the root ACL held, not just the
+one it restores — any share the owner had granted someone else at the root is gone too, and
+has to be re-created after. The env variable accepts any boolish value: `1`, `0`, `true`,
+`false`, `yes`, `no`, `on`, `off` (case-insensitive). This only exists for the root; an emptied
+ACL anywhere else has no equivalent flag and is a real dead end for that subtree.
+
 ## `/.well-known/` belongs to the origin, not to the pod
 
-`/.well-known/` is defined by RFC 8615 as a place the *host* provides. The pod stores
-nothing there and refuses writes to it; serving it is the deployment's job — in this
-architecture the reverse proxy that terminates TLS, which can answer it without the pod ever
-seeing the request.
+`/.well-known/` is defined by RFC 8615 as a place the *host* provides. `.well-known` is not
+the reserved segment (only `.aux` is, see above), so this pod does not reserve it or treat it
+specially: `PUT /.well-known/x` is an ordinary authorized write, like any other path. Serving
+`/.well-known/` is expected to be the deployment's job instead — in this architecture the
+reverse proxy that terminates TLS, which can answer it without the pod ever seeing the
+request.
 
 This only arises when the pod's base URI is the origin root. In a path-based topology
 (`https://host/{user}/`) `/.well-known/` sits above the pod's base URI and is not part of
@@ -97,10 +113,12 @@ The tables above document the current mapping so operators can reason about the 
 > "Clients MUST NOT derive the URI of the ACL resource through string operations on the URI
 > of the resource."
 
-This pod advertises `Link: <…>; rel="acl"` on every response for a resource path —
-including `404` and denial responses, so a client mid-create-flow never has to guess. The
-auxiliary URL scheme is an implementation detail and may change; the `Link` header is the
-interface.
+This pod advertises `Link: <…>; rel="acl"` wherever a client mid-create-flow needs it: a
+successful `GET` (and its `304`), a `404` for a resource that does not exist yet, a denial
+(`401`/`403`), and a `201` on creation. It is not present on every possible response — a `406`,
+`415`, `400`, `409`, `412`, `405`, `204`, or `500` carries no target to advertise a `Link` for
+and has none. The auxiliary URL scheme is an implementation detail and may change; the `Link`
+header is the interface.
 
 Server implementations differ here, which is why the header exists: Community Solid Server
 uses a configurable `.acl` suffix, Trellis uses `?ext=acl`, Manas uses `<res>._aux/acl`, and

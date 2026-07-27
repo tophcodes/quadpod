@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use percent_encoding::percent_decode_str;
 
 use crate::http::AppState;
-use crate::space::StorageSpace;
+use crate::space::{GraphName, StorageSpace};
 
 use super::authenticate;
 
@@ -28,18 +28,44 @@ const HTU_DECODE_FAILURE_SENTINEL: &str = "urn:sparql-pod:invalid-percent-decode
 /// handlers in `http.rs` actually operate on — they read it via axum's
 /// `Path<String>` extractor, which percent-decodes it. Without this
 /// decoding, a DPoP proof's `htu` would be checked against a *different* IRI
-/// than the one the handler reads/writes, which Plan 5's WAC gate would
-/// then authorize incorrectly.
+/// than the one the handler reads/writes, which the WAC gate would then
+/// authorize incorrectly.
 ///
-/// A `graph_iri` failure on the successfully-decoded path (e.g. it contains
-/// IRI-breaking characters) is returned as `Err(())`, matching the request
-/// being unroutable to any resource — the caller should reject it outright.
-/// A percent-decode failure (invalid UTF-8) is NOT treated as an error here:
+/// For every path that resolves, the `htu` is the target's graph IRI. That
+/// comparison is coarser than graph identity, though: `dpop-verifier`'s
+/// `normalize_htu` drops empty path segments, resolves `.`/`..`, and strips
+/// fragments before comparing, so it cannot by itself distinguish every pair
+/// of paths this pod treats as different named graphs (e.g. `/box` vs.
+/// `/box//`, or a path containing `#`). Closing that gap is
+/// [`StorageSpace::resolve`]'s job, not this function's: `resolve` refuses
+/// any request path that normalization would change (`SpaceError::NotNormalized`),
+/// so by the time a path gets here and resolves, it is already the one shape
+/// that survives `normalize_htu` unchanged — the coarser comparison and the
+/// exact one agree.
+///
+/// A path that does NOT resolve is not an error here. The handler answers it
+/// (`404` for the reserved namespace, `400` for an IRI-breaking path), and it
+/// can only do so if authentication succeeded first — so the `htu` falls back
+/// to what a client signs for such a URL, the configured base plus the
+/// request path. That is the same string `resolve` would have produced: every
+/// target's graph IRI is base + path, auxiliaries included (`AuxUrl` is
+/// reassembled from the reserved segment and its subject's path). Failing
+/// closed here instead would answer `401` to a correctly-signed request and
+/// hide the real reason.
+///
+/// A percent-decode failure (invalid UTF-8) IS still unmatchable on purpose:
 /// see [`HTU_DECODE_FAILURE_SENTINEL`].
-fn derive_htu(space: &StorageSpace, raw_path: &str) -> Result<String, ()> {
-    match percent_decode_str(raw_path).decode_utf8() {
-        Ok(decoded) => space.graph_iri(&decoded).map_err(|_| ()),
-        Err(_) => Ok(HTU_DECODE_FAILURE_SENTINEL.to_string()),
+fn derive_htu(space: &StorageSpace, raw_path: &str) -> String {
+    let Ok(decoded) = percent_decode_str(raw_path).decode_utf8() else {
+        return HTU_DECODE_FAILURE_SENTINEL.to_string();
+    };
+    match space.resolve(&decoded) {
+        Ok(target) => target.graph_iri().to_string(),
+        Err(_) => {
+            // The root container's IRI is the configured base, by definition.
+            let base = space.root().graph_iri().trim_end_matches('/').to_string();
+            format!("{base}{decoded}")
+        }
     }
 }
 
@@ -61,10 +87,7 @@ fn derive_htu(space: &StorageSpace, raw_path: &str) -> Result<String, ()> {
 /// `401`. Only the total absence of both credential headers proceeds as
 /// `Agent::Public`.
 pub async fn auth_layer(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
-    let htu = match derive_htu(&st.space, req.uri().path()) {
-        Ok(iri) => iri,
-        Err(()) => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    let htu = derive_htu(&st.space, req.uri().path());
     let htm = req.method().as_str().to_string();
     let auth_header = req
         .headers()
@@ -122,14 +145,38 @@ mod tests {
     #[test]
     fn derive_htu_matches_handlers_decoded_path() {
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
-        assert_eq!(
-            derive_htu(&space, "/a%2Fb").unwrap(),
-            "https://pod.toph.so/a/b"
-        );
-        assert_eq!(
-            derive_htu(&space, "/caf%C3%A9").unwrap(),
-            "https://pod.toph.so/café"
-        );
+        assert_eq!(derive_htu(&space, "/a%2Fb"), "https://pod.toph.so/a/b");
+        assert_eq!(derive_htu(&space, "/caf%C3%A9"), "https://pod.toph.so/café");
+    }
+
+    // The identity the whole DPoP check rests on: whatever a request path
+    // resolves to, the `htu` is that target's graph IRI — the very IRI the
+    // handler reads and writes. Auxiliaries are included deliberately: their
+    // IRI is reassembled from the reserved segment and the subject's path, so
+    // if that reassembly ever stopped being "base + request path", every
+    // authenticated request to an auxiliary would fail with a 401.
+    #[test]
+    fn derive_htu_is_the_graph_iri_the_handler_operates_on() {
+        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+        for path in ["/", "/foo", "/box/", "/a/b/c", "/.aux/acl/", "/.aux/acl/foo",
+                     "/.aux/acl/box/", "/.auxiliary"] {
+            let target = space.resolve(path).expect("resolvable");
+            assert_eq!(derive_htu(&space, path), target.graph_iri(), "htu for {path}");
+            assert_eq!(derive_htu(&space, path), format!("https://pod.toph.so{path}"));
+        }
+    }
+
+    // A path in the reserved namespace that names no auxiliary is answered by
+    // the handler (404), which it can only do if the credential check passed
+    // — so the `htu` must be the one a client signs for that URL, not a
+    // fail-closed sentinel that would turn the 404 into a misleading 401.
+    #[test]
+    fn derive_htu_still_matches_a_signed_url_that_resolves_to_nothing() {
+        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+        for path in ["/.aux", "/.aux/", "/.aux/bogus/x", "/foo> bar"] {
+            assert!(space.resolve(path).is_err(), "{path} should not resolve");
+            assert_eq!(derive_htu(&space, path), format!("https://pod.toph.so{path}"));
+        }
     }
 
     // A raw path whose percent-decoding is not valid UTF-8 must not abort
@@ -141,7 +188,7 @@ mod tests {
     #[test]
     fn derive_htu_on_invalid_utf8_yields_unmatchable_htu_not_an_error() {
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
-        let htu = derive_htu(&space, "/%ff%fe").expect("decode failure must not be Err(())");
+        let htu = derive_htu(&space, "/%ff%fe");
         assert_ne!(htu, "https://pod.toph.so/%ff%fe");
         assert!(!htu.is_empty());
     }

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod aux;
 pub mod config;
 pub mod container;
 pub mod http;

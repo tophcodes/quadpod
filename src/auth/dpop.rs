@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use dpop_verifier::{DpopError, DpopVerifier, ReplayContext, ReplayStore};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::AuthError;
@@ -138,6 +141,100 @@ impl ReplayStore for NoopReplayStore {
     }
 }
 
+/// Read the `htu` claim out of a proof whose signature has ALREADY been
+/// verified.
+///
+/// `dpop-verifier`'s `VerifiedDpop` carries only `jkt`, `jti` and `iat` — it
+/// never hands back the `htu` it compared — so the claim has to be decoded
+/// here. The caller must only ever pass a `proof` string that
+/// `DpopVerifier::verify` has just accepted: the signature covers exactly
+/// the `header.payload` prefix of that same string, so re-decoding its
+/// payload segment yields signed bytes, not an unverified peek. This is
+/// deliberately *not* the pattern in `access_token::peek_untrusted_issuer`
+/// (which reads an unsigned payload to pick a key); nothing here may be read
+/// before verification.
+fn verified_htu_claim(proof: &str) -> Result<String, AuthError> {
+    let parts: Vec<&str> = proof.split('.').collect();
+    let [_header_part, payload_part, _signature_part] = parts[..] else {
+        return Err(AuthError::DpopInvalid(
+            "dpop proof is not a compact JWS".to_string(),
+        ));
+    };
+    let bytes = URL_SAFE_NO_PAD.decode(payload_part).map_err(|_| {
+        AuthError::DpopInvalid("dpop proof payload is not base64url".to_string())
+    })?;
+    let payload: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AuthError::DpopInvalid("dpop proof payload is not JSON".to_string()))?;
+    payload
+        .get("htu")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AuthError::DpopInvalid("dpop proof has no htu claim".to_string()))
+}
+
+/// Whether the proof's own `htu` names exactly the resource `expected`
+/// names.
+///
+/// `dpop-verifier` compares the two through `uri::normalize_htu`, which
+/// **drops empty path segments** — and a trailing slash is an empty final
+/// segment. In this pod the trailing slash is precisely what separates a
+/// container from a resource: `/foo` and `/foo/` are distinct named graphs
+/// with distinct ACLs. Left at `dpop-verifier`'s comparison, a proof minted
+/// for `/.aux/acl/foo` also verifies against `PUT /.aux/acl/foo/`, so an
+/// on-path adversary can re-target a signed ACL write at the container's
+/// ACL, whose rules then name no governed IRI at all — an empty ACL that
+/// wins over every ancestor and locks the subtree out permanently. Refusing
+/// trailing slashes the way [`crate::space::StorageSpace::resolve`] refuses
+/// the other normalization-unstable shapes is not an option here, so the
+/// comparison is tightened instead.
+///
+/// The tightening is deliberately scoped to the **path only** — scheme,
+/// host, port and query are left to `dpop-verifier`'s own
+/// RFC-3986-following comparison. `normalize_htu` already lowercases
+/// scheme/host and elides a default port, and RFC 9449 §4.3 says a server
+/// SHOULD apply exactly that normalization "to reduce the likelihood of
+/// false negatives"; comparing the whole URL byte-for-byte here would
+/// silently re-impose case- and default-port-sensitivity that
+/// `dpop-verifier` deliberately relaxed, 401-ing e.g. `solid-client-authn-js`
+/// clients that mint `htu` with an explicit `:443` or a differently-cased
+/// host. Comparing only `.path()` keeps the trailing-slash fix (`Url::path`
+/// preserves it; `normalize_htu` only loses it because it rebuilds the path
+/// from `path_segments()`, which yields no empty final segment) without
+/// discarding any of `dpop-verifier`'s own RFC-conformant tolerance.
+///
+/// Within the path, the comparison is byte equality after percent-decoding
+/// both sides, and nothing else — no dot-segment resolution, no
+/// empty-segment collapsing, no case folding. Percent-decoding is the one
+/// widening step, and it is required rather than optional: `expected` comes
+/// from `auth::middleware::derive_htu`, which percent-decodes the request
+/// path so the `htu` lines up with the graph IRI the handler actually
+/// operates on, while a client signs the URL as it puts it on the wire
+/// (`/caf%C3%A9`, not `/café`). Decoding both is what makes those the same
+/// string. It widens nothing this pod distinguishes: `derive_htu` and the
+/// handlers both read the decoded path, so `/a%2Fb` and `/a/b` already *are*
+/// one resource here. A percent sequence that is not valid UTF-8 decodes
+/// lossily on both sides, which can only ever make the check reject more,
+/// never less.
+///
+/// Either side failing to parse as a URL (the proof's claimed `htu` is
+/// attacker-controlled and need not be one) is treated as a mismatch, not a
+/// separate error — the caller already turns "not the same resource" into
+/// the one `DpopInvalid` rejection.
+fn htu_names_the_same_resource(proof_htu: &str, expected: &str) -> bool {
+    fn decoded_path(s: &str) -> Option<String> {
+        let url = url::Url::parse(s).ok()?;
+        Some(
+            percent_encoding::percent_decode_str(url.path())
+                .decode_utf8_lossy()
+                .into_owned(),
+        )
+    }
+    match (decoded_path(proof_htu), decoded_path(expected)) {
+        (Some(p), Some(e)) => p == e,
+        _ => false,
+    }
+}
+
 /// Verify a DPoP proof: signature (against its own embedded `jwk`), `htu`
 /// and `htm` match, `iat` freshness (against `now_unix`), `jti` replay, and
 /// — critically — that the proof key's thumbprint matches `expected_jkt`
@@ -158,6 +255,19 @@ pub async fn verify_dpop(
         .verify(&mut store, proof, htu, htm, None)
         .await
         .map_err(|e| AuthError::DpopInvalid(e.to_string()))?;
+
+    // `dpop-verifier` has now checked the proof's `htu` against ours, but
+    // only through its normalizing comparison, which erases the trailing
+    // slash that separates a container from a resource in this pod. Redo it
+    // exactly, on the signed claim (see `verified_htu_claim` and
+    // `htu_names_the_same_resource`), and reject with the same
+    // `DpopInvalid` the crate's own htu mismatch produces — the middleware
+    // answers 401 either way.
+    if !htu_names_the_same_resource(&verified_htu_claim(proof)?, htu) {
+        return Err(AuthError::DpopInvalid(
+            "dpop proof htu does not match the request URL exactly".to_string(),
+        ));
+    }
 
     // `iat` comes from the proof's own JSON claims and is fully
     // caller-controlled (e.g. `i64::MIN`), so these comparisons use
@@ -210,6 +320,144 @@ mod tests {
         let _guard = test_lock().lock().await;
         let client = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-a");
+        assert!(verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_ok());
+    }
+
+    /// The trailing slash is what separates a container from a resource
+    /// here, and `dpop-verifier`'s `normalize_htu` drops it — so on its
+    /// comparison alone a proof minted for `/foo` verifies against a request
+    /// for `/foo/` and vice versa. Both directions must be rejected: the
+    /// dangerous one is a signed `PUT /.aux/acl/foo` re-delivered as
+    /// `PUT /.aux/acl/foo/`, which would write the body as the *container's*
+    /// ACL, naming no governed IRI and locking the subtree out for good.
+    #[tokio::test]
+    async fn trailing_slash_difference_is_rejected_in_both_directions() {
+        let client = TestClient::new();
+        let resource = client.mint_dpop("https://pod.toph.so/foo", "PUT", 1_000, "jti-slash-1");
+        assert!(verify_dpop(
+            &resource,
+            "https://pod.toph.so/foo/",
+            "PUT",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_err());
+
+        let container = client.mint_dpop("https://pod.toph.so/foo/", "PUT", 1_000, "jti-slash-2");
+        assert!(verify_dpop(
+            &container,
+            "https://pod.toph.so/foo",
+            "PUT",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_err());
+
+        // The exact scenario the fix exists for: a proof for the resource's
+        // ACL must not authorize a write to the container's ACL.
+        let acl = client.mint_dpop("https://pod.toph.so/.aux/acl/foo", "PUT", 1_000, "jti-slash-3");
+        assert!(verify_dpop(
+            &acl,
+            "https://pod.toph.so/.aux/acl/foo/",
+            "PUT",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_err());
+    }
+
+    /// The other half of the same boundary: tightening the comparison must
+    /// not start rejecting correctly-signed proofs. A container path (the
+    /// shape the fix is about), a plain resource and an auxiliary all keep
+    /// working when the proof names them exactly.
+    #[tokio::test]
+    async fn exact_htu_still_passes_for_resource_container_and_auxiliary() {
+        let _guard = test_lock().lock().await;
+        let client = TestClient::new();
+        for (i, htu) in [
+            "https://pod.toph.so/foo",
+            "https://pod.toph.so/box/",
+            "https://pod.toph.so/",
+            "https://pod.toph.so/.aux/acl/foo",
+            "https://pod.toph.so/.aux/acl/box/",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let jti = format!("jti-exact-{i}");
+            let proof = client.mint_dpop(htu, "GET", 1_000, &jti);
+            assert!(
+                verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010)
+                    .await
+                    .is_ok(),
+                "exact htu {htu} must still verify"
+            );
+        }
+    }
+
+    /// `derive_htu` hands `verify_dpop` the percent-DECODED path (so the
+    /// `htu` is the graph IRI the handler operates on), while a client signs
+    /// the URL as it goes on the wire. The exact comparison has to see
+    /// through that difference or every request to a path needing
+    /// percent-encoding would 401.
+    #[tokio::test]
+    async fn percent_encoded_proof_matches_the_decoded_expected_htu() {
+        let _guard = test_lock().lock().await;
+        let client = TestClient::new();
+        let proof = client.mint_dpop("https://pod.toph.so/caf%C3%A9", "GET", 1_000, "jti-pct");
+        assert!(verify_dpop(
+            &proof,
+            "https://pod.toph.so/café",
+            "GET",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_ok());
+    }
+
+    /// The tightened check compares only the path; scheme/host/port are left
+    /// to `dpop-verifier`'s own RFC-3986 normalization. A proof minted with
+    /// an explicit default port (`:443`) must still verify against a request
+    /// `htu` that omits it — before this fix, comparing the whole URL
+    /// byte-for-byte rejected this even though `dpop-verifier` itself (and
+    /// `solid-client-authn-js`, which elides default ports via `new URL()`)
+    /// treats the two as identical.
+    #[tokio::test]
+    async fn explicit_default_port_in_proof_htu_still_verifies() {
+        let _guard = test_lock().lock().await;
+        let client = TestClient::new();
+        let proof = client.mint_dpop("https://pod.toph.so:443/foo", "GET", 1_000, "jti-port");
+        assert!(verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_ok());
+    }
+
+    /// Same reasoning, for host casing: `dpop-verifier` lowercases the host
+    /// before comparing, so a proof minted against a differently-cased host
+    /// must still verify. Comparing the whole URL would have rejected this.
+    #[tokio::test]
+    async fn differently_cased_host_in_proof_htu_still_verifies() {
+        let _guard = test_lock().lock().await;
+        let client = TestClient::new();
+        let proof = client.mint_dpop("https://POD.TOPH.SO/foo", "GET", 1_000, "jti-case");
         assert!(verify_dpop(
             &proof,
             "https://pod.toph.so/foo",

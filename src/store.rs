@@ -13,6 +13,7 @@ pub enum StoreError {
 pub trait SparqlStore: Send + Sync {
     async fn update(&self, sparql: &str) -> Result<(), StoreError>;
     async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, StoreError>;
+    async fn ask(&self, sparql: &str) -> Result<bool, StoreError>;
 }
 
 pub struct OxigraphStore {
@@ -49,6 +50,19 @@ impl SparqlStore for OxigraphStore {
             .map(|t| t.map_err(|e| StoreError::Backend(e.to_string())))
             .collect()
     }
+
+    async fn ask(&self, sparql: &str) -> Result<bool, StoreError> {
+        let results = SparqlEvaluator::new()
+            .parse_query(sparql)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .on_store(&self.inner)
+            .execute()
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        match results {
+            QueryResults::Boolean(b) => Ok(b),
+            _ => Err(StoreError::Backend("expected ASK/boolean results".into())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -78,5 +92,24 @@ mod tests {
             "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <https://pod.toph.so/missing> { ?s ?p ?o } }",
         ).await.unwrap();
         assert!(triples.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_reports_true_and_false() {
+        let store = OxigraphStore::in_memory().unwrap();
+        store.update(
+            "INSERT DATA { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#it> <http://schema.org/name> \"Toph\" } }",
+        ).await.unwrap();
+
+        assert!(store.ask(
+            "ASK { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#it> <http://schema.org/name> \"Toph\" } }",
+        ).await.unwrap());
+
+        assert!(!store.ask(
+            "ASK { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#it> <http://schema.org/name> \"Nope\" } }",
+        ).await.unwrap());
     }
 }

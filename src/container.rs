@@ -1,83 +1,77 @@
-use crate::{resource::ResourceError, space::StorageSpace, store::SparqlStore};
-use oxigraph::model::Triple;
+use crate::{
+    resource::{insert_marked, ResourceError},
+    space::{ContainerUrl, GraphName},
+    store::SparqlStore,
+};
+use oxigraph::model::{NamedNode, Triple};
 
 pub const LDP_CONTAINER: &str = "http://www.w3.org/ns/ldp#Container";
 pub const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
 pub const LDP_CONTAINS: &str = "http://www.w3.org/ns/ldp#contains";
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-pub fn is_container_path(request_path: &str) -> bool {
-    request_path.ends_with('/')
-}
-
 /// True if the client is attempting to set server-managed containment triples.
 pub fn body_sets_containment(triples: &[Triple]) -> bool {
     triples.iter().any(|t| t.predicate.as_str() == LDP_CONTAINS)
 }
 
-/// Parent container path (always trailing-slash), or None for the root "/".
-pub fn parent_container(request_path: &str) -> Option<String> {
-    if request_path == "/" {
-        return None;
-    }
-    let trimmed = request_path.strip_suffix('/').unwrap_or(request_path);
-    match trimmed.rfind('/') {
-        Some(idx) => Some(trimmed[..=idx].to_string()),
-        None => Some("/".to_string()),
-    }
+/// A `NamedNode` for an IRI that already passed through `StorageSpace`, or
+/// for one of the vocabulary constants above. Both are known-valid; the
+/// checked constructor is used anyway so a future caller that is neither
+/// cannot smuggle a broken IRI into a SPARQL body.
+fn node(iri: &str) -> Result<NamedNode, ResourceError> {
+    NamedNode::new(iri).map_err(|_| ResourceError::InvalidIri)
 }
 
+/// Create `c` if it is absent, and mark it present either way.
+///
+/// The type triples go in through `insert_marked` rather than a bare
+/// `INSERT DATA`: existence is a stored marker, so content written without
+/// one is invisible — the container would read as absent forever, and every
+/// "did this ancestor already exist" probe above it would be wrong. It is
+/// additive rather than a `put_rdf`, because an existing container's members
+/// must survive.
 pub async fn ensure_container(
-    store: &dyn SparqlStore, space: &StorageSpace, path: &str,
+    store: &dyn SparqlStore, c: &ContainerUrl,
 ) -> Result<(), ResourceError> {
-    let c = space.graph_iri(path)?;
-    let update = format!(
-        "INSERT DATA {{ GRAPH <{c}> {{ \
-         <{c}> <{RDF_TYPE}> <{LDP_CONTAINER}> . \
-         <{c}> <{RDF_TYPE}> <{LDP_BASIC_CONTAINER}> }} }}",
-    );
-    store.update(&update).await?;
-    Ok(())
+    let iri = node(c.graph_iri())?;
+    let rdf_type = node(RDF_TYPE)?;
+    let triples = [
+        Triple::new(iri.clone(), rdf_type.clone(), node(LDP_CONTAINER)?),
+        Triple::new(iri, rdf_type, node(LDP_BASIC_CONTAINER)?),
+    ];
+    insert_marked(store, c, &triples).await
 }
 
+/// Record `child_iri` as a member of `parent`. The IRI is a `GraphName`'s at
+/// every call site; it is passed as a string because the walk in
+/// `wac::guard` records the target at one level and the containers it
+/// creates at the next. It goes in through `insert_marked` for the same
+/// reason as [`ensure_container`]: this module must not be able to leave
+/// content in a graph the store reads as absent.
 pub async fn add_containment(
-    store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
+    store: &dyn SparqlStore, parent: &ContainerUrl, child_iri: &str,
 ) -> Result<(), ResourceError> {
-    // ACLs are addressable resources but not container members: listing them
-    // as ldp:contains children would put server-managed access-control
-    // documents into every client's view of the container.
-    if crate::wac::prp::is_acl_path(child) {
-        return Ok(());
-    }
-    let p = space.graph_iri(parent)?;
-    let c = space.graph_iri(child)?;
-    store.update(&format!(
-        "INSERT DATA {{ GRAPH <{p}> {{ <{p}> <{LDP_CONTAINS}> <{c}> }} }}",
-    )).await?;
-    Ok(())
+    let p = node(parent.graph_iri())?;
+    let triples = [Triple::new(p, node(LDP_CONTAINS)?, node(child_iri)?)];
+    insert_marked(store, parent, &triples).await
 }
 
 pub async fn remove_containment(
-    store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
+    store: &dyn SparqlStore, parent: &ContainerUrl, child_iri: &str,
 ) -> Result<(), ResourceError> {
-    // ACLs are addressable resources but not container members: listing them
-    // as ldp:contains children would put server-managed access-control
-    // documents into every client's view of the container.
-    if crate::wac::prp::is_acl_path(child) {
-        return Ok(());
-    }
-    let p = space.graph_iri(parent)?;
-    let c = space.graph_iri(child)?;
+    let p = parent.graph_iri();
+    let c = node(child_iri)?;
     store.update(&format!(
-        "DELETE DATA {{ GRAPH <{p}> {{ <{p}> <{LDP_CONTAINS}> <{c}> }} }}",
+        "DELETE DATA {{ GRAPH <{p}> {{ <{p}> <{LDP_CONTAINS}> {c} }} }}",
     )).await?;
     Ok(())
 }
 
 pub async fn container_is_empty(
-    store: &dyn SparqlStore, space: &StorageSpace, path: &str,
+    store: &dyn SparqlStore, c: &ContainerUrl,
 ) -> Result<bool, ResourceError> {
-    let c = space.graph_iri(path)?;
+    let c = c.graph_iri();
     let triples = store.query_triples(&format!(
         "CONSTRUCT {{ <{c}> <{LDP_CONTAINS}> ?x }} \
          WHERE {{ GRAPH <{c}> {{ <{c}> <{LDP_CONTAINS}> ?x }} }}",
@@ -85,38 +79,10 @@ pub async fn container_is_empty(
     Ok(triples.is_empty())
 }
 
-/// Materialize the container chain above `request_path`: create every missing
-/// ancestor and link each level to the one below it.
-///
-/// The walk stops at the first ancestor that ALREADY existed when it was
-/// reached — that one still gains a containment triple, but everything above
-/// it is untouched, because its own type triples and its containment link to
-/// it are already in the store and re-inserting them would be a no-op. That
-/// boundary is load-bearing for access control: `http`'s handlers authorize
-/// exactly the levels this function can observably change (see
-/// `http::authorize_ancestors`), so ascending past it would demand rights on
-/// containers no request ever modifies. On a fresh, unprovisioned store
-/// nothing exists yet, so the chain is still built all the way to `/`.
-pub async fn ensure_ancestors(
-    store: &dyn SparqlStore, space: &StorageSpace, request_path: &str,
-) -> Result<(), ResourceError> {
-    let mut child = request_path.to_string();
-    while let Some(parent) = parent_container(&child) {
-        let existed = crate::resource::get_rdf(store, space, &parent).await?.is_some();
-        ensure_container(store, space, &parent).await?;
-        add_containment(store, space, &parent, &child).await?;
-        if existed {
-            return Ok(());
-        }
-        child = parent;
-    }
-    Ok(())
-}
-
 pub async fn provision_root(
-    store: &dyn SparqlStore, space: &StorageSpace,
+    store: &dyn SparqlStore, root: &ContainerUrl,
 ) -> Result<(), ResourceError> {
-    ensure_container(store, space, "/").await
+    ensure_container(store, root).await
 }
 
 /// Sanitize a client-supplied `Slug` header into a safe child segment.
@@ -136,75 +102,66 @@ pub fn child_name(slug: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{space::StorageSpace, store::OxigraphStore};
+    use crate::{
+        resource::exists,
+        space::{StorageSpace, Target},
+        store::OxigraphStore,
+    };
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
-    #[tokio::test]
-    async fn ensure_ancestors_creates_chain_and_links() {
-        let store = OxigraphStore::in_memory().unwrap();
-        let space = sp();
-        ensure_ancestors(&store, &space, "/a/b/c").await.unwrap();
-
-        // /a/b/ contains /a/b/c
-        assert!(!container_is_empty(&store, &space, "/a/b/").await.unwrap());
-        // /a/ contains /a/b/
-        assert!(!container_is_empty(&store, &space, "/a/").await.unwrap());
-        // root contains /a/
-        assert!(!container_is_empty(&store, &space, "/").await.unwrap());
-        // /a/b/ is typed as a container (its graph is non-empty with type triples)
-        let g = crate::resource::get_rdf(&store, &space, "/a/b/").await.unwrap().unwrap();
-        assert!(g.iter().any(|t| t.predicate.as_str() == RDF_TYPE
-            && matches!(&t.object, oxigraph::model::Term::NamedNode(n) if n.as_str() == LDP_BASIC_CONTAINER)));
+    fn container(path: &str) -> ContainerUrl {
+        match sp().resolve(path).unwrap() {
+            Target::Container(c) => c,
+            _ => panic!("not a container path"),
+        }
     }
 
-    // The walk must stop at the first ancestor that already exists: above it
-    // every insert would be a no-op, and `http` authorizes exactly the levels
-    // this function can change. `/a/` exists here but is deliberately NOT
-    // linked into `/`, so the root staying empty is unambiguous evidence that
-    // the walk never went past `/a/`.
-    #[tokio::test]
-    async fn ensure_ancestors_stops_at_the_first_existing_ancestor() {
-        let store = OxigraphStore::in_memory().unwrap();
-        let space = sp();
-        provision_root(&store, &space).await.unwrap();
-        ensure_container(&store, &space, "/a/").await.unwrap();
-
-        ensure_ancestors(&store, &space, "/a/b/c").await.unwrap();
-
-        assert!(!container_is_empty(&store, &space, "/a/b/").await.unwrap(), "/a/b/ contains the leaf");
-        assert!(!container_is_empty(&store, &space, "/a/").await.unwrap(), "/a/ gains the new child");
-        assert!(container_is_empty(&store, &space, "/").await.unwrap(),
-            "the walk must not touch containers above the first existing one");
+    fn iri(path: &str) -> String {
+        sp().resolve(path).unwrap().graph_iri().to_string()
     }
 
     #[tokio::test]
     async fn add_then_remove_containment_toggles_emptiness() {
         let store = OxigraphStore::in_memory().unwrap();
-        let space = sp();
-        ensure_container(&store, &space, "/c/").await.unwrap();
-        assert!(container_is_empty(&store, &space, "/c/").await.unwrap());
-        add_containment(&store, &space, "/c/", "/c/x").await.unwrap();
-        assert!(!container_is_empty(&store, &space, "/c/").await.unwrap());
-        remove_containment(&store, &space, "/c/", "/c/x").await.unwrap();
-        assert!(container_is_empty(&store, &space, "/c/").await.unwrap());
+        let c = container("/c/");
+        ensure_container(&store, &c).await.unwrap();
+        assert!(container_is_empty(&store, &c).await.unwrap());
+        add_containment(&store, &c, &iri("/c/x")).await.unwrap();
+        assert!(!container_is_empty(&store, &c).await.unwrap());
+        remove_containment(&store, &c, &iri("/c/x")).await.unwrap();
+        assert!(container_is_empty(&store, &c).await.unwrap());
     }
 
-    #[test]
-    fn container_paths_end_with_slash() {
-        assert!(is_container_path("/foo/"));
-        assert!(is_container_path("/"));
-        assert!(!is_container_path("/foo"));
-        assert!(!is_container_path("/a/b"));
+    // Existence is a stored marker, so a container written without one reads
+    // as absent — and the traversal that asks "did this ancestor already
+    // exist" would then rebuild and re-link it on every write. Creating a
+    // container must mark it, and re-ensuring an existing one must not
+    // discard its members.
+    #[tokio::test]
+    async fn ensure_container_marks_presence_and_keeps_existing_members() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let c = container("/c/");
+        assert!(!exists(&store, &c).await.unwrap());
+
+        ensure_container(&store, &c).await.unwrap();
+        assert!(exists(&store, &c).await.unwrap(), "a created container exists");
+
+        add_containment(&store, &c, &iri("/c/x")).await.unwrap();
+        ensure_container(&store, &c).await.unwrap();
+        assert!(!container_is_empty(&store, &c).await.unwrap(),
+            "re-ensuring must not erase members");
     }
 
-    #[test]
-    fn parent_of_resource_and_container() {
-        assert_eq!(parent_container("/a/b/c").as_deref(), Some("/a/b/"));
-        assert_eq!(parent_container("/a/b/").as_deref(), Some("/a/"));
-        assert_eq!(parent_container("/foo").as_deref(), Some("/"));
-        assert_eq!(parent_container("/foo/").as_deref(), Some("/"));
-        assert_eq!(parent_container("/"), None);
+    #[tokio::test]
+    async fn a_created_container_is_typed() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let c = container("/a/b/");
+        ensure_container(&store, &c).await.unwrap();
+        let g = crate::resource::get_rdf(&store, &c).await.unwrap().unwrap();
+        assert!(g.iter().any(|t| t.predicate.as_str() == RDF_TYPE
+            && matches!(&t.object, oxigraph::model::Term::NamedNode(n)
+                if n.as_str() == LDP_BASIC_CONTAINER)));
     }
 
     #[test]
@@ -212,19 +169,5 @@ mod tests {
         assert_ne!(child_name(Some("..")), "..");
         assert_ne!(child_name(Some(".")), ".");
         assert_eq!(child_name(Some("photo")), "photo");
-    }
-
-    // ACLs are system resources: they are addressable, but they must never
-    // show up as ldp:contains children of their container (Plan 3 deferred
-    // this decision; Plan 6 settles it).
-    #[tokio::test]
-    async fn acl_children_are_not_recorded_as_containment() {
-        let store = OxigraphStore::in_memory().unwrap();
-        let space = sp();
-        ensure_container(&store, &space, "/c/").await.unwrap();
-        add_containment(&store, &space, "/c/", "/c/x.acl").await.unwrap();
-        assert!(container_is_empty(&store, &space, "/c/").await.unwrap());
-        add_containment(&store, &space, "/c/", "/c/x").await.unwrap();
-        assert!(!container_is_empty(&store, &space, "/c/").await.unwrap());
     }
 }

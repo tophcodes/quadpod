@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
+use clap::builder::BoolishValueParser;
 use clap::Parser;
 use oxigraph::model::NamedNode;
 use thiserror::Error;
@@ -42,6 +43,23 @@ pub struct Config {
     /// Address to bind. Plain HTTP — keep it behind the reverse proxy.
     #[arg(long, env = "POD_LISTEN", default_value = "127.0.0.1:3000")]
     pub listen: SocketAddr,
+
+    /// Overwrite the root ACL with the owner's default grant on startup,
+    /// even if one already exists. The only way back from a root ACL that
+    /// grants nobody (not even the owner) Control — see
+    /// `wac::provision::provision_root_acl`. Off by default: every other
+    /// start must leave an operator's or owner's own root ACL exactly as
+    /// they left it. Accepts boolish values: 1, 0, true, false, yes, no, on,
+    /// off (case-insensitive). Both `--reset-root-acl` (bare flag) and
+    /// `POD_RESET_ROOT_ACL=1` work as documented.
+    #[arg(
+        long,
+        env = "POD_RESET_ROOT_ACL",
+        value_parser = BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub reset_root_acl: bool,
 }
 
 impl Config {
@@ -134,5 +152,92 @@ mod tests {
             c.validated_owner_webid().unwrap(),
             "https://alice.example/card#me"
         );
+    }
+
+    #[test]
+    fn reset_root_acl_defaults_to_false() {
+        let c = parse(&["--owner-webid", "https://alice.example/card#me"]).unwrap();
+        assert!(!c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_bare_flag_is_true() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl",
+        ]).unwrap();
+        assert!(c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_true_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "true",
+        ]).unwrap();
+        assert!(c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_false_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "false",
+        ]).unwrap();
+        assert!(!c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_1_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "1",
+        ]).unwrap();
+        assert!(c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_0_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "0",
+        ]).unwrap();
+        assert!(!c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_yes_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "yes",
+        ]).unwrap();
+        assert!(c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_no_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "no",
+        ]).unwrap();
+        assert!(!c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_on_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "on",
+        ]).unwrap();
+        assert!(c.reset_root_acl);
+    }
+
+    #[test]
+    fn reset_root_acl_with_off_value() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--reset-root-acl", "off",
+        ]).unwrap();
+        assert!(!c.reset_root_acl);
     }
 }

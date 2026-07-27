@@ -1,79 +1,58 @@
 //! The WAC policy retrieval point: find the ACL that governs a resource.
 //!
-//! The ACL for `<res>` lives in the named graph `<res>.acl` (design spec §5).
-//! If that graph does not exist, WAC inheritance applies: walk up the
-//! container hierarchy and use the first `.acl` found there, evaluated
-//! through `acl:default`. The first ACL found wins completely — ancestor
-//! rules are never merged in.
+//! The ACL of `<res>` is `<res>`'s auxiliary of kind [`AuxKind::Acl`]. If it
+//! has no representation, WAC inheritance applies: walk up the container
+//! chain and use the first ACL found there, evaluated through `acl:default`.
+//! The first ACL found wins completely — ancestor rules are never merged in,
+//! because merging would make revoking access on a subtree impossible.
+//!
+//! The candidate chain comes from [`ResourceUrl::ancestors`], the same
+//! derivation the guard authorizes against. There is deliberately no second
+//! way to compute it.
 
 use oxigraph::model::Triple;
 
 use crate::{
-    container::parent_container,
-    resource::{get_rdf, ResourceError},
-    space::StorageSpace,
+    resource::{exists, get_rdf, ResourceError},
+    space::{AuxKind, GraphName, ResourceUrl},
     store::SparqlStore,
 };
 
 /// The ACL that governs a resource, plus the context needed to evaluate it.
 #[derive(Debug)]
 pub struct EffectiveAcl {
-    /// The ACL graph's triples.
     pub triples: Vec<Triple>,
-    /// IRI of the resource this ACL document belongs to — the object that
-    /// `acl:accessTo`/`acl:default` must name for an authorization to apply.
+    /// IRI of the resource this ACL belongs to — what `acl:accessTo` or
+    /// `acl:default` must name for an authorization to apply.
     pub governed_iri: String,
-    /// True when this ACL was reached by walking up to a container, i.e.
-    /// authorizations apply through `acl:default` rather than `acl:accessTo`.
+    /// True when reached by walking up, so `acl:default` applies rather than
+    /// `acl:accessTo`.
     pub inherited: bool,
 }
 
-const ACL_SUFFIX: &str = ".acl";
-
-/// The request path of the ACL governing `request_path`.
-pub fn acl_path(request_path: &str) -> String {
-    format!("{request_path}{ACL_SUFFIX}")
-}
-
-/// True if `request_path` addresses an ACL resource.
-pub fn is_acl_path(request_path: &str) -> bool {
-    request_path.ends_with(ACL_SUFFIX)
-}
-
-/// Inverse of [`acl_path`]: the resource an ACL path governs. Returns the
-/// input unchanged if it is not an ACL path.
-pub fn acl_subject_path(acl_request_path: &str) -> String {
-    acl_request_path
-        .strip_suffix(ACL_SUFFIX)
-        .unwrap_or(acl_request_path)
-        .to_string()
-}
-
-/// Resolve the ACL governing `request_path`: the resource's own `.acl` if it
-/// exists, else the nearest ancestor container's, else `None` (which the
-/// guard turns into a denial — WAC has no implicit grant).
+/// Resolve the ACL governing `subject`, or `None` — which the guard turns
+/// into a denial, because WAC has no implicit grant.
 pub async fn effective_acl(
     store: &dyn SparqlStore,
-    space: &StorageSpace,
-    request_path: &str,
+    subject: &ResourceUrl,
 ) -> Result<Option<EffectiveAcl>, ResourceError> {
-    if let Some(triples) = get_rdf(store, space, &acl_path(request_path)).await? {
+    let direct = subject.aux(AuxKind::Acl);
+    if exists(store, &direct).await? {
         return Ok(Some(EffectiveAcl {
-            triples,
-            governed_iri: space.graph_iri(request_path)?,
+            triples: get_rdf(store, &direct).await?.unwrap_or_default(),
+            governed_iri: subject.graph_iri().to_string(),
             inherited: false,
         }));
     }
-    let mut current = request_path.to_string();
-    while let Some(parent) = parent_container(&current) {
-        if let Some(triples) = get_rdf(store, space, &acl_path(&parent)).await? {
+    for ancestor in subject.ancestors() {
+        let acl = ancestor.as_resource().aux(AuxKind::Acl);
+        if exists(store, &acl).await? {
             return Ok(Some(EffectiveAcl {
-                triples,
-                governed_iri: space.graph_iri(&parent)?,
+                triples: get_rdf(store, &acl).await?.unwrap_or_default(),
+                governed_iri: ancestor.graph_iri().to_string(),
                 inherited: true,
             }));
         }
-        current = parent;
     }
     Ok(None)
 }
@@ -82,65 +61,50 @@ pub async fn effective_acl(
 mod tests {
     use super::*;
     use crate::wac::pdp::{ACL_ACCESS_TO, ACL_AGENT, ACL_DEFAULT, ACL_MODE, ACL_READ};
-    use crate::{rdf, resource::put_rdf, store::OxigraphStore};
+    use crate::{rdf, resource::put_rdf, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
     use oxigraph::io::RdfFormat;
 
     const ALICE: &str = "https://alice.example/card#me";
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
-    async fn write_acl(store: &OxigraphStore, path: &str, turtle: &str) {
-        let base = sp().graph_iri(path).unwrap();
-        let t = rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, &base).unwrap();
-        put_rdf(store, &sp(), path, &t).await.unwrap();
+    fn res(path: &str) -> ResourceUrl {
+        match sp().resolve(path).unwrap() {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource().clone(),
+            Target::Aux(_) => panic!("not a resource path"),
+        }
     }
 
-    #[test]
-    fn acl_path_appends_dot_acl() {
-        assert_eq!(acl_path("/foo"), "/foo.acl");
-        assert_eq!(acl_path("/box/"), "/box/.acl");
-        assert_eq!(acl_path("/"), "/.acl");
-    }
-
-    #[test]
-    fn acl_subject_path_is_the_inverse() {
-        assert_eq!(acl_subject_path("/foo.acl"), "/foo");
-        assert_eq!(acl_subject_path("/box/.acl"), "/box/");
-        assert_eq!(acl_subject_path("/.acl"), "/");
-    }
-
-    #[test]
-    fn is_acl_path_only_matches_the_suffix() {
-        assert!(is_acl_path("/foo.acl"));
-        assert!(is_acl_path("/.acl"));
-        assert!(!is_acl_path("/foo"));
-        assert!(!is_acl_path("/acl"));
-        assert!(!is_acl_path("/x.acl/")); // a container that merely looks like one
+    async fn write_acl(store: &OxigraphStore, subject_path: &str, turtle: &str) {
+        let subject = res(subject_path);
+        put_rdf(store, &subject, &[]).await.unwrap();
+        let aux = subject.aux(AuxKind::Acl);
+        let t = rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, aux.graph_iri()).unwrap();
+        crate::aux::put(store, &aux, &t).await.unwrap();
     }
 
     #[tokio::test]
     async fn direct_acl_is_found_and_not_marked_inherited() {
         let store = OxigraphStore::in_memory().unwrap();
-        write_acl(&store, "/foo.acl", &format!(
+        write_acl(&store, "/foo", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        let acl = effective_acl(&store, &sp(), "/foo").await.unwrap().expect("found");
+        let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("found");
         assert!(!acl.inherited);
         assert_eq!(acl.governed_iri, "https://pod.toph.so/foo");
-        assert!(!acl.triples.is_empty(), "triples must be populated");
-        assert!(acl.triples.iter().any(|t| t.predicate.as_str() == ACL_MODE),
-            "triples must contain ACL_MODE");
+        assert!(acl.triples.iter().any(|t| t.predicate.as_str() == ACL_MODE));
     }
 
     #[tokio::test]
     async fn missing_direct_acl_inherits_from_the_nearest_container() {
         let store = OxigraphStore::in_memory().unwrap();
-        write_acl(&store, "/box/.acl", &format!(
+        write_acl(&store, "/box/", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        let acl = effective_acl(&store, &sp(), "/box/item").await.unwrap().expect("found");
+        let acl = effective_acl(&store, &res("/box/item")).await.unwrap().expect("found");
         assert!(acl.inherited);
         assert_eq!(acl.governed_iri, "https://pod.toph.so/box/");
     }
@@ -148,61 +112,94 @@ mod tests {
     #[tokio::test]
     async fn walk_ascends_all_the_way_to_the_root_acl() {
         let store = OxigraphStore::in_memory().unwrap();
-        write_acl(&store, "/.acl", &format!(
+        write_acl(&store, "/", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        let acl = effective_acl(&store, &sp(), "/a/b/c").await.unwrap().expect("found");
+        let acl = effective_acl(&store, &res("/a/b/c")).await.unwrap().expect("found");
         assert!(acl.inherited);
         assert_eq!(acl.governed_iri, "https://pod.toph.so/");
     }
 
-    // WAC: the nearest ACL wins COMPLETELY. An ancestor's rules must not be
-    // merged in — otherwise revoking access on a subtree would be impossible.
     #[tokio::test]
     async fn nearest_acl_wins_entirely_over_ancestors() {
         let store = OxigraphStore::in_memory().unwrap();
-        write_acl(&store, "/.acl", &format!(
+        write_acl(&store, "/", &format!(
             "<#root> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        write_acl(&store, "/box/.acl", &format!(
+        write_acl(&store, "/box/", &format!(
             "<#box> <{ACL_AGENT}> <https://bob.example/card#me> ; \
              <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        let acl = effective_acl(&store, &sp(), "/box/item").await.unwrap().expect("found");
+        let acl = effective_acl(&store, &res("/box/item")).await.unwrap().expect("found");
         assert_eq!(acl.governed_iri, "https://pod.toph.so/box/");
         assert!(!acl.triples.iter().any(|t| matches!(&t.object,
-            oxigraph::model::Term::NamedNode(n) if n.as_str() == ALICE)),
-            "root rules must not be merged into the nearer ACL");
+            oxigraph::model::Term::NamedNode(n) if n.as_str() == ALICE)));
+    }
+
+    // The reason existence became a stored fact: an empty ACL is a policy
+    // ("nothing is granted here"), not an absence that falls back to ancestors.
+    #[tokio::test]
+    async fn an_empty_acl_is_found_and_stops_the_walk() {
+        let store = OxigraphStore::in_memory().unwrap();
+        write_acl(&store, "/", &format!(
+            "<#root> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        write_acl(&store, "/locked/", "").await;
+        let acl = effective_acl(&store, &res("/locked/x")).await.unwrap().expect("found");
+        assert_eq!(acl.governed_iri, "https://pod.toph.so/locked/");
+        assert!(acl.triples.is_empty(), "an empty ACL grants nothing");
     }
 
     #[tokio::test]
     async fn no_acl_anywhere_is_none() {
         let store = OxigraphStore::in_memory().unwrap();
-        assert!(effective_acl(&store, &sp(), "/foo").await.unwrap().is_none());
+        assert!(effective_acl(&store, &res("/foo")).await.unwrap().is_none());
     }
 
-    // An ACL for a resource must not be shadowed by that resource's own
-    // graph: /foo.acl is looked up as a graph, /foo is never consulted.
     #[tokio::test]
     async fn resource_data_is_not_mistaken_for_its_acl() {
         let store = OxigraphStore::in_memory().unwrap();
-        write_acl(&store, "/foo", "<#it> <http://schema.org/name> \"Toph\" .").await;
-        assert!(effective_acl(&store, &sp(), "/foo").await.unwrap().is_none());
+        let foo = res("/foo");
+        let t = rdf::parse(b"<#it> <http://schema.org/name> \"Toph\" .", RdfFormat::Turtle, foo.graph_iri()).unwrap();
+        put_rdf(&store, &foo, &t).await.unwrap();
+        assert!(effective_acl(&store, &foo).await.unwrap().is_none());
     }
 
-    // A container's own ACL must be governed by the container IRI WITH its
-    // trailing slash — `decide` compares that string exactly, so normalizing
-    // it away here would silently deny everything under the container.
+    // A resource's OWN empty ACL must win over an ancestor's grant — it says
+    // "nothing is granted here". This is the fixture that distinguishes the
+    // direct branch from the inherited one: it fails if the ancestor loop
+    // runs first, and it fails if the direct check ever goes back to asking
+    // whether triples came back instead of whether the ACL exists.
+    #[tokio::test]
+    async fn an_own_empty_acl_wins_over_an_ancestor_grant() {
+        let store = OxigraphStore::in_memory().unwrap();
+        write_acl(&store, "/", &format!(
+            "<#root> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        write_acl(&store, "/foo", "").await;
+
+        let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("found");
+        assert!(!acl.inherited, "the resource's own ACL must win over the ancestor's");
+        assert_eq!(acl.governed_iri, "https://pod.toph.so/foo");
+        assert!(acl.triples.is_empty(), "an empty own ACL grants nothing");
+    }
+
+    // A container's own ACL is governed by the container IRI WITH its
+    // trailing slash; `decide` compares that string exactly, so trimming it
+    // here would silently deny everything under the container.
     #[tokio::test]
     async fn direct_container_acl_keeps_the_trailing_slash() {
         let store = OxigraphStore::in_memory().unwrap();
-        write_acl(&store, "/box/.acl", &format!(
+        write_acl(&store, "/box/", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        let acl = effective_acl(&store, &sp(), "/box/").await.unwrap().expect("found");
+
+        let acl = effective_acl(&store, &res("/box/")).await.unwrap().expect("found");
         assert!(!acl.inherited);
         assert_eq!(acl.governed_iri, "https://pod.toph.so/box/");
     }
