@@ -202,11 +202,15 @@ fn verified_htu_claim(proof: &str) -> Result<String, AuthError> {
 /// segment. In this pod the trailing slash is precisely what separates a
 /// container from a resource: `/foo` and `/foo/` are distinct named graphs
 /// with distinct ACLs. Left at `dpop-verifier`'s comparison, a proof minted
-/// for `/.aux/acl/foo` also verifies against `PUT /.aux/acl/foo/`, so an
-/// on-path adversary can re-target a signed ACL write at the container's
-/// ACL, whose rules then name no governed IRI at all — an empty ACL that
-/// wins over every ancestor and locks the subtree out permanently. Refusing
-/// trailing slashes the way [`crate::space::StorageSpace::resolve`] refuses
+/// for `PUT /foo` also verifies against `PUT /foo/`, so an on-path adversary
+/// can re-target a signed resource write at the container of the same
+/// name — a different resource from the one the client authorized, with its
+/// own, independent ACL. (An auxiliary URL's kind is a suffix, e.g.
+/// `/.aux/foo.acl`, so it has no exactly analogous case: appending a
+/// trailing slash still collapses under `normalize_htu`, but the result,
+/// `/.aux/foo.acl/`, ends in no kind's suffix and resolves to `Reserved` ->
+/// 404 regardless of what this comparison decides.) Refusing trailing
+/// slashes the way [`crate::space::StorageSpace::resolve`] refuses
 /// the other normalization-unstable shapes is not an option here, so the
 /// comparison is tightened instead.
 ///
@@ -615,9 +619,21 @@ mod tests {
     /// here, and `dpop-verifier`'s `normalize_htu` drops it — so on its
     /// comparison alone a proof minted for `/foo` verifies against a request
     /// for `/foo/` and vice versa. Both directions must be rejected: the
-    /// dangerous one is a signed `PUT /.aux/acl/foo` re-delivered as
-    /// `PUT /.aux/acl/foo/`, which would write the body as the *container's*
-    /// ACL, naming no governed IRI and locking the subtree out for good.
+    /// dangerous one is a signed `PUT /foo` re-delivered as `PUT /foo/`,
+    /// which would install the body as the *container* of the same name — a
+    /// different resource from the one the client authorized. See
+    /// `http::tests::a_proof_for_a_resource_cannot_write_its_container_counterpart`
+    /// for that scenario pinned end to end, including the mutation evidence
+    /// that this comparison is what stops it.
+    ///
+    /// The auxiliary case below is included for completeness, not because
+    /// it is exploitable: an auxiliary's kind is a suffix, so appending `/`
+    /// directly to its URL (`/.aux/foo.acl` -> `/.aux/foo.acl/`) still
+    /// collapses under `normalize_htu`, but `/.aux/foo.acl/` ends in no
+    /// kind's suffix and resolves to `Reserved` -> 404 whatever
+    /// `verify_dpop` decides — so this assertion confirms the tightened
+    /// comparison also rejects it, not that leaving it unrejected would be
+    /// dangerous.
     #[tokio::test]
     async fn trailing_slash_difference_is_rejected_in_both_directions() {
         let client = TestClient::new();
@@ -643,12 +659,11 @@ mod tests {
         .await
         .is_err());
 
-        // The exact scenario the fix exists for: a proof for the resource's
-        // ACL must not authorize a write to the container's ACL.
-        let acl = client.mint_dpop("https://pod.toph.so/.aux/acl/foo", "PUT", 1_000, "jti-slash-3");
+        // Harmless-but-still-rejected auxiliary case; see the doc comment above.
+        let acl = client.mint_dpop("https://pod.toph.so/.aux/foo.acl", "PUT", 1_000, "jti-slash-3");
         assert!(verify_dpop(
             &acl,
-            "https://pod.toph.so/.aux/acl/foo/",
+            "https://pod.toph.so/.aux/foo.acl/",
             "PUT",
             &client.jkt(),
             1_010
@@ -669,8 +684,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "https://pod.toph.so/box/",
             "https://pod.toph.so/",
-            "https://pod.toph.so/.aux/acl/foo",
-            "https://pod.toph.so/.aux/acl/box/",
+            "https://pod.toph.so/.aux/foo.acl",
+            "https://pod.toph.so/.aux/box/.acl",
         ]
         .iter()
         .enumerate()
@@ -760,14 +775,14 @@ mod tests {
         // The shape it matters for: a signed ACL write must not be re-targeted
         // at the ACL of a different resource.
         let acl = client.mint_dpop(
-            "https://pod.toph.so/.aux/acl/a%41",
+            "https://pod.toph.so/.aux/a%41.acl",
             "PUT",
             1_000,
             "jti-pct25-3",
         );
         assert!(verify_dpop(
             &acl,
-            "https://pod.toph.so/.aux/acl/a%2541",
+            "https://pod.toph.so/.aux/a%2541.acl",
             "PUT",
             &client.jkt(),
             1_010
@@ -1257,17 +1272,18 @@ mod tests {
     /// The RS256 path is a second way into `verify_dpop`, so every hardened
     /// check downstream of it must still apply — starting with the exact
     /// wire-form `htu` comparison, whose absence would let a signed
-    /// `PUT /.aux/acl/foo` be re-delivered as `PUT /.aux/acl/foo/`. That
-    /// check is shared code, and this pins that RS256 actually reaches it
-    /// rather than routing around it.
+    /// `PUT /foo` be re-delivered as `PUT /foo/`, installing the body as
+    /// the *container* of the same name. That check is shared code, and
+    /// this pins that RS256 actually reaches it rather than routing around
+    /// it.
     #[tokio::test]
     async fn an_rs256_proof_is_held_to_the_exact_htu_comparison_too() {
         let client = TestClient::new_rsa();
-        let acl =
-            client.mint_dpop("https://pod.toph.so/.aux/acl/foo", "PUT", 1_000, "jti-rsa-slash");
+        let proof =
+            client.mint_dpop("https://pod.toph.so/foo", "PUT", 1_000, "jti-rsa-slash");
         assert!(verify_dpop(
-            &acl,
-            "https://pod.toph.so/.aux/acl/foo/",
+            &proof,
+            "https://pod.toph.so/foo/",
             "PUT",
             &client.jkt(),
             1_010
