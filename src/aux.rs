@@ -22,6 +22,17 @@ pub enum AuxError {
     Resource(#[from] ResourceError),
 }
 
+/// The `404` body for an auxiliary write refused for [`AuxError::SubjectMissing`].
+///
+/// Two call sites answer this: `wac::guard::authorize_and_materialize` (the
+/// ancestor-authorization walk, which can tell a missing subject apart from a
+/// missing ancestor before writing anything) and `http::put_impl`'s
+/// `aux::put` match arm (the in-update guard, for the window between that
+/// check and the write). Both are wanted — see their call sites — so the
+/// message lives here once rather than drifting between two copies.
+pub const AUX_SUBJECT_MISSING_MESSAGE: &str =
+    "an auxiliary resource cannot be created for a resource that does not exist";
+
 /// The update [`put`] issues: it replaces the auxiliary's contents and marks
 /// it present, but only for a subject that is present *at the moment of the
 /// write*.

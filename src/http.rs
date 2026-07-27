@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
     http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
-use crate::{aux::{self, AuxError}, container,
+use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     resource::{put_rdf, get_rdf, delete_rdf, exists, ResourceError},
     rdf::{format_for_content_type, format_for_accept, parse, serialize, etag},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
@@ -180,10 +180,8 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         // would plant a policy document on a path that no longer exists.
         Target::Aux(a) => match aux::put(store, a, &triples).await {
             Ok(()) => created(&target),
-            Err(AuxError::SubjectMissing) => (
-                StatusCode::NOT_FOUND,
-                "an auxiliary resource cannot be created for a resource that does not exist",
-            ).into_response(),
+            Err(AuxError::SubjectMissing) =>
+                (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
             Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
         },
         Target::Container(c) => {

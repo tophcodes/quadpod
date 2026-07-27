@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::{
     auth::Agent,
+    aux::AUX_SUBJECT_MISSING_MESSAGE,
     container,
     resource,
     space::{AuxKind, ContainerUrl, GraphName, ResourceUrl, Target},
@@ -169,11 +170,7 @@ pub async fn authorize_and_materialize(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
     {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "an auxiliary resource cannot be created for a resource that does not exist",
-        )
-            .into_response());
+        return Err((StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response());
     }
 
     for (ancestor, child_iri) in plan {
