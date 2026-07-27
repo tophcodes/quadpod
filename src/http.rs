@@ -707,10 +707,10 @@ mod tests {
     #[tokio::test]
     async fn paths_normalization_would_alias_are_400() {
         let f = fixture().await;
-        // No percent-encoding in any of these, so `owner_request`'s naive
-        // htu (raw path, undecoded) matches `derive_htu`'s (decoded path)
-        // exactly — the `#` case needs its own test below, since decoding
-        // changes what the signed `htu` would have to be.
+        // `owner_request` signs the raw path, which is exactly what
+        // `derive_htu` derives the `htu` from, so every shape here
+        // authenticates and is then refused by `classify`, not by the
+        // credential check.
         for path in ["/a//b", "/a/b//", "/a/./b", "/a/../b"] {
             let get = f.owner_request("GET", path).body(Body::empty()).unwrap();
             assert_eq!(
@@ -729,26 +729,17 @@ mod tests {
         }
     }
 
-    // A raw request path of `/a%23b` decodes (the same way `derive_htu` and
-    // `classify` both decode it) to `/a#b`, which `resolve` now refuses as
-    // `NotNormalized`. The `htu` a client signs for such a URL is the
-    // configured base plus the DECODED path (see `derive_htu`'s doc comment),
-    // i.e. a literal `#` — not the wire-encoded `%23` — so it is crafted
-    // directly here rather than through `owner_request`'s naive (undecoded)
-    // helper, which cannot express it.
+    // A raw request path of `/a%23b` decodes (the way `classify` decodes it)
+    // to `/a#b`, which `resolve` refuses as `NotNormalized` — a `400`, and it
+    // must stay a `400` rather than becoming a misleading `401`. The `htu` a
+    // client signs is the WIRE form, `%23` and all (see `derive_htu`), which
+    // is exactly what `owner_request` builds; before the wire-form fix this
+    // test had to craft a proof over the decoded `https://pod.toph.so/a#b`
+    // instead, and `owner_request` could not express it.
     #[tokio::test]
     async fn hash_in_the_decoded_path_is_400_not_401() {
         let f = fixture().await;
-        let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
-        let htu = "https://pod.toph.so/a#b";
-        let proof = f.client.mint_dpop(htu, "GET", now_unix(), "jti-hash-in-path-test");
-        let req = Request::builder()
-            .method("GET")
-            .uri("/a%23b")
-            .header(header::AUTHORIZATION, format!("DPoP {at}"))
-            .header("dpop", proof)
-            .body(Body::empty())
-            .unwrap();
+        let req = f.owner_request("GET", "/a%23b").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
@@ -799,6 +790,59 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // The same re-targeting, through a percent-escape instead of a trailing
+    // slash. The owner signs `PUT /.aux/acl/a%41` — whose subject the handlers
+    // read as `/aA` — and an on-path adversary re-delivers the identical bytes
+    // as `PUT /.aux/acl/a%2541`, whose subject is `/a%41`, a DIFFERENT
+    // resource. While `htu` was the percent-DECODED graph IRI and the exact
+    // comparison decoded both sides, the two collapsed to the same string and
+    // this authenticated. It must be a 401, from the middleware.
+    #[tokio::test]
+    async fn a_proof_for_one_acl_cannot_be_redirected_by_a_double_escape() {
+        let f = fixture().await;
+        let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
+        let proof = f.client.mint_dpop(
+            "https://pod.toph.so/.aux/acl/a%41",
+            "PUT",
+            now_unix(),
+            "jti-acl-double-escape",
+        );
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/.aux/acl/a%2541")
+            .header(header::AUTHORIZATION, format!("DPoP {at}"))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("dpop", proof)
+            .body(Body::from(
+                "<#r> a <http://www.w3.org/ns/auth/acl#Authorization> ;\
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/aA> .",
+            ))
+            .unwrap();
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // The other half: a client that signs the wire form it actually requests
+    // must get through, end to end. `%41` is a plain `A`, so this once failed
+    // with a `401` even for the honest client — `dpop-verifier` compared the
+    // still-encoded proof against a `derive_htu` that had already decoded it.
+    #[tokio::test]
+    async fn a_percent_encoded_path_authenticates_for_its_own_request() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/a%41")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        let res = f.app.clone().oneshot(put).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        // The handler decoded the path, so the resource is `/aA` — the `htu`
+        // being the wire form changed the credential check, not the storage.
+        assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/aA");
+
+        let get = f.owner_request("GET", "/aA").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_string(res).await.contains("schema.org/name"));
     }
 
     #[tokio::test]

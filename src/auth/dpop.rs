@@ -202,34 +202,34 @@ fn verified_htu_claim(proof: &str) -> Result<String, AuthError> {
 /// from `path_segments()`, which yields no empty final segment) without
 /// discarding any of `dpop-verifier`'s own RFC-conformant tolerance.
 ///
-/// Within the path, the comparison is byte equality after percent-decoding
-/// both sides, and nothing else — no dot-segment resolution, no
-/// empty-segment collapsing, no case folding. Percent-decoding is the one
-/// widening step, and it is required rather than optional: `expected` comes
-/// from `auth::middleware::derive_htu`, which percent-decodes the request
-/// path so the `htu` lines up with the graph IRI the handler actually
-/// operates on, while a client signs the URL as it puts it on the wire
-/// (`/caf%C3%A9`, not `/café`). Decoding both is what makes those the same
-/// string. It widens nothing this pod distinguishes: `derive_htu` and the
-/// handlers both read the decoded path, so `/a%2Fb` and `/a/b` already *are*
-/// one resource here. A percent sequence that is not valid UTF-8 decodes
-/// lossily on both sides, which can only ever make the check reject more,
-/// never less.
+/// Within the path, the comparison is byte equality and nothing else — no
+/// dot-segment resolution, no empty-segment collapsing, no case folding, and
+/// **no percent-decoding**. Both sides are already the wire form: `expected`
+/// comes from `auth::middleware::derive_htu`, which is the configured base
+/// plus the raw request path, and a client signs the URL as it puts it on the
+/// wire (`/caf%C3%A9`, not `/café`). `Url::path` returns that wire form
+/// verbatim, so the two line up with no widening step at all.
+///
+/// Percent-decoding here used to be that widening step, and it was the whole
+/// defect. `derive_htu` returned the DECODED graph IRI, so this comparison had
+/// to decode to compensate — and decoding makes two distinct wire URLs
+/// interchangeable. A proof minted for `/a%41` (handlers: `/aA`) also verified
+/// against a request to `/a%2541` (handlers: `/a%41`), a *different* resource:
+/// both sides decoded to `/aA` and matched. An on-path adversary could
+/// therefore land a signed body — an ACL write, say — on a resource its client
+/// never addressed. Comparing the wire form closes that: `/a%41` and `/a%2541`
+/// are simply different strings. It costs nothing legitimate, because a client
+/// signing `/a%2541` for a request to `/a%2541` still matches exactly.
 ///
 /// Either side failing to parse as a URL (the proof's claimed `htu` is
 /// attacker-controlled and need not be one) is treated as a mismatch, not a
 /// separate error — the caller already turns "not the same resource" into
 /// the one `DpopInvalid` rejection.
 fn htu_names_the_same_resource(proof_htu: &str, expected: &str) -> bool {
-    fn decoded_path(s: &str) -> Option<String> {
-        let url = url::Url::parse(s).ok()?;
-        Some(
-            percent_encoding::percent_decode_str(url.path())
-                .decode_utf8_lossy()
-                .into_owned(),
-        )
+    fn wire_path(s: &str) -> Option<String> {
+        Some(url::Url::parse(s).ok()?.path().to_string())
     }
-    match (decoded_path(proof_htu), decoded_path(expected)) {
+    match (wire_path(proof_htu), wire_path(expected)) {
         (Some(p), Some(e)) => p == e,
         _ => false,
     }
@@ -406,25 +406,94 @@ mod tests {
         }
     }
 
-    /// `derive_htu` hands `verify_dpop` the percent-DECODED path (so the
-    /// `htu` is the graph IRI the handler operates on), while a client signs
-    /// the URL as it goes on the wire. The exact comparison has to see
-    /// through that difference or every request to a path needing
-    /// percent-encoding would 401.
+    /// A client signs the URL as it goes on the wire, and `derive_htu` now
+    /// hands `verify_dpop` that same wire form — so a percent-encoded path
+    /// verifies for the request it was actually signed for, with no decoding
+    /// step on either side. Both an escape the `url` crate would itself
+    /// produce (`%C3%A9`) and one it would not (`%41`, a plain `A`) must work;
+    /// before this fix the latter was answered `401` even for the honest
+    /// client, because `dpop-verifier` compared the still-encoded `%41`
+    /// against a `derive_htu` that had already decoded it to `A`.
     #[tokio::test]
-    async fn percent_encoded_proof_matches_the_decoded_expected_htu() {
+    async fn a_percent_encoded_path_verifies_for_the_request_it_was_signed_for() {
         let _guard = test_lock().lock().await;
         let client = TestClient::new();
-        let proof = client.mint_dpop("https://pod.toph.so/caf%C3%A9", "GET", 1_000, "jti-pct");
+        for (i, htu) in [
+            "https://pod.toph.so/caf%C3%A9",
+            "https://pod.toph.so/a%41",
+            "https://pod.toph.so/a%2541",
+            "https://pod.toph.so/a%2Fb",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let jti = format!("jti-pct-{i}");
+            let proof = client.mint_dpop(htu, "GET", 1_000, &jti);
+            assert!(
+                verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010)
+                    .await
+                    .is_ok(),
+                "wire-form htu {htu} must verify for its own request"
+            );
+        }
+    }
+
+    /// A percent-escape difference in the path is a mismatch, full stop: this
+    /// comparison never decodes its way to an equivalence. `/a%41` and
+    /// `/a%2541` name different resources here — the handlers read them as
+    /// `/aA` and `/a%41` — so a proof for one must not verify against the
+    /// other, in either direction.
+    ///
+    /// `dpop-verifier`'s own comparison rejects these too, because
+    /// `normalize_htu` preserves percent-escapes; this pins the property at
+    /// the layer that has to hold it whatever the crate does. The `%25`
+    /// redirect itself lived one level up, in `derive_htu`: while that handed
+    /// `verify_dpop` the percent-DECODED graph IRI, a request to `/a%2541`
+    /// arrived here already decoded to `/a%41` and matched a proof minted for
+    /// `/a%41` at *both* comparisons. That defect is pinned end to end by
+    /// `http::tests::a_proof_for_one_acl_cannot_be_redirected_by_a_double_escape`.
+    #[tokio::test]
+    async fn a_percent_encoded_proof_cannot_be_redirected_through_a_double_escape() {
+        let client = TestClient::new();
+        let plain = client.mint_dpop("https://pod.toph.so/a%41", "PUT", 1_000, "jti-pct25-1");
         assert!(verify_dpop(
-            &proof,
-            "https://pod.toph.so/café",
-            "GET",
+            &plain,
+            "https://pod.toph.so/a%2541",
+            "PUT",
             &client.jkt(),
             1_010
         )
         .await
-        .is_ok());
+        .is_err());
+
+        let doubled = client.mint_dpop("https://pod.toph.so/a%2541", "PUT", 1_000, "jti-pct25-2");
+        assert!(verify_dpop(
+            &doubled,
+            "https://pod.toph.so/a%41",
+            "PUT",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_err());
+
+        // The shape it matters for: a signed ACL write must not be re-targeted
+        // at the ACL of a different resource.
+        let acl = client.mint_dpop(
+            "https://pod.toph.so/.aux/acl/a%41",
+            "PUT",
+            1_000,
+            "jti-pct25-3",
+        );
+        assert!(verify_dpop(
+            &acl,
+            "https://pod.toph.so/.aux/acl/a%2541",
+            "PUT",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_err());
     }
 
     /// The tightened check compares only the path; scheme/host/port are left
