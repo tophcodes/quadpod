@@ -91,10 +91,27 @@ pub async fn authorize_and_materialize(
     agent: &Agent,
     target: &Target,
 ) -> Result<(), Response> {
-    let (subject, is_member): (&ResourceUrl, bool) = match target {
+    let (subject, may_be_member): (&ResourceUrl, bool) = match target {
         Target::Resource(r) => (r, true),
         Target::Container(c) => (c.as_resource(), true),
         Target::Aux(a) => (a.subject(), false),
+    };
+    // Whether this write adds a containment triple at the level above. An
+    // auxiliary is never a container member — and neither is a target that
+    // already exists, whose parent already records it: re-inserting that
+    // triple changes nothing, so demanding `Append` for it would refuse the
+    // ordinary "you may edit this file" grant, where an agent holds Write on
+    // one document and nothing on the container around it.
+    //
+    // Existence is consulted before any `authorize` call here, which is safe
+    // because every caller has already authorized the target itself — so it
+    // is not a fresh oracle for an agent who holds nothing.
+    let is_member = if may_be_member {
+        !resource::exists(store, target)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+    } else {
+        false
     };
 
     // The IRI to record as a member at the next level up. It starts as the
