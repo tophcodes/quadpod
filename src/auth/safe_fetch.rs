@@ -691,6 +691,24 @@ mod tests {
         assert!(resolve_allowed("fd00::1", 9999, &policy).await.is_ok());
     }
 
+    // Whitespace and empty entries (the comma-separated env form can
+    // produce both, e.g. `"localhost:3001, css.local,,"`) must not survive
+    // into the working set, and the reported entries must reflect that —
+    // an operator must never see a setting confirmed that does nothing.
+    #[tokio::test]
+    async fn whitespace_and_empty_entries_are_dropped_and_not_reported() {
+        let policy = FetchPolicy::with_insecure_hosts(
+            [" localhost:3001", "css.local", "", "  ", "\t"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(
+            policy.insecure_host_entries(),
+            vec!["css.local".to_string(), "localhost:3001".to_string()]
+        );
+        assert!(resolve_allowed("localhost", 3001, &policy).await.is_ok());
+    }
+
     #[tokio::test]
     async fn redirect_to_forbidden_target_is_not_followed() {
         let url = spawn_redirect_server().await;

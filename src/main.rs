@@ -19,12 +19,16 @@ async fn main() {
         std::process::exit(2);
     }
     let fetch_policy = cfg.fetch_policy();
-    if !cfg.allow_insecure_hosts.is_empty() {
+    let understood_insecure_hosts = fetch_policy.insecure_host_entries();
+    if !understood_insecure_hosts.is_empty() {
         // Loud on purpose: this is the operator relaxing an SSRF control.
         // For these hosts the pod will talk plain http and reach private
-        // addresses on pre-authentication fetches.
+        // addresses on pre-authentication fetches. Logs what was actually
+        // understood after trimming/parsing, not the raw flag value — an
+        // entry that didn't parse (empty, or an ambiguous IPv6 spelling)
+        // does nothing, and must not appear here as if it did.
         tracing::warn!(
-            hosts = %cfg.allow_insecure_hosts.join(", "),
+            hosts = %understood_insecure_hosts.join(", "),
             "--allow-insecure-host: private-IP and https-only checks are waived for these hosts"
         );
     }

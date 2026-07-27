@@ -87,10 +87,19 @@ impl Config {
     }
 
     /// The outbound-fetch posture for this process: the SSRF-safe default
-    /// plus whatever hosts the operator named on the command line.
+    /// plus whatever hosts the operator named on the command line. Entries
+    /// are trimmed and empty ones dropped before parsing, mirroring
+    /// `auth_config()`'s treatment of `trusted_issuers` — a comma-separated
+    /// env value like `"localhost:3001, css.local,,"` must not leave
+    /// whitespace- or empty-string entries in the set that can never match
+    /// a URL host.
     pub fn fetch_policy(&self) -> crate::auth::safe_fetch::FetchPolicy {
         crate::auth::safe_fetch::FetchPolicy::with_insecure_hosts(
-            self.allow_insecure_hosts.iter().cloned(),
+            self.allow_insecure_hosts
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         )
     }
 
@@ -182,6 +191,30 @@ mod tests {
             "--allow-insecure-host", "css.local",
         ]).unwrap();
         assert_eq!(c.allow_insecure_hosts, vec!["localhost:3001", "css.local"]);
+    }
+
+    // The comma-separated env form (`POD_ALLOW_INSECURE_HOSTS=a, b,,`) is what the docs
+    // advertise, and clap's `value_delimiter` does not trim or drop what it splits: a
+    // whitespace- or empty-string entry must not survive into the working fetch policy, and
+    // the startup warning (built from `insecure_host_entries()`) must not confirm a setting
+    // that does nothing — mirrors `auth_config()`'s `.map(str::trim).filter(|s|
+    // !s.is_empty())` treatment of `trusted_issuers`.
+    #[test]
+    fn fetch_policy_trims_and_drops_empty_insecure_host_entries() {
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--allow-insecure-host", "localhost:3001, css.local,,",
+        ]).unwrap();
+        assert_eq!(
+            c.allow_insecure_hosts,
+            vec!["localhost:3001", " css.local", "", ""],
+            "clap's value_delimiter itself does not trim or filter"
+        );
+        assert_eq!(
+            c.fetch_policy().insecure_host_entries(),
+            vec!["css.local".to_string(), "localhost:3001".to_string()],
+            "the built policy must reflect only the entries actually understood"
+        );
     }
 
     #[test]
