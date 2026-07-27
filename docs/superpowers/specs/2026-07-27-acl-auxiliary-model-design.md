@@ -38,9 +38,36 @@ This design adopts that class, and makes both questions answerable in one place 
 - No fix for defect 2 (a `Write`-holder destroying a narrowing ACL by delete-and-recreate). It is inherent to path-anchored policy; CSS and ESS behave identically. See §11.
 - No data migration. This pod has never been deployed; `pod.toph.so` is the separate file-based pod and is untouched.
 
-## 4. The ACL namespace
+## 4. Auxiliaries in general, ACL in particular
 
-The ACL of a resource lives under a **reserved root prefix**, not as a sibling:
+The ACL is one auxiliary kind, not a special case. The machinery below is parameterized by
+kind from the start — one reserved prefix per kind, one lifecycle rule, one router
+classification — because the defect history is a history of second implementations of
+rules that already existed.
+
+| Kind | Prefix | Written by | Authorized by |
+|---|---|---|---|
+| `Acl` | `/.acl/` | client | `Control` on the subject |
+| `Description` (later) | `/.meta/` | client | `Write` on the subject |
+| system projection (later) | — | server only | read-only, see §12.4 |
+
+**Built now: `Acl` only.** A `Description` resource today would be speculation — there is
+no user-supplied per-resource metadata in the system, and no caller for it. What is built
+now is the *shape*: `AuxKind`, one prefix table, one lifecycle. Adding `Description` later
+is then a variant, not a parallel implementation.
+
+**Server-asserted facts are deliberately not auxiliaries.** Creation and modification
+times, size, hash, the `object_store` key: these stay in the reserved `urn:pod:sys:<res>`
+graph (parent design §5), exposed through HTTP headers (`Last-Modified`, `ETag`,
+`Content-Length`) rather than as an addressable RDF resource. The split is by **authority,
+not by aboutness** — the moment a server-asserted fact has a writable URL, a client can
+dictate its own creation timestamp and the value is worthless for audit or ordering. None
+of these fields exist in the code today; they arrive with blobs, which need `size`, `hash`
+and `content-type` in the system graph anyway.
+
+### The ACL namespace
+
+The ACL of a resource lives under its reserved root prefix, not as a sibling:
 
 | Subject | ACL URL |
 |---|---|
@@ -68,12 +95,15 @@ The rules become types. All constructors are private to `space`; a URL enters th
 ```rust
 pub struct ResourceUrl(String);   // in the resource space
 pub struct ContainerUrl(String);  // a ResourceUrl ending in '/'
-pub struct AclUrl(String);        // in the reserved ACL space
+
+#[derive(Clone, Copy)]
+pub enum AuxKind { Acl }          // + Description later; each owns one prefix
+pub struct AuxUrl { kind: AuxKind, subject: ResourceUrl }
 
 pub enum Target {
     Resource(ResourceUrl),
     Container(ContainerUrl),
-    Acl(AclUrl),
+    Aux(AuxUrl),
 }
 
 impl StorageSpace {
@@ -83,22 +113,24 @@ impl StorageSpace {
 }
 
 impl ResourceUrl {
-    pub fn acl(&self) -> AclUrl;                                // total
+    pub fn aux(&self, kind: AuxKind) -> AuxUrl;                 // total
     pub fn ancestors(&self) -> impl Iterator<Item = ContainerUrl>;
     pub fn parent(&self) -> Option<ContainerUrl>;
 }
 
-impl AclUrl {
-    pub fn subject(&self) -> ResourceUrl;                       // total inverse
+impl AuxUrl {
+    pub fn subject(&self) -> &ResourceUrl;                      // total inverse
+    pub fn kind(&self) -> AuxKind;
 }
 
-pub trait GraphName { fn graph_iri(&self) -> &str; }            // all three
+pub trait GraphName { fn graph_iri(&self) -> &str; }            // all of them
 ```
 
 What becomes **unrepresentable**, rather than merely checked:
 
-- `AclUrl` has no `.acl()`. The ACL-of-an-ACL chain (defect 7) cannot be written down.
-- `AclUrl`'s only sources are `ResourceUrl::acl()` and the ACL route. No `Slug`, no concatenated string, can produce one — defect 1 has no path to the type.
+- `AuxUrl` has no `.aux()`. The auxiliary-of-an-auxiliary chain (defect 7) cannot be written down — for every kind, not just ACLs.
+- `AuxUrl` holds its subject as a `ResourceUrl` rather than a string, so `subject()` cannot fail or disagree with the URL it came from.
+- `AuxUrl`'s only sources are `ResourceUrl::aux()` and the auxiliary routes. No `Slug`, no concatenated string, can produce one — defect 1 has no path to the type.
 - `ancestors()` yields `ContainerUrl`, and the same iterator feeds authorization and materialization — defects 3 and 5 lose their second source of truth.
 - Store operations take `&impl GraphName`, so a write cannot address a graph the caller did not name.
 
@@ -137,12 +169,12 @@ One ACL is one named graph, as today. A single shared ACL graph was considered a
 
 | Defect | After |
 |---|---|
-| 1 — `Slug: .acl` escalation | **unrepresentable** (no path from `Slug` to `AclUrl`) |
+| 1 — `Slug: .acl` escalation | **unrepresentable** (no path from `Slug` to `AuxUrl`) |
 | 3 — unauthorized ancestor mutation | **unrepresentable** (one traversal, one chain) |
 | 4 — empty-body PUT reports success while widening access | **unrepresentable** (existence is stored) |
 | 5 — orphaned ACL re-materializes containers | **unrepresentable** (no orphan state) |
 | 6 — ACL for a nonexistent subject | one check, one place (was: two rules, four sites) |
-| 7 — `.acl.acl` chain | **unrepresentable** (`AclUrl` has no `.acl()`) |
+| 7 — `.acl.acl` chain | **unrepresentable** (`AuxUrl` has no `.aux()`) |
 | 2 — narrowing ACL destroyed by delete+recreate | unchanged; inherent, see §11 |
 
 ## 10. Migration
@@ -159,9 +191,10 @@ Related and already documented in the current spec: `acl:default acl:Control` on
 
 ## 12. Open questions
 
-1. **Existence witness.** `AclUrl` could be constructible only from a proof that the subject exists (`fn acl_of(subject: &Existing<ResourceUrl>) -> AclUrl`), moving defect 6 into the type system too. Cost: an `Existing<T>` token threaded through call sites that currently take a URL. **Recommendation: no** — one check in the typed store wrapper, with a test, is the better trade at this size.
-2. **How far `Target` travels.** It could stop at the guard, with handlers taking the unwrapped URL types, or be matched on inside each handler. **Recommendation: into the handlers** — the match is what replaces the scattered predicates, and a handler that receives `AclUrl` cannot accidentally treat it as a container.
+1. **Existence witness.** `AuxUrl` could be constructible only from a proof that the subject exists (`fn aux_of(subject: &Existing<ResourceUrl>, kind: AuxKind) -> AuxUrl`), moving defect 6 into the type system too. Cost: an `Existing<T>` token threaded through call sites that currently take a URL. **Recommendation: no** — one check in the typed store wrapper, with a test, is the better trade at this size.
+2. **How far `Target` travels.** It could stop at the guard, with handlers taking the unwrapped URL types, or be matched on inside each handler. **Recommendation: into the handlers** — the match is what replaces the scattered predicates, and a handler that receives `AuxUrl` cannot accidentally treat it as a container.
 3. **`HEAD` and `Link` on denials.** Obligation 1 in §4 says the header goes on 404s. Does it also go on 401/403? Emitting it discloses only a URL the client could not use anyway, and SolidOS's fallback path can be reached from a denial too. **Recommendation: yes, emit it always.**
+4. **The system-graph read projection.** Server-asserted facts are not writable, but they should be *readable* — for clients and for the deferred `/sparql` proxy. The natural shape is a GET-only URL serving `urn:pod:sys:<res>` as Turtle, answering 405 on write. Two things need verifying against the spec text before building it, the same way the ACL-URL risk was verified: whether Solid's description resource is required to be writable (which would make `rel="describedby"` the wrong relation for a read-only server projection), and what relation a read-only projection should carry instead. **Recommendation: named follow-up, not this change** — it has no caller until blobs land.
 
 ## 13. Success criteria
 
