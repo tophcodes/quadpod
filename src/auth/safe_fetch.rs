@@ -148,9 +148,13 @@ impl FetchPolicy {
 ///   literals) if the tail parses as a `u16`, else a bare host with no
 ///   port.
 ///
-/// The returned host is de-bracketed and lowercased, matching how
-/// [`FetchPolicy::permits_insecure`] normalizes the host it looks up, so
-/// the two representations cannot disagree.
+/// The returned IPv6 host is stored in **canonical form** (via
+/// [`Ipv6Addr`]'s `Display`, e.g. `0:0:0:0:0:0:0:1` becomes `::1`), matching
+/// what `url` (and so [`guarded_get`]'s `host_str()`) produces for the same
+/// address — lowercasing alone is not enough, since `url` also compresses
+/// and abbreviates IPv6 addresses, and a non-canonical stored spelling would
+/// never equal the canonical one `permits_insecure` looks up. Non-IPv6 hosts
+/// are only de-bracketed (never applicable) and lowercased.
 fn parse_insecure_host_entry(entry: &str) -> Option<(String, Option<u16>)> {
     let entry = entry.trim();
     if entry.is_empty() {
@@ -159,18 +163,17 @@ fn parse_insecure_host_entry(entry: &str) -> Option<(String, Option<u16>)> {
 
     if let Some(rest) = entry.strip_prefix('[') {
         let close = rest.find(']')?;
-        let addr = &rest[..close];
-        addr.parse::<Ipv6Addr>().ok()?;
+        let addr: Ipv6Addr = rest[..close].parse().ok()?;
         return match &rest[close + 1..] {
-            "" => Some((addr.to_lowercase(), None)),
+            "" => Some((addr.to_string(), None)),
             tail => {
                 let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
-                Some((addr.to_lowercase(), Some(port)))
+                Some((addr.to_string(), Some(port)))
             }
         };
     }
 
-    if entry.parse::<Ipv6Addr>().is_ok() {
+    if let Ok(addr) = entry.parse::<Ipv6Addr>() {
         let ambiguous = entry.rfind(':').is_some_and(|idx| {
             let (host, port_str) = (&entry[..idx], &entry[idx + 1..]);
             host.parse::<Ipv6Addr>().is_ok() && port_str.parse::<u16>().is_ok()
@@ -178,7 +181,7 @@ fn parse_insecure_host_entry(entry: &str) -> Option<(String, Option<u16>)> {
         return if ambiguous {
             None
         } else {
-            Some((entry.to_lowercase(), None))
+            Some((addr.to_string(), None))
         };
     }
 
@@ -806,6 +809,33 @@ mod tests {
         let policy = named(&["fd00::1"]);
         assert!(resolve_allowed("fd00::1", 80, &policy).await.is_ok());
         assert!(resolve_allowed("fd00::1", 9999, &policy).await.is_ok());
+    }
+
+    // `url` canonicalizes IPv6 hosts (RFC 5952: compressed, lowercase) —
+    // lowercasing a non-canonical spelling is not enough, since
+    // `0:0:0:0:0:0:0:1` and `::1` are the same address but different
+    // strings. Before this fix the entry was stored as typed (lowercased
+    // only), so it silently never matched what `guarded_get` looks up.
+    #[tokio::test]
+    async fn non_canonical_bracketed_ipv6_entry_matches_the_canonical_form_url_produces() {
+        let url = reqwest::Url::parse("https://[0:0:0:0:0:0:0:1]:3001/x").unwrap();
+        assert_eq!(url.host_str(), Some("[::1]"), "sanity: url compresses this address");
+        let policy = named(&["[0:0:0:0:0:0:0:1]:3001"]);
+        assert!(
+            resolve_allowed("::1", 3001, &policy).await.is_ok(),
+            "a non-canonical entry must match the canonical host url produces"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_canonical_bracketed_ipv6_entry_with_leading_zeros_matches_canonical_form() {
+        let url = reqwest::Url::parse("https://[fd00::0001]:80/x").unwrap();
+        assert_eq!(url.host_str(), Some("[fd00::1]"), "sanity: url drops the leading zeros");
+        let policy = named(&["[fd00::0001]:80"]);
+        assert!(
+            resolve_allowed("fd00::1", 80, &policy).await.is_ok(),
+            "a non-canonical entry must match the canonical host url produces"
+        );
     }
 
     // Whitespace and empty entries (the comma-separated env form can
