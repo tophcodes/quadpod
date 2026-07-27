@@ -14,18 +14,29 @@ pub enum SpaceError {
     NotAbsolute,
     #[error("base URI must end with a trailing slash")]
     NoTrailingSlash,
+    #[error("base URI does not form a valid IRI")]
+    InvalidBaseIri,
     #[error("resource path does not form a valid IRI")]
     InvalidResourceIri,
     #[error("path is in the reserved namespace but names no auxiliary resource")]
     Reserved,
+    #[error("request path must start with '/'")]
+    NotRooted,
 }
 
 /// The reserved first segment. Everything under it is server-understood;
 /// everything else is the user's.
 const AUX_SEGMENT: &str = ".aux";
 
-/// Anything addressable as a named graph.
-pub trait GraphName {
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Anything addressable as a named graph. Sealed: every implementor's
+/// `graph_iri` is interpolated verbatim into SPARQL, so only types minted
+/// through `StorageSpace::resolve` (and its `root`/`parent`/`ancestors`/
+/// `as_container` derivatives) may implement it.
+pub trait GraphName: sealed::Sealed {
     fn graph_iri(&self) -> &str;
 }
 
@@ -67,9 +78,11 @@ pub struct ResourceUrl {
     iri: String,
 }
 
-/// A [`ResourceUrl`] whose path ends in `/`.
+/// A [`ResourceUrl`] whose path ends in `/`. The field is private, not
+/// `pub(crate)`: the only checked constructor is [`ResourceUrl::as_container`],
+/// so a `ContainerUrl` cannot be minted around a resource that isn't one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerUrl(pub(crate) ResourceUrl);
+pub struct ContainerUrl(ResourceUrl);
 
 /// A URL in the reserved auxiliary space, carrying its subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +99,11 @@ pub enum Target {
     Container(ContainerUrl),
     Aux(AuxUrl),
 }
+
+impl sealed::Sealed for ResourceUrl {}
+impl sealed::Sealed for ContainerUrl {}
+impl sealed::Sealed for AuxUrl {}
+impl sealed::Sealed for Target {}
 
 impl GraphName for ResourceUrl {
     fn graph_iri(&self) -> &str {
@@ -190,6 +208,7 @@ impl StorageSpace {
         if !base.ends_with('/') {
             return Err(SpaceError::NoTrailingSlash);
         }
+        NamedNode::new(&base).map_err(|_| SpaceError::InvalidBaseIri)?;
         Ok(Self { base })
     }
 
@@ -199,6 +218,9 @@ impl StorageSpace {
     /// The IRI is validated here, once, because it is later interpolated
     /// verbatim into SPARQL as `<{iri}>`.
     pub fn resolve(&self, request_path: &str) -> Result<Target, SpaceError> {
+        if !request_path.starts_with('/') {
+            return Err(SpaceError::NotRooted);
+        }
         if let Some(rest) = self.reserved_remainder(request_path) {
             let Some(rest) = rest.strip_prefix('/') else {
                 return Err(SpaceError::Reserved); // "/.aux"
@@ -244,7 +266,9 @@ impl StorageSpace {
     }
 
     fn resource(&self, request_path: &str) -> Result<ResourceUrl, SpaceError> {
-        let trimmed = request_path.strip_prefix('/').unwrap_or(request_path);
+        let trimmed = request_path
+            .strip_prefix('/')
+            .expect("callers only pass paths validated to start with '/'");
         let iri = format!("{}{}", self.base, trimmed);
         NamedNode::new(&iri).map_err(|_| SpaceError::InvalidResourceIri)?;
         Ok(ResourceUrl { path: request_path.to_string(), iri })
@@ -265,6 +289,14 @@ mod tests {
     fn rejects_non_absolute_base() {
         assert!(matches!(StorageSpace::new("pod.toph.so/"),
             Err(SpaceError::NotAbsolute)));
+    }
+
+    // Passes the scheme/trailing-slash checks but is not a valid IRI (the
+    // space), so without this check `root()`'s `.expect(...)` would panic.
+    #[test]
+    fn rejects_a_base_that_is_not_a_valid_iri() {
+        assert!(matches!(StorageSpace::new("https://pod .toph.so/"),
+            Err(SpaceError::InvalidBaseIri)));
     }
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
@@ -300,6 +332,16 @@ mod tests {
         assert_eq!(s.resolve("/foo").unwrap().graph_iri(), "https://pod.toph.so/foo");
         assert_eq!(s.resolve("/a/b").unwrap().graph_iri(), "https://pod.toph.so/a/b");
         assert_eq!(s.resolve("/").unwrap().graph_iri(), "https://pod.toph.so/");
+    }
+
+    // Every URL enters through `resolve`, so a slashless path must be
+    // refused here rather than silently aliasing another resource's IRI.
+    #[test]
+    fn resolve_rejects_a_path_without_a_leading_slash() {
+        let s = sp();
+        assert_eq!(s.resolve(""), Err(SpaceError::NotRooted));
+        assert_eq!(s.resolve("foo"), Err(SpaceError::NotRooted));
+        assert_eq!(s.resolve("a/b/c"), Err(SpaceError::NotRooted));
     }
 
     #[test]
@@ -349,6 +391,16 @@ mod tests {
         assert_eq!(acl_of("/a/b/c").graph_iri(), "https://pod.toph.so/.aux/acl/a/b/c");
     }
 
+    // The direction an attacker controls: decode an `AuxUrl` from a request
+    // path, rather than building one from a subject via `aux()`.
+    #[test]
+    fn resolve_decodes_aux_urls_from_the_request_path() {
+        let s = sp();
+        let Target::Aux(aux) = s.resolve("/.aux/acl/box/").unwrap() else { panic!() };
+        assert_eq!(aux.subject().path(), "/box/");
+        assert_eq!(aux.graph_iri(), "https://pod.toph.so/.aux/acl/box/");
+    }
+
     // The chain a create actually mutates: nearest first, root last.
     #[test]
     fn ancestors_are_nearest_first_and_end_at_root() {
@@ -364,5 +416,25 @@ mod tests {
     #[test]
     fn graph_iri_still_rejects_iri_breaking_paths() {
         assert_eq!(sp().resolve("/foo> bar"), Err(SpaceError::InvalidResourceIri));
+    }
+
+    // Pins `AuxKind`'s invariants so a new variant can't silently misbehave:
+    // the `match` is exhaustive over the enum, so forgetting to add the
+    // variant here — and to `ALL` — is a compile error, not a silent gap in
+    // routing or `Link` headers. Each kind's segment must also be non-empty
+    // and slash-free (`resolve` splits on the first `/`, so two kinds could
+    // otherwise collide) and IRI-safe (it is interpolated into a graph IRI).
+    #[test]
+    fn aux_kind_segments_are_well_formed() {
+        for kind in AuxKind::ALL {
+            match kind {
+                AuxKind::Acl => {}
+            }
+            let segment = kind.segment();
+            assert!(!segment.is_empty(), "{kind:?} has an empty segment");
+            assert!(!segment.contains('/'), "{kind:?}'s segment contains '/'");
+            let iri = format!("https://pod.toph.so/.aux/{segment}/x");
+            assert!(NamedNode::new(&iri).is_ok(), "{kind:?}'s segment is not IRI-safe");
+        }
     }
 }
