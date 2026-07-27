@@ -115,8 +115,27 @@ impl TestClient {
     ///
     /// 2048 bits because that is the floor `josekit` enforces on the
     /// verifying side; a smaller key could not be used to test acceptance.
+    /// See [`Self::new_rsa_with_bits`] for exercising the *rejection* of a
+    /// smaller key.
     pub fn new_rsa() -> Self {
         let private_jwk = Jwk::generate_rsa_key(2048).expect("generate client RSA key");
+        Self::from_private(private_jwk)
+    }
+
+    /// A client whose DPoP key is RSA at an arbitrary bit size, including
+    /// below the 2048-bit floor `josekit` enforces.
+    ///
+    /// Key *generation* has no such floor (`Jwk::generate_rsa_key` delegates
+    /// to `RsaKeyPair::generate`, which does not check key size), but
+    /// `josekit`'s `RS256.signer_from_jwk` enforces the floor on the
+    /// *signing* side too — so a client built with a sub-2048-bit key here
+    /// cannot mint a genuinely-signed proof via [`Self::mint_dpop`] (its
+    /// `signer()` would panic). Use
+    /// [`Self::mint_dpop_with_dummy_signature`] instead: the rejection this
+    /// exists to test happens while building the verifier, before any
+    /// signature is ever inspected, so a genuine one is not needed.
+    pub fn new_rsa_with_bits(bits: u32) -> Self {
+        let private_jwk = Jwk::generate_rsa_key(bits).expect("generate client RSA key");
         Self::from_private(private_jwk)
     }
 
@@ -259,6 +278,70 @@ impl TestClient {
             .expect("sign DPoP proof");
 
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    /// Mint a proof shaped exactly like [`Self::mint_dpop`], but with an
+    /// arbitrary signature segment instead of a genuine one.
+    ///
+    /// Exists only for [`Self::new_rsa_with_bits`] keys below 2048 bits:
+    /// `josekit`'s own `RS256.signer_from_jwk` refuses to sign with such a
+    /// key at all (see that method's doc comment), so a genuine signature
+    /// cannot be produced. `verify_rs256_proof` rejects a too-small key while
+    /// building its own verifier, strictly before it ever reads the
+    /// signature bytes, so an arbitrary placeholder here still exercises
+    /// exactly the rejection under test.
+    pub fn mint_dpop_with_dummy_signature(
+        &self,
+        htu: &str,
+        htm: &str,
+        iat_unix: i64,
+        jti: &str,
+    ) -> String {
+        let header = json!({
+            "typ": "dpop+jwt",
+            "alg": "RS256",
+            "jwk": serde_json::Value::Object(self.public_jwk.as_ref().clone()),
+        });
+        let payload = json!({ "htu": htu, "htm": htm, "iat": iat_unix, "jti": jti });
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        format!(
+            "{header_b64}.{payload_b64}.{}",
+            URL_SAFE_NO_PAD.encode([0u8; 32])
+        )
+    }
+
+    /// Mint a genuinely-signed RS256 proof whose embedded `jwk` header
+    /// carries this client's PRIVATE key material (`d`, plus the RSA CRT
+    /// parameters) — the shape RFC 9449 §4.2 forbids a DPoP proof from ever
+    /// containing. Used to test `verify_rs256_proof`'s explicit `d` check.
+    pub fn mint_dpop_with_private_jwk_in_header(
+        &self,
+        htu: &str,
+        htm: &str,
+        iat_unix: i64,
+        jti: &str,
+    ) -> String {
+        let mut header = JwsHeader::new();
+        header.set_token_type("dpop+jwt");
+        header.set_jwk(self.private_jwk.clone());
+
+        let mut payload = JwtPayload::new();
+        payload
+            .set_claim("htu", Some(json!(htu)))
+            .expect("set htu claim");
+        payload
+            .set_claim("htm", Some(json!(htm)))
+            .expect("set htm claim");
+        payload
+            .set_claim("iat", Some(json!(iat_unix)))
+            .expect("set iat claim");
+        payload
+            .set_claim("jti", Some(json!(jti)))
+            .expect("set jti claim");
+
+        jwt::encode_with_signer(&payload, &header, &*self.signer()).expect("sign DPoP proof")
     }
 }
 

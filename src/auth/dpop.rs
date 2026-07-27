@@ -391,7 +391,12 @@ fn thumbprint_rsa(n_b64: &str, e_b64: &str) -> String {
 ///   never arrives here at all: it routes to `dpop-verifier`, whose `Jwk`
 ///   enum has no RSA variant to deserialize into;
 /// - the signature verifies over `header.payload` under that key, through
-///   `josekit`, which additionally refuses any RSA modulus below 2048 bits;
+///   `josekit`, which additionally refuses any RSA modulus below 2048 bits —
+///   this pod enforces no such floor itself; it is entirely `josekit`'s own
+///   enforcement (`RS256.verifier_from_jwk`), not a documented contract of
+///   the crate, so a future `josekit` version could in principle relax or
+///   move it. [`tests::rs256_proof_with_a_1024_bit_key_is_rejected`] pins the
+///   current behaviour;
 /// - `jti` is bounded, and `htm`/`htu` match, through the *same*
 ///   `dpop_verifier::uri` normalizers the ES256 path uses — so the two paths
 ///   cannot drift, and `htu_names_the_same_resource` layers its exact
@@ -530,13 +535,14 @@ pub async fn verify_dpop(
             .map_err(|e| AuthError::DpopInvalid(e.to_string()))?
     };
 
-    // `dpop-verifier` has now checked the proof's `htu` against ours, but
-    // only through its normalizing comparison, which erases the trailing
-    // slash that separates a container from a resource in this pod. Redo it
-    // exactly, on the signed claim (see `verified_htu_claim` and
-    // `htu_names_the_same_resource`), and reject with the same
-    // `DpopInvalid` the crate's own htu mismatch produces — the middleware
-    // answers 401 either way.
+    // Whichever path produced `verified` — `dpop-verifier` for ES256, or
+    // `verify_rs256_proof` above for RS256 — has now checked the proof's
+    // `htu` against ours, but only through its normalizing comparison, which
+    // erases the trailing slash that separates a container from a resource
+    // in this pod. Redo it exactly, on the signed claim (see
+    // `verified_htu_claim` and `htu_names_the_same_resource`), and reject
+    // with the same `DpopInvalid` a plain htu mismatch produces — the
+    // middleware answers 401 either way.
     if !htu_names_the_same_resource(&verified_htu_claim(proof)?, htu) {
         return Err(AuthError::DpopInvalid(
             "dpop proof htu does not match the request URL exactly".to_string(),
@@ -1005,6 +1011,160 @@ mod tests {
                 .is_err(),
             "an RSA proof must not verify against another key's cnf.jkt"
         );
+    }
+
+    /// The 2048-bit modulus floor `verify_rs256_proof`'s doc comment
+    /// attributes to `josekit` is not enforced anywhere in this pod's own
+    /// code — it lives entirely inside `josekit`'s `RS256.verifier_from_jwk`,
+    /// which is an implementation detail rather than a documented contract.
+    /// If a future `josekit` version relaxed or moved that check, this test
+    /// is what would catch a smaller RSA key becoming accepted.
+    ///
+    /// A genuine signature cannot be produced for a sub-2048-bit key at all
+    /// (`josekit`'s own signer refuses one — see
+    /// `TestClient::mint_dpop_with_dummy_signature`), which is fine here:
+    /// `verify_rs256_proof` rejects the key while building its own verifier,
+    /// strictly before it ever inspects the signature bytes.
+    #[tokio::test]
+    async fn rs256_proof_with_a_1024_bit_key_is_rejected() {
+        let client = TestClient::new_rsa_with_bits(1024);
+        let proof = client.mint_dpop_with_dummy_signature(
+            "https://pod.toph.so/foo",
+            "GET",
+            1_000,
+            "jti-rsa-1024",
+        );
+        let err = verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            1_010,
+        )
+        .await
+        .expect_err("a 1024-bit RSA key must be rejected");
+        match err {
+            AuthError::DpopInvalid(msg) => assert_eq!(
+                msg, "dpop proof jwk is not a usable RS256 verification key",
+                "must be rejected specifically for being an unusable (too-small) key"
+            ),
+            other => panic!("expected DpopInvalid, got {other:?}"),
+        }
+    }
+
+    /// RFC 9449 §4.2 forbids a DPoP proof's embedded `jwk` from ever carrying
+    /// private key material, and `verify_rs256_proof` checks for it
+    /// explicitly. If that check were deleted, `josekit` would simply build
+    /// the public verifier from the embedded `n`/`e` and this proof — signed
+    /// with a genuine key, over genuine claims — would verify: the check
+    /// exists only to refuse a client that leaks its own private key, not to
+    /// close a server-side hole, which is why coverage of it was missing.
+    #[tokio::test]
+    async fn rs256_proof_with_embedded_private_key_is_rejected() {
+        let client = TestClient::new_rsa();
+        let proof = client.mint_dpop_with_private_jwk_in_header(
+            "https://pod.toph.so/foo",
+            "GET",
+            1_000,
+            "jti-rsa-leaked-d",
+        );
+        let err = verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            1_010,
+        )
+        .await
+        .expect_err("a jwk carrying private key material must be rejected");
+        match err {
+            AuthError::DpopInvalid(msg) => assert_eq!(
+                msg, "dpop proof jwk must not include private key material",
+                "must be rejected specifically for the embedded d, not some other reason"
+            ),
+            other => panic!("expected DpopInvalid, got {other:?}"),
+        }
+    }
+
+    /// `dpop-verifier` bounds `jti` at 512 bytes (`JTI_MAX_LENGTH`) but does
+    /// not export that constant, so the RS256 path restates it by hand (see
+    /// `JTI_MAX_LENGTH`'s doc comment). This pins the pod's own side of that
+    /// restatement against drift: a `jti` one character over the bound must
+    /// still be refused.
+    #[tokio::test]
+    async fn rs256_proof_with_a_513_character_jti_is_rejected() {
+        let client = TestClient::new_rsa();
+        let jti = "a".repeat(513);
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, &jti);
+        let err = verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            1_010,
+        )
+        .await
+        .expect_err("a 513-character jti must be rejected");
+        match err {
+            AuthError::DpopInvalid(msg) => assert_eq!(
+                msg, "dpop proof jti is too long",
+                "must be rejected specifically for jti length, not some other reason"
+            ),
+            other => panic!("expected DpopInvalid, got {other:?}"),
+        }
+    }
+
+    /// `alg_confusion_is_refused_in_both_directions`'s ES256-over-RSA half is
+    /// refused only because `dpop-verifier`'s `Jwk` enum has no RSA variant
+    /// to deserialize into — a fact about that crate, not a rule this pod
+    /// enforces itself. This test lands on the pod's *own* `kty` check
+    /// instead (`verify_rs256_proof`'s `kty` must be `RSA`, checked right
+    /// after the `d` check), using an RS256 header over an OKP/Ed25519 JWK —
+    /// a key type `dpop-verifier` has no concept of at all, and `josekit`
+    /// would happily deserialize as a `Jwk` (it just isn't RSA). Unlike the
+    /// existing test, this one stays meaningful even if `dpop-verifier` ever
+    /// grew an RSA variant.
+    ///
+    /// The rejection happens on the `kty` check, before any verifier is
+    /// built or signature inspected, so — as with the 1024-bit-key test — no
+    /// genuine signature is needed; an arbitrary one exercises the same
+    /// path.
+    #[tokio::test]
+    async fn rs256_header_over_an_okp_key_is_refused_by_the_pods_own_kty_check() {
+        use josekit::jwk::alg::ed::EdCurve;
+
+        let ed_private = Jwk::generate_ed_key(EdCurve::Ed25519).expect("generate Ed25519 key");
+        let ed_public = ed_private.to_public_key().expect("derive Ed25519 public key");
+        assert_eq!(ed_public.key_type(), "OKP");
+
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "RS256",
+            "jwk": serde_json::Value::Object(ed_public.as_ref().clone()),
+        });
+        let payload = serde_json::json!({
+            "htu": "https://pod.toph.so/foo",
+            "htm": "GET",
+            "iat": 1_000,
+            "jti": "jti-conf-okp",
+        });
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let proof = format!(
+            "{header_b64}.{payload_b64}.{}",
+            URL_SAFE_NO_PAD.encode([0u8; 32])
+        );
+
+        let err = verify_dpop(&proof, "https://pod.toph.so/foo", "GET", "irrelevant-jkt", 1_010)
+            .await
+            .expect_err("an RS256 header over an OKP jwk must be refused");
+        match err {
+            AuthError::DpopInvalid(msg) => assert_eq!(
+                msg, "dpop proof alg RS256 requires an RSA jwk",
+                "must be rejected specifically by the pod's own kty check"
+            ),
+            other => panic!("expected DpopInvalid, got {other:?}"),
+        }
     }
 
     /// Widening the accepted algorithms must not widen them to `none` or to
