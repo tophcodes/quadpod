@@ -17,6 +17,10 @@
 //! hostname to `reqwest` and letting it re-resolve — which is what would
 //! let a name that answers with a public IP on the first lookup and a
 //! private one moments later race past the check.
+//!
+//! See `docs/deployment.md` for the operator-facing contract: what this
+//! module fetches before any credential is verified, and the entry-form
+//! rules for `--allow-insecure-host`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -59,18 +63,41 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct FetchPolicy {
     allow_http: bool,
     allow_private_ips: bool,
-    insecure_hosts: std::sync::Arc<std::collections::HashSet<String>>,
+    insecure_hosts: std::sync::Arc<std::collections::HashSet<(String, Option<u16>)>>,
 }
 
 impl FetchPolicy {
     /// The production constructor: the safe default plus the hosts the
-    /// operator vouched for. An entry may be `host` (any port on it) or
-    /// `host:port` (that port only).
+    /// operator vouched for. Each entry is parsed once, here — not
+    /// re-matched as a raw string on every lookup — into a normalized
+    /// `(host, Option<port>)` pair. See [`parse_insecure_host_entry`] for
+    /// the grammar. An entry that cannot be understood unambiguously
+    /// (empty, or ambiguous IPv6) is dropped rather than guessed at;
+    /// [`FetchPolicy::insecure_host_entries`] reports what actually made
+    /// it into the set, for logging.
     pub fn with_insecure_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
         Self {
-            insecure_hosts: std::sync::Arc::new(hosts.into_iter().collect()),
+            insecure_hosts: std::sync::Arc::new(
+                hosts
+                    .into_iter()
+                    .filter_map(|entry| parse_insecure_host_entry(&entry))
+                    .collect(),
+            ),
             ..Self::default()
         }
+    }
+
+    /// The entries actually understood after parsing and normalization —
+    /// for logging what will really take effect, not what was typed.
+    /// Sorted for deterministic output.
+    pub fn insecure_host_entries(&self) -> Vec<String> {
+        let mut entries: Vec<String> = self
+            .insecure_hosts
+            .iter()
+            .map(|(host, port)| display_insecure_host_entry(host, *port))
+            .collect();
+        entries.sort();
+        entries
     }
 
     /// Allow http and private/loopback IPs — for hermetic tests hitting a
@@ -87,9 +114,98 @@ impl FetchPolicy {
 
     /// Whether this exact host (and port) is on the operator's list.
     fn permits_insecure(&self, host: &str, port: u16) -> bool {
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        self.insecure_hosts.contains(host)
-            || self.insecure_hosts.contains(&format!("{host}:{port}"))
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_lowercase();
+        self.insecure_hosts.contains(&(host.clone(), None))
+            || self.insecure_hosts.contains(&(host, Some(port)))
+    }
+}
+
+/// Parse one `--allow-insecure-host` / `POD_ALLOW_INSECURE_HOSTS` entry into
+/// a normalized `(host, port)` pair, where `port: None` means "every port on
+/// this host". Returns `None` for an entry that cannot be understood
+/// unambiguously — it is dropped from the set rather than guessed at.
+///
+/// Grammar:
+///
+/// - **Bracketed IPv6**, `[addr]` or `[addr]:port` — the unambiguous way to
+///   name an IPv6 host, with or without a port. `addr` must itself parse as
+///   an [`Ipv6Addr`]; a malformed bracketed entry is dropped.
+/// - A bare entry that parses as a whole [`Ipv6Addr`] (e.g. `fd00::1`) is a
+///   host with no port restriction — every colon in it is part of the
+///   address, never a port separator, so it is never split.
+/// - A bare entry that is *simultaneously* a valid whole `Ipv6Addr` **and**
+///   has a `host:port` reading whose `host` portion is *also* a valid
+///   `Ipv6Addr` (e.g. `fd00::1:80`, which is at once the address
+///   `fd00::1:80` and the pair `fd00::1` + port `80`) is ambiguous and is
+///   dropped entirely: guessing "whole address" would silently grant an
+///   unnamed address every port, and guessing "split" would silently drop
+///   the address actually typed. There is no safe default, so the entry
+///   contributes nothing — the bracketed form must be used instead.
+/// - Otherwise, split on the last colon: `host:port` (hostnames, IPv4
+///   literals) if the tail parses as a `u16`, else a bare host with no
+///   port.
+///
+/// The returned host is de-bracketed and lowercased, matching how
+/// [`FetchPolicy::permits_insecure`] normalizes the host it looks up, so
+/// the two representations cannot disagree.
+fn parse_insecure_host_entry(entry: &str) -> Option<(String, Option<u16>)> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = entry.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let addr = &rest[..close];
+        addr.parse::<Ipv6Addr>().ok()?;
+        return match &rest[close + 1..] {
+            "" => Some((addr.to_lowercase(), None)),
+            tail => {
+                let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
+                Some((addr.to_lowercase(), Some(port)))
+            }
+        };
+    }
+
+    if entry.parse::<Ipv6Addr>().is_ok() {
+        let ambiguous = entry.rfind(':').is_some_and(|idx| {
+            let (host, port_str) = (&entry[..idx], &entry[idx + 1..]);
+            host.parse::<Ipv6Addr>().is_ok() && port_str.parse::<u16>().is_ok()
+        });
+        return if ambiguous {
+            None
+        } else {
+            Some((entry.to_lowercase(), None))
+        };
+    }
+
+    if let Some(idx) = entry.rfind(':') {
+        let (host, port_str) = (&entry[..idx], &entry[idx + 1..]);
+        if !host.is_empty() {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some((host.to_lowercase(), Some(port)));
+            }
+        }
+    }
+
+    Some((entry.to_lowercase(), None))
+}
+
+/// Render a parsed entry back to display form, for the startup warning.
+/// Brackets the host if it contains a colon (IPv6), so the result is
+/// itself a valid re-parseable entry in the grammar above.
+fn display_insecure_host_entry(host: &str, port: Option<u16>) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
     }
 }
 
@@ -526,6 +642,53 @@ mod tests {
         let r = guarded_get(&c, "http://example.com/x", "text/turtle", &named(&["other.example"]))
             .await;
         assert!(matches!(r, Err(AuthError::FetchBlocked(_))));
+    }
+
+    // The Critical fix: `permits_insecure` used to build its port-scoped key
+    // via `format!("{host}:{port}")` and look it up in the *same* flat set
+    // as the bare-host check. For an entry like `fd00::1:80` (the exact
+    // spelling the docs used to instruct, meaning "host fd00::1, port 80"),
+    // that concatenation is itself a syntactically valid, *different* IPv6
+    // address — so the bare-host arm matched it and opened every port on
+    // `fd00::1:80`, an address nobody named. Entries are now parsed once,
+    // structurally, and this exact spelling — ambiguous between "the
+    // address fd00::1:80" and "fd00::1 + port 80" — is dropped rather than
+    // guessed at, so it must not permit `fd00::1:80` on any port.
+    #[tokio::test]
+    async fn an_ambiguous_ipv6_host_port_entry_does_not_alias_a_different_address() {
+        let policy = named(&["fd00::1:80"]);
+        assert!(
+            resolve_allowed("fd00::1:80", 22, &policy).await.is_err(),
+            "an ambiguous entry must not alias a different address"
+        );
+        assert!(
+            resolve_allowed("fd00::1:80", 6379, &policy).await.is_err(),
+            "an ambiguous entry must not alias a different address on any port"
+        );
+        assert!(
+            resolve_allowed("fd00::1:80", 80, &policy).await.is_err(),
+            "an ambiguous entry must not alias a different address even on the port it names"
+        );
+    }
+
+    // The bracketed form is the unambiguous way to pair an IPv6 host with a
+    // port — it must actually work (Minor 5 in the review: it was silently
+    // inert before this fix) and must stay port-scoped like any other
+    // `host:port` entry.
+    #[tokio::test]
+    async fn bracketed_ipv6_entry_is_port_scoped() {
+        let policy = named(&["[::1]:3001"]);
+        assert!(resolve_allowed("::1", 3001, &policy).await.is_ok());
+        assert!(resolve_allowed("::1", 9999, &policy).await.is_err());
+    }
+
+    // A bare (unbracketed) IPv6 address with no trailing ambiguity opens
+    // every port on it, same as a bare hostname or IPv4 literal.
+    #[tokio::test]
+    async fn bare_ipv6_entry_opens_every_port_on_it() {
+        let policy = named(&["fd00::1"]);
+        assert!(resolve_allowed("fd00::1", 80, &policy).await.is_ok());
+        assert!(resolve_allowed("fd00::1", 9999, &policy).await.is_ok());
     }
 
     #[tokio::test]

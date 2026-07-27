@@ -39,6 +39,12 @@ Matching is on the **host string as it appears in the URL**, before resolution: 
 issuer is `http://localhost:3001/`, the entry must be `localhost:3001`. `127.0.0.1:3001`
 will not match it, even though the name resolves there.
 
+Each entry is parsed once, at startup, into a host and an optional port — not re-matched
+as a raw string on every fetch. That matters for IPv6: naively splitting `host:port` on
+the last colon breaks as soon as the host itself contains colons, and — worse — the wrong
+fallback (treating the whole string as one opaque token) let one entry alias a completely
+different, unlisted address. Both failure modes are closed by the rules below.
+
 Entry form, exactly:
 
 - **Lowercase.** The URL's host is compared after the URL parser has lowercased it, so
@@ -48,8 +54,21 @@ Entry form, exactly:
 - **Default ports are explicit.** A URL with no port is compared against the scheme's
   default, so `http://css.local/` matches the entry `css.local:80` (or the bare
   `css.local`), not `css.local:3001`.
-- **IPv6 literals go unbracketed**: `::1` for every port, `::1:3001` for one. The brackets
-  a URL requires (`http://[::1]:3001/`) are stripped before the comparison.
+- **A trailing dot on a hostname is not stripped.** `http://localhost.:3001/` has host
+  `"localhost."` (a syntactically legal absolute FQDN), which will not match the entry
+  `localhost:3001`. This is the safe direction — under-matching, never over-matching — but
+  it costs an operator an hour if they don't know about it, so: don't write the trailing
+  dot, and don't expect the entry to grow one for you.
+- **IPv6 host, no port: unbracketed** — `fd00::1` or `::1`, matching every port on that
+  address. The brackets a URL requires (`http://[::1]:3001/`) are stripped before the
+  comparison, so the bare, unbracketed form is what you write.
+- **IPv6 host with a port: bracketed, `[host]:port`** — `[fd00::1]:80`, `[::1]:3001`. This
+  is the *only* way to pair an IPv6 host with a port. An unbracketed `host:port`-looking
+  spelling for IPv6 (e.g. `fd00::1:80`, which reads exactly like the address
+  `fd00::1:80`) is ambiguous — a colon-delimited port suffix is indistinguishable from
+  another IPv6 group — and is **dropped entirely**, matching neither reading, rather than
+  guessed at. It will not appear in the startup warning, and it grants nothing. Use the
+  bracketed form.
 
 ### What it relaxes, for a listed host only
 
