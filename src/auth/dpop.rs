@@ -11,14 +11,36 @@
 //! an access token bound to a *different* key, breaking proof-of-possession
 //! entirely. Fails closed: every verification error, or a `jkt` mismatch,
 //! is rejected.
+//!
+//! # Two signature paths, one set of downstream checks
+//!
+//! `dpop-verifier` 4.4.0's accepted algorithm set is a hardcoded `match` in
+//! its private `verify_signature_and_compute_jkt` (ES256, plus EdDSA behind a
+//! feature this pod does not enable); `VerifyOptions` exposes no algorithm
+//! knob, and its `Jwk` type is an untagged enum with only EC-P-256 and
+//! OKP-Ed25519 variants, so an RSA JWK does not even deserialize. RS256 —
+//! which RFC 9449 permits, and which the official Solid conformance harness
+//! signs its proofs with — therefore cannot be reached through the crate at
+//! all. [`verify_rs256_proof`] is that one missing path, written here and
+//! deliberately confined to RS256: every other algorithm still goes to
+//! `dpop-verifier` unchanged, so its `none`, `HS*` and unsupported-alg
+//! rejections, and its EC signature verification, are exactly what they were.
+//!
+//! The two paths meet at a [`VerifiedDpop`], and *everything* after that —
+//! the exact wire-form `htu` comparison, the saturating freshness arithmetic,
+//! the `cnf.jkt` binding, and recording the `jti` only once all of those have
+//! passed — is shared. No property is re-implemented per algorithm.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use dpop_verifier::{DpopError, DpopVerifier, ReplayContext, ReplayStore};
+use dpop_verifier::uri::{normalize_htu, normalize_method};
+use dpop_verifier::{DpopError, DpopVerifier, ReplayContext, ReplayStore, VerifiedDpop};
+use josekit::jwk::Jwk;
+use josekit::jws::RS256;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -263,6 +285,221 @@ fn htu_names_the_same_resource(proof_htu: &str, expected: &str) -> bool {
     }
 }
 
+/// The one JWS algorithm this module verifies itself, because
+/// `dpop-verifier` cannot (see the module docs). Written once and compared
+/// against twice — by [`proof_alg_is_rs256`] to route, and again inside
+/// [`verify_rs256_proof`] to confirm.
+const RS256_ALG: &str = "RS256";
+
+/// `dpop-verifier`'s own `JTI_MAX_LENGTH`, which its ES256 path applies to
+/// every proof it accepts. Restated here so the RS256 path bounds the `jti`
+/// it hands to [`record_jti_or_reject_replay`] identically — an unbounded
+/// `jti` is an unbounded key into the process-wide replay map.
+const JTI_MAX_LENGTH: usize = 512;
+
+/// Decode one base64url segment of a compact JWS as JSON.
+///
+/// `what` names the segment for the error message only; nothing about the
+/// decoded value is trusted by this function's callers until they have
+/// checked it (the header) or verified the signature over it (the payload).
+fn decode_jws_segment(segment: &str, what: &str) -> Result<Value, AuthError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|_| AuthError::DpopInvalid(format!("dpop proof {what} is not base64url")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| AuthError::DpopInvalid(format!("dpop proof {what} is not JSON")))
+}
+
+/// Whether the proof's JOSE header claims `RS256`, read from the header
+/// segment WITHOUT having verified anything.
+///
+/// This is a routing decision, not a trust decision, and it is written to be
+/// safe as one. It picks between two verifiers that each re-derive the
+/// algorithm and the key type from these same header bytes and reject on any
+/// disagreement: [`verify_rs256_proof`] re-reads `alg` and requires an RSA
+/// JWK, and `dpop-verifier` matches `(alg, jwk)` as a pair and refuses
+/// `none`, every `HS*`, and everything it does not implement. So a lie here
+/// only sends the proof to a verifier that then rejects it; there is no
+/// algorithm a proof can claim in order to be checked *less* than it would
+/// have been. Anything other than exactly `RS256` — including a missing or
+/// non-string `alg`, or a header that is not JSON at all — routes to
+/// `dpop-verifier`, which is the behaviour this pod had before RS256 existed.
+fn proof_alg_is_rs256(proof: &str) -> bool {
+    let Some(header_b64) = proof.split('.').next() else {
+        return false;
+    };
+    let Ok(header) = decode_jws_segment(header_b64, "header") else {
+        return false;
+    };
+    header.get("alg").and_then(Value::as_str) == Some(RS256_ALG)
+}
+
+/// The RFC 7638 thumbprint of an RSA public key, as `cnf.jkt` carries it.
+///
+/// RFC 7638 §3.2 fixes the required members per key type, and for `RSA` they
+/// are `e`, `kty` and `n` — a *different* set from the `crv`/`kty`/`x`/`y`
+/// that `dpop_verifier::thumbprint_ec_p256` hashes for an EC key. Getting
+/// the member set wrong does not fail loudly: it yields a well-formed
+/// 43-character thumbprint that simply never equals the one the issuer put in
+/// `cnf.jkt`, which would turn the proof-of-possession binding into a
+/// permanent 401 for every RSA client — or, if the mistake ran the other way
+/// and *both* sides computed it wrongly, into a binding over fewer key
+/// members than the key has. So the member set is the load-bearing part here,
+/// and [`tests::rsa_thumbprint_matches_the_rfc_7638_worked_example`] pins it
+/// against the exact key and thumbprint printed in RFC 7638 §3.1.
+///
+/// The canonical form is those members and only those, as a JSON object with
+/// no whitespace and keys in lexicographic order (`e` < `kty` < `n`),
+/// SHA-256'd and base64url-encoded without padding. `serde_json` over a
+/// `BTreeMap` emits exactly that — the same construction `dpop-verifier`
+/// uses for its EC and Ed25519 thumbprints.
+///
+/// `n_b64` and `e_b64` are hashed as the proof spelled them. RFC 7638 hashes
+/// the JWK's own encoding and defines no re-canonicalization of the integers,
+/// so a proof that pads `n` with a leading zero byte gets a different
+/// thumbprint — which is not an attack, only a proof whose `jkt` no longer
+/// matches the `cnf.jkt` its issuer computed, i.e. a rejection.
+fn thumbprint_rsa(n_b64: &str, e_b64: &str) -> String {
+    let mut canonical_jwk_map = BTreeMap::new();
+    canonical_jwk_map.insert("e", e_b64);
+    canonical_jwk_map.insert("kty", "RSA");
+    canonical_jwk_map.insert("n", n_b64);
+    let canonical_json = serde_json::to_string(&canonical_jwk_map)
+        .expect("a BTreeMap<&str, &str> always serializes as JSON");
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical_json.as_bytes()))
+}
+
+/// Verify an RS256 DPoP proof, producing the same [`VerifiedDpop`]
+/// `dpop-verifier` would have produced had it supported RS256.
+///
+/// This mirrors `dpop-verifier`'s ES256 path check for check, in its order,
+/// with the same strictness — the module docs explain why the path has to
+/// exist at all. Specifically:
+///
+/// - exactly three compact-JWS segments;
+/// - `typ` is `dpop+jwt`;
+/// - `alg` is `RS256`, re-read here rather than taken from the routing peek;
+/// - the embedded `jwk` carries no `d`, so a proof can never ship private key
+///   material (RFC 9449 §4.2, and `dpop-verifier`'s own `parse_token` check);
+/// - **`kty` is `RSA`** — the alg↔key-type correspondence, checked twice
+///   over: once here on the raw header, and again by `josekit`, which refuses
+///   to build an `RS256` verifier from a JWK of any other type. An RS256
+///   header over an EC key is the alg-confusion shape a fixed ES256 pin used
+///   to make unreachable, and widening the accepted set is exactly when it
+///   becomes reachable, so it is refused explicitly rather than incidentally.
+///   The mirror case — an ES256 (or any non-RS256) header over an RSA key —
+///   never arrives here at all: it routes to `dpop-verifier`, whose `Jwk`
+///   enum has no RSA variant to deserialize into;
+/// - the signature verifies over `header.payload` under that key, through
+///   `josekit`, which additionally refuses any RSA modulus below 2048 bits;
+/// - `jti` is bounded, and `htm`/`htu` match, through the *same*
+///   `dpop_verifier::uri` normalizers the ES256 path uses — so the two paths
+///   cannot drift, and `htu_names_the_same_resource` layers its exact
+///   wire-form comparison on top of an identical baseline for both.
+///
+/// Freshness, the `cnf.jkt` binding and the `jti` recording are deliberately
+/// NOT done here: they belong to [`verify_dpop`], which applies them to
+/// whichever path produced the [`VerifiedDpop`]. In particular this function
+/// never touches the replay store, exactly as `NoopReplayStore` keeps the
+/// crate from touching it — a proof rejected downstream must not burn its
+/// `jti`.
+fn verify_rs256_proof(
+    proof: &str,
+    expected_htu: &str,
+    expected_htm: &str,
+) -> Result<VerifiedDpop, AuthError> {
+    let invalid = |m: &str| AuthError::DpopInvalid(m.to_string());
+
+    let parts: Vec<&str> = proof.split('.').collect();
+    let [header_b64, payload_b64, signature_b64] = parts[..] else {
+        return Err(invalid("dpop proof is not a compact JWS"));
+    };
+
+    let header = decode_jws_segment(header_b64, "header")?;
+    if header.get("typ").and_then(Value::as_str) != Some("dpop+jwt") {
+        return Err(invalid("dpop proof typ is not dpop+jwt"));
+    }
+    if header.get("alg").and_then(Value::as_str) != Some(RS256_ALG) {
+        return Err(invalid("dpop proof alg is not RS256"));
+    }
+
+    let jwk_value = header
+        .get("jwk")
+        .ok_or_else(|| invalid("dpop proof header has no jwk"))?;
+    if jwk_value.get("d").is_some() {
+        return Err(invalid(
+            "dpop proof jwk must not include private key material",
+        ));
+    }
+    if jwk_value.get("kty").and_then(Value::as_str) != Some("RSA") {
+        return Err(invalid("dpop proof alg RS256 requires an RSA jwk"));
+    }
+    let n = jwk_value
+        .get("n")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("dpop proof RSA jwk has no n"))?;
+    let e = jwk_value
+        .get("e")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("dpop proof RSA jwk has no e"))?;
+
+    let jwk_map = jwk_value
+        .as_object()
+        .ok_or_else(|| invalid("dpop proof jwk is not a JSON object"))?
+        .clone();
+    let jwk = Jwk::from_map(jwk_map).map_err(|_| invalid("dpop proof jwk is not a valid JWK"))?;
+    let verifier = RS256
+        .verifier_from_jwk(&jwk)
+        .map_err(|_| invalid("dpop proof jwk is not a usable RS256 verification key"))?;
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|_| invalid("dpop proof signature is not base64url"))?;
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    josekit::jws::JwsVerifier::verify(&verifier, signing_input.as_bytes(), &signature)
+        .map_err(|_| invalid("invalid DPoP signature"))?;
+
+    // The signature is verified: from here the payload's bytes are signed
+    // bytes, and the header's `n`/`e` are the key that signed them.
+    let jkt = thumbprint_rsa(n, e);
+
+    let claims = decode_jws_segment(payload_b64, "payload")?;
+    let jti = claims
+        .get("jti")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("dpop proof has no jti claim"))?;
+    if jti.len() > JTI_MAX_LENGTH {
+        return Err(invalid("dpop proof jti is too long"));
+    }
+    let iat = claims
+        .get("iat")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| invalid("dpop proof has no integer iat claim"))?;
+    let htm = claims
+        .get("htm")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("dpop proof has no htm claim"))?;
+    let htu = claims
+        .get("htu")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("dpop proof has no htu claim"))?;
+
+    let normalized =
+        |r: Result<String, DpopError>| r.map_err(|e| AuthError::DpopInvalid(e.to_string()));
+    if normalized(normalize_method(htm))? != normalized(normalize_method(expected_htm))? {
+        return Err(invalid("dpop proof htm does not match the request method"));
+    }
+    if normalized(normalize_htu(htu))? != normalized(normalize_htu(expected_htu))? {
+        return Err(invalid("dpop proof htu does not match the request URL"));
+    }
+
+    Ok(VerifiedDpop {
+        jkt,
+        jti: jti.to_string(),
+        iat,
+    })
+}
+
 /// Verify a DPoP proof: signature (against its own embedded `jwk`), `htu`
 /// and `htm` match, `iat` freshness (against `now_unix`), `jti` replay, and
 /// — critically — that the proof key's thumbprint matches `expected_jkt`
@@ -274,15 +511,24 @@ pub async fn verify_dpop(
     expected_jkt: &str,
     now_unix: i64,
 ) -> Result<(), AuthError> {
-    let verifier = DpopVerifier::new()
-        .with_max_age_seconds(DISABLE_INTERNAL_CLOCK_CHECK_SECONDS)
-        .with_future_skew_seconds(DISABLE_INTERNAL_CLOCK_CHECK_SECONDS);
+    // Only RS256 — the one algorithm `dpop-verifier` cannot reach — is
+    // verified here; everything else, `none` and `HS*` included, still goes
+    // to the crate exactly as before. See `proof_alg_is_rs256` for why
+    // routing on an unverified header is safe, and the module docs for why
+    // there are two paths at all.
+    let verified = if proof_alg_is_rs256(proof) {
+        verify_rs256_proof(proof, htu, htm)?
+    } else {
+        let verifier = DpopVerifier::new()
+            .with_max_age_seconds(DISABLE_INTERNAL_CLOCK_CHECK_SECONDS)
+            .with_future_skew_seconds(DISABLE_INTERNAL_CLOCK_CHECK_SECONDS);
 
-    let mut store = NoopReplayStore;
-    let verified = verifier
-        .verify(&mut store, proof, htu, htm, None)
-        .await
-        .map_err(|e| AuthError::DpopInvalid(e.to_string()))?;
+        let mut store = NoopReplayStore;
+        verifier
+            .verify(&mut store, proof, htu, htm, None)
+            .await
+            .map_err(|e| AuthError::DpopInvalid(e.to_string()))?
+    };
 
     // `dpop-verifier` has now checked the proof's `htu` against ours, but
     // only through its normalizing comparison, which erases the trailing
@@ -676,6 +922,229 @@ mod tests {
         // replay the SAME valid proof/jti -> must be rejected
         assert!(
             verify_dpop(&p_ok, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+                .await
+                .is_err()
+        );
+    }
+
+    /// The RSA thumbprint's member set is the whole of [`thumbprint_rsa`]'s
+    /// risk (see its doc comment), so it is pinned against the one published
+    /// vector: the RSA key and thumbprint printed verbatim in RFC 7638 §3.1.
+    ///
+    /// Any drift in the member set, their order, the JSON spacing, the digest
+    /// or the encoding moves this value. Reusing `thumbprint_ec_p256`'s
+    /// `crv`/`kty`/`x`/`y` members would too — which is exactly the silent
+    /// failure the widened algorithm set could otherwise have introduced.
+    #[test]
+    fn rsa_thumbprint_matches_the_rfc_7638_worked_example() {
+        let n = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK\
+                 7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yB\
+                 XArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb\
+                 9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0f\
+                 M4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw";
+        assert_eq!(
+            thumbprint_rsa(n, "AQAB"),
+            "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+        );
+    }
+
+    /// RFC 9449 permits any asymmetric JWS algorithm, and the official Solid
+    /// conformance harness signs its proofs `RS256` — which this pod refused
+    /// outright, 401-ing the harness before it ran a single test. An RS256
+    /// proof over an RSA JWK, presented for an access token whose `cnf.jkt`
+    /// is that key's RFC 7638 thumbprint, must now verify end to end.
+    #[tokio::test]
+    async fn an_rs256_proof_with_a_matching_rsa_jkt_verifies() {
+        let _guard = test_lock().lock().await;
+        let client = TestClient::new_rsa();
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-rsa-ok");
+        assert!(verify_dpop(
+            &proof,
+            "https://pod.toph.so/foo",
+            "GET",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_ok());
+    }
+
+    /// The proof-of-possession binding has to hold for RSA keys exactly as it
+    /// does for EC ones, and it only can if the RSA thumbprint is computed
+    /// over RFC 7638's RSA member set.
+    ///
+    /// Both halves are asserted here on purpose, and the positive one is what
+    /// makes this test mutation-sensitive: an `is_err()` assertion alone
+    /// would still pass if [`thumbprint_rsa`] were computing garbage — every
+    /// jkt would mismatch, including the honest client's. Break the
+    /// thumbprint (feed it the EC member set, reorder the members, drop
+    /// `kty`) and the *acceptance* below fails, which is how a silently
+    /// broken binding announces itself.
+    #[tokio::test]
+    async fn the_rsa_jkt_binding_is_load_bearing() {
+        let _guard = test_lock().lock().await;
+        let client = TestClient::new_rsa();
+        let other = TestClient::new_rsa();
+
+        // Bound to its own key: accepted. This is the half that fails if the
+        // RSA thumbprint is computed wrongly.
+        let ok = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-rsa-bind-1");
+        assert!(
+            verify_dpop(&ok, "https://pod.toph.so/foo", "GET", &client.jkt(), 1_010)
+                .await
+                .is_ok(),
+            "an RSA proof must verify against its own key's RFC 7638 thumbprint"
+        );
+
+        // A perfectly valid, correctly-signed RSA proof from a *different*
+        // key must not satisfy this token's binding.
+        let wrong = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-rsa-bind-2");
+        assert!(
+            verify_dpop(&wrong, "https://pod.toph.so/foo", "GET", &other.jkt(), 1_010)
+                .await
+                .is_err(),
+            "an RSA proof must not verify against another key's cnf.jkt"
+        );
+    }
+
+    /// Widening the accepted algorithms must not widen them to `none` or to
+    /// any symmetric MAC — with a symmetric `alg` the embedded `jwk` is the
+    /// verification key *and* the signing key, so accepting one would let
+    /// anyone mint a proof for any `cnf.jkt` they like. Refused for both key
+    /// types the pod now accepts, so neither the ES256 nor the RS256 route
+    /// can be talked into it.
+    #[tokio::test]
+    async fn alg_none_and_symmetric_algs_are_refused() {
+        let ec = TestClient::new();
+        let rsa = TestClient::new_rsa();
+        for (i, client) in [&ec, &rsa].iter().enumerate() {
+            for alg in ["none", "HS256", "HS384", "HS512"] {
+                let jti = format!("jti-badalg-{i}-{alg}");
+                let proof = client
+                    .mint_dpop_claiming_alg(alg, "https://pod.toph.so/foo", "GET", 1_000, &jti);
+                assert!(
+                    verify_dpop(
+                        &proof,
+                        "https://pod.toph.so/foo",
+                        "GET",
+                        &client.jkt(),
+                        1_010
+                    )
+                    .await
+                    .is_err(),
+                    "alg {alg} must never be accepted"
+                );
+            }
+        }
+    }
+
+    /// The alg-confusion class the old ES256 pin made unreachable, and that
+    /// widening the allowlist is exactly the moment to close by hand: the
+    /// header's `alg` must agree with the embedded JWK's key type.
+    ///
+    /// Both proofs below carry a genuine key and a genuine signature — only
+    /// the `alg` label is wrong — so neither is rejected merely for failing
+    /// to verify. An `RS256` header over an EC JWK is caught on the RS256
+    /// path's explicit `kty` check (and again by `josekit`, which will not
+    /// build an RS256 verifier from a non-RSA key); an `ES256` header over an
+    /// RSA JWK never reaches that path at all, and `dpop-verifier` refuses
+    /// it because its `Jwk` type has no RSA variant to deserialize into.
+    #[tokio::test]
+    async fn alg_confusion_is_refused_in_both_directions() {
+        let ec = TestClient::new();
+        let rs256_over_ec_key = ec.mint_dpop_claiming_alg(
+            "RS256",
+            "https://pod.toph.so/foo",
+            "GET",
+            1_000,
+            "jti-conf-1",
+        );
+        assert!(
+            verify_dpop(
+                &rs256_over_ec_key,
+                "https://pod.toph.so/foo",
+                "GET",
+                &ec.jkt(),
+                1_010
+            )
+            .await
+            .is_err(),
+            "an RS256 header over an EC jwk must be refused"
+        );
+
+        let rsa = TestClient::new_rsa();
+        let es256_over_rsa_key = rsa.mint_dpop_claiming_alg(
+            "ES256",
+            "https://pod.toph.so/foo",
+            "GET",
+            1_000,
+            "jti-conf-2",
+        );
+        assert!(
+            verify_dpop(
+                &es256_over_rsa_key,
+                "https://pod.toph.so/foo",
+                "GET",
+                &rsa.jkt(),
+                1_010
+            )
+            .await
+            .is_err(),
+            "an ES256 header over an RSA jwk must be refused"
+        );
+    }
+
+    /// The RS256 path is a second way into `verify_dpop`, so every hardened
+    /// check downstream of it must still apply — starting with the exact
+    /// wire-form `htu` comparison, whose absence would let a signed
+    /// `PUT /.aux/acl/foo` be re-delivered as `PUT /.aux/acl/foo/`. That
+    /// check is shared code, and this pins that RS256 actually reaches it
+    /// rather than routing around it.
+    #[tokio::test]
+    async fn an_rs256_proof_is_held_to_the_exact_htu_comparison_too() {
+        let client = TestClient::new_rsa();
+        let acl =
+            client.mint_dpop("https://pod.toph.so/.aux/acl/foo", "PUT", 1_000, "jti-rsa-slash");
+        assert!(verify_dpop(
+            &acl,
+            "https://pod.toph.so/.aux/acl/foo/",
+            "PUT",
+            &client.jkt(),
+            1_010
+        )
+        .await
+        .is_err());
+    }
+
+    /// The replay ordering — `jti` recorded only after every other check has
+    /// passed — is shared code, but the RS256 path could have consumed one on
+    /// its way through. It must not: a rejected RS256 proof leaves its `jti`
+    /// available to the honest client, and only a fully-valid one burns it.
+    #[tokio::test]
+    async fn a_rejected_rs256_proof_does_not_burn_its_jti() {
+        let _guard = test_lock().lock().await;
+        let client = TestClient::new_rsa();
+        let other = TestClient::new_rsa();
+
+        // Fails the jkt binding, the last check before the jti is recorded.
+        let rejected = client.mint_dpop("https://pod.toph.so/x", "GET", 1_000, "jti-rsa-shared");
+        assert!(
+            verify_dpop(&rejected, "https://pod.toph.so/x", "GET", &other.jkt(), 1_010)
+                .await
+                .is_err()
+        );
+
+        // The same jti, now on a valid proof: must still be available.
+        let accepted = client.mint_dpop("https://pod.toph.so/y", "GET", 1_000, "jti-rsa-shared");
+        assert!(
+            verify_dpop(&accepted, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+                .await
+                .is_ok()
+        );
+
+        // And now it is burned: replaying the valid proof is rejected.
+        assert!(
+            verify_dpop(&accepted, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
                 .await
                 .is_err()
         );

@@ -21,7 +21,16 @@ use super::{pdp, prp, Mode};
 /// The challenge sent with a 401, telling a client which credential the pod
 /// accepts. `Bearer` is deliberately absent: Plan 4 verifies DPoP-bound
 /// tokens only.
-const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256\"";
+///
+/// `algs` is RFC 9449 §5.1's space-delimited list of the JWS algorithms the
+/// pod will verify a proof under, and it must stay an accurate description of
+/// [`crate::auth::dpop::verify_dpop`]: a client that reads this header picks
+/// its proof algorithm from it, so advertising one the pod rejects sends
+/// honest clients into a 401 loop, and omitting one it accepts turns away
+/// clients that could have authenticated. ES256 comes from `dpop-verifier`,
+/// RS256 from the pod's own path; EdDSA is absent because `dpop-verifier`'s
+/// `eddsa` feature is not enabled here.
+const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256 RS256\"";
 
 /// Deny in the way that tells the caller the truth without leaking anything:
 /// an anonymous caller learns that credentials would help (401), a verified
