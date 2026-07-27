@@ -51,6 +51,14 @@ rules that already existed.
 | `Description` (later) | `/.meta/` | client | `Write` on the subject |
 | system projection (later) | — | server only | read-only, see §12.4 |
 
+**The whole reserved space is claimed at once**, not one prefix per feature: any path whose
+**first segment begins with a dot** belongs to the server, and an unallocated reserved
+prefix is refused rather than treated as data. That way `/.meta/` can be reserved today and
+implemented later without taking anything away from users at that point. A dot in any later
+segment is ordinary — `/box/.acl` is a normal resource. The client-facing statement of this
+contract is [`docs/uri-space.md`](../../uri-space.md); it is normative and must be kept in
+step with the prefix table above.
+
 **Built now: `Acl` only.** A `Description` resource today would be speculation — there is
 no user-supplied per-resource metadata in the system, and no caller for it. What is built
 now is the *shape*: `AuxKind`, one prefix table, one lifecycle. Adding `Description` later
