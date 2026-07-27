@@ -40,6 +40,15 @@ pub struct Config {
     #[arg(long, env = "POD_EXPECTED_AUDIENCE")]
     pub expected_audience: Option<String>,
 
+    /// A host the operator vouches for: the private-IP filter and the
+    /// https-only rule do not apply to it. Repeatable. `host` opens every
+    /// port on that host; `host:port` opens only that port. Everything else
+    /// — redirect refusal, IP pinning, body cap, timeout — still applies.
+    /// Pair it with `--trusted-issuer` so an untrusted issuer is rejected
+    /// before any fetch is attempted.
+    #[arg(long = "allow-insecure-host", env = "POD_ALLOW_INSECURE_HOSTS", value_delimiter = ',')]
+    pub allow_insecure_hosts: Vec<String>,
+
     /// Address to bind. Plain HTTP — keep it behind the reverse proxy.
     #[arg(long, env = "POD_LISTEN", default_value = "127.0.0.1:3000")]
     pub listen: SocketAddr,
@@ -75,6 +84,14 @@ impl Config {
             trusted_issuers: if set.is_empty() { None } else { Some(set) },
             expected_audience: self.expected_audience.clone(),
         }
+    }
+
+    /// The outbound-fetch posture for this process: the SSRF-safe default
+    /// plus whatever hosts the operator named on the command line.
+    pub fn fetch_policy(&self) -> crate::auth::safe_fetch::FetchPolicy {
+        crate::auth::safe_fetch::FetchPolicy::with_insecure_hosts(
+            self.allow_insecure_hosts.iter().cloned(),
+        )
     }
 
     pub fn space(&self) -> Result<StorageSpace, SpaceError> {
@@ -152,6 +169,19 @@ mod tests {
             c.validated_owner_webid().unwrap(),
             "https://alice.example/card#me"
         );
+    }
+
+    #[test]
+    fn insecure_hosts_are_repeatable_and_default_empty() {
+        let c = parse(&["--owner-webid", "https://alice.example/card#me"]).unwrap();
+        assert!(c.allow_insecure_hosts.is_empty());
+
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--allow-insecure-host", "localhost:3001",
+            "--allow-insecure-host", "css.local",
+        ]).unwrap();
+        assert_eq!(c.allow_insecure_hosts, vec!["localhost:3001", "css.local"]);
     }
 
     #[test]

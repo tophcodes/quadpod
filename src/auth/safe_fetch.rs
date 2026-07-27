@@ -37,19 +37,42 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Controls which network destinations [`guarded_get`] will contact.
+///
 /// `Default` is the production-safe posture: https-only, private IPs
-/// blocked. The permissive combination (both `true`) is only constructible
-/// via [`FetchPolicy::permissive`], which is `#[cfg(test)]`-gated: a
-/// production build cannot obtain anything but the safe default, so a
-/// future caller can't accidentally (or maliciously) bypass SSRF
-/// protection by hand-constructing a permissive policy.
+/// blocked, no named hosts. The blanket-permissive combination (both
+/// `allow_*` flags `true`) is only constructible via
+/// [`FetchPolicy::permissive`], which is `#[cfg(test)]`-gated: a production
+/// build cannot obtain anything but the default plus an explicit host list,
+/// so a future caller can't accidentally (or maliciously) bypass SSRF
+/// protection wholesale by hand-constructing a permissive policy.
+///
+/// `insecure_hosts` is the operator's explicit exception list. The
+/// distinction that matters for SSRF is not private-versus-public but
+/// **named-by-the-operator versus chosen-by-the-attacker**: the fetch that
+/// this policy guards happens before any credential is verified, so the URL
+/// is attacker-influenced — unless the operator has named the host, which is
+/// what this list is. For a named host the private-IP filter and the
+/// https-only rule do not apply. Everything else still does, for every host:
+/// redirects are refused, the connection is pinned to the validated IP, and
+/// the body cap and timeout hold.
 #[derive(Clone, Default)]
 pub struct FetchPolicy {
     allow_http: bool,
     allow_private_ips: bool,
+    insecure_hosts: std::sync::Arc<std::collections::HashSet<String>>,
 }
 
 impl FetchPolicy {
+    /// The production constructor: the safe default plus the hosts the
+    /// operator vouched for. An entry may be `host` (any port on it) or
+    /// `host:port` (that port only).
+    pub fn with_insecure_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            insecure_hosts: std::sync::Arc::new(hosts.into_iter().collect()),
+            ..Self::default()
+        }
+    }
+
     /// Allow http and private/loopback IPs — for hermetic tests hitting a
     /// local (`127.0.0.1`) test server. Unavailable outside `#[cfg(test)]`,
     /// so this combination cannot exist in a release build.
@@ -58,7 +81,15 @@ impl FetchPolicy {
         Self {
             allow_http: true,
             allow_private_ips: true,
+            ..Self::default()
         }
+    }
+
+    /// Whether this exact host (and port) is on the operator's list.
+    fn permits_insecure(&self, host: &str, port: u16) -> bool {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        self.insecure_hosts.contains(host)
+            || self.insecure_hosts.contains(&format!("{host}:{port}"))
     }
 }
 
@@ -122,7 +153,8 @@ fn is_link_local_v6(ip: Ipv6Addr) -> bool {
 /// Resolve `host` (IP literal used directly; hostname resolved via the
 /// system resolver against `port`) and validate every candidate address
 /// against [`is_forbidden_ip`] (skipped entirely when
-/// `policy.allow_private_ips`). Returns the resolved addresses so the
+/// `policy.allow_private_ips`, or when the operator named this host —
+/// see [`FetchPolicy`]). Returns the resolved addresses so the
 /// caller can pin the actual connection to one of them, or an error if
 /// resolution fails, yields nothing, or (under the default policy) yields
 /// any forbidden address.
@@ -153,7 +185,8 @@ pub(crate) async fn resolve_allowed(
         ));
     }
 
-    if !policy.allow_private_ips && resolved.iter().any(|addr| is_forbidden_ip(addr.ip())) {
+    let allow_private = policy.allow_private_ips || policy.permits_insecure(host, port);
+    if !allow_private && resolved.iter().any(|addr| is_forbidden_ip(addr.ip())) {
         return Err(AuthError::FetchBlocked(
             "target resolves to a forbidden (private/loopback/link-local) IP".to_string(),
         ));
@@ -163,10 +196,11 @@ pub(crate) async fn resolve_allowed(
 }
 
 /// Fetch `url` with the `accept` header, refusing to run at all unless it
-/// passes `policy`: https-only (unless `allow_http`), and every IP the
-/// host resolves to must be a public address (unless `allow_private_ips`).
-/// Fails closed on any parse, resolution, network, status, size, or
-/// encoding error.
+/// passes `policy`: https-only (unless `allow_http`, or the host is on the
+/// operator's `insecure_hosts` list), and every IP the host resolves to
+/// must be a public address (unless `allow_private_ips`, or the host is on
+/// that same list). Fails closed on any parse, resolution, network, status,
+/// size, or encoding error.
 ///
 /// The connection is pinned to the exact validated address (via a
 /// per-request client built with reqwest's DNS override) rather than
@@ -186,22 +220,26 @@ pub async fn guarded_get(
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| AuthError::FetchBlocked(format!("invalid URL: {e}")))?;
 
-    match parsed.scheme() {
-        "https" => {}
-        "http" if policy.allow_http => {}
-        other => {
-            return Err(AuthError::FetchBlocked(format!(
-                "refusing non-https scheme: {other}"
-            )))
-        }
-    }
-
+    // Host and port are extracted before the scheme check because the
+    // scheme rule now depends on them: http is permitted only for a host
+    // the operator named.
     let host = parsed
         .host_str()
         .ok_or_else(|| AuthError::FetchBlocked("URL has no host".to_string()))?;
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| AuthError::FetchBlocked("URL has no port".to_string()))?;
+
+    let insecure_ok = policy.permits_insecure(host, port);
+    match parsed.scheme() {
+        "https" => {}
+        "http" if policy.allow_http || insecure_ok => {}
+        other => {
+            return Err(AuthError::FetchBlocked(format!(
+                "refusing non-https scheme: {other}"
+            )))
+        }
+    }
 
     let pinned_addr = *resolve_allowed(host, port, policy).await?.first().expect(
         "resolve_allowed only returns Ok with a non-empty Vec (empty case is its own Err)",
@@ -439,6 +477,55 @@ mod tests {
         });
 
         format!("http://{addr}/redirect-me")
+    }
+
+    fn named(hosts: &[&str]) -> FetchPolicy {
+        FetchPolicy::with_insecure_hosts(hosts.iter().map(|h| h.to_string()))
+    }
+
+    // The rule is "named by the operator", not "private vs public": a host
+    // the operator vouched for may be private and may be plain http.
+    #[tokio::test]
+    async fn a_named_host_may_be_private() {
+        let addrs = resolve_allowed("127.0.0.1", 3001, &named(&["127.0.0.1"])).await;
+        assert!(addrs.is_ok(), "an operator-named host must be reachable");
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_host_is_still_blocked() {
+        let addrs = resolve_allowed("127.0.0.1", 3001, &named(&["other.example"])).await;
+        assert!(addrs.is_err(), "naming one host must not unblock another");
+    }
+
+    // Naming a host:port must not open every port on that host — port
+    // scanning is most of what an SSRF primitive is worth.
+    #[tokio::test]
+    async fn naming_a_port_does_not_open_the_others() {
+        let policy = named(&["127.0.0.1:3001"]);
+        assert!(resolve_allowed("127.0.0.1", 3001, &policy).await.is_ok());
+        assert!(resolve_allowed("127.0.0.1", 9999, &policy).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn naming_a_bare_host_opens_every_port_on_it() {
+        let policy = named(&["127.0.0.1"]);
+        assert!(resolve_allowed("127.0.0.1", 3001, &policy).await.is_ok());
+        assert!(resolve_allowed("127.0.0.1", 9999, &policy).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_empty_host_list_is_the_default_posture() {
+        let addrs = resolve_allowed("127.0.0.1", 3001, &named(&[])).await;
+        assert!(addrs.is_err());
+    }
+
+    // http is permitted for a named host and refused everywhere else.
+    #[tokio::test]
+    async fn http_is_refused_for_an_unnamed_host() {
+        let c = reqwest::Client::new();
+        let r = guarded_get(&c, "http://example.com/x", "text/turtle", &named(&["other.example"]))
+            .await;
+        assert!(matches!(r, Err(AuthError::FetchBlocked(_))));
     }
 
     #[tokio::test]

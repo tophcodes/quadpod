@@ -81,11 +81,12 @@ pub struct HttpWebIdIssuers {
 }
 
 impl HttpWebIdIssuers {
-    /// Production constructor: fetches are SSRF-guarded with
-    /// [`FetchPolicy::default`] (https-only, private IPs blocked) — the
+    /// Production constructor: fetches are SSRF-guarded with the policy the
+    /// operator configured — [`FetchPolicy::default`] (https-only, private
+    /// IPs blocked) unless they named hosts via `--allow-insecure-host`. The
     /// webid is attacker-influenced input just like the token's `iss`.
-    pub fn new() -> Self {
-        Self::build(FetchPolicy::default())
+    pub fn new(policy: FetchPolicy) -> Self {
+        Self::build(policy)
     }
 
     /// Construct with an explicit [`FetchPolicy`] — used by hermetic tests
@@ -106,12 +107,6 @@ impl HttpWebIdIssuers {
             .build()
             .expect("reqwest client with timeouts should always build");
         Self { client, policy }
-    }
-}
-
-impl Default for HttpWebIdIssuers {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
