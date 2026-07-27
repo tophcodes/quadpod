@@ -48,7 +48,7 @@ rules that already existed.
 | Kind | Path | Written by | Authorized by |
 |---|---|---|---|
 | `Acl` | `/.aux/acl/{subject}` | client | `Control` on the subject |
-| `Description` (later) | `/.aux/meta/{subject}` | client | `Write` on the subject |
+| `Description` (candidate) | `/.aux/meta/{subject}` | client | `Write` on the subject |
 | system projection (later) | — | server only | read-only, see §12.4 |
 
 The auxiliary's **content is the user's data**; what the server contributes is the
@@ -68,10 +68,27 @@ path-based topology it sits above the base URI entirely.
 The client-facing statement of this contract is [`docs/uri-space.md`](../../uri-space.md);
 it is normative and must be kept in step with the table above.
 
-**Built now: `Acl` only.** A `Description` resource today would be speculation — there is
-no user-supplied per-resource metadata in the system, and no caller for it. What is built
-now is the *shape*: `AuxKind`, one prefix table, one lifecycle. Adding `Description` later
-is then a variant, not a parallel implementation.
+**Built now: `Acl` only, and `Description` is not promised.** For an RDF resource a
+description resource is largely redundant — statements about a graph can live in that graph.
+Its real justification arrives with **blobs**: a PNG cannot carry triples, so user-asserted
+metadata (licence, caption, creator) needs a sidecar, while server-asserted facts (size,
+hash, content-type) go to the system graph. Both halves appear for the first time together
+there, split by authority. The blob plan decides whether that sidecar is a description
+resource; until then `/.aux/meta/` is reserved space, not a commitment.
+
+What is built now is the *shape*: `AuxKind`, one path table, one lifecycle. A second kind is
+then a variant plus one row in the authorization table, not a parallel subsystem — it
+inherits conneg, ETags, conditional requests, authorization, cascade and discovery
+unchanged.
+
+**The set of kinds is closed and server-defined.** A user cannot introduce an auxiliary
+kind, because what makes something auxiliary is semantics the *server* enforces: lifecycle
+binding, exclusion from listings, authorization derived from the subject. A kind the server
+does not understand has none of that, so it is an ordinary resource — and nothing is lost:
+anyone can create `/notes/foo-annotations` and link it from their own data with
+`rdfs:seeAlso`. It simply gets its own ACL and its own lifecycle, like any resource.
+Consequently `AuxKind` is the single source of truth for both the routing table and the set
+of `Link` headers, so the two cannot drift.
 
 **Server-asserted facts are deliberately not auxiliaries.** Creation and modification
 times, size, hash, the `object_store` key: these stay in the reserved `urn:pod:sys:<res>`
@@ -162,6 +179,69 @@ What becomes **unrepresentable**, rather than merely checked:
 - ACLs are never `ldp:contains` members. They are not in the resource space at all, so the question does not arise at `add_containment`; the exclusion rule disappears rather than being enforced.
 - Consequently there is no orphaned-ACL state to reason about: defect 5's precondition cannot be constructed.
 
+## 6a. Association, discovery, and what we do not support
+
+**The `Link` header is unconditional and costs no lookup.** Every response for a resource
+path carries a `Link` header for every implemented auxiliary kind, whether or not that
+auxiliary has a representation — one header field, comma-separated:
+
+```
+Link: <https://pod.toph.so/.aux/acl/foo>; rel="acl"
+```
+
+Emitting it only when the auxiliary exists would be a chicken-and-egg trap: a client must
+not derive the URL (WAC MUST NOT), so it learns it only from the header — and it needs it
+precisely in order to *create* the first ACL. WAC anticipates the case explicitly, noting
+that an associated ACL resource may have no representation, in which case a container's ACL
+applies. Following the link and receiving 404 is the correct answer: *no own policy here,
+you inherit, and this is where to change that.*
+
+The URL is a pure function of the request path, so this is a string construction and zero
+store access. **There is deliberately no index of which auxiliaries exist.** It would help
+nowhere — the header needs no lookup, the PRP needs the nearest ACL's *content* rather than
+its existence and gets it in one query, and the delete cascade is idempotent via
+`DROP SILENT GRAPH`. It would only add a second source for a fact already stored elsewhere,
+which is the exact construction behind defects 3 and 5.
+
+The principle, stated once: **store what cannot be derived; derive what can.** Resource
+existence is stored (§7) because "empty graph" and "absent graph" are indistinguishable in
+the store. An auxiliary URL is derived, because it is a total function of the path.
+
+We also do not write `rdfs:seeAlso` or similar association triples into the subject's graph:
+those would be server-asserted statements inside user data (which parent design §5 rules
+out) and a second description to keep in step. The header is the interface, and `HEAD`
+delivers it without a body.
+
+**Cascade applies only within this pod's storage space.** Deleting a resource deletes its
+local auxiliaries; nothing foreign is touched, because nothing foreign can be.
+
+**Remote auxiliaries are a non-goal.** WAC permits a server to associate an ACL on another
+origin; we do not. The association here is server-managed and always resolves locally, so a
+client cannot redirect it (it cannot set response headers, and a body triple is not a WAC
+discovery mechanism). Supporting it would make every authorization decision depend on a
+third-party fetch on the hot path: SSRF surface, availability coupling to a foreign host,
+and cache/TTL questions with no good answer — we already paid for a hardened fetcher with IP
+filtering, redirect refusal and a negative cache to make WebID and JWKS lookups safe. WAC's
+own issue #90 leaves four cross-origin security questions unresolved. Not a trade worth
+making for an authorization decision.
+
+**Base IRI when parsing an auxiliary document.** An auxiliary is parsed with *its own* URL as
+base, like any other resource — so `<>` inside `/.aux/acl/foo` denotes the ACL document, not
+`/foo`. Statements about the subject name it explicitly (`</foo>` or the absolute IRI). This
+matches CSS and is the least surprising rule, but it is a genuine trip hazard and belongs in
+the client-facing documentation.
+
+**There is no atomic create-with-policy, and that is a known window.** Creating a resource
+and then setting its ACL is two requests; in between, the inherited policy applies. A
+resource created in a public container is briefly public. This is inherent to Solid — no
+server offers an atomic form — and the practical answer is to keep the window *empty*:
+create the container first, set its ACL, then write content into it. An empty container
+discloses nothing. Closing the window properly would mean allowing an ACL to precede its
+subject, which is exactly what enables the squat defect (6) unless `Control` over an
+auxiliary is also derivable from the inherited chain — a deliberate deviation from
+nearest-ACL-wins that deserves its own design and its own adversarial review, not a
+smuggled-in clause here.
+
 ## 7. Existence as a stored fact
 
 Resource existence moves out of "the user graph has at least one triple" into the reserved system graph the parent spec already defines (`urn:pod:sys:<res>`, parent design §5).
@@ -211,7 +291,7 @@ Related and already documented in the current spec: `acl:default acl:Control` on
 1. **Existence witness.** `AuxUrl` could be constructible only from a proof that the subject exists (`fn aux_of(subject: &Existing<ResourceUrl>, kind: AuxKind) -> AuxUrl`), moving defect 6 into the type system too. Cost: an `Existing<T>` token threaded through call sites that currently take a URL. **Recommendation: no** — one check in the typed store wrapper, with a test, is the better trade at this size.
 2. **How far `Target` travels.** It could stop at the guard, with handlers taking the unwrapped URL types, or be matched on inside each handler. **Recommendation: into the handlers** — the match is what replaces the scattered predicates, and a handler that receives `AuxUrl` cannot accidentally treat it as a container.
 3. **`HEAD` and `Link` on denials.** Obligation 1 in §4 says the header goes on 404s. Does it also go on 401/403? Emitting it discloses only a URL the client could not use anyway, and SolidOS's fallback path can be reached from a denial too. **Recommendation: yes, emit it always.**
-4. **The system-graph read projection.** Server-asserted facts are not writable, but they should be *readable* — for clients and for the deferred `/sparql` proxy. The natural shape is a GET-only URL serving `urn:pod:sys:<res>` as Turtle, answering 405 on write. Two things need verifying against the spec text before building it, the same way the ACL-URL risk was verified: whether Solid's description resource is required to be writable (which would make `rel="describedby"` the wrong relation for a read-only server projection), and what relation a read-only projection should carry instead. **Recommendation: named follow-up, not this change** — it has no caller until blobs land.
+4. **The system-graph read projection.** Server-asserted facts are not writable, but they should be *readable* — for clients and for the deferred `/sparql` proxy. The natural shape is a GET-only URL serving `urn:pod:sys:<res>` as Turtle, answering 405 on write. Two things need verifying against the spec text before building it, the same way the ACL-URL risk was verified: whether Solid's description resource is required to be writable (which would make `rel="describedby"` the wrong relation for a read-only server projection); what relation a read-only projection should carry instead; and — a distinction this design has so far treated loosely — whether `rel="describedby"` denotes a per-resource metadata sidecar, the *storage description resource* the Protocol defines at a storage root, or both. Those are not the same thing and must not be conflated before either is built. **Recommendation: named follow-up, not this change** — it has no caller until blobs land.
 
 ## 13. Success criteria
 

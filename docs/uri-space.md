@@ -35,7 +35,7 @@ part a client cannot enforce alone:
 | Kind | Path | Status | You may write it | Authorized by |
 |---|---|---|---|---|
 | access control (WAC) | `/.aux/acl/{subject}` | live | yes | `acl:Control` on the subject |
-| description / metadata | `/.aux/meta/{subject}` | reserved, not implemented | yes, once implemented | `acl:Write` on the subject |
+| description / metadata | `/.aux/meta/{subject}` | reserved, candidate — not promised | yes, if implemented | `acl:Write` on the subject |
 | anything else under `/.aux/` | — | reserved | no | — |
 
 | Subject | Its ACL |
@@ -45,10 +45,35 @@ part a client cannot enforce alone:
 | `/box/` | `/.aux/acl/box/` |
 | `/a/b/c` | `/.aux/acl/a/b/c` |
 
+The set of kinds is **closed and defined by the server**. You cannot introduce your own: what
+makes a resource auxiliary is behaviour the server enforces for you — the lifecycle binding,
+the exclusion from listings, the authorization derived from the subject. A kind the server
+does not understand would get none of that. If you want your own side-document about
+something, create an ordinary resource and link it from your own data (`rdfs:seeAlso` or
+whatever your vocabulary uses). It behaves like any other resource, with its own ACL and its
+own lifecycle.
+
 **Writable does not mean ordinary.** A description resource is yours to write, and it is
 still an auxiliary: it lives and dies with its subject, stays out of listings, and is
 authorized through the subject. The same holds for an ACL. Writability and ordinariness are
 different properties, and this is the distinction the reserved segment encodes.
+
+## Practical notes
+
+**The link is always advertised, even when the auxiliary does not exist.** Following it and
+receiving `404` is the normal answer for "no own policy here — you inherit, and this is where
+to change that". The header has to be there before the resource is, or you could never create
+the first one.
+
+**An auxiliary is parsed with its own URL as base.** Inside `/.aux/acl/foo`, `<>` denotes the
+ACL document itself, *not* `/foo`. Name the subject explicitly — `</foo>` or its absolute
+IRI. This trips people up; it is the same rule other Solid servers use.
+
+**Set policy on the container before you fill it.** Creating a resource and then setting its
+ACL is two requests, and in between the inherited policy applies — so a resource created in a
+public container is briefly public. There is no atomic "create with policy" operation in
+Solid. Keep the window empty instead of trying to close it: create the container, set its
+ACL, then write into it. An empty container discloses nothing.
 
 ## `/.well-known/` belongs to the origin, not to the pod
 
@@ -89,7 +114,9 @@ exposed through the HTTP headers that already exist for them — `Last-Modified`
 `Content-Length`.
 
 The split is by authority, not by subject matter. An auxiliary holds what *you* assert about
-a resource; these are what the *server* asserts about it. The moment a server-asserted fact
+a resource; these are what the *server* asserts about it. This pod also never writes
+association triples into your data — no `seeAlso` pointing at an ACL, nothing. The `Link`
+header is the interface; your graphs stay yours. The moment a server-asserted fact
 has a writable URL, a client can assert its own creation timestamp and the value is
 worthless for auditing or ordering. A read-only projection of these facts may be offered
 later; it will never be writable.
