@@ -167,4 +167,40 @@ mod tests {
         put_rdf(&store, &foo, &t).await.unwrap();
         assert!(effective_acl(&store, &foo).await.unwrap().is_none());
     }
+
+    // A resource's OWN empty ACL must win over an ancestor's grant — it says
+    // "nothing is granted here". This is the fixture that distinguishes the
+    // direct branch from the inherited one: it fails if the ancestor loop
+    // runs first, and it fails if the direct check ever goes back to asking
+    // whether triples came back instead of whether the ACL exists.
+    #[tokio::test]
+    async fn an_own_empty_acl_wins_over_an_ancestor_grant() {
+        let store = OxigraphStore::in_memory().unwrap();
+        write_acl(&store, "/", &format!(
+            "<#root> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        write_acl(&store, "/foo", "").await;
+
+        let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("found");
+        assert!(!acl.inherited, "the resource's own ACL must win over the ancestor's");
+        assert_eq!(acl.governed_iri, "https://pod.toph.so/foo");
+        assert!(acl.triples.is_empty(), "an empty own ACL grants nothing");
+    }
+
+    // A container's own ACL is governed by the container IRI WITH its
+    // trailing slash; `decide` compares that string exactly, so trimming it
+    // here would silently deny everything under the container.
+    #[tokio::test]
+    async fn direct_container_acl_keeps_the_trailing_slash() {
+        let store = OxigraphStore::in_memory().unwrap();
+        write_acl(&store, "/box/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+
+        let acl = effective_acl(&store, &res("/box/")).await.unwrap().expect("found");
+        assert!(!acl.inherited);
+        assert_eq!(acl.governed_iri, "https://pod.toph.so/box/");
+    }
 }
