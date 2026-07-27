@@ -81,9 +81,11 @@ wins over whatever an ancestor would otherwise hand down, and grants nothing to 
 including its own owner. `DELETE` on it needs `acl:Control`, which that same empty ACL just
 revoked from everyone — so at the root, an empty root ACL is terminal over HTTP: no request can
 remove it, and no request can replace it. The way out is the operator, not the API: restart the
-server with `--reset-root-acl` (or `POD_RESET_ROOT_ACL=1`), which overwrites the root ACL with
-the owner's default grant regardless of what is there. This only exists for the root; an emptied
-ACL anywhere else has no equivalent flag and is a real dead end for that subtree.
+server with `--reset-root-acl` (or `POD_RESET_ROOT_ACL=1` or `POD_RESET_ROOT_ACL=true`), which
+overwrites the root ACL with the owner's default grant regardless of what is there. The env
+variable accepts any boolish value: `1`, `0`, `true`, `false`, `yes`, `no`, `on`, `off`
+(case-insensitive). This only exists for the root; an emptied ACL anywhere else has no
+equivalent flag and is a real dead end for that subtree.
 
 ## `/.well-known/` belongs to the origin, not to the pod
 
