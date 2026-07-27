@@ -13,6 +13,7 @@ pub enum StoreError {
 pub trait SparqlStore: Send + Sync {
     async fn update(&self, sparql: &str) -> Result<(), StoreError>;
     async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, StoreError>;
+    async fn ask(&self, sparql: &str) -> Result<bool, StoreError>;
 }
 
 pub struct OxigraphStore {
@@ -48,6 +49,19 @@ impl SparqlStore for OxigraphStore {
         triples
             .map(|t| t.map_err(|e| StoreError::Backend(e.to_string())))
             .collect()
+    }
+
+    async fn ask(&self, sparql: &str) -> Result<bool, StoreError> {
+        let results = SparqlEvaluator::new()
+            .parse_query(sparql)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .on_store(&self.inner)
+            .execute()
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        match results {
+            QueryResults::Boolean(b) => Ok(b),
+            _ => Err(StoreError::Backend("expected ASK/boolean results".into())),
+        }
     }
 }
 
