@@ -80,13 +80,22 @@ pub async fn put(
 
 /// Delete a subject resource together with every auxiliary it may have, in a
 /// single store update. Returns whether the subject existed.
+///
+/// The drops run unconditionally — they are `DROP SILENT`, a no-op on an
+/// absent graph — and the existence check only decides the returned boolean.
+/// An early return on `!exists` would leave an already-orphaned auxiliary in
+/// place and unreported, and since this is the only cascade path that orphan
+/// would be permanent: recreating the subject would resurrect its grants.
+/// Same reasoning as [`crate::resource::delete_rdf`].
+///
+/// Graphs only. Callers remain responsible for containment: the subject's
+/// membership triple in its parent, and for a container subject its children,
+/// are `container`'s business, not this function's.
 pub async fn delete_subject(
     store: &dyn SparqlStore,
     subject: &ResourceUrl,
 ) -> Result<bool, ResourceError> {
-    if !exists(store, subject).await? {
-        return Ok(false);
-    }
+    let existed = exists(store, subject).await?;
     let mut drops = vec![
         format!("DROP SILENT GRAPH <{}>", subject.graph_iri()),
         format!("DROP SILENT GRAPH <{}>", sys_graph_iri(subject)),
@@ -97,7 +106,7 @@ pub async fn delete_subject(
         drops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(&aux)));
     }
     store.update(&drops.join("; ")).await?;
-    Ok(true)
+    Ok(existed)
 }
 
 #[cfg(test)]
@@ -266,5 +275,44 @@ mod tests {
     async fn deleting_an_absent_subject_reports_absence() {
         let store = OxigraphStore::in_memory().unwrap();
         assert!(!delete_subject(&store, &res("/nope")).await.unwrap());
+    }
+
+    // Finding 1b/3: the asymmetric state — auxiliaries present, subject not.
+    // An early return on `!exists` would leave this orphan in place, and as
+    // the only cascade path that would make it permanent: nearest-ACL-wins
+    // would hand the recreated path a policy nobody can remove.
+    #[tokio::test]
+    async fn an_orphaned_auxiliary_is_removed_even_though_the_subject_is_gone() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        put(&store, &acl, &grant(&acl)).await.unwrap();
+
+        // Fabricate the orphan behind the API: the subject's graphs vanish
+        // without the cascade ever running.
+        let iri = foo.graph_iri();
+        let sys = sys_graph_iri(&foo);
+        store
+            .update(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>"))
+            .await
+            .unwrap();
+        assert!(!exists(&store, &foo).await.unwrap());
+        assert!(exists(&store, &acl).await.unwrap(), "orphan not staged");
+
+        assert!(
+            !delete_subject(&store, &foo).await.unwrap(),
+            "the subject was already absent, so the answer is false"
+        );
+
+        assert!(!exists(&store, &acl).await.unwrap(), "orphan survived");
+        assert!(
+            graph_contents(&store, acl.graph_iri()).await.is_empty(),
+            "orphan kept its triples"
+        );
+        assert!(
+            graph_contents(&store, &sys_graph_iri(&acl)).await.is_empty(),
+            "orphan kept its presence marker"
+        );
     }
 }
