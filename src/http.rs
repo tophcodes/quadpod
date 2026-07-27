@@ -86,6 +86,31 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
     res
 }
 
+/// The methods a target actually accepts, as an `Allow` field value.
+///
+/// Derived from the router's own shape rather than a fixed list: a container
+/// is the only thing `POST` may address, the root is the only container
+/// `DELETE` refuses (`delete_impl`), and `OPTIONS` is absent because no route
+/// serves it — advertising a method the pod answers with `405` would be worse
+/// than saying nothing.
+fn allowed_methods(target: &Target) -> &'static str {
+    match target {
+        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT",
+        Target::Container(_) => "GET, HEAD, POST, PUT, DELETE",
+        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, DELETE",
+    }
+}
+
+/// Attach [`allowed_methods`] to a read that succeeded — Protocol §4.1 makes
+/// it a MUST on `GET`/`HEAD`.
+fn with_allow(mut res: Response, target: &Target) -> Response {
+    res.headers_mut().insert(
+        header::ALLOW,
+        allowed_methods(target).parse().expect("method list is header-safe"),
+    );
+    res
+}
+
 /// The one sentence a self-denying ACL is reported with, in both places it is
 /// reported — [`warn_if_acl_grants_nothing`] logs this string and puts this
 /// same string on the response, so the two can never drift.
@@ -500,8 +525,11 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Ok(Some(triples)) => {
             let tag = etag(&triples);
             if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
-                return with_aux_links(
-                    (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response(),
+                return with_allow(
+                    with_aux_links(
+                        (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response(),
+                        &target,
+                    ),
                     &target,
                 );
             }
@@ -510,7 +538,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
                     let mut headers = HeaderMap::new();
                     headers.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
                     headers.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
-                    with_aux_links((headers, bytes).into_response(), &target)
+                    with_allow(with_aux_links((headers, bytes).into_response(), &target), &target)
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
@@ -1214,6 +1242,38 @@ mod tests {
         f.app.clone().oneshot(del_child).await.unwrap();
         let del_empty = f.owner_request("DELETE", "/box/").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(del_empty).await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+
+    // Solid Protocol §4.1: a successful GET/HEAD MUST advertise the methods
+    // its target supports.
+    #[tokio::test]
+    async fn reads_advertise_the_methods_the_target_supports() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/box/doc")
+            .header(header::CONTENT_TYPE, "text/turtle").body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        for (method, path, expected) in [
+            ("GET", "/box/", "GET, HEAD, POST, PUT, DELETE"),
+            ("HEAD", "/box/", "GET, HEAD, POST, PUT, DELETE"),
+            ("GET", "/box/doc", "GET, HEAD, PUT, DELETE"),
+            ("HEAD", "/box/doc", "GET, HEAD, PUT, DELETE"),
+        ] {
+            let req = f.owner_request(method, path).body(Body::empty()).unwrap();
+            let res = f.app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{method} {path}");
+            assert_eq!(res.headers().get(header::ALLOW).unwrap(), expected, "{method} {path}");
+        }
+    }
+
+    // The root is the one container DELETE refuses, and `Allow` has to say so
+    // rather than repeat a generic list.
+    #[tokio::test]
+    async fn the_root_does_not_advertise_delete() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT");
     }
 
     #[tokio::test]
