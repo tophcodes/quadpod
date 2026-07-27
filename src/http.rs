@@ -700,6 +700,77 @@ mod tests {
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
+    // Each shape here is one `dpop-verifier::normalize_htu` would silently
+    // change (drop an empty segment, resolve a dot-segment, or strip
+    // whatever follows a fragment marker) while this pod would otherwise
+    // treat it as naming a distinct resource. `resolve`'s `NotNormalized`
+    // check refuses them all at the HTTP layer, through `classify`, before
+    // any of them can reach the store or the WAC guard.
+    #[tokio::test]
+    async fn paths_normalization_would_alias_are_400() {
+        let f = fixture().await;
+        // No percent-encoding in any of these, so `owner_request`'s naive
+        // htu (raw path, undecoded) matches `derive_htu`'s (decoded path)
+        // exactly — the `#` case needs its own test below, since decoding
+        // changes what the signed `htu` would have to be.
+        for path in ["/a//b", "/a/b//", "/a/./b", "/a/../b"] {
+            let get = f.owner_request("GET", path).body(Body::empty()).unwrap();
+            assert_eq!(
+                f.app.clone().oneshot(get).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "GET {path} should be refused as not normalization-stable"
+            );
+            let put = f.owner_request("PUT", path)
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+            assert_eq!(
+                f.app.clone().oneshot(put).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "PUT {path} should be refused as not normalization-stable"
+            );
+        }
+    }
+
+    // A raw request path of `/a%23b` decodes (the same way `derive_htu` and
+    // `classify` both decode it) to `/a#b`, which `resolve` now refuses as
+    // `NotNormalized`. The `htu` a client signs for such a URL is the
+    // configured base plus the DECODED path (see `derive_htu`'s doc comment),
+    // i.e. a literal `#` — not the wire-encoded `%23` — so it is crafted
+    // directly here rather than through `owner_request`'s naive (undecoded)
+    // helper, which cannot express it.
+    #[tokio::test]
+    async fn hash_in_the_decoded_path_is_400_not_401() {
+        let f = fixture().await;
+        let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
+        let htu = "https://pod.toph.so/a#b";
+        let proof = f.client.mint_dpop(htu, "GET", now_unix(), "jti-hash-in-path-test");
+        let req = Request::builder()
+            .method("GET")
+            .uri("/a%23b")
+            .header(header::AUTHORIZATION, format!("DPoP {at}"))
+            .header("dpop", proof)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    // The trailing slash is not a segment normalization would remove — it is
+    // what distinguishes a container from a resource — so it must keep
+    // working exactly as it did before the `NotNormalized` rule existed.
+    #[tokio::test]
+    async fn trailing_slash_container_still_resolves() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+        let get = f.owner_request("GET", "/box/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_string(res).await.contains("ldp#BasicContainer"));
+    }
+
     #[tokio::test]
     async fn get_emits_etag_and_304_on_if_none_match() {
         let f = fixture().await;

@@ -22,6 +22,8 @@ pub enum SpaceError {
     Reserved,
     #[error("request path must start with '/'")]
     NotRooted,
+    #[error("request path contains a segment that URI/htu normalization would remove or resolve")]
+    NotNormalized,
 }
 
 /// The reserved first segment. Everything under it is server-understood;
@@ -256,6 +258,21 @@ impl StorageSpace {
         if !request_path.starts_with('/') {
             return Err(SpaceError::NotRooted);
         }
+        // `dpop-verifier`'s `htu` comparison (see `auth::middleware`) drops
+        // empty path segments, resolves `.`/`..`, and strips fragments before
+        // comparing. A path that normalization would change names one
+        // resource here but a DIFFERENT, canonicalized one to that
+        // comparison — so two distinct named graphs with independent ACLs
+        // (e.g. `/box` and `/box//`, or `/a/b` and `/a/%23/../b`) would look
+        // like the same `htu` to a replayed or re-routed request. Refusing
+        // the non-stable shape outright is cheaper and safer than trying to
+        // canonicalize it, which would silently change which resource a
+        // request names. The trailing slash itself is exempt: it is what
+        // distinguishes a container and is not a segment normalization would
+        // remove.
+        if !Self::is_normalization_stable(request_path) {
+            return Err(SpaceError::NotNormalized);
+        }
         if let Some(rest) = self.reserved_remainder(request_path) {
             let Some(rest) = rest.strip_prefix('/') else {
                 return Err(SpaceError::Reserved); // "/.aux"
@@ -290,6 +307,37 @@ impl StorageSpace {
             Target::Container(c) => c,
             _ => unreachable!("\"/\" resolves to a container"),
         }
+    }
+
+    /// True iff normalizing `request_path` the way DPoP's `htu` comparison
+    /// does (dropping empty segments, resolving `.`/`..`, stripping
+    /// fragments) would leave it unchanged. Callers only pass paths already
+    /// validated to start with `/`.
+    ///
+    /// The single trailing slash is deliberately not a segment: `/box` and
+    /// `/box/` are different resources here (a resource and a container) and
+    /// both must stay stable. It is any OTHER empty segment — `//` anywhere,
+    /// including a doubled trailing slash — that normalization would remove.
+    fn is_normalization_stable(request_path: &str) -> bool {
+        if request_path.contains('#') {
+            return false;
+        }
+        let rest = &request_path[1..]; // strip the leading '/' callers guarantee
+        if rest.is_empty() {
+            return true; // "/" itself — the root, nothing to check
+        }
+        let segments: Vec<&str> = rest.split('/').collect();
+        // Every segment but the last must be non-empty and not a dot-segment
+        // — an empty or dot segment there is exactly what normalization would
+        // drop or resolve. The last segment is different: empty is how a
+        // legitimate single trailing slash appears here (the container
+        // marker, not a removable segment), so it is allowed to be empty,
+        // but if it is NOT empty it is an ordinary segment and must pass the
+        // same check as any other.
+        let (init, last) = segments.split_at(segments.len() - 1);
+        let init_ok = init.iter().all(|seg| !seg.is_empty() && *seg != "." && *seg != "..");
+        let last_ok = last[0].is_empty() || (last[0] != "." && last[0] != "..");
+        init_ok && last_ok
     }
 
     /// What follows `/.aux` when the path's *whole* first segment is the
@@ -471,5 +519,45 @@ mod tests {
             let iri = format!("https://pod.toph.so/.aux/{segment}/x");
             assert!(NamedNode::new(&iri).is_ok(), "{kind:?}'s segment is not IRI-safe");
         }
+    }
+
+    // The aliasing `dpop-verifier::normalize_htu` performs (drop empty
+    // segments, resolve dot-segments, strip fragments) must never let two
+    // paths this pod treats as distinct named graphs compare equal as `htu`.
+    // `resolve` closes that gap by refusing every shape normalization would
+    // change, rather than by canonicalizing it — see the doc comment on
+    // `is_normalization_stable`.
+    #[test]
+    fn resolve_rejects_paths_normalization_would_alias() {
+        let s = sp();
+        for path in [
+            "/a//b",        // empty segment in the middle
+            "/a/b//",       // doubled trailing slash — not the one legitimate slash
+            "//",           // an empty segment followed by the trailing slash
+            "/a/./b",       // a `.` segment
+            "/a/../b",      // a `..` segment
+            "/a/..",        // trailing `..`
+            "/./",          // `.` as the only segment
+            // A literal `#`. `resolve` always receives an already
+            // percent-DECODED path (see `auth::middleware::derive_htu` and
+            // `http::classify`'s callers), so `%23` in a raw request path
+            // arrives here as this literal character, not as the three
+            // characters `%23`.
+            "/a#b",
+        ] {
+            assert_eq!(s.resolve(path), Err(SpaceError::NotNormalized), "{path} must be refused");
+        }
+    }
+
+    // The trailing slash is NOT a segment normalization would remove — it is
+    // what distinguishes a container from a resource, and it must keep
+    // resolving exactly as before this rule existed.
+    #[test]
+    fn resolve_still_accepts_the_legitimate_trailing_slash() {
+        let s = sp();
+        assert!(matches!(s.resolve("/box/").unwrap(), Target::Container(_)));
+        assert!(matches!(s.resolve("/box").unwrap(), Target::Resource(_)));
+        assert!(matches!(s.resolve("/").unwrap(), Target::Container(_)));
+        assert!(matches!(s.resolve("/a/b/c/").unwrap(), Target::Container(_)));
     }
 }

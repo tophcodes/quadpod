@@ -31,8 +31,17 @@ const HTU_DECODE_FAILURE_SENTINEL: &str = "urn:sparql-pod:invalid-percent-decode
 /// than the one the handler reads/writes, which the WAC gate would then
 /// authorize incorrectly.
 ///
-/// For every path that resolves, the `htu` is the target's graph IRI — the
-/// one identity that matters, since that is the IRI the handler operates on.
+/// For every path that resolves, the `htu` is the target's graph IRI. That
+/// comparison is coarser than graph identity, though: `dpop-verifier`'s
+/// `normalize_htu` drops empty path segments, resolves `.`/`..`, and strips
+/// fragments before comparing, so it cannot by itself distinguish every pair
+/// of paths this pod treats as different named graphs (e.g. `/box` vs.
+/// `/box//`, or a path containing `#`). Closing that gap is
+/// [`StorageSpace::resolve`]'s job, not this function's: `resolve` refuses
+/// any request path that normalization would change (`SpaceError::NotNormalized`),
+/// so by the time a path gets here and resolves, it is already the one shape
+/// that survives `normalize_htu` unchanged — the coarser comparison and the
+/// exact one agree.
 ///
 /// A path that does NOT resolve is not an error here. The handler answers it
 /// (`404` for the reserved namespace, `400` for an IRI-breaking path), and it
