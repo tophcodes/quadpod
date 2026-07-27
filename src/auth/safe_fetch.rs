@@ -147,6 +147,12 @@ impl FetchPolicy {
 /// - Otherwise, split on the last colon: `host:port` (hostnames, IPv4
 ///   literals) if the tail parses as a `u16`, else a bare host with no
 ///   port.
+/// - A host portion (whether alone or before a `:port`) containing `/`,
+///   `:`, whitespace, or a bracket is rejected outright rather than stored:
+///   these are exactly the mistakes a scheme, a path, or a fat-fingered
+///   out-of-range port produce (`http://localhost:3001`, `localhost/x`,
+///   `localhost:99999`), and none of them can ever match a URL host — so an
+///   entry shaped like one is unambiguously a mistake, not a host.
 ///
 /// The returned IPv6 host is stored in **canonical form** (via
 /// [`Ipv6Addr`]'s `Display`, e.g. `0:0:0:0:0:0:0:1` becomes `::1`), matching
@@ -187,14 +193,28 @@ fn parse_insecure_host_entry(entry: &str) -> Option<(String, Option<u16>)> {
 
     if let Some(idx) = entry.rfind(':') {
         let (host, port_str) = (&entry[..idx], &entry[idx + 1..]);
-        if !host.is_empty() {
-            if let Ok(port) = port_str.parse::<u16>() {
-                return Some((host.to_lowercase(), Some(port)));
-            }
+        if !is_valid_host_portion(host) {
+            return None;
         }
+        return port_str.parse::<u16>().ok().map(|port| (host.to_lowercase(), Some(port)));
     }
 
-    Some((entry.to_lowercase(), None))
+    if is_valid_host_portion(entry) {
+        Some((entry.to_lowercase(), None))
+    } else {
+        None
+    }
+}
+
+/// True for a host portion that could plausibly appear in a URL's authority:
+/// non-empty, and free of `/`, `:`, whitespace, and brackets. A `--allow-
+/// insecure-host` entry whose host portion fails this can never match a real
+/// URL host, so [`parse_insecure_host_entry`] rejects it rather than storing
+/// it inert.
+fn is_valid_host_portion(host: &str) -> bool {
+    !host.is_empty()
+        && !host
+            .contains(|c: char| c == '/' || c == ':' || c == '[' || c == ']' || c.is_whitespace())
 }
 
 /// Render a parsed entry back to display form, for the startup warning.
@@ -888,5 +908,20 @@ mod tests {
             r.is_err(),
             "a 3xx redirect must not be transparently followed to an unvalidated target"
         );
+    }
+
+    // Exactly the mistakes docs/deployment.md warns operators against. Each
+    // used to be accepted and stored as an inert bare-host entry (a scheme
+    // or path folded into the host string, or an out-of-range port that
+    // failed to parse and fell back to "the whole thing is the host") —
+    // matching nothing, ever, while `insecure_host_entries()` still reported
+    // it as understood. Now they must be rejected outright.
+    #[test]
+    fn malformed_entries_are_rejected_not_stored_inert() {
+        assert_eq!(parse_insecure_host_entry("http://localhost:3001"), None);
+        assert_eq!(parse_insecure_host_entry("localhost:99999"), None);
+        assert_eq!(parse_insecure_host_entry("localhost/x"), None);
+        assert_eq!(parse_insecure_host_entry("localhost:3001/"), None);
+        assert_eq!(parse_insecure_host_entry("localhost:"), None);
     }
 }

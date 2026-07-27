@@ -69,6 +69,10 @@ Entry form, exactly:
   another IPv6 group — and is **dropped entirely**, matching neither reading, rather than
   guessed at. It will not appear in the startup warning, and it grants nothing. Use the
   bracketed form.
+- **A malformed entry is dropped, not stored inert.** A scheme, a path, whitespace, or an
+  out-of-range port folded into the host — `http://localhost:3001`, `localhost/x`,
+  `localhost:3001/`, `localhost:99999` — can never match a real URL host, so it is rejected
+  outright rather than accepted and silently doing nothing.
 
 ### What it relaxes, for a listed host only
 
