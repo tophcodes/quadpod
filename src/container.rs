@@ -43,12 +43,6 @@ pub async fn ensure_container(
 pub async fn add_containment(
     store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
 ) -> Result<(), ResourceError> {
-    // ACLs are addressable resources but not container members: listing them
-    // as ldp:contains children would put server-managed access-control
-    // documents into every client's view of the container.
-    if crate::wac::prp::is_acl_path(child) {
-        return Ok(());
-    }
     let p = space.graph_iri(parent)?;
     let c = space.graph_iri(child)?;
     store.update(&format!(
@@ -60,12 +54,6 @@ pub async fn add_containment(
 pub async fn remove_containment(
     store: &dyn SparqlStore, space: &StorageSpace, parent: &str, child: &str,
 ) -> Result<(), ResourceError> {
-    // ACLs are addressable resources but not container members: listing them
-    // as ldp:contains children would put server-managed access-control
-    // documents into every client's view of the container.
-    if crate::wac::prp::is_acl_path(child) {
-        return Ok(());
-    }
     let p = space.graph_iri(parent)?;
     let c = space.graph_iri(child)?;
     store.update(&format!(
