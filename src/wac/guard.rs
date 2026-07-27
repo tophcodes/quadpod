@@ -11,7 +11,7 @@ use crate::{
     auth::Agent,
     container,
     resource,
-    space::{ContainerUrl, GraphName, ResourceUrl, Target},
+    space::{AuxKind, ContainerUrl, GraphName, ResourceUrl, Target},
     store::SparqlStore,
 };
 
@@ -37,13 +37,24 @@ fn deny(agent: &Agent) -> Response {
     }
 }
 
+/// The mode required to access an auxiliary of this kind, whatever `mode` the
+/// handler asked for. Exhaustive over [`AuxKind`]: a new kind is a compile
+/// error here until this match says what it requires, rather than silently
+/// inheriting `Control` (over-restrictive) or `mode` (potentially
+/// under-restrictive) from a fallback arm.
+fn required_mode_for_aux(kind: AuxKind) -> Mode {
+    match kind {
+        AuxKind::Acl => Mode::Control,
+    }
+}
+
 /// May `agent` perform `mode` on `target`?
 ///
-/// An auxiliary is decided against its subject and always requires
-/// `acl:Control`, whatever `mode` the handler asked for. That rewrite lives
-/// here rather than in the handlers so no handler can forget it — and it is
-/// now the type that carries the subject, so there is nothing left to derive
-/// from a string.
+/// An auxiliary is decided against its subject and requires the mode its
+/// [`AuxKind`] demands ([`required_mode_for_aux`]), not necessarily `mode`
+/// itself. That rewrite lives here rather than in the handlers so no handler
+/// can forget it — and it is now the type that carries the subject, so there
+/// is nothing left to derive from a string.
 pub async fn authorize(
     store: &dyn SparqlStore,
     agent: &Agent,
@@ -51,7 +62,7 @@ pub async fn authorize(
     mode: Mode,
 ) -> Result<(), Response> {
     let (subject, required) = match target {
-        Target::Aux(a) => (a.subject().clone(), Mode::Control),
+        Target::Aux(a) => (a.subject().clone(), required_mode_for_aux(a.kind())),
         Target::Resource(r) => (r.clone(), mode),
         Target::Container(c) => (c.as_resource().clone(), mode),
     };
