@@ -107,7 +107,9 @@ impl AuxKind {
     /// the subject path that remains. The inverse of appending [`suffix`].
     ///
     /// No two kinds' suffixes may be suffixes of one another, or this split
-    /// would be ambiguous — pinned by `aux_kind_suffixes_are_unambiguous`.
+    /// would be ambiguous. Guaranteed by `aux_kind_names_are_well_formed`'s
+    /// no-dot rule on every name — see its doc comment for why that alone
+    /// is enough.
     fn split_suffix(rest: &str) -> Option<(Self, &str)> {
         AuxKind::ALL
             .iter()
@@ -211,6 +213,17 @@ impl ResourceUrl {
     /// *addressable* — `/box` and `/box/` are still two names, one of which
     /// may exist — so this derivation is what a create consults, not a
     /// canonicalization of one onto the other.
+    ///
+    /// Unlike `resource()`, this mints the `ResourceUrl` directly rather than
+    /// re-running `NamedNode::new` on the result — which is exactly what the
+    /// module header says the private constructors exist to prevent going
+    /// unexamined. It is safe here: `self.iri` was already validated by
+    /// whichever constructor produced `self`, and adding or removing a
+    /// single trailing `/` is the only byte-level change made to it — it
+    /// cannot turn a valid IRI into an invalid one (and the root, the one
+    /// path whose counterpart would be the empty string, is handled above by
+    /// returning `None` before an IRI is built at all). The `debug_assert!`
+    /// pins that argument rather than leaving it asserted only in prose.
     pub fn slash_counterpart(&self) -> Option<ResourceUrl> {
         let path = match self.path.strip_suffix('/') {
             Some("") => return None, // the root
@@ -218,7 +231,12 @@ impl ResourceUrl {
             None => format!("{}/", self.path),
         };
         let base = self.iri.strip_suffix(&self.path).expect("iri ends with path");
-        Some(ResourceUrl { iri: format!("{base}{path}"), path })
+        let iri = format!("{base}{path}");
+        debug_assert!(
+            NamedNode::new(&iri).is_ok(),
+            "slash_counterpart must preserve IRI validity: {iri}"
+        );
+        Some(ResourceUrl { iri, path })
     }
 
     pub fn as_container(&self) -> Option<ContainerUrl> {
@@ -632,6 +650,14 @@ mod tests {
     // routing or `Link` headers. Each kind's name must also be non-empty and
     // slash-free (a `/` would make the suffix span segments and the split
     // ambiguous) and IRI-safe (it is interpolated into a graph IRI).
+    //
+    // The no-dot rule is also what keeps `split_suffix` unambiguous as more
+    // kinds are added, with no separate test needed for it: every suffix is
+    // `"." + name`, and a name here contains no `.`, so the only `.` in a
+    // suffix is its own leading one. One suffix can therefore never be a
+    // suffix of a different one — that would require the shorter suffix's
+    // leading `.` to land on some OTHER `.` inside the longer one, and there
+    // is no such character to land on.
     #[test]
     fn aux_kind_names_are_well_formed() {
         for kind in AuxKind::ALL {
@@ -644,27 +670,6 @@ mod tests {
             assert!(!name.contains('.'), "{kind:?}'s name contains '.'");
             let iri = format!("https://pod.toph.so/.aux/x{}", kind.suffix());
             assert!(NamedNode::new(&iri).is_ok(), "{kind:?}'s name is not IRI-safe");
-        }
-    }
-
-    // The one way the suffix shape could become ambiguous: if one kind's
-    // suffix ended another's, `split_suffix` would have two readings of the
-    // same URL — `<p>.x` and `<p>.y.x` — and which one it returned would
-    // depend on the order of `ALL`. Distinctness alone is not enough; no
-    // suffix may be a suffix of another.
-    #[test]
-    fn aux_kind_suffixes_are_unambiguous() {
-        for a in AuxKind::ALL {
-            for b in AuxKind::ALL {
-                if a == b {
-                    continue;
-                }
-                assert_ne!(a.name(), b.name(), "{a:?} and {b:?} share a name");
-                assert!(
-                    !a.suffix().ends_with(&b.suffix()),
-                    "{a:?}'s suffix ends with {b:?}'s — the split would be ambiguous"
-                );
-            }
         }
     }
 

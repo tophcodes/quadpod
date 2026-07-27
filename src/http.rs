@@ -2093,8 +2093,8 @@ mod tests {
         assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
 
         // Bob gets Control on /.aux/box/.acl itself, delegated via that same
-        // document's own
-        // acl:default — i.e. exactly the ancestor route the finding used.
+        // document's own acl:default — i.e. exactly the ancestor route the
+        // finding used.
         let box_acl_body = format!(
             "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
              <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \

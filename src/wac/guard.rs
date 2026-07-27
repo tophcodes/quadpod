@@ -49,7 +49,7 @@ fn deny(agent: &Agent) -> Response {
 
 /// The `409` body a create is refused with when it would produce the other
 /// half of a trailing-slash pair.
-pub const SLASH_PAIR_MESSAGE: &str =
+const SLASH_PAIR_MESSAGE: &str =
     "another resource already exists whose URI differs from this one only in the trailing slash";
 
 /// Solid Protocol §3.1: "If two URIs differ only in the trailing slash, and
@@ -63,11 +63,21 @@ pub const SLASH_PAIR_MESSAGE: &str =
 /// does not make one URI mean the other.
 ///
 /// Callers run this only after authorizing every level of the write (see
-/// [`authorize_and_materialize`], its only caller): the answer depends on
-/// whether some *other* resource exists, so answering it before a denial would
-/// hand an unauthorized caller an existence oracle for the whole namespace —
-/// the mistake `put_impl`'s conditional-request branch already avoids by
-/// sitting after `authorize`.
+/// [`authorize_and_materialize`], its only caller): a caller denied on the
+/// target itself, or on any ancestor the write would touch, never reaches
+/// this check and so learns nothing about the counterpart from it — the
+/// mistake `put_impl`'s conditional-request branch already avoids by sitting
+/// after `authorize`.
+///
+/// That does not close the oracle for the counterpart's *own* ACL, which
+/// this check never consults: a caller authorized to write `/box` by some
+/// unrelated, inherited rule, but who holds no access at all under `/box/`'s
+/// own, narrower ACL, still learns from a `409` that `/box/` exists — where a
+/// direct request to `/box/` would have answered `403` without confirming
+/// anything. That residual is inherent to enforcing Protocol §3.1 at all:
+/// the rule turns on whether the *other* URI names a resource, so answering
+/// it has to consult that resource's existence, not its ACL. Community Solid
+/// Server discloses the same way, for the same reason.
 async fn refuse_slash_pair(
     store: &dyn SparqlStore,
     created: &ResourceUrl,

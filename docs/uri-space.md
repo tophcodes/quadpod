@@ -69,6 +69,11 @@ are ordinary resources of yours, because they do not begin with `/.aux`. A path 
 that ends in no kind's name — `/.aux/foo`, `/.aux/bogus/x`, `/.aux/` itself — names nothing
 and answers `404`.
 
+One shape under `/.aux/` answers `400`, not `404`: stripping a kind's suffix can leave a subject
+path that is itself malformed — `/.aux/..acl` strips to the subject `/.`, a dot-segment no
+request could ever address on its own. That is reported as a malformed path, the same `400` a
+directly-requested `/.` would get, not as "no such auxiliary".
+
 The set of kinds is **closed and defined by the server**. You cannot introduce your own: what
 makes a resource auxiliary is behaviour the server enforces for you — the lifecycle binding,
 the exclusion from listings, the authorization derived from the subject. A kind the server
