@@ -413,6 +413,10 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
         match exists(store, &aux).await {
             Ok(false) => {}
             Ok(true) => {
+                // `authorize` ignores this `Mode::Write` for an `Aux` target
+                // and requires `Control` instead — passed here only to match
+                // every other call site's shape, not because the mode itself
+                // matters.
                 if let Err(res) = authorize(store, &agent, &Target::Aux(aux), Mode::Write).await {
                     return with_aux_links(res, &target);
                 }
@@ -421,7 +425,7 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
         }
     }
     if let Target::Container(c) = &target {
-        if c.path() == "/" {
+        if subject.parent().is_none() {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
         match container::container_is_empty(store, c).await {
@@ -1339,7 +1343,11 @@ mod tests {
         assert_eq!(bob_app.oneshot(write).await.unwrap().status(), StatusCode::FORBIDDEN);
 
         // ...and the owner locked themselves out of the subtree too, which is
-        // what an empty ACL means. Recovering means deleting it.
+        // what an empty ACL means — including of DELETE, which needs Control
+        // here and this ACL grants that to nobody, not even the owner. There
+        // is no HTTP route back for a subtree ACL emptied this way; only the
+        // root has an operator-level escape hatch (`--reset-root-acl`, see
+        // `wac::provision::provision_root_acl`).
         let owner_read = f.owner_request("GET", "/box/").body(Body::empty()).unwrap();
         assert_eq!(f.app.clone().oneshot(owner_read).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
@@ -1414,10 +1422,10 @@ mod tests {
         assert_eq!(bob_app.oneshot(deep()).await.unwrap().status(), StatusCode::CREATED);
     }
 
-    // The residual from the previous round: an ACL path is exempt from
-    // containment (an `.acl` is never listed via `ldp:contains`), but
-    // `ensure_ancestors` still materializes any missing ancestor containers
-    // for `PUT /a/b/c.acl` exactly as it would for `PUT /a/b/c`. Bob's grant
+    // The residual from the previous round: an ACL is exempt from containment
+    // (it is never listed via `ldp:contains`), but `authorize_and_materialize`
+    // still materializes any missing ancestor containers for
+    // `PUT /.aux/acl/a/b/c` exactly as it would for `PUT /a/b/c`. Bob's grant
     // here is `acl:Control` via the ROOT ACL's `acl:default` — inherited onto
     // every descendant, `/a/`, `/a/b/`, and `/a/b/c` alike — and deliberately
     // nothing else, so he has no `acl:Append` anywhere. That is enough to
@@ -1468,11 +1476,14 @@ mod tests {
 
     // The counterweight to THIS test above's counterweight: when the ACL's
     // immediate parent already exists, creating the ACL is a zero-mutation
-    // event — `add_containment` never records an ACL as a container member,
-    // and `ensure_container` is a no-op on a container that already has its
-    // type triples. So an agent holding `acl:Control` on the ACL's subject
-    // (here, via `/box/.acl`'s own `acl:default`) and NOTHING else — in
-    // particular no `acl:Append` on `/box/` — must still be able to write
+    // event — an `Aux` target is never a containment member (that's
+    // `authorize_and_materialize`'s `may_be_member` match on the `Target`
+    // variant, a property of the type rather than something `add_containment`
+    // has to notice at runtime), and `ensure_container` is a no-op on a
+    // container that already has its type triples. So an agent holding
+    // `acl:Control` on the ACL's subject (here, via `/.aux/acl/box/`'s own
+    // `acl:default`) and NOTHING else — in particular no `acl:Append` on
+    // `/box/` — must still be able to write
     // that subject's ACL. Requiring `Append` here would refuse a legitimate
     // "you may manage access below here" delegation for a request that
     // never touches `/box/`'s containment triples at all.
@@ -1750,13 +1761,14 @@ mod tests {
             "no auxiliary may have been created");
     }
 
-    // The other half of `authorize_ancestors`' exemption, and the one that
-    // makes calling it unconditionally safe: overwriting a resource that
+    // The other half of `authorize_and_materialize`'s exemption, and the one
+    // that makes calling it unconditionally safe: overwriting a resource that
     // already exists adds no containment triple its parent does not already
     // hold, so it must NOT start demanding `Append` there. Bob here holds
     // Read+Write on one document and deliberately nothing on the container
     // around it — the ordinary "you may edit this file" grant. Without the
-    // `target_exists` half of the exemption every such edit would 403.
+    // `is_member` half of the exemption (false whenever the target already
+    // exists) every such edit would 403.
     #[tokio::test]
     async fn overwriting_an_existing_resource_needs_no_append_on_its_container() {
         let f = fixture().await;
