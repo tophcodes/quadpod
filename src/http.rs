@@ -12,9 +12,9 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     resource::{put_rdf, get_rdf, delete_rdf, exists, ResourceError},
     rdf::{format_for_content_type, format_for_accept, parse, serialize, etag},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
-    space::{AuxKind, GraphName, SpaceError, StorageSpace, Target},
+    space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize}, Mode}};
+    wac::{guard::{authorize, authorize_and_materialize}, pdp, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -82,6 +82,114 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
             header::LINK,
             value.parse().expect("aux link value is header-safe"),
         );
+    }
+    res
+}
+
+/// The one sentence a self-denying ACL is reported with, in both places it is
+/// reported — [`warn_if_acl_grants_nothing`] logs this string and puts this
+/// same string on the response, so the two can never drift.
+///
+/// `acl_iri` is where the document now lives, `subject_iri` the resource it
+/// governs. `is_container` decides whether the message claims a subtree: a
+/// container's ACL is inherited by everything under it, but a plain
+/// resource's ancestor chain never contains the resource itself, so its ACL
+/// governs exactly that one resource and nothing "below" it. `is_root` adds
+/// the recovery instruction, which only applies to the root: for any other
+/// subtree there is genuinely no way back, since removing the ACL needs the
+/// `Control` it just revoked from everyone.
+fn acl_grants_nothing_message(
+    acl_iri: &str,
+    subject_iri: &str,
+    is_container: bool,
+    is_root: bool,
+) -> String {
+    let scope = if is_container { " and everything below it" } else { "" };
+    let mut m = format!(
+        "The ACL at {acl_iri} grants no access to anyone, so every request for \
+         {subject_iri}{scope} is now denied, including the Control needed to \
+         remove this ACL."
+    );
+    if is_root {
+        m.push_str(" Recovery requires restarting the server with --reset-root-acl.");
+    }
+    m
+}
+
+/// A `Warning` header carrying `message`, if it can be expressed as one.
+///
+/// `Warning` is obsolete — RFC 9111 §5.5 retired it along with the cache
+/// semantics it was invented for — and it is still the right field here. It
+/// was never reassigned, `199` is precisely its "miscellaneous warning, text
+/// MAY be presented to a human" code, and a `curl -i` user reads it as a
+/// warning without being told anything about this pod, which no bespoke
+/// `X-`-prefixed name achieves. The response is a `201` to a `PUT`, never
+/// cached, so the caching rules that obsoleted the field cannot apply to it.
+/// The authoritative channel is the log; this is the convenience copy, so an
+/// intermediary that strips it costs nothing.
+///
+/// [`acl_grants_nothing_message`] interpolates IRIs, and RFC 3987 permits
+/// non-ASCII IRI characters, so the message is not guaranteed to be pure
+/// ASCII — only guaranteed to contain no `"` or `\`, which is what actually
+/// keeps the `quoted-string` this builds well-formed. `HeaderValue::from_str`
+/// accepts any byte `>= 32` except `127`, so a non-ASCII subject IRI becomes
+/// obs-text in the header value rather than being rejected: legal, if not
+/// always readable by a client that assumes ASCII. The `Option` return is for
+/// what actually can make `from_str` fail — a `"` or `\` that somehow reached
+/// this point despite the guard below, or a control byte below `32`. Should
+/// that ever happen, the header is dropped rather than a malformed one sent —
+/// the log still carries the whole story.
+fn warning_header(message: &str) -> Option<header::HeaderValue> {
+    if message.contains(['"', '\\']) {
+        return None;
+    }
+    header::HeaderValue::from_str(&format!("199 - \"{message}\"")).ok()
+}
+
+/// Say so, twice, when a just-written ACL grants nobody anything.
+///
+/// This pod treats an empty ACL as "nothing is granted here" rather than
+/// "absent" — existence is a stored marker, not a triple count — so such a
+/// document wins over every ancestor and denies its whole subtree, including
+/// the `Control` that removing it would need. At the root that means the pod
+/// is locked out of itself and only `--reset-root-acl` gets back in; anywhere
+/// else there is no route back at all. Neither the empty body nor the far more
+/// likely near-miss (the wrong predicate, an `acl:accessTo` naming something
+/// else) was signalled before this — a typo in a WebID is not among the
+/// near-misses this catches: see [`pdp::grants_anything`]'s doc comment for
+/// why.
+///
+/// The write is not refused. An ACL that locks its own subtree is a legitimate
+/// thing to want, and second-guessing a `PUT` that `aux::put` already accepted
+/// would be the handler overruling the policy layer. It is reported instead:
+/// once to the log, which is authoritative, and once on the response, so a
+/// `curl` user sees it without reading server logs. Both carry the identical
+/// sentence from [`acl_grants_nothing_message`].
+///
+/// The question itself is [`pdp::grants_anything`]'s — the layer that owns
+/// what a grant *is*. Asking it here, by re-reading the triples, is exactly
+/// the duplication this codebase has spent its ACL defects unlearning.
+/// `triples` is what `aux::put` just stored, so no second round-trip is
+/// needed to know the document's contents.
+fn warn_if_acl_grants_nothing(
+    space: &StorageSpace,
+    aux: &AuxUrl,
+    triples: &[oxigraph::model::Triple],
+    mut res: Response,
+) -> Response {
+    if aux.kind() != AuxKind::Acl {
+        return res;
+    }
+    let subject_iri = aux.subject().graph_iri();
+    if pdp::grants_anything(triples, subject_iri) {
+        return res;
+    }
+    let is_root = subject_iri == space.root().graph_iri();
+    let is_container = aux.subject().as_container().is_some();
+    let message = acl_grants_nothing_message(aux.graph_iri(), subject_iri, is_container, is_root);
+    tracing::warn!("{message}");
+    if let Some(value) = warning_header(&message) {
+        res.headers_mut().insert(header::WARNING, value);
     }
     res
 }
@@ -179,7 +287,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         // write are two round-trips, and an interleaved DELETE between them
         // would plant a policy document on a path that no longer exists.
         Target::Aux(a) => match aux::put(store, a, &triples).await {
-            Ok(()) => created(&target),
+            Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(&target)),
             Err(AuxError::SubjectMissing) =>
                 (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
             Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
@@ -707,10 +815,10 @@ mod tests {
     #[tokio::test]
     async fn paths_normalization_would_alias_are_400() {
         let f = fixture().await;
-        // No percent-encoding in any of these, so `owner_request`'s naive
-        // htu (raw path, undecoded) matches `derive_htu`'s (decoded path)
-        // exactly — the `#` case needs its own test below, since decoding
-        // changes what the signed `htu` would have to be.
+        // `owner_request` signs the raw path, which is exactly what
+        // `derive_htu` derives the `htu` from, so every shape here
+        // authenticates and is then refused by `classify`, not by the
+        // credential check.
         for path in ["/a//b", "/a/b//", "/a/./b", "/a/../b"] {
             let get = f.owner_request("GET", path).body(Body::empty()).unwrap();
             assert_eq!(
@@ -729,26 +837,33 @@ mod tests {
         }
     }
 
-    // A raw request path of `/a%23b` decodes (the same way `derive_htu` and
-    // `classify` both decode it) to `/a#b`, which `resolve` now refuses as
-    // `NotNormalized`. The `htu` a client signs for such a URL is the
-    // configured base plus the DECODED path (see `derive_htu`'s doc comment),
-    // i.e. a literal `#` — not the wire-encoded `%23` — so it is crafted
-    // directly here rather than through `owner_request`'s naive (undecoded)
-    // helper, which cannot express it.
+    // A raw request path of `/a%23b` decodes (the way `classify` decodes it)
+    // to `/a#b`, which `resolve` refuses as `NotNormalized` — a `400`, and it
+    // must stay a `400` rather than becoming a misleading `401`. The `htu` a
+    // client signs is the WIRE form, `%23` and all (see `derive_htu`), which
+    // is exactly what `owner_request` builds; before the wire-form fix this
+    // test had to craft a proof over the decoded `https://pod.toph.so/a#b`
+    // instead, and `owner_request` could not express it.
     #[tokio::test]
     async fn hash_in_the_decoded_path_is_400_not_401() {
         let f = fixture().await;
-        let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
-        let htu = "https://pod.toph.so/a#b";
-        let proof = f.client.mint_dpop(htu, "GET", now_unix(), "jti-hash-in-path-test");
-        let req = Request::builder()
-            .method("GET")
-            .uri("/a%23b")
-            .header(header::AUTHORIZATION, format!("DPoP {at}"))
-            .header("dpop", proof)
-            .body(Body::empty())
-            .unwrap();
+        let req = f.owner_request("GET", "/a%23b").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    // This pins the property `HTU_DECODE_FAILURE_SENTINEL` used to guarantee
+    // before it was deleted as unreachable: a request whose path does not
+    // percent-decode to valid UTF-8 must fail closed, never reach a handler,
+    // and never be mistaken for an authentication failure. `derive_htu` signs
+    // and compares the wire form (see its doc comment), so this request
+    // authenticates just fine; it is axum's own `Path<String>` extractor that
+    // now rejects the invalid UTF-8 with a `400` before `handle_get`'s body
+    // ever runs. If this ever regresses to a `401` or a `200`, the sentinel's
+    // guarantee is gone and nothing else in this suite would catch it.
+    #[tokio::test]
+    async fn an_undecodable_path_is_400_even_when_authenticated() {
+        let f = fixture().await;
+        let req = f.owner_request("GET", "/%ff%fe").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
@@ -799,6 +914,59 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // The same re-targeting, through a percent-escape instead of a trailing
+    // slash. The owner signs `PUT /.aux/acl/a%41` — whose subject the handlers
+    // read as `/aA` — and an on-path adversary re-delivers the identical bytes
+    // as `PUT /.aux/acl/a%2541`, whose subject is `/a%41`, a DIFFERENT
+    // resource. While `htu` was the percent-DECODED graph IRI and the exact
+    // comparison decoded both sides, the two collapsed to the same string and
+    // this authenticated. It must be a 401, from the middleware.
+    #[tokio::test]
+    async fn a_proof_for_one_acl_cannot_be_redirected_by_a_double_escape() {
+        let f = fixture().await;
+        let at = f.idp.mint_access_token(OWNER, &f.client.jkt(), now_unix() + 3600);
+        let proof = f.client.mint_dpop(
+            "https://pod.toph.so/.aux/acl/a%41",
+            "PUT",
+            now_unix(),
+            "jti-acl-double-escape",
+        );
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/.aux/acl/a%2541")
+            .header(header::AUTHORIZATION, format!("DPoP {at}"))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("dpop", proof)
+            .body(Body::from(
+                "<#r> a <http://www.w3.org/ns/auth/acl#Authorization> ;\
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/aA> .",
+            ))
+            .unwrap();
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // The other half: a client that signs the wire form it actually requests
+    // must get through, end to end. `%41` is a plain `A`, so this once failed
+    // with a `401` even for the honest client — `dpop-verifier` compared the
+    // still-encoded proof against a `derive_htu` that had already decoded it.
+    #[tokio::test]
+    async fn a_percent_encoded_path_authenticates_for_its_own_request() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/a%41")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        let res = f.app.clone().oneshot(put).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        // The handler decoded the path, so the resource is `/aA` — the `htu`
+        // being the wire form changed the credential check, not the storage.
+        assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/aA");
+
+        let get = f.owner_request("GET", "/aA").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_string(res).await.contains("schema.org/name"));
     }
 
     #[tokio::test]
@@ -1161,6 +1329,109 @@ mod tests {
         let read_acl = f.sign(Request::builder().method("GET").uri("/.aux/acl/shared"), bob, "GET", "/.aux/acl/shared")
             .body(Body::empty()).unwrap();
         assert_eq!(bob_app.oneshot(read_acl).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The `Warning` header on a response, if it carries one.
+    fn warning_of(res: &axum::response::Response) -> Option<String> {
+        res.headers()
+            .get(header::WARNING)
+            .map(|v| v.to_str().unwrap().to_owned())
+    }
+
+    /// Write `body` as the ACL of `subject_path` and return the response.
+    async fn put_acl(f: &Fixture, subject_path: &str, body: &str) -> axum::response::Response {
+        let path = format!("/.aux/acl{subject_path}");
+        let req = f.owner_request("PUT", &path)
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(body.to_owned())).unwrap();
+        f.app.clone().oneshot(req).await.unwrap()
+    }
+
+    // The empty body: the obvious way to write an ACL that denies its whole
+    // subtree, including the Control that removing it would need. It is
+    // accepted — that is a legitimate thing to want — but never silently.
+    #[tokio::test]
+    async fn an_empty_acl_is_created_and_warned_about() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/locked")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+
+        let res = put_acl(&f, "/locked", "").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let expected = acl_grants_nothing_message(
+            "https://pod.toph.so/.aux/acl/locked",
+            "https://pod.toph.so/locked",
+            false, // "/locked" is a resource, not a container: no subtree to mention
+            false,
+        );
+        assert_eq!(warning_of(&res), Some(format!("199 - \"{expected}\"")));
+        assert!(expected.contains("grants no access to anyone"));
+        assert!(!expected.contains("--reset-root-acl"), "only the root can be reset");
+    }
+
+    // The case that actually happens: a document full of triples that grant
+    // nothing, because `acl:accessTo` names the wrong resource. Identical
+    // effect to the empty body, so it must get identical treatment — an
+    // emptiness check on the body would have missed this entirely.
+    #[tokio::test]
+    async fn an_acl_whose_triples_grant_nothing_is_warned_about_too() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/typo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+
+        // Every predicate is right; the `accessTo` names a DIFFERENT resource.
+        let body = format!(
+            "<#o> a <http://www.w3.org/ns/auth/acl#Authorization> ; \
+             <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/somewhere-else> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+             <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let res = put_acl(&f, "/typo", &body).await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(res.headers().contains_key(header::WARNING), "a non-empty body can grant nothing");
+        assert!(warning_of(&res).unwrap().contains("https://pod.toph.so/typo"));
+    }
+
+    // The counterweight: an ACL that does grant something must be silent, or
+    // the warning is noise nobody reads.
+    #[tokio::test]
+    async fn an_acl_that_grants_something_is_not_warned_about() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/kept")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        f.app.clone().oneshot(put).await.unwrap();
+
+        let body = format!(
+            "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/kept> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let res = put_acl(&f, "/kept", &body).await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(warning_of(&res), None, "a real grant must not be warned about");
+    }
+
+    // The root is the one subject with a way back, and the warning is the only
+    // place a client learns what it is: `--reset-root-acl`, out of band,
+    // because the HTTP route needs the Control this ACL just revoked.
+    #[tokio::test]
+    async fn an_empty_root_acl_warning_names_the_recovery_flag() {
+        let f = fixture().await;
+        let res = put_acl(&f, "/", "").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let warning = warning_of(&res).expect("the root lockout must be warned about");
+        assert!(warning.contains("--reset-root-acl"), "{warning}");
+        assert!(warning.contains("https://pod.toph.so/.aux/acl/"), "{warning}");
+
+        // And it is really locked: the owner can no longer read their own pod.
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(get).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 
     // An orphaned ACL would outlive its resource and be resurrected — with
