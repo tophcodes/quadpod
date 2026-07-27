@@ -187,6 +187,20 @@ mod tests {
         r.err().map(|res| res.status())
     }
 
+    /// Whether `parent`'s containment graph records `child_iri` as a member —
+    /// the direct triple check, stronger than merely asking if the container
+    /// holds *some* member.
+    async fn contains(store: &OxigraphStore, parent: &ContainerUrl, child_iri: &str) -> bool {
+        let p = parent.graph_iri();
+        store
+            .ask(&format!(
+                "ASK {{ GRAPH <{p}> {{ <{p}> <{}> <{child_iri}> }} }}",
+                crate::container::LDP_CONTAINS
+            ))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn granted_mode_is_allowed() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -308,6 +322,35 @@ mod tests {
         let target = sp().resolve("/inbox/note").unwrap();
         assert!(authorize_and_materialize(&store, &bob(), &target).await.is_ok(),
             "an append-only agent must not need rights on the root");
+        assert!(contains(&store, &container("/inbox/"), "https://pod.toph.so/inbox/note").await,
+            "the walk must actually record /inbox/note as a member of /inbox/");
+        assert!(!resource::exists(&store, &container("/")).await.unwrap(),
+            "the walk must stop at the first existing ancestor and never touch the root");
+    }
+
+    // A fresh store, nothing materialized yet: every ancestor of a deep
+    // create must be built and linked to its parent, not merely authorized.
+    #[tokio::test]
+    async fn a_deep_create_materializes_and_links_the_whole_chain() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
+             <{ACL_DEFAULT}> <https://pod.toph.so/> ; <{ACL_MODE}> <{ACL_WRITE}> ."
+        )).await;
+        let target = sp().resolve("/a/b/c").unwrap();
+        assert!(authorize_and_materialize(&store, &alice(), &target).await.is_ok(),
+            "a root grant with acl:default must authorize the whole chain");
+
+        for path in ["/a/b/", "/a/", "/"] {
+            assert!(resource::exists(&store, &container(path)).await.unwrap(),
+                "{path} must be materialized");
+        }
+        assert!(contains(&store, &container("/"), "https://pod.toph.so/a/").await,
+            "/ must contain /a/");
+        assert!(contains(&store, &container("/a/"), "https://pod.toph.so/a/b/").await,
+            "/a/ must contain /a/b/");
+        assert!(contains(&store, &container("/a/b/"), "https://pod.toph.so/a/b/c").await,
+            "/a/b/ must contain /a/b/c");
     }
 
     // An auxiliary is not a container member, so writing one materializes
