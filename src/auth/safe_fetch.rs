@@ -635,13 +635,130 @@ mod tests {
         assert!(addrs.is_err());
     }
 
-    // http is permitted for a named host and refused everywhere else.
+    // http is permitted for a named host and refused everywhere else. The
+    // error message is asserted too: `example.com` resolves over the real
+    // network, so if `permits_insecure` ever regressed to `true` this would
+    // still return `Err(FetchBlocked(_))` offline (DNS failure or the
+    // forbidden-IP check) and the weaker `matches!` assertion would pass for
+    // the wrong reason — it cannot distinguish "refused by the scheme rule"
+    // from "the network was unavailable". Pinning the message closes that.
     #[tokio::test]
     async fn http_is_refused_for_an_unnamed_host() {
         let c = reqwest::Client::new();
         let r = guarded_get(&c, "http://example.com/x", "text/turtle", &named(&["other.example"]))
             .await;
-        assert!(matches!(r, Err(AuthError::FetchBlocked(_))));
+        match r {
+            Err(AuthError::FetchBlocked(msg)) => {
+                assert_eq!(msg, "refusing non-https scheme: http");
+            }
+            other => panic!("expected FetchBlocked(\"refusing non-https scheme: http\"), got {other:?}"),
+        }
+    }
+
+    /// A minimal HTTP/1.1 server that always answers `200 OK` with a short
+    /// text body, for asserting a positive `guarded_get` outcome — none of
+    /// the other test servers in this module return success, so there was
+    /// no existing helper for it.
+    async fn spawn_ok_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 1024];
+                let _ = socket.read(&mut req_buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: text/plain\r\n\
+                          Content-Length: 2\r\n\
+                          Connection: close\r\n\r\n\
+                          ok",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        addr
+    }
+
+    /// Pins the headline relaxation itself, not just its absence of an
+    /// error: a listed host must actually succeed over **plain http**
+    /// against a **private** address. Before this test, the scheme and IP
+    /// relaxation were proven only by an out-of-tree smoke test and by the
+    /// negative test above (which can't tell "refused by the scheme rule"
+    /// from an offline network). This would have caught the Critical
+    /// aliasing bug too: with the pre-fix string-concatenation lookup, a
+    /// policy naming `127.0.0.1:<port>` behaved the same as after the fix
+    /// for this exact host/port, but the same bug let an unrelated
+    /// `host:port`-shaped IPv6 string alias a different address — see
+    /// `an_ipv6_host_port_entry_does_not_alias_a_different_address` below.
+    #[tokio::test]
+    async fn a_named_host_succeeds_over_plain_http() {
+        let addr = spawn_ok_server().await;
+        let policy = FetchPolicy::with_insecure_hosts(vec![addr.to_string()]);
+        let c = reqwest::Client::new();
+        let url = format!("http://{addr}/x");
+        let r = guarded_get(&c, &url, "text/plain", &policy).await;
+        let (body, _content_type) = r.expect("a named host must succeed over http");
+        assert_eq!(body, "ok");
+    }
+
+    /// Same positive assertion, over IPv6 loopback (`::1`), naming the host
+    /// via the bracketed entry form `[::1]:<port>`. Covers the Critical fix
+    /// end-to-end: bracket parsing, the pin, and the scheme/IP relaxation
+    /// together, for an address family the aliasing bug specifically
+    /// targeted.
+    #[tokio::test]
+    async fn a_named_ipv6_host_succeeds_over_plain_http() {
+        use tokio::net::TcpListener;
+
+        let listener = match TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "skipping a_named_ipv6_host_succeeds_over_plain_http: \
+                     IPv6 loopback unavailable in this environment ({e})"
+                );
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 1024];
+                let _ = socket.read(&mut req_buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: text/plain\r\n\
+                          Content-Length: 2\r\n\
+                          Connection: close\r\n\r\n\
+                          ok",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let entry = format!("[::1]:{}", addr.port());
+        let policy = FetchPolicy::with_insecure_hosts(vec![entry]);
+        let c = reqwest::Client::new();
+        let url = format!("http://{addr}/x");
+        let r = guarded_get(&c, &url, "text/plain", &policy).await;
+        let (body, _) = r.expect("a bracketed IPv6 entry must permit its host over http");
+        assert_eq!(body, "ok");
     }
 
     // The Critical fix: `permits_insecure` used to build its port-scoped key
@@ -707,6 +824,24 @@ mod tests {
             vec!["css.local".to_string(), "localhost:3001".to_string()]
         );
         assert!(resolve_allowed("localhost", 3001, &policy).await.is_ok());
+    }
+
+    // Retraction of a claim in the task 1 report (§7b): a non-special
+    // scheme still fails closed after host/port extraction moved above the
+    // scheme check, but for `ftp` specifically the message is unchanged —
+    // `url` knows ftp's default port (21), so `port_or_known_default()`
+    // still succeeds and the scheme check still produces the scheme error.
+    // Only a genuinely non-special scheme shifts the message to "URL has no
+    // port", covered here so the reorder itself is under test.
+    #[tokio::test]
+    async fn non_special_scheme_fails_closed_with_no_port_error() {
+        let c = reqwest::Client::new();
+        let r = guarded_get(&c, "foo://example.com/x", "text/turtle", &FetchPolicy::default())
+            .await;
+        match r {
+            Err(AuthError::FetchBlocked(msg)) => assert_eq!(msg, "URL has no port"),
+            other => panic!("expected FetchBlocked(\"URL has no port\"), got {other:?}"),
+        }
     }
 
     #[tokio::test]
