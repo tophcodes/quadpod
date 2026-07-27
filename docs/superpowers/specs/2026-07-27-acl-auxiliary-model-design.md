@@ -45,19 +45,28 @@ kind from the start — one reserved prefix per kind, one lifecycle rule, one ro
 classification — because the defect history is a history of second implementations of
 rules that already existed.
 
-| Kind | Prefix | Written by | Authorized by |
+| Kind | Path | Written by | Authorized by |
 |---|---|---|---|
-| `Acl` | `/.acl/` | client | `Control` on the subject |
-| `Description` (later) | `/.meta/` | client | `Write` on the subject |
+| `Acl` | `/.aux/acl/{subject}` | client | `Control` on the subject |
+| `Description` (later) | `/.aux/meta/{subject}` | client | `Write` on the subject |
 | system projection (later) | — | server only | read-only, see §12.4 |
 
-**The whole reserved space is claimed at once**, not one prefix per feature: any path whose
-**first segment begins with a dot** belongs to the server, and an unallocated reserved
-prefix is refused rather than treated as data. That way `/.meta/` can be reserved today and
-implemented later without taking anything away from users at that point. A dot in any later
-segment is ordinary — `/box/.acl` is a normal resource. The client-facing statement of this
-contract is [`docs/uri-space.md`](../../uri-space.md); it is normative and must be kept in
-step with the prefix table above.
+The auxiliary's **content is the user's data**; what the server contributes is the
+association, the lifecycle, the exclusion from listings and the authorization derivation.
+"Reserved" here means the server understands these paths, not that it owns what is in them.
+
+**Exactly one segment is reserved, once and for all: `/.aux/`.** Every auxiliary kind is a
+subdirectory inside it, so adding a kind later takes nothing further away from users. Any
+other dot-prefixed name stays ordinary — `/.hidden`, `/.config` and `/notes/.env` are
+normal resources. An unallocated path under `/.aux/` is refused rather than treated as data.
+
+`/.well-known/` is a separate matter and not an auxiliary: RFC 8615 assigns it to the
+*origin*, so the pod stores nothing there and refuses writes, and serving it is the reverse
+proxy's job. It only arises at all when the pod's base URI is the origin root; under a
+path-based topology it sits above the base URI entirely.
+
+The client-facing statement of this contract is [`docs/uri-space.md`](../../uri-space.md);
+it is normative and must be kept in step with the table above.
 
 **Built now: `Acl` only.** A `Description` resource today would be speculation — there is
 no user-supplied per-resource metadata in the system, and no caller for it. What is built
@@ -75,18 +84,18 @@ and `content-type` in the system graph anyway.
 
 ### The ACL namespace
 
-The ACL of a resource lives under its reserved root prefix, not as a sibling:
+The ACL of a resource lives under the reserved auxiliary prefix, not as a sibling:
 
 | Subject | ACL URL |
 |---|---|
-| `/` | `/.acl/` |
-| `/foo` | `/.acl/foo` |
-| `/box/` | `/.acl/box/` |
-| `/a/b/c` | `/.acl/a/b/c` |
+| `/` | `/.aux/acl/` |
+| `/foo` | `/.aux/acl/foo` |
+| `/box/` | `/.aux/acl/box/` |
+| `/a/b/c` | `/.aux/acl/a/b/c` |
 
-Both directions are total and mutually inverse: strip or prepend the one prefix segment.
+Both directions are total and mutually inverse: strip or prepend the two prefix segments.
 
-**Why a prefix rather than a suffix.** A reserved prefix is a total function over the path space, evaluated once by the router. A reserved suffix is a partial predicate that must be re-evaluated wherever a path is constructed — which is precisely how defects 1, 5, 6 and 7 arose. `/.acl` without a trailing slash is reserved as well (404), so the space is unambiguous.
+**Why a prefix rather than a suffix.** A reserved prefix is a total function over the path space, evaluated once by the router. A reserved suffix is a partial predicate that must be re-evaluated wherever a path is constructed — which is precisely how defects 1, 5, 6 and 7 arose. `/.aux` and `/.aux/acl` without a trailing slash are reserved as well (404), so the space is unambiguous.
 
 **Conformance.** WAC constrains discovery, not URL shape: servers MUST advertise the ACL via `Link: rel="acl"`, clients MUST discover it that way, and clients **MUST NOT** derive it by string operations — WAC even permits the ACL to live on a different origin. The official conformance harness contains no `.acl` string in its sources; it reads the `Link` header and fails loudly when absent. CSS treats its `.acl` suffix as a swappable config value behind a pluggable strategy and ships `.acr` and `.meta` alongside; Trellis uses `?ext=acl`; Manas uses `<res>._aux/acl`; ESS hosts ACRs on a different service entirely. Four implementations, four shapes.
 
@@ -116,7 +125,7 @@ pub enum Target {
 
 impl StorageSpace {
     /// The single entry point from a raw request path. Rejects paths that
-    /// form no valid IRI, and classifies the ACL space by prefix.
+    /// form no valid IRI, and classifies the auxiliary space by prefix.
     pub fn resolve(&self, request_path: &str) -> Result<Target, SpaceError>;
 }
 
@@ -167,7 +176,7 @@ Touches: `resource::{put_rdf, get_rdf, delete_rdf}`, `container::container_is_em
 
 **Materialization and authorization share a traversal.** A single function walks `ancestors()`, authorizing `Append` and creating containers as it goes, stopping at the first ancestor that already exists — because above that level nothing observable changes. The mirror pair `authorize_ancestors` / `ensure_ancestors` collapses into it. This is the post-mortem's B-lite, and it is mostly deletion.
 
-**The ACL walk is one query.** The candidate ACL graphs for `/a/b/c` are derivable from the path — `/.acl/a/b/c`, `/.acl/a/b/`, `/.acl/a/`, `/.acl/` — so the PRP asks for all of them in a single SPARQL query (`VALUES ?g { … } GRAPH ?g { … }`), ordered by depth, and takes the nearest non-empty one. One round trip instead of depth+1.
+**The ACL walk is one query.** The candidate ACL graphs for `/a/b/c` are derivable from the path — `/.aux/acl/a/b/c`, `/.aux/acl/a/b/`, `/.aux/acl/a/`, `/.aux/acl/` — so the PRP asks for all of them in a single SPARQL query (`VALUES ?g { … } GRAPH ?g { … }`), ordered by depth, and takes the nearest non-empty one. One round trip instead of depth+1.
 
 One ACL is one named graph, as today. A single shared ACL graph was considered and rejected: it turns `DROP GRAPH` into a subject-scoped `DELETE WHERE` (unsound for blank-node authorizations, and a bug there deletes other people's policy), turns `PUT` into a non-atomic diff on shared structure, and removes the isolation that makes the lifecycle binding in §6 a one-liner. Graph count is not a concern: only resources with an *own* policy have an ACL graph at all, and in a quad store a graph name is just the fourth term.
 
