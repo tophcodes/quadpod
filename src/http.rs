@@ -831,6 +831,22 @@ mod tests {
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
+    // This pins the property `HTU_DECODE_FAILURE_SENTINEL` used to guarantee
+    // before it was deleted as unreachable: a request whose path does not
+    // percent-decode to valid UTF-8 must fail closed, never reach a handler,
+    // and never be mistaken for an authentication failure. `derive_htu` signs
+    // and compares the wire form (see its doc comment), so this request
+    // authenticates just fine; it is axum's own `Path<String>` extractor that
+    // now rejects the invalid UTF-8 with a `400` before `handle_get`'s body
+    // ever runs. If this ever regresses to a `401` or a `200`, the sentinel's
+    // guarantee is gone and nothing else in this suite would catch it.
+    #[tokio::test]
+    async fn an_undecodable_path_is_400_even_when_authenticated() {
+        let f = fixture().await;
+        let req = f.owner_request("GET", "/%ff%fe").body(Body::empty()).unwrap();
+        assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
     // The trailing slash is not a segment normalization would remove — it is
     // what distinguishes a container from a resource — so it must keep
     // working exactly as it did before the `NotNormalized` rule existed.
