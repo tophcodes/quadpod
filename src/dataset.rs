@@ -329,4 +329,54 @@ mod tests {
         )];
         assert!(Skolemized::ground(not_ok).is_none());
     }
+
+    #[test]
+    fn distinct_blank_nodes_stay_distinct() {
+        let b1 = BlankNode::new("b1").unwrap();
+        let b2 = BlankNode::new("b2").unwrap();
+
+        let ds = Dataset::new(vec![
+            Quad::new(
+                NamedNode::new("http://example.org/a").unwrap(),
+                NamedNode::new("http://example.org/links").unwrap(),
+                b1.clone(),
+                oxigraph::model::GraphName::DefaultGraph,
+            ),
+            Quad::new(
+                NamedNode::new("http://example.org/c").unwrap(),
+                NamedNode::new("http://example.org/links").unwrap(),
+                b2.clone(),
+                oxigraph::model::GraphName::DefaultGraph,
+            ),
+        ]);
+
+        let stored = Skolemized::skolemize(&ds);
+
+        // Collect all skolem IRIs in the stored dataset
+        let skolem_iris: Vec<String> = stored.quads().iter()
+            .filter_map(|q| match &q.object {
+                oxigraph::model::Term::NamedNode(n) => {
+                    if n.as_str().starts_with("urn:quadpod:bnode:") {
+                        Some(n.as_str().to_string())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skolem_iris.len(), 2, "two distinct blank nodes should get two distinct skolem IRIs");
+        assert_ne!(skolem_iris[0], skolem_iris[1], "each blank node gets its own skolem IRI");
+
+        // Verify the round trip preserves distinctness
+        let back = stored.deskolemize();
+        let blank_nodes: Vec<oxigraph::model::BlankNode> = back.quads().iter()
+            .filter_map(|q| match &q.object {
+                oxigraph::model::Term::BlankNode(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blank_nodes.len(), 2, "deskolemization should restore both blank nodes");
+        assert_ne!(blank_nodes[0], blank_nodes[1], "the two blank nodes should remain distinct");
+    }
 }
