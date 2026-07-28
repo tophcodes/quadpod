@@ -421,8 +421,8 @@ a `Link` header naming the formats that carry the whole thing.**
 200 OK
 Content-Type: text/turtle
 Vary: Accept
-Link: <urn:example:g1>; rel="https://pod.toph.so/ns#containsGraph"
-Link: <urn:example:g2>; rel="https://pod.toph.so/ns#containsGraph"
+Link: <urn:example:g1>; rel="https://quadpod.toph.so/ns#containsGraph"
+Link: <urn:example:g2>; rel="https://quadpod.toph.so/ns#containsGraph"
 Link: <https://pod.toph.so/c/notes>; rel="alternate"; type="application/trig"
 Link: <https://pod.toph.so/c/notes>; rel="alternate"; type="application/ld+json"
 ```

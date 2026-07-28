@@ -254,30 +254,42 @@ fn triples_of(dataset: &Dataset) -> Vec<Triple> {
     dataset.quads().iter().cloned().map(Triple::from).collect()
 }
 
-/// The `ETag` an `Accept`-less `GET` of `target` would return right now —
+/// Every `ETag` `target` currently answers with, one per representation —
 /// what `If-Match`/`If-None-Match` compare against, since neither header
-/// carries a representation format the way `Accept` does.
+/// carries a format the way `Accept` does. `None` means the target does not
+/// exist, which is what `If-None-Match: *` tests.
 ///
-/// For a [`Target::Resource`] this has to be [`Skolemized::etag`] over the
-/// same format `get_impl`'s own empty-`Accept` negotiation would pick — that
-/// tag embeds its format (§6.4, RFC 9110 §8.8.1: different representations
-/// are different entities), so comparing against anything else would make a
-/// legitimate `If-Match` round trip (`GET`, then conditional `PUT`) fail
-/// every time. Containers and auxiliaries are unaffected: they carry no
-/// named graphs, so their one representation's tag is still [`etag`] over
-/// [`get_rdf`]'s raw, un-deskolemized triples.
-async fn current_tag(store: &dyn SparqlStore, target: &Target) -> Result<Option<String>, ResourceError> {
+/// A [`Target::Resource`]'s validator embeds the format it labels (§6.4, RFC
+/// 9110 §8.8.1: different representations are different entities), so there is
+/// no single "the" tag to compare against. RFC 9110 §13.1.1 matches `If-Match`
+/// against *any* current representation of the resource, so every format the
+/// resource can be served as contributes one: a client that fetched it as
+/// TriG and conditionally writes it back must not be told `412` forever
+/// because the server compared against the Turtle tag instead.
+///
+/// Containers and auxiliaries contribute exactly one, because [`etag`] over
+/// [`get_rdf`]'s raw triples does not embed a format — every representation
+/// of theirs shares it.
+async fn current_tags(store: &dyn SparqlStore, target: &Target) -> Result<Option<Vec<String>>, ResourceError> {
     if let Target::Resource(r) = target {
         let Some(stored) = get_dataset(store, r).await? else {
             return Ok(None);
         };
-        let shape = if stored.deskolemize().has_named_graphs() { Shape::Dataset } else { Shape::Graph };
-        let stored_type = stored_media_type(store, r).await?;
-        let fmt = negotiate("", shape, stored_type)
-            .expect("an empty Accept always resolves to some supported format");
-        return Ok(Some(stored.etag(fmt)));
+        // The media types `Format::from_content_type` accepts. A format
+        // missing here can still be served but its validator would never
+        // match, which is a legitimate conditional write refused forever.
+        const SERVABLE: [&str; 5] = [
+            "text/turtle", "application/n-triples", "application/ld+json",
+            "application/trig", "application/n-quads",
+        ];
+        return Ok(Some(
+            SERVABLE.iter()
+                .filter_map(|ct| Format::from_content_type(ct))
+                .map(|f| stored.etag(f))
+                .collect(),
+        ));
     }
-    Ok(get_rdf(store, target).await?.map(|tr| etag(&tr)))
+    Ok(get_rdf(store, target).await?.map(|tr| vec![etag(&tr)]))
 }
 
 async fn handle_put(
@@ -332,10 +344,33 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // format could not have shown the client in the first place.
     if let Target::Resource(r) = &target {
         if !fmt.carries_dataset() {
-            if let Ok(Some(existing)) = get_dataset(store, r).await {
-                let names = existing.deskolemize().named_graphs();
-                if !names.is_empty() {
-                    let list = names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+            // A store error is not "no named graphs": reading it that way lets
+            // the overwrite this check exists to refuse proceed on exactly the
+            // request the check could not evaluate.
+            let existing = match get_dataset(store, r).await {
+                Ok(v) => v,
+                Err(e) => return (put_status(&e), e.to_string()).into_response(),
+            };
+            if let Some(existing) = existing {
+                // Over the stored quads, where every graph name is an IRI. A
+                // graph the client named with a blank node is destroyed by
+                // this write just as surely, and the de-skolemized view shows
+                // it as a blank node again — invisible to `named_graphs`.
+                let stored_shape = Dataset::new(existing.quads().to_vec());
+                if stored_shape.has_named_graphs() {
+                    // Only IRI names go in the message: a blank-named graph
+                    // has no name the client ever wrote, and the IRI the
+                    // server minted for it is not the client's to see
+                    // (§3.2.2). It is still counted, so the refusal accounts
+                    // for everything it is refusing to destroy.
+                    let named = existing.deskolemize().named_graphs();
+                    let mut parts: Vec<String> =
+                        named.iter().map(|n| n.as_str().to_owned()).collect();
+                    let blank_named = stored_shape.named_graphs().len() - parts.len();
+                    if blank_named > 0 {
+                        parts.push(format!("{blank_named} named by a blank node"));
+                    }
+                    let list = parts.join(", ");
                     return (StatusCode::CONFLICT, format!(
                         "this resource has named graphs ({list}) that {} cannot carry; \
                          write it as application/trig or application/ld+json, or DELETE it first",
@@ -347,17 +382,20 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     }
     let skolemized = Skolemized::skolemize(&dataset);
     if headers.contains_key(IF_MATCH) || headers.contains_key(IF_NONE_MATCH) {
-        let current_tag = match current_tag(store, &target).await {
+        let current_tags = match current_tags(store, &target).await {
             Ok(t) => t,
             Err(e) => return (put_status(&e), e.to_string()).into_response(),
         };
         if let Some(im) = headers.get(IF_MATCH).and_then(|v| v.to_str().ok()) {
-            if Some(im) != current_tag.as_deref() {
+            // RFC 9110 §13.1.1: `If-Match` matches *any* current
+            // representation, not the one the server would have picked.
+            let matched = current_tags.as_ref().is_some_and(|ts| ts.iter().any(|t| t == im));
+            if !matched {
                 return StatusCode::PRECONDITION_FAILED.into_response();
             }
         }
         if headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("*")
-            && current_tag.is_some()
+            && current_tags.is_some()
         {
             return StatusCode::PRECONDITION_FAILED.into_response();
         }
@@ -614,15 +652,26 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let visible = stored.deskolemize();
-    let shape = if visible.has_named_graphs() { Shape::Dataset } else { Shape::Graph };
+    // What is withheld is decided on the **stored** quads, where every graph
+    // name is an IRI (§4) and no graph is invisible; what can be *named* comes
+    // from the visible view, further down. The de-skolemized view shows a
+    // blank-node graph name as a blank node again, which `named_graphs` cannot
+    // list, so deriving the shape from it would leave that decision resting on
+    // the narrower of the two questions. §6.1 puts the ETag before
+    // de-skolemization for the same reason.
+    let stored_shape = Dataset::new(stored.quads().to_vec());
+    let shape = if stored_shape.has_named_graphs() { Shape::Dataset } else { Shape::Graph };
     let stored_type = stored_media_type(store, r).await.ok().flatten();
     let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), shape, stored_type) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
     let tag = stored.etag(fmt);
     if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
+        let mut out = HeaderMap::new();
+        out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
+        out.insert(header::VARY, "Accept".parse().expect("static"));
         return with_allow(with_aux_links(
-            (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response(), &target), &target);
+            (StatusCode::NOT_MODIFIED, out).into_response(), &target), &target);
     }
     // §6.2: a graph format gets the default graph, and is told what it missed.
     let served = if fmt.carries_dataset() { visible.clone() } else { visible.default_graph_only() };
@@ -637,7 +686,14 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // Only when something was actually left out — an ordinary graph-shaped
     // resource served as Turtle has nothing to point `alternate` at, and
     // must not carry these headers just because Turtle itself is lossy.
-    if !fmt.carries_dataset() && visible.has_named_graphs() {
+    if !fmt.carries_dataset() && stored_shape.has_named_graphs() {
+        // `containsGraph` names what a client would recognise, so it is drawn
+        // from the visible view: a graph the client named with a blank node
+        // has no IRI it ever wrote, and the IRI the server minted for it is
+        // reserved (§3.2.2), so there is nothing this header could name it
+        // with. The `alternate` links below are emitted for either kind, so a
+        // resource whose only withheld graph is blank-named still tells the
+        // client that something was withheld and where to get it whole.
         for name in visible.named_graphs() {
             out.append(header::LINK, format!(
                 "<{}>; rel=\"https://quadpod.toph.so/ns#containsGraph\"", name.as_str()
@@ -669,11 +725,13 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
         Ok(Some(triples)) => {
             let tag = etag(&triples);
             if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
+                // `Vary: Accept` on every negotiated response (§6.3), and this
+                // path negotiates as much as the resource path does.
+                let mut out = HeaderMap::new();
+                out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
+                out.insert(header::VARY, "Accept".parse().expect("static"));
                 return with_allow(
-                    with_aux_links(
-                        (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response(),
-                        &target,
-                    ),
+                    with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target),
                     &target,
                 );
             }
@@ -687,6 +745,7 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
                     let mut headers = HeaderMap::new();
                     headers.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
                     headers.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
+                    headers.insert(header::VARY, "Accept".parse().expect("static"));
                     with_allow(with_aux_links((headers, bytes).into_response(), &target), &target)
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3132,5 +3191,307 @@ mod tests {
             "the server's internal IRI must not reach a client: {out}");
         assert!(out.contains("acl:Authorization") || out.contains("auth/acl#Authorization"),
             "and the rule itself survived: {out}");
+    }
+
+    /// A resource whose only content sits in a graph the client named with a
+    /// blank node. TriG is the only way to write one over HTTP, and the shape
+    /// is the deployed Verifiable Credentials `proof` pattern (§4).
+    const BLANK_NAMED_GRAPH_TRIG: &str =
+        "_:g { <http://example.org/alice> <http://schema.org/name> \"Alice\" }";
+
+    // §6.2, on the input that used to be invisible to every dataset decision:
+    // a blank-node graph name is not an IRI, so nothing a `Link` header can
+    // name — but the resource is still a dataset, and a graph format still
+    // serves only part of it. Before, this answered `200` with an empty body
+    // and no indication anything existed at all, which is the exact silent
+    // loss §6.2 exists to prevent.
+    #[tokio::test]
+    async fn a_blank_named_graph_is_a_dataset_and_a_graph_format_is_told_so() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(BLANK_NAMED_GRAPH_TRIG)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let links: Vec<String> = res.headers().get_all(header::LINK).iter()
+            .map(|v| v.to_str().unwrap().to_owned()).collect();
+        assert!(links.iter().any(|l| l.contains("alternate") && l.contains("application/trig")),
+            "the client must be told the whole thing is available elsewhere: {links:?}");
+        assert!(!links.iter().any(|l| l.contains("containsGraph")),
+            "and not under a name it never wrote: {links:?}");
+        assert!(!body_string(res).await.contains("Alice"),
+            "the withheld graph is withheld, not merged into the default graph");
+    }
+
+    // §6.3 on the same input: the client offered a format that carries the
+    // whole resource, so preferring the lossy one it happened to list first is
+    // the wrong answer — and it is what a shape read off the de-skolemized
+    // view produces, since the graph name is a blank node again there.
+    #[tokio::test]
+    async fn a_blank_named_graph_makes_negotiation_prefer_a_dataset_format() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(BLANK_NAMED_GRAPH_TRIG)).unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "text/turtle, application/trig").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
+        assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "application/trig");
+        let out = body_string(res).await;
+        assert!(out.contains("Alice"), "and it carries the graph: {out}");
+        assert!(!out.contains(crate::dataset::RESERVED_PREFIX),
+            "under a blank node, not the server's internal IRI: {out}");
+    }
+
+    // §6.2.1 on the same input. The refusal cannot name the graph — the client
+    // never wrote a name for it — but it must still refuse, or a Turtle write
+    // destroys it with a `201` and no warning.
+    #[tokio::test]
+    async fn a_graph_format_write_over_a_blank_named_graph_is_refused() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(BLANK_NAMED_GRAPH_TRIG)).unwrap()).await.unwrap();
+
+        let overwrite = f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        let res = f.app.clone().oneshot(overwrite).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = body_string(res).await;
+        assert!(body.contains("named by a blank node"),
+            "the refusal accounts for what it is refusing to destroy: {body}");
+        assert!(!body.contains(crate::dataset::RESERVED_PREFIX),
+            "without leaking the server's internal IRI: {body}");
+
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/trig").body(Body::empty()).unwrap();
+        assert!(body_string(f.app.oneshot(get).await.unwrap()).await.contains("Alice"),
+            "and nothing was destroyed");
+    }
+
+    // §3.4, which runs on the parsed dataset before skolemization. A container
+    // that accepts this stores nothing and says `201`; for an ACL it tells an
+    // author a rule was created when it was not.
+    #[tokio::test]
+    async fn a_blank_named_graph_is_refused_on_a_container_and_an_auxiliary() {
+        let f = fixture().await;
+        let container = f.owner_request("PUT", "/box/")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(BLANK_NAMED_GRAPH_TRIG)).unwrap();
+        assert_eq!(f.app.clone().oneshot(container).await.unwrap().status(),
+            StatusCode::BAD_REQUEST, "a container's graph carries containment");
+
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
+        let acl = f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(BLANK_NAMED_GRAPH_TRIG)).unwrap();
+        assert_eq!(f.app.clone().oneshot(acl).await.unwrap().status(),
+            StatusCode::BAD_REQUEST, "an ACL's rules would be invisible to WAC in a subgraph");
+        assert!(f.stored("/.aux/c/notes.acl").await.is_none(),
+            "and the refusal wrote nothing");
+    }
+
+    // Every other `containsGraph` assertion uses one named graph, where
+    // `insert` and `append` are indistinguishable. Two of them tell them
+    // apart — `insert` would replace the first `Link` with the second, and the
+    // client would be told about half of what it did not get.
+    #[tokio::test]
+    async fn every_withheld_graph_is_named_not_just_the_last() {
+        let f = fixture().await;
+        let body = "<urn:example:g1> { <http://example.org/alice> <http://schema.org/name> \"Alice\" }\n\
+                    <urn:example:g2> { <http://example.org/bob> <http://schema.org/name> \"Bob\" }";
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let links: Vec<String> = f.app.oneshot(get).await.unwrap()
+            .headers().get_all(header::LINK).iter()
+            .map(|v| v.to_str().unwrap().to_owned()).collect();
+        for g in ["urn:example:g1", "urn:example:g2"] {
+            assert!(links.iter().any(|l| l.contains("containsGraph") && l.contains(g)),
+                "{g} is missing from {links:?}");
+        }
+    }
+
+    // §6.2.1's body is the whole remedy: a `409` that does not say which
+    // graphs are in the way is a refusal the client cannot act on.
+    #[tokio::test]
+    async fn the_refusal_names_the_graphs_it_is_protecting() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(
+                "<urn:example:g1> { <http://example.org/alice> <http://schema.org/name> \"Alice\" }"
+            )).unwrap()).await.unwrap();
+
+        let overwrite = f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        let res = f.app.oneshot(overwrite).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = body_string(res).await;
+        assert!(body.contains("urn:example:g1"), "which graph is in the way: {body}");
+        assert!(body.contains("application/trig"), "and how to write it anyway: {body}");
+    }
+
+    // RFC 9110 §13.1.1 matches `If-Match` against any current representation.
+    // A resource's validator embeds its format (§6.4), so comparing against
+    // one server-chosen representation makes `GET` as TriG followed by a
+    // conditional `PUT` fail with `412` permanently.
+    #[tokio::test]
+    async fn a_validator_from_any_format_satisfies_a_conditional_write() {
+        let f = fixture().await;
+
+        // A graph-shaped resource stored as Turtle, fetched as JSON-LD: the
+        // two representations have different validators, and only one of them
+        // is what an `Accept`-less `GET` would have returned.
+        f.app.clone().oneshot(f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/foo")
+            .header(header::ACCEPT, "application/ld+json").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
+        assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "application/ld+json");
+        let json_tag = res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+
+        let plain = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let plain_tag = f.app.clone().oneshot(plain).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_ne!(json_tag, plain_tag,
+            "different representations are different entities (RFC 9110 §8.8.1)");
+
+        let conditional = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_MATCH, &json_tag)
+            .body(Body::from("<#it> <http://schema.org/name> \"X\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(conditional).await.unwrap().status(),
+            StatusCode::CREATED, "the tag the client was just handed must be accepted");
+
+        // And the same for a dataset-shaped resource, whose stored type is
+        // JSON-LD while the client fetched it as TriG.
+        let body = "<urn:example:g1> { <http://example.org/alice> <http://schema.org/name> \"Alice\" }";
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/ld+json")
+            .body(Body::from(r#"{"@graph":[{"@id":"urn:example:g1","@graph":[
+                {"@id":"http://example.org/alice","http://schema.org/name":"Alice"}]}]}"#))
+            .unwrap()).await.unwrap();
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/trig").body(Body::empty()).unwrap();
+        let trig_tag = f.app.clone().oneshot(get).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        let conditional = f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .header(header::IF_MATCH, &trig_tag)
+            .body(Body::from(body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(conditional).await.unwrap().status(),
+            StatusCode::CREATED);
+
+        // A validator of no representation at all is still refused.
+        let stale = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_MATCH, "\"deadbeef\"")
+            .body(Body::from("")).unwrap();
+        assert_eq!(f.app.oneshot(stale).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    // RFC 9110 §15.4.5: a `304` carries the `ETag` it was matched on, or the
+    // client cannot refresh its cache entry. `Vary` for the same reason it is
+    // on the `200` (§6.3) — the answer depended on `Accept`.
+    #[tokio::test]
+    async fn a_304_still_carries_its_validator_and_vary() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let tag = f.app.clone().oneshot(get).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+
+        let cond = f.owner_request("GET", "/foo")
+            .header(header::IF_NONE_MATCH, &tag).body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(cond).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(res.headers().get(header::ETAG).unwrap(), tag.as_str());
+        assert_eq!(res.headers().get(header::VARY).unwrap(), "Accept");
+    }
+
+    // §6.3: `Vary: Accept` on every negotiated response. The container and
+    // auxiliary path negotiates as much as the resource path does.
+    #[tokio::test]
+    async fn a_container_read_varies_on_accept_including_its_304() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get(header::VARY).unwrap(), "Accept");
+        let tag = res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+
+        let cond = f.owner_request("GET", "/")
+            .header(header::IF_NONE_MATCH, &tag).body(Body::empty()).unwrap();
+        let res = f.app.oneshot(cond).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(res.headers().get(header::VARY).unwrap(), "Accept");
+        assert_eq!(res.headers().get(header::ETAG).unwrap(), tag.as_str());
+    }
+
+    // §4 on the ordinary resource path. Only the auxiliary path was pinned,
+    // so a read that skipped de-skolemization returned the server's internal
+    // IRI to the client for every resource that ever held a blank node.
+    #[tokio::test]
+    async fn a_resource_containing_a_blank_node_round_trips_as_a_blank_node() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/knows> [ <http://schema.org/name> \"Alice\" ] ."))
+            .unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/foo")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let out = body_string(f.app.oneshot(get).await.unwrap()).await;
+        // The constant, not a literal: only `dataset` may write or match the
+        // skolem sub-namespace (`docs/constraints.md`).
+        assert!(!out.contains(crate::dataset::RESERVED_PREFIX),
+            "the server's internal IRI must not reach a client: {out}");
+        assert!(out.contains("Alice"), "and the statement itself survived: {out}");
+    }
+
+    // §6.3, against a resource that is genuinely dataset-shaped: the client
+    // offered a format carrying everything, so the lossy one it listed first
+    // is the wrong answer. A shape hardcoded to `Graph` answers Turtle here.
+    #[tokio::test]
+    async fn a_dataset_shaped_resource_negotiates_away_from_a_lossy_format() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(
+                "<urn:example:g1> { <http://example.org/alice> <http://schema.org/name> \"Alice\" }"
+            )).unwrap()).await.unwrap();
+
+        for accept in ["text/turtle, application/trig", "text/turtle, application/ld+json"] {
+            let get = f.owner_request("GET", "/c/notes")
+                .header(header::ACCEPT, accept).body(Body::empty()).unwrap();
+            let res = f.app.clone().oneshot(get).await.unwrap();
+            assert_ne!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/turtle",
+                "{accept}: a format that carries the whole resource was offered");
+        }
+
+        // §6.3: `text/*` admits Turtle, and Turtle can serve the default
+        // graph — that is a `200` with `Link`s, never a `406`.
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "text/*").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/turtle");
     }
 }

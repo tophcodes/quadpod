@@ -216,22 +216,30 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
     // Nothing offered can serve the resource fully — the first pass only
     // accepts a format that can. §6.2: a graph format against a Shape::Dataset
     // resource still answers with what it can carry (the default graph, plus
-    // Link headers naming what it left out), so a second pass accepts any
-    // explicitly named, non-wildcard, non-rejected recognised format before
-    // giving up. Only a media type this server never recognises at all still
-    // falls through to the `None` below — the one remaining `406`.
+    // Link headers naming what it left out), so a second pass repeats the
+    // resolution with the `usable` filter dropped. Wildcards are resolved here
+    // too, and scoped by their type exactly as above: `text/*` admits only
+    // `text/turtle`, and skipping it would answer `406` to a client that named
+    // a range this server can serve. Only a media type this server never
+    // recognises at all falls through to the `None` below — the one remaining
+    // `406`.
+    let lax_fallback = || {
+        [ "text/turtle", "application/ld+json" ].iter()
+            .filter_map(|ct| Format::from_content_type(ct))
+            .find(|f| not_rejected(*f))
+    };
     for &(q, _, mt) in &ranked {
         if q == 0.0 {
             continue;
         }
-        let lower = mt.to_ascii_lowercase();
-        if lower.ends_with("/*") {
-            continue;
-        }
-        if let Some(f) = Format::from_content_type(&lower) {
-            if not_rejected(f) {
-                return Some(f);
-            }
+        let candidate = match mt.to_ascii_lowercase().as_str() {
+            "*/*" => stored.filter(|f| not_rejected(*f)).or_else(lax_fallback),
+            "text/*" => Format::from_content_type("text/turtle").filter(|f| not_rejected(*f)),
+            "application/*" => lax_fallback(),
+            other => Format::from_content_type(other).filter(|f| not_rejected(*f)),
+        };
+        if candidate.is_some() {
+            return candidate;
         }
     }
     None
@@ -497,5 +505,23 @@ mod tests {
         assert_eq!(negotiate("text/turtle;q=0", Shape::Dataset, None), None);
         // A genuinely unsupported type gets no such fallback.
         assert_eq!(negotiate("image/png", Shape::Dataset, None), None);
+    }
+
+    // §6.3: `text/*` admits `text/turtle`, and `406` is for when *nothing*
+    // acceptable is supported at all. A range that resolves to a format this
+    // server serves is not that case — even when the format can only carry
+    // part of the resource, which is precisely what §6.2 answers with the
+    // default graph. `*/*` and `application/*` reach a dataset-capable format
+    // in the first pass, so `text/*` is the range where the second pass is
+    // the only thing standing between the client and a wrong `406`.
+    #[test]
+    fn a_wildcard_range_still_serves_a_dataset_shaped_resource() {
+        let turtle = Format::from_content_type("text/turtle").unwrap();
+        assert_eq!(negotiate("text/*", Shape::Dataset, None), Some(turtle));
+        assert_eq!(negotiate("Text/*", Shape::Dataset, None), Some(turtle),
+            "media ranges are case-insensitive here too (RFC 9110 §8.3.1)");
+        // Still scoped by its type, and still refusable.
+        assert_eq!(negotiate("text/*, text/turtle;q=0", Shape::Dataset, None), None);
+        assert_eq!(negotiate("image/*", Shape::Dataset, None), None);
     }
 }

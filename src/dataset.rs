@@ -38,8 +38,13 @@ impl Dataset {
         &self.0
     }
 
-    /// The graph names this dataset carries, in no particular order. Drives
-    /// §6.2's `containsGraph` links and §6.3's "can this format serve it".
+    /// The **IRI-named** graphs this dataset carries, in no particular order.
+    /// Drives §6.2's `containsGraph` links, and only those: a `Link` header can
+    /// name a graph by IRI and by nothing else, so a graph whose name is a
+    /// blank node is deliberately absent from this list.
+    ///
+    /// It is therefore not the predicate for "is this a dataset" —
+    /// [`has_named_graphs`](Self::has_named_graphs) is.
     pub fn named_graphs(&self) -> Vec<NamedNode> {
         let mut seen: Vec<NamedNode> = Vec::new();
         for q in &self.0 {
@@ -52,8 +57,17 @@ impl Dataset {
         seen
     }
 
+    /// Whether any quad sits outside the default graph — a blank-node graph
+    /// name counts, which is why this reads the quads rather than asking
+    /// [`named_graphs`](Self::named_graphs), whose list is narrower on purpose.
+    ///
+    /// This is what §3.4 refuses on containers and auxiliaries and what §6.2
+    /// calls a dataset. Defining it as "`named_graphs` is non-empty" makes
+    /// `GRAPH _:g { … }` invisible to every one of those decisions, and that
+    /// shape — a blank node that is both graph name and term — is the deployed
+    /// Verifiable Credentials `proof` pattern §4 exists for.
     pub fn has_named_graphs(&self) -> bool {
-        !self.named_graphs().is_empty()
+        self.0.iter().any(|q| q.graph_name != oxigraph::model::GraphName::DefaultGraph)
     }
 
     /// §3.2.2: any `urn:quadpod:` IRI anywhere — subject, predicate, object or
@@ -236,6 +250,22 @@ mod tests {
         assert_eq!(ds.named_graphs().len(), 1, "two quads, one graph name");
         assert!(ds.has_named_graphs());
         assert_eq!(ds.default_graph_only().quads().len(), 1);
+    }
+
+    // A `Link` header can name a graph by IRI and by nothing else, so
+    // `named_graphs` lists only those — but a blank-named graph is still a
+    // graph, and every dataset decision (§3.4's refusal, §6.2's shape,
+    // §6.2.1's refusal) hangs off `has_named_graphs`. Defining the predicate
+    // as "the list is non-empty" makes `GRAPH _:g { … }` invisible to all
+    // three at once.
+    #[test]
+    fn a_blank_named_graph_is_a_dataset_even_though_it_cannot_be_linked() {
+        let ds = Dataset::new(vec![q(
+            "http://example.org/s", "inside", BlankNode::default().into())]);
+        assert!(ds.named_graphs().is_empty(), "no IRI to put in a Link header");
+        assert!(ds.has_named_graphs(), "and yet the quad is not in the default graph");
+        assert!(ds.default_graph_only().quads().is_empty(),
+            "so a graph format would serve nothing at all");
     }
 
     // §3.2.2. RFC 8141 makes the URN scheme and NID case-insensitive, so a

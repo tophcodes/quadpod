@@ -1385,9 +1385,52 @@ the check above.
 `with_aux_links` inserts its own `Link`, so it must use `append` rather than `insert` after
 this change — check it, or the `containsGraph` links are silently dropped.
 
-`legacy_graph_read` is not a new function: it is the existing `get_rdf`-based body, left in
-place for containers and auxiliaries. Move it into the `else` arm rather than extracting it,
-so no new public surface appears.
+`legacy_graph_read` is not a new function: it is the existing `get_rdf`-based body, kept for
+containers and auxiliaries. Move it into the `else` arm rather than extracting it, so no new
+public surface appears.
+
+**It must de-skolemize before serializing.** Containers and auxiliaries take raw client bodies,
+so `put_rdf` and `aux::put` skolemize on the way in — an ACL may legitimately contain `[]`.
+Without the matching step on the way out, `GET /.aux/notes.acl` returns
+`<urn:quadpod:bnode:…>` where the client wrote a blank node. The design spec §4 states this
+directly: de-skolemization belongs where the shared path serializes, not inside a
+resource-shaped branch.
+
+Concretely: wrap the triples from `get_rdf` as default-graph quads, put them through
+`Skolemized::ground(…)` (they come from the store, so they are ground by construction),
+`deskolemize()`, and serialize with `Format::serialize`. This also retires
+`rdf::serialize` for these callers ahead of Task 11.
+
+- [ ] **Step 4b: Pin the auxiliary round trip**
+
+```rust
+    // Containers and auxiliaries are skolemized on the way in like everything
+    // else; without the matching step out, a client's blank node comes back as
+    // an IRI it never wrote.
+    #[tokio::test]
+    async fn an_acl_containing_a_blank_node_round_trips_as_a_blank_node() {
+        let f = fixture().await;
+        let acl = "@prefix acl: <http://www.w3.org/ns/auth/acl#> .\n\
+                   [] a acl:Authorization ; acl:mode acl:Read ; \
+                      acl:agentClass <http://xmlns.com/foaf/0.1/Agent> ; \
+                      acl:accessTo </c/notes> .";
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
+        let put = f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        let get = f.owner_request("GET", "/.aux/c/notes.acl")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let out = body_string(f.app.oneshot(get).await.unwrap()).await;
+        assert!(!out.contains("urn:quadpod:bnode"),
+            "the server's internal IRI must not reach a client: {out}");
+        assert!(out.contains("acl:Authorization") || out.contains("auth/acl#Authorization"),
+            "and the rule itself survived: {out}");
+    }
+```
 
 - [ ] **Step 5: Run the full suite**
 
@@ -1533,7 +1576,25 @@ check guarantees that), and to `Skolemized::etag`. `tests/route_coverage.rs` cal
 Expected: the compiler lists every call site. If one cannot move, that is a finding — report
 it rather than keeping the old function alive for it.
 
-- [ ] **Step 2: Remove the skeleton markers**
+- [ ] **Step 2: Remove the skeleton markers and the process artefacts in comments**
+
+Two sweeps, both mechanical.
+
+`rg -n '#\[allow' src` — every hit should now be a filled body. Delete the attribute and its
+comment. Re-run `nix develop -c cargo clippy --all-targets`; if a warning appears, fix the code
+rather than restoring the attribute.
+
+Then `rg -n 'skeleton|Task [0-9]|revision [0-9]|Plan [0-9]|the plan' src` — a doc comment states
+the contract in the present tense and never how the code came to be. Process artefacts (task
+numbers, plan filenames, revision numbers, "what the review found") are the journal-comment
+antipattern: they rot on the next edit and mean nothing to a reader who never saw the change.
+Reword them into present facts, or delete them where the fact is already obvious. A pointer to
+a durable document — a spec section, an issue number — stays.
+
+Known hits at the time of writing: `src/rdf.rs` (the `negotiate` marker's comment),
+`src/dataset.rs` (module header, and three comments citing revisions). `src/config.rs:163` and
+`src/http.rs:332` predate this plan; reword them too if you are touching that region, otherwise
+leave them.
 
 Run: `rg -n '#\[allow' src` — every hit should now be a filled body. Delete the attribute and its `// skeleton:` comment. Re-run `nix develop -c cargo clippy --all-targets`; if a warning appears, fix the code rather than restoring the attribute.
 
