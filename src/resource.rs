@@ -63,13 +63,20 @@ pub(crate) fn serialize_for_insert(triples: &[Triple]) -> String {
 /// server-managed containment, and an auxiliary's rules would be invisible to
 /// WAC in a subgraph. Auxiliaries keep `aux::put`, whose `FILTER EXISTS` guard
 /// has no equivalent here.
+///
+/// Like [`delete_rdf`], this reads the registry (`registered_shelves`, below)
+/// before it writes. A concurrent write to the same resource landing in that
+/// window can leave orphaned or under-dropped shelves — the same
+/// read-then-write race, accepted for the same reason: single-user v1, and
+/// `DROP GRAPH` takes no variable, so the read cannot be folded into the
+/// update (design spec §5.1).
 pub async fn put_dataset(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
     dataset: &Skolemized,
     media_type: Format,
 ) -> Result<(), ResourceError> {
-    use oxigraph::model::GraphName;
+    use oxigraph::model::{GraphName, NamedNode};
     let iri = r.graph_iri();
     let sys = sys_graph_iri(r);
 
@@ -119,6 +126,13 @@ pub async fn put_dataset(
         media_type.media_type()
     );
     for (key, name, _) in &shelves {
+        // §3.6: `space::GraphName` is sealed so only server-minted types may
+        // normally reach an interpolation site; a client-supplied graph name
+        // is the one exception, and it has been safe so far only because
+        // oxigraph's own parsers reject anything that could break out of an
+        // IRIREF before it gets here — safe by accident, not by rule. Restore
+        // the property explicitly rather than inherit it by luck.
+        NamedNode::new(name).map_err(|_| ResourceError::InvalidIri)?;
         registry.push_str(&format!(
             "<{iri}> <{SYS_HAS_SUBGRAPH}> <{k}> . <{k}> <{SYS_GRAPH_NAME}> <{name}> . ",
             k = key.graph_iri()
@@ -671,5 +685,95 @@ mod tests {
 
         assert!(exists(&store, &r).await.unwrap(), "a graphless dataset write must still mark presence");
         assert!(get_dataset(&store, &r).await.unwrap().is_some());
+    }
+
+    // §3.6: the re-validation added to `put_dataset` sits between the parser
+    // and the interpolation site, so it must accept everything that already
+    // made it through the parser. This pins that: a graph name the parser
+    // let through still round-trips, so the added check has not narrowed
+    // what used to work.
+    #[tokio::test]
+    async fn a_graph_name_that_survived_the_parser_still_round_trips() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:valid-name").unwrap();
+        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            g.clone())]).unwrap();
+
+        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+
+        let back = get_dataset(&store, &r).await.unwrap().expect("present");
+        assert_eq!(back.quads().len(), 1);
+        assert!(back.quads().iter().any(|q| q.graph_name == g.clone().into()));
+    }
+
+    // No test before this one writes default-graph content to the same
+    // resource twice. `put_dataset`'s drop list includes `DROP SILENT GRAPH
+    // <iri>` alongside the shelf drops precisely so the default graph is
+    // replaced rather than accumulated — this exercises that specific drop.
+    #[tokio::test]
+    async fn a_second_default_graph_write_replaces_not_accumulates() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let first = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            oxigraph::model::GraphName::DefaultGraph)]).unwrap();
+        let second = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/bob").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Bob"),
+            oxigraph::model::GraphName::DefaultGraph)]).unwrap();
+
+        put_dataset(&store, &r, &first, ttl).await.unwrap();
+        put_dataset(&store, &r, &second, ttl).await.unwrap();
+
+        let back = get_dataset(&store, &r).await.unwrap().unwrap();
+        assert_eq!(back.quads().len(), 1, "second default-graph write should replace, not accumulate");
+        assert!(
+            matches!(&back.quads()[0].object, oxigraph::model::Term::Literal(l) if l.value() == "Bob"),
+            "read-back must be the second write's content, not the first's"
+        );
+    }
+
+    // §3.2.3's invariant: a shelf the registry lists must have a
+    // `sys:graphName`. This state should never occur — every writer of the
+    // registry writes both in the same update — but pins the fail-closed
+    // answer for when it somehow does: refusing beats serving content under
+    // a name `get_dataset` invented itself.
+    #[tokio::test]
+    async fn a_shelf_with_no_graph_name_makes_get_dataset_fail_closed() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            g.clone())]).unwrap();
+
+        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+
+        // Derived the same way the module itself derives it — never by
+        // writing the string `"urn:quadpod:sys:"` here.
+        let key = ShelfKey::of(&r, g.as_ref());
+        let sys = sys_graph_iri(&r);
+        store
+            .update(&format!(
+                "DELETE DATA {{ GRAPH <{sys}> {{ <{}> <{SYS_GRAPH_NAME}> <{}> }} }}",
+                key.graph_iri(),
+                g.as_str()
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(get_dataset(&store, &r).await, Err(ResourceError::InvalidIri)));
     }
 }
