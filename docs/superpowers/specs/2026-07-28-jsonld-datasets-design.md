@@ -1,15 +1,18 @@
 # Dataset-Valued Resources — Full JSON-LD Support — Design
 
 **Date:** 2026-07-28
-**Status:** Proposed (pre-implementation), revision 2
+**Status:** Proposed (pre-implementation), revision 3
 **Author:** Christopher Mühl (with Claude)
 **Parent spec:** [2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md)
 **Origin:** `docs/conformance-findings.md` — defect D3, deliberately deferred out of Plan 8
 Task 4 because it is a data-model decision, not a forgotten line.
-**Reviews:** `.superpowers/sdd/spec-review-dev.md` (implementability),
-`.superpowers/sdd/spec-review-domain.md` (Solid/RDF domain, adversarial). Revision 2 exists
-because those reviews falsified four load-bearing claims of revision 1; §4 is a different
-mechanism now, not a rewording. What changed and why is recorded in §12.
+**Reviews:** two rounds, each read by an implementability reviewer and an adversarial
+Solid/RDF domain reviewer — `.superpowers/sdd/spec-review-dev.md`, `spec-review-domain.md`,
+`spec-review-dev-r2.md`, `spec-review-domain-r2.md`. Revision 2 exists because round one
+falsified four load-bearing claims of revision 1 and §4 became a different mechanism; revision
+3 exists because round two found that mechanism contradicting §6.4, unreconciled with
+auxiliaries, and — in §6.2 — opening a data loss the design it replaced did not have. Every
+change is recorded in §12.
 
 ## 1. What is wrong today
 
@@ -174,7 +177,10 @@ resources land in two different shelves.
    request body — as subject, predicate, object or graph name — is rejected with `400`. This
    is a single check in one place, and it removes a family of questions rather than answering
    them one at a time (§4 needs it for de-skolemization; §3 would otherwise need to argue
-   that a graph named `urn:pod:subgraph:…` is harmless).
+   that a graph named `urn:pod:subgraph:…` is harmless). Its normative basis is RDF 1.1 §3.5
+   (§4). **The match is case-insensitive over the scheme and NID**: RFC 8141 makes both
+   case-insensitive, so `URN:POD:bnode:…` denotes the same namespace and a literal prefix
+   comparison would let it through.
 3. **Content and bookkeeping appear and disappear in the same update.** No subgraph without a
    registry entry, no registry entry without a subgraph.
 4. **An orphaned shelf is a correctness hazard, not litter.** Because the key is a pure
@@ -232,13 +238,30 @@ property the sealed trait guaranteed is restored explicitly rather than inherite
 
 Every blank node in a `PUT` body — in triples and as a graph name — is replaced on write by a
 server-minted IRI in the reserved namespace, `urn:pod:bnode:<uuid>`. Each occurrence of the
-same blank node within one document gets the same skolem IRI. Nothing else in the store is a
-blank node. On read, every `urn:pod:bnode:` IRI is turned back into a blank node, one fresh
-blank node per distinct skolem IRI, before serialization.
+same blank node within one document gets the same skolem IRI. On read, every `urn:pod:bnode:`
+IRI becomes a blank node again, one per distinct skolem IRI, **with a label derived from the
+skolem IRI rather than freshly generated** — §6.4 guarantees byte-identical responses for an
+unchanged resource, and a fresh label per read would break it in Turtle and JSON-LD (measured).
 
-RDF 1.1 §3.5 blesses skolemization explicitly. The returned dataset is isomorphic to the one
-written: same structure, same co-reference, labels not preserved — which they need not be,
-and are not today either.
+**No blank node ever reaches the store**, and that is enforced at `serialize_for_insert`, the
+one function every write path renders through — not in the two handlers this design happens to
+touch. Three other writers pass arbitrary triples (`container::ensure_container`,
+`add_containment`, `aux` provisioning), and the invariant holds for them today only because
+`provision_root_acl` happens to write `<#owner>` rather than `[] a acl:Authorization`. An
+invariant asserted globally and enforced locally is one refactor from being false.
+
+RDF 1.1 §3.5 blesses skolemization, and the exact wording is the normative basis for invariant
+3.2.2 rather than a convenience: replacing blank nodes with Skolem IRIs preserves meaning
+*"provided that the Skolem IRIs do not occur anywhere else"*. That is why a request body may
+not contain `urn:pod:` IRIs — not because tracking them would be more expensive.
+
+The `.well-known/genid/` form the same section suggests does **not** apply here: it is
+conditional on wanting the IRIs recognisable as skolem constants *outside* the system that
+minted them. These never leave the server, and a `.well-known/genid/` IRI under our own origin
+would be worse — dereferenceable-looking and answering `404`.
+
+The returned dataset is isomorphic to the one written: same structure, same co-reference,
+labels not preserved — which they need not be, and are not today either.
 
 What this buys, in the order the reviews falsified revision 1:
 
@@ -275,10 +298,19 @@ cross-write determinism; this does not. It is invisible from outside — within 
 state everything is stable, which is what `If-None-Match` needs — and it applies only to
 blank-node-named graphs. IRI-named graphs keep stable keys.
 
-**What it costs.** Invariant 3.2.2: a document may not contain `urn:pod:` IRIs. Without that,
-a client could write a real IRI in the skolem namespace and get a blank node back — a visible
-rewrite of their data. The check is one predicate over the parsed quads and it is cheaper than
-the alternative (recording per-resource which IRIs are skolems).
+**What it costs.** Invariant 3.2.2: a document may not contain `urn:pod:` IRIs. Without it a
+client could write a real IRI in the skolem namespace and get a blank node back — a visible
+rewrite of their data — and §3.5's meaning-preservation clause would not hold.
+
+**Auxiliaries are skolemized too, and keep their own write path.** An ACL document may contain
+blank nodes like any other; §3.4 refuses *named graphs* there, not blank nodes. What must not
+happen is auxiliaries being routed through §5's unconditional drop-and-insert: `aux::put`'s
+`FILTER EXISTS` guard is what stops a policy document being planted on a path that no longer
+exists, and it has no equivalent here. So skolemization and de-skolemization apply to
+auxiliaries; the registry, the shelves and §5 steps 4–6 do not. The read side needs the same
+care — `get_impl` shares one path across `Resource`, `Container` and `Aux` today, and
+de-skolemization belongs where that path serialises, not inside a resource-shaped branch, or
+`GET /.aux/foo.acl` returns `<urn:pod:bnode:…>` literally.
 
 **A note on `PATCH`.** The day N3 Patch arrives, skolemization needs a rule for what a patch
 means against a skolemized store. Not in scope here, but it is the place this decision will
@@ -353,17 +385,29 @@ on the trait as a documented obligation of any implementor.
    triple came from. For a resource with N named graphs that is 2+N in-process queries. No
    store-trait change is needed; blank-node identity across separate `CONSTRUCT`s was measured
    to survive, and after §4 there are no blank nodes in the store anyway.
-3. Compute the **ETag from the stored quads**, before de-skolemization, over graph names as
-   well as triples.
-4. De-skolemize, then serialize.
+3. **Negotiate**, which needs both the shape read in step 2 and the stored media type (§6.4).
+4. Compute the **ETag** over the stored quads — graph names included, before de-skolemization
+   — and over the selected format.
+5. De-skolemize, sort, serialize (§6.4).
 
-### 6.1 The ETag order is normative
+### 6.1 The order is normative, and it is the reason step 2 has no shortcut
 
-Step 3 before step 4, and the reason is not stylistic. If the ETag were computed after
-de-skolemization — the natural code order, since one would build "the dataset to serialize"
-once and use it for both body and header — every `GET` would mint fresh blank node labels,
-`etag()` renders terms via `Display`, and every response would carry a different validator.
-`If-None-Match` would never match and `304` would never fire.
+Three constraints have to hold at once, and only this order satisfies all three.
+
+**The whole dataset is read even when only part of it is served.** A `text/turtle` request
+against a resource with named graphs answers with the default graph alone (§6.2) — but the
+ETag covers the resource, not the response body, so the shelves are read regardless. There is
+no fast path that skips them.
+
+**Negotiation precedes the ETag**, because the selected format participates in it (§6.3);
+computing a validator before knowing what will be served would produce one that does not
+identify the representation it labels.
+
+**The ETag precedes de-skolemization.** Step 4 before step 5, and the reason is not stylistic:
+`etag()` renders terms via `Display`, so hashing after blank nodes reappear would tie the
+validator to labels rather than to content. This is safe now in a second way as well — §4
+derives read-side labels from the skolem IRI rather than generating them — but the order is
+what makes it robust to that changing.
 
 `rdf::etag(&[Triple])` must become dataset-aware: graph names participate in the hash, or two
 datasets differing only in which graph a statement sits in share a validator.
@@ -377,18 +421,51 @@ a `Link` header naming the formats that carry the whole thing.**
 200 OK
 Content-Type: text/turtle
 Vary: Accept
-Link: <https://pod.toph.so/c/x.json>; rel="alternate"; type="application/trig"
-Link: <https://pod.toph.so/c/x.json>; rel="alternate"; type="application/ld+json"
+Link: <urn:example:g1>; rel="https://pod.toph.so/ns#containsGraph"
+Link: <urn:example:g2>; rel="https://pod.toph.so/ns#containsGraph"
+Link: <https://pod.toph.so/c/notes>; rel="alternate"; type="application/trig"
+Link: <https://pod.toph.so/c/notes>; rel="alternate"; type="application/ld+json"
 ```
+
+(Paths in this document are opaque: `/c/notes` has no extension because the pod derives
+nothing from one. The media type comes from `Content-Type` on write, stored as `sys:mediaType`
+— never from a suffix. The single exception is the auxiliary space, where `/.aux/notes.acl`
+uses its suffix to name the *kind* of auxiliary.)
 
 This is what **RDF 1.1 Concepts §4.2** recommends — *"If an RDF dataset is returned and the
 consumer is expecting an RDF graph, the consumer is expected to use the RDF dataset's default
 graph"* — and it satisfies Solid Protocol §5.5's MUST to answer `text/turtle` and
 `application/ld+json` on an RDF source.
 
-The objection to it is that the loss is silent, and that is what the `Link` headers answer:
-the response says, in a standard machine-readable way, that other representations carry more.
-`Warning` is not used; RFC 9111 obsoleted it.
+The objection to it is that the loss is otherwise silent. The `containsGraph` links answer
+that directly: they name the graphs this representation does not contain, so a client learns
+what exists and can re-request in a format that carries it. The relation is minted here
+because none is registered for it; RFC 8288 permits extension relations, requiring only an
+absolute IRI.
+
+`rel="alternate"` is used for its ordinary meaning — another representation is available —
+and **not** as a signal that this one is lossy. It carries no such meaning: IANA registers it
+as "a substitute for this context", nothing deployed reads it as a completeness claim, and
+`type` is explicitly a hint. Revision 2 claimed otherwise; the `containsGraph` links are what
+actually carry the information. `Warning` is not used either; RFC 9111 obsoleted it.
+
+### 6.2.1 And a graph-format write is refused
+
+A `PUT` whose body is in a format that cannot carry a dataset, against a resource that
+currently has named graphs, is refused with **`409`** and a body naming those graphs.
+
+Without it §6.2 opens a data loss the `406` of revision 2 did not have: `GET` as Turtle, edit,
+`PUT` back, and every named graph is gone — `2xx`, no warning, and the client never saw them.
+The read-side links tell a client what exists; this is what stops the obvious next request
+from destroying it. The two belong together, and a `409` without §6.2's links would be a
+refusal a client cannot act on.
+
+The remedy is to send a dataset format, or to `DELETE` first if replacement really is intended.
+
+Considered and rejected: letting a graph-format `PUT` replace only the default graph and leave
+the named graphs standing. It makes the round trip lossless and mirrors the read exactly — but
+it breaks what `PUT` means. A client intending full replacement would silently retain content
+it cannot see. Of the two surprises, the silently-kept one is worse than the refused one.
 
 Revision 1 chose `406` here. The reversal is deliberate and the reasons are worth keeping,
 because they were not known when the first decision was made:
@@ -461,20 +538,46 @@ which is the case for a resource written as Turtle that later contains named gra
 datasets": a client that expresses no preference gets back what was put in, which is less
 surprising than a server-chosen default.
 
-The strategic reason is **LWS**. The W3C Linked Web Storage WG (chartered September 2024;
-Solid Protocol 0.11.0 is an input document, not the base text) drops the RDF-source concept
-from its core: containers are JSON-LD with a fixed vocabulary, Turtle is explicitly MAY, and a
-data resource is content plus a *stored* media type, with `Range` support and `ETag` as MUSTs.
-None of that requires byte fidelity — the phrase about returning "exactly the stored data" is
-prose around a non-normative example — but two of its requirements assume the server knows
-what a resource *is*, and one assumes the bytes of a representation are stable enough to take
-a range of.
+The stronger reason is **LWS**, and it is not strategic but immediate: a container listing
+there MUST carry a `mediaType` per member. A pod that does not record what a representation
+arrived as cannot produce that field at all.
 
-So: **serialization must be a deterministic function of stored state.** For a given resource
-version and format, two `GET`s produce byte-identical output. After §4 there are no blank
-nodes in the store, so this is nearly free; it is stated as a guaranteed property with a test
-rather than left as a plausible side effect. It is what makes `Range` implementable later
-without changing the storage model.
+The W3C Linked Web Storage WG (chartered September 2024; Solid Protocol 0.11.0 is the input
+document, with the Fedora API named separately as a point of comparison) drops the RDF-source
+concept from its core: containers are JSON-LD under a fixed vocabulary — with the payload
+required to be **identical** across `application/lws+json`, `application/ld+json` and
+`application/json`, which is the inverse of RDF content negotiation and means containers stop
+being RDF sources — Turtle is explicitly MAY, and a data resource is content plus a stored
+media type, with `Range` and `ETag` as MUSTs.
+
+**A triples-first pod can be LWS-conformant.** Byte fidelity is not required, and the reason
+is not that the "exactly the stored data" phrasing sits near a non-normative example — LWS
+elevates descriptive text over snippets, so that argument is attackable. The sound one is
+§2.3: conformance is defined as compliance with the MUSTs, and that sentence contains none.
+`Range` and `ETag` are both defined over the *selected representation*, so determinism is the
+entire constraint they place on a server that generates its representations.
+
+So: **serialization is a deterministic function of stored state.** Two `GET`s of the same
+resource version in the same format are byte-identical — and, because `etag()` is
+deliberately order-independent, **two states that share an ETag must serialize identically
+too**. That does not follow from repeatability: oxigraph's in-memory backend returns
+`CONSTRUCT` results in insertion order, so the same triples written in a different order
+serialize differently while carrying the same validator (measured). A client combining a
+cached validator with a `Range` request would splice mismatched bytes.
+
+The fix is to **sort before serializing**, exactly as `etag()` already sorts before hashing —
+one canonical order for both, so equal meaning yields equal bytes. Stated as a guaranteed
+property with a test rather than left as a plausible side effect.
+
+One LWS field this pod cannot produce honestly is `size`, which the container listing also
+asks for: the byte length of a representation the server generates is not a property of the
+resource. That is the sharpest argument for §11's two-path decision — for a non-RDF resource
+stored as bytes it is simply the length.
+
+Worth watching, because the question is live: LWS issue **#110** (whether a data resource is
+bytes or triples — no normative text settles it, and the editors publicly disagree), **#92**
+(contesting "the media type of a resource" as ill-defined), and **#62** (arguing to drop the
+`ETag` MUST that half of this section rests on).
 
 This pod stays triples-first for RDF — that is the property that distinguishes it, and it is
 what makes an index impossible to desynchronise, since there is no second copy. Byte fidelity
@@ -557,10 +660,17 @@ No migration is needed regardless: the pod is pre-1.0, the store is in-memory on
   default graph with both `rel="alternate"` links; `*/*` yields the stored media type;
   `Vary: Accept` present; `400` for container, auxiliary, and a `urn:pod:` IRI in the body; the
   two graph-naming cases from §9.
-- **Determinism** — two `GET`s of the same stored state in the same format are byte-identical
-  (§6.4). This is a property of oxigraph's serializers as much as of our code, so it is pinned
-  by a test rather than assumed; if it does not hold, `Range` support later would be built on
-  sand and we want to know now.
+- **Determinism** — two `GET`s of the same stored state in the same format are byte-identical,
+  **and two states that share an ETag serialize identically** (§6.4). The second is the one
+  that fails without sorting: write the same triples in two different orders, confirm the ETags
+  are equal, then confirm the bytes are. A test that only repeats a `GET` passes on the broken
+  version.
+- **Auxiliaries** — an ACL containing a blank node round-trips as a blank node, not as
+  `<urn:pod:bnode:…>`, and an auxiliary write still refuses a missing subject: `aux::put`'s
+  guard is not bypassed by the new write path (§4).
+- **The graph-format write refusal** — `PUT` Turtle onto a resource with named graphs is `409`
+  and changes nothing; the same content as TriG succeeds. Plus the `containsGraph` links on the
+  read that make the refusal actionable.
 - **Conformance** — `content-negotiation-named-graphs:16` passes, and the full run does not
   regress against the counts in `docs/conformance-findings.md`.
 
@@ -583,6 +693,15 @@ needs a direct assertion on the response instead.
   truth each, rather than one kind with two. Moving RDF onto documents would buy byte fidelity
   at the cost of the property that distinguishes this pod from a file-backed server with a
   search index beside it.
+
+  This is the **minority** pattern and worth knowing as such: CSS and NSS both run one uniform
+  byte path, and CSS's `SparqlDataAccessor` — the closest architectural twin — cannot store
+  binaries at all. **Fedora 6 is the precedent for exactly this split**: RDF is parsed to a
+  Jena model on ingest and re-serialized on `GET`, while binaries pass through a separate
+  persister untouched. Not two stores — one OCFL root with two persister classes above it,
+  which is the shape to copy. The LWS charter names the Fedora API as a point of comparison
+  (the Solid Protocol is its only input document), so it is a design the working group already
+  has in view.
 - **Per-subgraph URLs.** A `Link` header per inner named graph, pointing at a URL from which
   that graph alone can be fetched in a graph format — so a Turtle-only client reaches
   everything, not only the default graph. Trellis is the precedent (`<iri>?ext=acl`,
@@ -607,7 +726,9 @@ needs a direct assertion on the response instead.
 - **Replacing the presence marker with `CREATE GRAPH`.** Moot here, since the registry records
   more than existence anyway.
 
-## 12. What changed in revision 2, and why
+## 12. What changed, and why
+
+### Revision 2
 
 | § | Revision 1 said | Why it was wrong |
 |---|---|---|
@@ -620,6 +741,22 @@ needs a direct assertion on the response instead.
 | 6.1 | A table keyed on one media type | `Accept` is a list with q-values; the table `406`s requests that offered a workable format. |
 | 6.2 | `406` for `text/turtle` on a dataset-valued resource | Reversed to default-graph-plus-`Link`. RDF 1.1 Concepts §4.2 recommends it, the LDP WG converged on it, the conformance suite records it, and it satisfies Solid §5.5 instead of knowingly breaking it. The silent-loss objection is answered by the `rel="alternate"` headers, not by refusing to answer. |
 | 6.4 | (absent) | The incoming media type is now stored, and serialization is a guaranteed deterministic function of stored state — both cheap here, and both prerequisites for LWS's `Range`/stored-media-type requirements later. |
+
+### Revision 3
+
+| § | Revision 2 said | Why it changed |
+|---|---|---|
+| 4 | De-skolemize to "one **fresh** blank node" per skolem IRI | Fresh labels break §6.4's byte-identical guarantee in Turtle and JSON-LD (measured). The label is derived from the skolem IRI instead. One word, and it was a contradiction between two sections of the same revision. |
+| 4 | "Nothing else in the store is a blank node" | Asserted globally, enforced in two handlers; three other writers take arbitrary triples and the invariant held only because `provision_root_acl` happens to write `<#owner>` rather than `[] a acl:Authorization`. Now enforced at `serialize_for_insert`. |
+| 4, 5, 6 | (silent on auxiliaries) | A literal reading routed ACL writes through §5's unconditional drop-and-insert, losing `aux::put`'s existence guard, and left de-skolemization out of the auxiliary read path — `GET /.aux/notes.acl` would have shown `<urn:pod:bnode:…>`. |
+| 4 | §3.2.2 justified as "cheaper than tracking skolems" | RDF 1.1 §3.5 preserves meaning only *"provided that the Skolem IRIs do not occur anywhere else"* — a normative basis, not an optimisation. The `.well-known/genid/` form does not apply, being conditional on external recognisability. |
+| 3.2.2 | A prefix check on `urn:pod:` | RFC 8141 makes scheme and NID case-insensitive; `URN:POD:` would have slipped a literal comparison. |
+| 6.2 | `rel="alternate"` signals that the response is lossy | It signals no such thing — IANA registers it as "a substitute for this context" and nothing reads it as a completeness claim. The graphs are now named explicitly by a minted `containsGraph` relation. |
+| 6.2 | (silent on writing back) | `GET` Turtle → edit → `PUT` Turtle destroyed every named graph with a `2xx`. The `406` of revision 2 did not have this failure; §6.2.1 closes it with a `409`, which the `containsGraph` links make actionable. |
+| 6.4 | "Deterministic" meaning repeatable | Repeatable was already true. Two states with the same order-independent ETag serialized differently, because oxigraph returns `CONSTRUCT` results in insertion order — so sorting before serializing is required, not incidental. |
+| 6.4 | Byte fidelity not required because the phrasing sits near a non-normative example | LWS elevates descriptive text over snippets, so that argument is weak. The sound one is §2.3: conformance is MUST-compliance and the sentence has no MUST. |
+| 6.4 | `sys:mediaType` justified by `*/*` resolution | LWS requires a `mediaType` per member in container listings — a MUST a pod that does not record it cannot satisfy at all. |
+| 11 | Fedora as a charter-named input document | The charter names the Solid Protocol as its input document and the Fedora API separately as a point of comparison. Fedora remains the precedent for the two-path split, but with one OCFL root and two persisters, not two stores. |
 | 8 | Conditional requests unchanged; storage unchanged without named graphs | Both false: the ETag becomes dataset- and format-aware, and skolemization touches every blank-node-bearing resource. |
 | 2 | Trellis stores one graph per resource; #559 shows the derivation breaking | Four graph kinds, one of them server-wide; `?ext=` is client-visible; #559 was a misconfiguration closed the next day. #592 is the relevant issue. |
 | 2 | `#804` mandates the opposite | It mandates flattening of the *query view* only and explicitly leaves stored representations untouched. Compatible. |
