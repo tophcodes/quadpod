@@ -157,10 +157,43 @@ impl Format {
 /// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
 /// it. `None` means nothing acceptable is supported at all, which is the only
 /// remaining `406`.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables, dead_code)]
 pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
-    todo!("skeleton")
+    let usable = |f: Format| shape == Shape::Graph || f.carries_dataset();
+    let fallback = || {
+        [ "application/ld+json", "text/turtle" ].iter()
+            .filter_map(|ct| Format::from_content_type(ct))
+            .find(|f| usable(*f))
+    };
+    let accept = accept.trim();
+    if accept.is_empty() {
+        return stored.filter(|f| usable(*f)).or_else(fallback);
+    }
+
+    // (quality, order) — highest quality wins, earlier entry breaks a tie.
+    let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
+    for (i, part) in accept.split(',').enumerate() {
+        let mut bits = part.split(';');
+        let mt = bits.next().unwrap_or("").trim();
+        let q = bits
+            .filter_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
+            .next()
+            .unwrap_or(1.0);
+        ranked.push((q, i, mt));
+    }
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+
+    for (_, _, mt) in ranked {
+        let candidate = match mt {
+            "*/*" => stored.filter(|f| usable(*f)).or_else(fallback),
+            "text/*" => Format::from_content_type("text/turtle").filter(|f| usable(*f)),
+            "application/*" => fallback(),
+            other => Format::from_content_type(other).filter(|f| usable(*f)),
+        };
+        if candidate.is_some() {
+            return candidate;
+        }
+    }
+    None
 }
 
 pub fn parse(bytes: &[u8], fmt: RdfFormat, base_iri: &str) -> Result<Vec<Triple>, RdfError> {
@@ -354,5 +387,33 @@ mod tests {
                 "{ct}: same quads in a different order must serialize identically"
             );
         }
+    }
+
+    #[test]
+    fn negotiation_prefers_a_format_that_can_carry_the_resource() {
+        let jsonld = Format::from_content_type("application/ld+json").unwrap();
+        let turtle = Format::from_content_type("text/turtle").unwrap();
+
+        // The case the old first-match resolver gets wrong: Turtle is listed
+        // first, but the client also offered a format that carries everything.
+        assert_eq!(
+            negotiate("text/turtle, application/ld+json", Shape::Dataset, None),
+            Some(jsonld));
+        // On a graph-shaped resource the same header takes the first match.
+        assert_eq!(
+            negotiate("text/turtle, application/ld+json", Shape::Graph, None),
+            Some(turtle));
+        // q-values outrank order.
+        assert_eq!(
+            negotiate("application/ld+json;q=0.2, text/turtle;q=0.9", Shape::Graph, None),
+            Some(turtle));
+        // `*/*` resolves to what the resource arrived as (§6.4).
+        assert_eq!(negotiate("*/*", Shape::Graph, Some(turtle)), Some(turtle));
+        assert_eq!(negotiate("*/*", Shape::Dataset, Some(turtle)), Some(jsonld),
+            "stored format cannot serve it, so fall to one that can");
+        // text/* is scoped by its type.
+        assert_eq!(negotiate("text/*", Shape::Graph, None), Some(turtle));
+        // Nothing supported at all is the only remaining 406.
+        assert_eq!(negotiate("image/png", Shape::Graph, None), None);
     }
 }

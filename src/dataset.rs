@@ -13,6 +13,7 @@
 
 use crate::rdf::Format;
 use oxigraph::model::{NamedNode, Quad};
+use sha2::{Digest, Sha256};
 
 /// The reserved namespace. Every server-minted IRI lives under it, and §3.2.2
 /// refuses it in request bodies — RDF 1.1 §3.5 preserves meaning only
@@ -196,10 +197,17 @@ impl Skolemized {
     /// this value: hashing something else, or hashing after the blank nodes
     /// come back, is the mistake — and both are harder to write by accident
     /// when the hash belongs to the stored form.
-    // skeleton: the attribute goes when the body lands
-    #[allow(unused_variables)]
     pub fn etag(&self, fmt: Format) -> String {
-        todo!("skeleton")
+        let mut lines: Vec<String> = self.0.iter().map(|q| q.to_string()).collect();
+        lines.sort();
+        let mut h = Sha256::new();
+        h.update(fmt.media_type().as_bytes());
+        h.update(b"\n");
+        for l in &lines {
+            h.update(l.as_bytes());
+            h.update(b"\n");
+        }
+        format!("\"{}\"", hex::encode(h.finalize()))
     }
 }
 
@@ -378,5 +386,22 @@ mod tests {
             .collect();
         assert_eq!(blank_nodes.len(), 2, "deskolemization should restore both blank nodes");
         assert_ne!(blank_nodes[0], blank_nodes[1], "the two blank nodes should remain distinct");
+    }
+
+    #[test]
+    fn the_etag_covers_graph_names_and_the_selected_format() {
+        let jsonld = Format::from_content_type("application/ld+json").unwrap();
+        let trig = Format::from_content_type("application/trig").unwrap();
+        let g1 = NamedNode::new("http://example.org/g1").unwrap();
+        let g2 = NamedNode::new("http://example.org/g2").unwrap();
+
+        let in_g1 = Skolemized::ground(vec![q("http://example.org/s", "x", g1.into())]).unwrap();
+        let in_g2 = Skolemized::ground(vec![q("http://example.org/s", "x", g2.into())]).unwrap();
+
+        assert_ne!(in_g1.etag(jsonld), in_g2.etag(jsonld),
+            "same triple, different graph — a shared validator would serve the wrong one");
+        assert_ne!(in_g1.etag(jsonld), in_g1.etag(trig),
+            "different representations are different entities (RFC 9110 §8.8.1)");
+        assert_eq!(in_g1.etag(jsonld), in_g1.etag(jsonld), "stable between reads");
     }
 }
