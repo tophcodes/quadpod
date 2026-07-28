@@ -40,7 +40,15 @@ impl Dataset {
     /// The graph names this dataset carries, in no particular order. Drives
     /// §6.2's `containsGraph` links and §6.3's "can this format serve it".
     pub fn named_graphs(&self) -> Vec<NamedNode> {
-        todo!("skeleton")
+        let mut seen: Vec<NamedNode> = Vec::new();
+        for q in &self.0 {
+            if let oxigraph::model::GraphName::NamedNode(n) = &q.graph_name {
+                if !seen.contains(n) {
+                    seen.push(n.clone());
+                }
+            }
+        }
+        seen
     }
 
     pub fn has_named_graphs(&self) -> bool {
@@ -52,12 +60,37 @@ impl Dataset {
     /// RFC 8141 makes both case-insensitive and `URN:QUADPOD:` denotes the same
     /// namespace.
     pub fn uses_reserved_namespace(&self) -> bool {
-        todo!("skeleton")
+        fn reserved(iri: &str) -> bool {
+            // `urn:quadpod:` — scheme and NID are case-insensitive (RFC 8141), the
+            // rest of the NSS is not, and only the prefix is ours.
+            iri.len() > RESERVED_PREFIX.len()
+                && iri[..RESERVED_PREFIX.len()].eq_ignore_ascii_case(RESERVED_PREFIX)
+        }
+        self.0.iter().any(|q| {
+            let subject = match &q.subject {
+                oxigraph::model::NamedOrBlankNode::NamedNode(n) => reserved(n.as_str()),
+                _ => false,
+            };
+            let object = match &q.object {
+                oxigraph::model::Term::NamedNode(n) => reserved(n.as_str()),
+                _ => false,
+            };
+            let graph = match &q.graph_name {
+                oxigraph::model::GraphName::NamedNode(n) => reserved(n.as_str()),
+                _ => false,
+            };
+            subject || object || graph || reserved(q.predicate.as_str())
+        })
     }
 
     /// The default graph alone, for the graph-format answer of §6.2.
     pub fn default_graph_only(&self) -> Dataset {
-        todo!("skeleton")
+        Dataset::new(
+            self.0.iter()
+                .filter(|q| q.graph_name == oxigraph::model::GraphName::DefaultGraph)
+                .cloned()
+                .collect(),
+        )
     }
 }
 
@@ -104,5 +137,61 @@ impl Skolemized {
     #[allow(unused_variables)]
     pub fn etag(&self, fmt: Format) -> String {
         todo!("skeleton")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxigraph::model::{Literal, NamedNode, Quad};
+
+    fn q(s: &str, o: &str, g: oxigraph::model::GraphName) -> Quad {
+        Quad::new(
+            NamedNode::new(s).unwrap(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            Literal::new_simple_literal(o),
+            g,
+        )
+    }
+
+    #[test]
+    fn named_graphs_are_listed_once_and_the_default_graph_is_not_one() {
+        let g1 = NamedNode::new("http://example.org/g1").unwrap();
+        let ds = Dataset::new(vec![
+            q("http://example.org/a", "A", g1.clone().into()),
+            q("http://example.org/b", "B", g1.into()),
+            q("http://example.org/c", "C", oxigraph::model::GraphName::DefaultGraph),
+        ]);
+        assert_eq!(ds.named_graphs().len(), 1, "two quads, one graph name");
+        assert!(ds.has_named_graphs());
+        assert_eq!(ds.default_graph_only().quads().len(), 1);
+    }
+
+    // §3.2.2. RFC 8141 makes the URN scheme and NID case-insensitive, so a
+    // literal prefix comparison lets `URN:QUADPOD:` through — and a document that
+    // gets through here comes back with its IRI rewritten into a blank node.
+    #[test]
+    fn the_reserved_namespace_is_refused_in_any_position_and_any_case() {
+        let reserved = "urn:quadpod:bnode:1234";
+        let subject = Dataset::new(vec![q(reserved, "x", oxigraph::model::GraphName::DefaultGraph)]);
+        assert!(subject.uses_reserved_namespace(), "as a subject");
+
+        let object = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://example.org/a").unwrap(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            NamedNode::new(reserved).unwrap(),
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert!(object.uses_reserved_namespace(), "as an object");
+
+        let graph = Dataset::new(vec![q(
+            "http://example.org/a", "x",
+            NamedNode::new("URN:QUADPOD:subgraph:dead").unwrap().into())]);
+        assert!(graph.uses_reserved_namespace(), "as a graph name, upper-case");
+
+        let clean = Dataset::new(vec![q(
+            "http://example.org/a", "x",
+            NamedNode::new("urn:podcast:1").unwrap().into())]);
+        assert!(!clean.uses_reserved_namespace(), "a longer NID is a different namespace");
     }
 }
