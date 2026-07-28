@@ -86,27 +86,37 @@ pub enum Shape {
 impl Format {
     /// The formats this pod accepts on write, from a `Content-Type`.
     /// Media-type tokens are case-insensitive per RFC 9110 §8.3.1.
-    // skeleton: the attribute goes when the body lands
-    #[allow(unused_variables, dead_code)]
     pub fn from_content_type(ct: &str) -> Option<Self> {
-        todo!("skeleton")
+        match media_type(ct).to_ascii_lowercase().as_str() {
+            "text/turtle" => Some(Self(RdfFormat::Turtle)),
+            "application/n-triples" => Some(Self(RdfFormat::NTriples)),
+            "application/ld+json" => Some(Self(RdfFormat::JsonLd {
+                profile: oxigraph::io::JsonLdProfileSet::empty(),
+            })),
+            "application/trig" => Some(Self(RdfFormat::TriG)),
+            "application/n-quads" => Some(Self(RdfFormat::NQuads)),
+            _ => None,
+        }
     }
 
     /// What goes in the `Content-Type` of a response.
-    // skeleton: the attribute goes when the body lands
-    #[allow(dead_code)]
     pub fn media_type(&self) -> &'static str {
-        todo!("skeleton")
+        match self.0 {
+            RdfFormat::Turtle => "text/turtle",
+            RdfFormat::NTriples => "application/n-triples",
+            RdfFormat::JsonLd { .. } => "application/ld+json",
+            RdfFormat::TriG => "application/trig",
+            RdfFormat::NQuads => "application/n-quads",
+            _ => unreachable!("Format is only constructed from the five arms above"),
+        }
     }
 
     /// §6.3: whether named graphs survive this format. `text/turtle` and
     /// `application/n-triples` cannot carry them — oxigraph refuses such a
     /// write outright rather than dropping the graph name, so this is the
     /// difference between a designed answer and a runtime error.
-    // skeleton: the attribute goes when the body lands
-    #[allow(dead_code)]
     pub fn carries_dataset(&self) -> bool {
-        todo!("skeleton")
+        self.0.supports_datasets()
     }
 
     // skeleton: the attribute goes when the body lands
@@ -254,5 +264,28 @@ mod tests {
         assert_eq!(via_json.len(), 1);
         assert_eq!(via_json[0].predicate.as_str(), "http://schema.org/name");
         assert!(String::from_utf8_lossy(&jsonld).contains("schema.org/name"));
+    }
+
+    #[test]
+    fn format_knows_which_media_types_carry_a_dataset() {
+        let turtle = Format::from_content_type("text/turtle").unwrap();
+        let jsonld = Format::from_content_type("application/ld+json").unwrap();
+        let trig = Format::from_content_type("application/trig").unwrap();
+        let nquads = Format::from_content_type("application/n-quads").unwrap();
+        let ntriples = Format::from_content_type("application/n-triples").unwrap();
+
+        assert!(!turtle.carries_dataset(), "Turtle has no syntax for named graphs");
+        assert!(!ntriples.carries_dataset());
+        assert!(jsonld.carries_dataset());
+        assert!(trig.carries_dataset());
+        assert!(nquads.carries_dataset());
+
+        // The media type comes back out for the Content-Type header.
+        assert_eq!(turtle.media_type(), "text/turtle");
+        assert_eq!(trig.media_type(), "application/trig");
+
+        // Parameters and case are per RFC 9110 §8.3.1.
+        assert_eq!(Format::from_content_type("TEXT/TURTLE; charset=utf-8"), Some(turtle));
+        assert_eq!(Format::from_content_type("application/json"), None);
     }
 }
