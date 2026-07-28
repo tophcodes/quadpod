@@ -1,3 +1,4 @@
+use crate::dataset::{Dataset, Skolemized};
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::Triple;
 use sha2::{Digest, Sha256};
@@ -61,6 +62,60 @@ pub fn format_for_accept(accept: &str) -> Option<RdfFormat> {
     } else {
         Some(turtle())
     }
+}
+
+/// Whether a format can carry named graphs (§6.3). `text/turtle` and
+/// `application/n-triples` cannot; oxigraph refuses such a write outright
+/// rather than dropping the graph name, so this predicate is the difference
+/// between a designed answer and a runtime error.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub fn carries_dataset(fmt: RdfFormat) -> bool {
+    todo!("skeleton")
+}
+
+/// §6.3: select the highest-ranked acceptable media range the server can
+/// serve, over the whole `Accept` list with q-values — not the first
+/// recognised entry, which is what `format_for_accept` does today and which
+/// answers `text/turtle, application/ld+json` with the lossy one.
+///
+/// `stored` is the media type the representation arrived in (§6.4); `*/*`
+/// resolves to it. `None` means nothing acceptable is supported at all, which
+/// is the only remaining `406`.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub fn negotiate(
+    accept: &str,
+    has_named_graphs: bool,
+    stored: Option<&str>,
+) -> Option<RdfFormat> {
+    todo!("skeleton")
+}
+
+/// §4/§6.1: the validator, over the stored quads *before* de-skolemization and
+/// over the selected format. Graph names participate, or two datasets
+/// differing only in which graph a statement sits in share a validator.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub fn etag_dataset(stored: &Skolemized, fmt: RdfFormat) -> String {
+    todo!("skeleton")
+}
+
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub fn parse_dataset(bytes: &[u8], fmt: RdfFormat, base_iri: &str) -> Result<Dataset, RdfError> {
+    todo!("skeleton")
+}
+
+/// §6.4: a deterministic function of its input. Quads are sorted before
+/// serialization, exactly as [`etag`] sorts before hashing — one canonical
+/// order for both, so two states that share a validator serialize identically.
+/// Repeatability alone is not enough: oxigraph returns `CONSTRUCT` results in
+/// insertion order.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub fn serialize_dataset(dataset: &Dataset, fmt: RdfFormat) -> Result<Vec<u8>, RdfError> {
+    todo!("skeleton")
 }
 
 pub fn parse(bytes: &[u8], fmt: RdfFormat, base_iri: &str) -> Result<Vec<Triple>, RdfError> {

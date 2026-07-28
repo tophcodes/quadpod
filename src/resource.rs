@@ -7,8 +7,10 @@
 //! denying). A presence marker in `urn:pod:sys:<iri>` removes the ambiguity.
 
 use crate::{
+    dataset::Skolemized,
     rdf::RdfError,
-    space::{DirectlyDeletable, DirectlyWritable, GraphName, SpaceError},
+    shelf::ShelfKey,
+    space::{DirectlyDeletable, DirectlyWritable, GraphName, ResourceUrl, SpaceError},
     store::{SparqlStore, StoreError},
 };
 use oxigraph::model::Triple;
@@ -51,6 +53,72 @@ pub(crate) fn serialize_for_insert(triples: &[Triple]) -> String {
         body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
     }
     body
+}
+
+/// §5: replace a resource's whole dataset, and record what it arrived as.
+///
+/// Takes [`Skolemized`] because the store may never see a blank node, and
+/// takes a [`ResourceUrl`] rather than `impl DirectlyWritable` because §3.4
+/// keeps containers and auxiliaries off this path: a container's graph carries
+/// server-managed containment, and an auxiliary's rules would be invisible to
+/// WAC in a subgraph. Auxiliaries keep `aux::put`, whose `FILTER EXISTS` guard
+/// has no equivalent here.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub async fn put_dataset(
+    store: &dyn SparqlStore,
+    r: &ResourceUrl,
+    dataset: &Skolemized,
+    media_type: &str,
+) -> Result<(), ResourceError> {
+    todo!("skeleton")
+}
+
+/// §6 step 2: the resource graph, the registry, and one `CONSTRUCT` per shelf.
+/// `query_triples` has no graph field, so a single query cannot recover which
+/// shelf a triple came from — 2+N in-process queries, and no fast path that
+/// skips the shelves, because the ETag covers the resource rather than the
+/// response body.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub async fn get_dataset(
+    store: &dyn SparqlStore,
+    r: &ResourceUrl,
+) -> Result<Option<Skolemized>, ResourceError> {
+    todo!("skeleton")
+}
+
+/// §7: resource graph, every registered shelf, and the system graph.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub async fn delete_dataset(
+    store: &dyn SparqlStore,
+    r: &ResourceUrl,
+) -> Result<bool, ResourceError> {
+    todo!("skeleton")
+}
+
+/// §6.4: what the representation arrived as, for `*/*` and for the
+/// `mediaType` LWS requires per container member.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub async fn stored_media_type(
+    store: &dyn SparqlStore,
+    r: &ResourceUrl,
+) -> Result<Option<String>, ResourceError> {
+    todo!("skeleton")
+}
+
+/// §5 step 5: the shelves the registry currently lists, read *before* the
+/// write update because `DROP GRAPH` takes a literal IRI and the
+/// variable-bound alternative empties a graph without removing it.
+// skeleton: the attribute goes when the body lands
+#[allow(unused_variables)]
+pub async fn registered_shelves(
+    store: &dyn SparqlStore,
+    r: &ResourceUrl,
+) -> Result<Vec<ShelfKey>, ResourceError> {
+    todo!("skeleton")
 }
 
 /// Replace a graph's contents and mark it present, in one update.
