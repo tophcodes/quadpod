@@ -404,4 +404,23 @@ mod tests {
             "different representations are different entities (RFC 9110 §8.8.1)");
         assert_eq!(in_g1.etag(jsonld), in_g1.etag(jsonld), "stable between reads");
     }
+
+    // Every other etag test uses a single-quad dataset, so it can't tell
+    // `lines.sort()` apart from no sort at all. This one builds the same two
+    // quads in two different orders — mirroring rdf.rs's
+    // `serialization_is_canonical_not_merely_repeatable` — so a missing sort
+    // fails it.
+    #[test]
+    fn the_etag_is_order_independent() {
+        let jsonld = Format::from_content_type("application/ld+json").unwrap();
+        let g = oxigraph::model::GraphName::DefaultGraph;
+        let q1 = q("http://example.org/a", "A", g.clone());
+        let q2 = q("http://example.org/b", "B", g);
+
+        let forward = Skolemized::ground(vec![q1.clone(), q2.clone()]).unwrap();
+        let backward = Skolemized::ground(vec![q2, q1]).unwrap();
+
+        assert_eq!(forward.etag(jsonld), backward.etag(jsonld),
+            "same quads in a different order must share a validator");
+    }
 }

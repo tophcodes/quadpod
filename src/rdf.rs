@@ -157,10 +157,13 @@ impl Format {
 /// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
 /// it. `None` means nothing acceptable is supported at all, which is the only
 /// remaining `406`.
+// `negotiate` has no caller outside its own tests until Task 9 wires it into
+// `http.rs`'s handlers — see the plan's File Structure table. Comes off then.
+#[allow(dead_code)]
 pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
     let usable = |f: Format| shape == Shape::Graph || f.carries_dataset();
     let fallback = || {
-        [ "application/ld+json", "text/turtle" ].iter()
+        [ "text/turtle", "application/ld+json" ].iter()
             .filter_map(|ct| Format::from_content_type(ct))
             .find(|f| usable(*f))
     };
@@ -415,5 +418,12 @@ mod tests {
         assert_eq!(negotiate("text/*", Shape::Graph, None), Some(turtle));
         // Nothing supported at all is the only remaining 406.
         assert_eq!(negotiate("image/png", Shape::Graph, None), None);
+        // `*/*` with nothing stored falls back to Turtle first (§6.4) — only
+        // when Turtle cannot carry the resource does JSON-LD win.
+        assert_eq!(negotiate("*/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(negotiate("*/*", Shape::Dataset, None), Some(jsonld));
+        // application/* must resolve to something that can serve the resource.
+        assert_eq!(negotiate("application/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(negotiate("application/*", Shape::Dataset, None), Some(jsonld));
     }
 }
