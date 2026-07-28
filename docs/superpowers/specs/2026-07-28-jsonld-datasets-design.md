@@ -141,6 +141,7 @@ naming scheme `urn:pod:sys:<resource-iri>`:
 
 ```
 <resource>              sys:present     true .
+<resource>              sys:mediaType   "application/ld+json" .   # §6.4
 <resource>              sys:hasSubgraph <urn:pod:subgraph:8f2a…> .
 <urn:pod:subgraph:8f2a…> sys:graphName  <urn:example:g1> .      # IRI-named
 <urn:pod:subgraph:1c07…> sys:graphSkolem <urn:pod:bnode:…> .    # was a blank node (§4)
@@ -308,7 +309,8 @@ today, so this is two call sites, not one.
    - `DROP SILENT GRAPH <k>` for every key from step 4 (invariant 3.2.4);
    - drop the resource graph and the system graph;
    - one `INSERT DATA` carrying the default-graph block and one `GRAPH` block per shelf;
-   - the registry and presence marker.
+   - the registry, the presence marker, and the media type the representation arrived in
+     (§6.4).
 
 ### 5.1 Why step 5 is a separate read
 
@@ -366,77 +368,118 @@ once and use it for both body and header — every `GET` would mint fresh blank 
 `rdf::etag(&[Triple])` must become dataset-aware: graph names participate in the hash, or two
 datasets differing only in which graph a statement sits in share a validator.
 
-### 6.2 Negotiation is a property, not a table
+### 6.2 A graph format answers with the default graph
 
-**The server selects the highest-ranked acceptable media range it can serve, and answers
-`406` only when no acceptable range can represent the resource.**
+**A format that cannot carry a dataset answers with the resource's default graph, `200`, and
+a `Link` header naming the formats that carry the whole thing.**
 
-That is a bigger change than revision 1's "negotiation moves after the read".
+```
+200 OK
+Content-Type: text/turtle
+Vary: Accept
+Link: <https://pod.toph.so/c/x.json>; rel="alternate"; type="application/trig"
+Link: <https://pod.toph.so/c/x.json>; rel="alternate"; type="application/ld+json"
+```
+
+This is what **RDF 1.1 Concepts §4.2** recommends — *"If an RDF dataset is returned and the
+consumer is expecting an RDF graph, the consumer is expected to use the RDF dataset's default
+graph"* — and it satisfies Solid Protocol §5.5's MUST to answer `text/turtle` and
+`application/ld+json` on an RDF source.
+
+The objection to it is that the loss is silent, and that is what the `Link` headers answer:
+the response says, in a standard machine-readable way, that other representations carry more.
+`Warning` is not used; RFC 9111 obsoleted it.
+
+Revision 1 chose `406` here. The reversal is deliberate and the reasons are worth keeping,
+because they were not known when the first decision was made:
+
+- §4.2 is the only published recommendation on the question, and it says default-graph.
+- The LDP WG ran the same argument and reversed itself: ISSUE-90 ("An LDPC/LDPR is a Named
+  Graph") was resolved in favour in December 2013, landed in the March 2014 LC draft, and was
+  removed six weeks later.
+- The Solid conformance suite records that expectation in a **disabled** scenario of the very
+  feature this design fixes:
+
+  ```gherkin
+    @ignore
+    Scenario: Alice can GET the JSON-LD with named graph as TTL
+      # The expected response is disputed - since TTL doesn't support Quads, the RDF spec suggests:
+      # "If an RDF dataset is returned and the consumer is expecting an RDF graph, the consumer is
+      #  expected to use the RDF dataset's default graph."
+  ```
+
+- A client that asks for Turtle cannot represent named graphs in the first place. Turtle has
+  no syntax for them, so the partial view is the most that format can carry — which is §4.2's
+  reasoning, not a concession.
+
+What is *not* done is merging every graph into the Turtle response. A statement in a named
+graph is not asserted in the default graph; merging would manufacture assertions the document
+never made. The default graph is a subset of what was written; a merge is not.
+
+For contrast, the alternative that ships: CSS's file backend answers `Accept: text/turtle`
+with `Content-Type: text/turtle` and a **TriG** body (measured, CSS 7.2.0; `CSS#1327`, open
+since 2022), which no strict Turtle parser accepts. Its SPARQL backend answers `501`.
+
+### 6.3 Negotiation is a property, not a table
+
+**The server selects the highest-ranked acceptable media range it can serve.**
+
 `format_for_accept` returns the first supported type in the list and ignores q-values
-entirely; it needs to become a capability-aware resolver over the whole `Accept` list, where
-"can this format carry a dataset" filters the candidate set instead of being checked on the
-winner. `Accept: text/turtle, application/ld+json` against a dataset-valued resource must
-return JSON-LD, not `406` — the client explicitly offered a format that works.
-
-Capabilities:
+entirely; it needs to become a resolver over the whole `Accept` list. `Accept: text/turtle,
+application/ld+json` must return JSON-LD when the resource has named graphs — the client
+offered a format that carries everything, and preferring the lossy one because it was listed
+first is a worse answer than either.
 
 | Format | Carries a dataset |
 |---|---|
 | `application/ld+json`, `application/trig`, `application/n-quads` | yes |
 | `text/turtle`, `application/n-triples` | no |
 
-Wildcards are scoped by their type: `*/*` admits every format, so a dataset-valued resource
-answers it with JSON-LD (and a graph-valued one with Turtle, as today); `text/*` admits only
-`text/turtle`, so it behaves like `text/turtle`. `application/*` admits the dataset formats.
+Wildcards are scoped by their type: `text/*` admits only `text/turtle`; `application/*` admits
+the dataset formats; `*/*` admits everything and resolves per §6.4.
+
+`406` remains reachable only when *nothing* acceptable is supported at all (`Accept:
+image/png`), which is today's behaviour and unchanged.
 
 `application/trig` and `application/n-quads` are new, for reading and writing. Without them
-JSON-LD would be the only lossless text form. Both are also unadvertised — the pod emits no
-`Accept-Put`/`Accept-Post` and has no `OPTIONS` route, so a client that gets a `406` has no
-way to learn that TriG would work. **That is a named follow-up (§11), not solved here**, and
-it is the reason the `406` body names the acceptable types and the response carries
-`Link: <…>; rel="alternate"; type="application/trig"`.
+JSON-LD would be the only lossless text form. Both are undiscoverable: the pod emits no
+`Accept-Put`/`Accept-Post` and has no `OPTIONS` route. **Named follow-up (§11)**, and the
+reason the `Link: rel="alternate"` headers of §6.2 matter more than they otherwise would.
 
 `Vary: Accept` is emitted on every negotiated response, and the selected format participates
 in the ETag. Today neither is true: one strong validator is shared by every representation,
-which RFC 9110 §8.8.1 forbids, and `*/*` now makes the selected format *state-dependent* —
-the same URL under identical request headers answers Turtle or JSON-LD depending on whether
-anyone has written a named graph into it since. That is precisely what `Vary` exists for.
+which RFC 9110 §8.8.1 forbids.
 
-### 6.3 Owning the Solid §5.5 violation
+### 6.4 The stored media type, and deterministic output
 
-Solid Protocol §5.5: *"the server MUST satisfy `GET` requests on this resource when the field
-value of the `Accept` header field requests a representation in `text/turtle` or
-`application/ld+json`."* A `406` does not satisfy it for `text/turtle`, and this design
-knowingly fails that MUST for dataset-valued resources.
+The media type a representation arrived in is recorded (§3, `sys:mediaType`) and preserved
+across reads. Two reasons, one immediate and one strategic:
 
-The position it is chosen against is not hypothetical. **RDF 1.1 Concepts §4.2**
-(non-normative) says: *"If an RDF dataset is returned and the consumer is expecting an RDF
-graph, the consumer is expected to use the RDF dataset's default graph."* The LDP WG ran the
-same argument and reversed itself — ISSUE-90 ("An LDPC/LDPR is a Named Graph") was resolved in
-favour in December 2013, landed in the March 2014 LC draft, and was removed six weeks later.
-And the Solid conformance suite records the expectation in a **disabled** scenario of the very
-feature this design fixes:
+`*/*` resolves to the stored media type, falling back to Turtle when it cannot be served —
+which is the case for a resource written as Turtle that later contains named graphs, where
+`*/*` yields JSON-LD instead. This replaces revision 1's "`*/*` yields Turtle, or JSON-LD for
+datasets": a client that expresses no preference gets back what was put in, which is less
+surprising than a server-chosen default.
 
-```gherkin
-  @ignore
-  Scenario: Alice can GET the JSON-LD with named graph as TTL
-    # The expected response is disputed - since TTL doesn't support Quads, the RDF spec suggests:
-    # "If an RDF dataset is returned and the consumer is expecting an RDF graph, the consumer is
-    #  expected to use the RDF dataset's default graph."
-```
+The strategic reason is **LWS**. The W3C Linked Web Storage WG (chartered September 2024;
+Solid Protocol 0.11.0 is an input document, not the base text) drops the RDF-source concept
+from its core: containers are JSON-LD with a fixed vocabulary, Turtle is explicitly MAY, and a
+data resource is content plus a *stored* media type, with `Range` support and `ETag` as MUSTs.
+None of that requires byte fidelity — the phrase about returning "exactly the stored data" is
+prose around a non-normative example — but two of its requirements assume the server knows
+what a resource *is*, and one assumes the bytes of a representation are stable enough to take
+a range of.
 
-`406` is chosen anyway, because a lossy `200` is indistinguishable from a correct one: a
-client asking for Turtle and receiving the default graph alone has no way to learn that
-anything was withheld. Merging all graphs into the response was rejected on semantics — a
-statement in a named graph is not asserted in the default graph, so merging manufactures
-assertions the document never made.
+So: **serialization must be a deterministic function of stored state.** For a given resource
+version and format, two `GET`s produce byte-identical output. After §4 there are no blank
+nodes in the store, so this is nearly free; it is stated as a guaranteed property with a test
+rather than left as a plausible side effect. It is what makes `Range` implementable later
+without changing the storage model.
 
-Two things worth being honest about: the conformance target is the JSON-LD scenario alone, so
-**passing `content-negotiation-named-graphs:16` does not require the `406`** — it is a free
-choice, which is a reason to make it deliberately, not a reason to make it. And the
-alternative that ships is worse: CSS's file backend answers `Accept: text/turtle` with
-`Content-Type: text/turtle` and a **TriG** body (measured, CSS 7.2.0; `CSS#1327`, open since
-2022), which no strict Turtle parser accepts. Its SPARQL backend answers `501` instead.
+This pod stays triples-first for RDF — that is the property that distinguishes it, and it is
+what makes an index impossible to desynchronise, since there is no second copy. Byte fidelity
+is the price, and it is not recoverable within this model. Non-RDF resources are a **separate
+storage path** (bytes, no parsing), not a reason to move RDF onto one; see §11.
 
 ## 7. Delete
 
@@ -484,6 +527,13 @@ No migration is needed regardless: the pod is pre-1.0, the store is in-memory on
    resource's shelf. This is the case §2.1 exists for, it is reachable with an eleven-character
    relative IRI, and it gets a test: writing that document must not change `GET /victim` by one
    triple.
+7. **A resource whose content lives entirely in named graphs answers Turtle with an empty
+   body** and `200` (§6.2). Consistent — the default graph really is empty — and it looks like
+   a bug at first sight. The alternative would be a special case, which is harder to justify
+   than the empty result.
+8. **The stored media type is recorded but does not yet drive anything but `*/*`** (§6.4).
+   Returning it for a request that named a different acceptable type would be a broader
+   behaviour change, with conformance consequences, and is not part of this design.
 
 ## 10. Testing
 
@@ -503,9 +553,14 @@ No migration is needed regardless: the pod is pre-1.0, the store is in-memory on
   resurrection case: delete a resource, recreate it with the same inner graph name, and the old
   triples must not reappear.
 - **HTTP** — JSON-LD with a named graph in and out; TriG and N-Quads both directions;
-  `Accept: text/turtle, application/ld+json` yields JSON-LD; `text/*` yields `406`; `*/*`
-  yields JSON-LD; `Vary: Accept` present; `400` for container, auxiliary, and a `urn:pod:` IRI
-  in the body; the two graph-naming cases from §9.
+  `Accept: text/turtle, application/ld+json` yields JSON-LD; `text/turtle` alone yields the
+  default graph with both `rel="alternate"` links; `*/*` yields the stored media type;
+  `Vary: Accept` present; `400` for container, auxiliary, and a `urn:pod:` IRI in the body; the
+  two graph-naming cases from §9.
+- **Determinism** — two `GET`s of the same stored state in the same format are byte-identical
+  (§6.4). This is a property of oxigraph's serializers as much as of our code, so it is pinned
+  by a test rather than assumed; if it does not hold, `Range` support later would be built on
+  sand and we want to know now.
 - **Conformance** — `content-negotiation-named-graphs:16` passes, and the full run does not
   regress against the counts in `docs/conformance-findings.md`.
 
@@ -521,7 +576,20 @@ needs a direct assertion on the response instead.
 
 ## 11. Follow-ups this design deliberately does not do
 
-- **Non-RDF resources (blobs).** 540 of the 615 conformance failures. Its own plan.
+- **Non-RDF resources (blobs) — a second storage path, not a replacement.** 540 of the 615
+  conformance failures, and its own plan. The decision that belongs there and not here: an RDF
+  resource stays triples-first (one truth, no index to desynchronise), a non-RDF resource is
+  stored as bytes (nothing to parse, byte fidelity for free). Two kinds of resource with one
+  truth each, rather than one kind with two. Moving RDF onto documents would buy byte fidelity
+  at the cost of the property that distinguishes this pod from a file-backed server with a
+  search index beside it.
+- **Per-subgraph URLs.** A `Link` header per inner named graph, pointing at a URL from which
+  that graph alone can be fetched in a graph format — so a Turtle-only client reaches
+  everything, not only the default graph. Trellis is the precedent (`<iri>?ext=acl`,
+  client-visible derived URLs). The condition that makes it safe: such a URL is a **view, not a
+  resource** — read-only, authorized exactly as its parent, never in containment, no
+  auxiliaries of its own. Belongs with the two items above and below, because all of them are
+  projections of the dataset outward and should be designed together.
 - **`OPTIONS`, `Accept-Put`, `Accept-Post`.** TriG and N-Quads are undiscoverable without
   them, and `solid/specification#610` makes discoverability the thing that makes optional quad
   support interoperable. Directly adjacent to §6.2 and worth doing next.
@@ -550,6 +618,8 @@ needs a direct assertion on the response instead.
 | 5 | "One SPARQL update" | Also needs to be one `INSERT DATA` *operation*, and needs a prior registry read, because `DROP GRAPH` cannot take a variable and `DELETE WHERE` leaves the graph entity behind. |
 | 5.1 | Atomicity must be measured | It was, twice, by both reviews. It holds for `OxigraphStore` and not for the trait. |
 | 6.1 | A table keyed on one media type | `Accept` is a list with q-values; the table `406`s requests that offered a workable format. |
+| 6.2 | `406` for `text/turtle` on a dataset-valued resource | Reversed to default-graph-plus-`Link`. RDF 1.1 Concepts §4.2 recommends it, the LDP WG converged on it, the conformance suite records it, and it satisfies Solid §5.5 instead of knowingly breaking it. The silent-loss objection is answered by the `rel="alternate"` headers, not by refusing to answer. |
+| 6.4 | (absent) | The incoming media type is now stored, and serialization is a guaranteed deterministic function of stored state — both cheap here, and both prerequisites for LWS's `Range`/stored-media-type requirements later. |
 | 8 | Conditional requests unchanged; storage unchanged without named graphs | Both false: the ETag becomes dataset- and format-aware, and skolemization touches every blank-node-bearing resource. |
 | 2 | Trellis stores one graph per resource; #559 shows the derivation breaking | Four graph kinds, one of them server-wide; `?ext=` is client-visible; #559 was a misconfiguration closed the next day. #592 is the relevant issue. |
 | 2 | `#804` mandates the opposite | It mandates flattening of the *query view* only and explicitly leaves stored representations untouched. Compatible. |
