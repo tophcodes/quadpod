@@ -584,4 +584,92 @@ mod tests {
         assert!(get_dataset(&store, &r).await.unwrap().is_none());
         assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
     }
+
+    // Every assertion above reads state back through the registry
+    // (`registered_shelves`, `get_dataset`, `exists`), so a shelf that got
+    // orphaned *outside* the registry is invisible to it. These three probe
+    // the store directly, bypassing the registry entirely.
+
+    // §3.2 invariant 4, probed directly. Unlike `a_replacing_write_leaves_no_shelf_behind`,
+    // graph A and graph B are different names, so the second `put_dataset`'s
+    // own drop loop (built from *this* write's shelves) cannot be the thing
+    // that empties A's shelf by re-dropping the same key it just wrote. Only
+    // the first loop — built from `registered_shelves`, i.e. what the
+    // registry said existed *before* this write — can drop A. So this test
+    // fails if that first loop is removed, where the existing same-name test
+    // does not.
+    #[tokio::test]
+    async fn a_replacing_write_with_a_different_graph_name_leaves_the_old_shelf_empty() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let a = oxigraph::model::NamedNode::new("urn:example:a").unwrap();
+        let b = oxigraph::model::NamedNode::new("urn:example:b").unwrap();
+
+        let with_a = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            a.clone())]).unwrap();
+        let with_b = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/bob").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Bob"),
+            b)]).unwrap();
+
+        put_dataset(&store, &r, &with_a, ttl).await.unwrap();
+        let key_a = ShelfKey::of(&r, a.as_ref());
+
+        put_dataset(&store, &r, &with_b, ttl).await.unwrap();
+
+        let leftover = store.query_triples(&format!(
+            "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", key_a.graph_iri()
+        )).await.unwrap();
+        assert!(leftover.is_empty(), "graph A's shelf must be emptied when a replacing write names graph B instead");
+    }
+
+    // Guards the read-before-drop ordering `delete_dataset` documents (§7):
+    // if the system graph were dropped before `registered_shelves` reads it,
+    // the shelf-drop list would come back empty and the shelf would survive —
+    // exactly the `aux::delete_subject` bug the module warns about. Probed
+    // directly because `registered_shelves`/`get_dataset` both read through
+    // the now-gone registry and would report "empty" either way.
+    #[tokio::test]
+    async fn delete_dataset_empties_the_shelf_probed_directly() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            g.clone())]).unwrap();
+
+        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+        let key = ShelfKey::of(&r, g.as_ref());
+
+        assert!(delete_dataset(&store, &r).await.unwrap(), "existed");
+
+        let leftover = store.query_triples(&format!(
+            "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", key.graph_iri()
+        )).await.unwrap();
+        assert!(leftover.is_empty(), "delete_dataset must drop the shelf graph itself, not just what the registry still lists");
+    }
+
+    // Module invariant at the top of this file: "existence is a stored fact,
+    // not an inference from triple count." A dataset with no named graphs
+    // writes no `sys:hasSubgraph` registry entries — nothing here should let
+    // that also skip the presence marker itself.
+    #[tokio::test]
+    async fn put_dataset_with_no_named_graphs_still_marks_presence() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+
+        put_dataset(&store, &r, &Skolemized::ground(vec![]).unwrap(), ttl).await.unwrap();
+
+        assert!(exists(&store, &r).await.unwrap(), "a graphless dataset write must still mark presence");
+        assert!(get_dataset(&store, &r).await.unwrap().is_some());
+    }
 }
