@@ -157,9 +157,6 @@ impl Format {
 /// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
 /// it. `None` means nothing acceptable is supported at all, which is the only
 /// remaining `406`.
-// `negotiate` has no caller outside its own tests until Task 9 wires it into
-// `http.rs`'s handlers — see the plan's File Structure table. Comes off then.
-#[allow(dead_code)]
 pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
     let usable = |f: Format| shape == Shape::Graph || f.carries_dataset();
     let fallback = || {
@@ -200,7 +197,7 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
             .find(|f| usable(*f) && not_rejected(*f))
     };
 
-    for (q, _, mt) in ranked {
+    for &(q, _, mt) in &ranked {
         if q == 0.0 {
             continue;
         }
@@ -214,6 +211,27 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
         };
         if candidate.is_some() {
             return candidate;
+        }
+    }
+    // Nothing offered can serve the resource fully — the first pass only
+    // accepts a format that can. §6.2: a graph format against a Shape::Dataset
+    // resource still answers with what it can carry (the default graph, plus
+    // Link headers naming what it left out), so a second pass accepts any
+    // explicitly named, non-wildcard, non-rejected recognised format before
+    // giving up. Only a media type this server never recognises at all still
+    // falls through to the `None` below — the one remaining `406`.
+    for &(q, _, mt) in &ranked {
+        if q == 0.0 {
+            continue;
+        }
+        let lower = mt.to_ascii_lowercase();
+        if lower.ends_with("/*") {
+            continue;
+        }
+        if let Some(f) = Format::from_content_type(&lower) {
+            if not_rejected(f) {
+                return Some(f);
+            }
         }
     }
     None
@@ -465,5 +483,19 @@ mod tests {
     fn wildcard_matching_is_case_insensitive() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
         assert_eq!(negotiate("Text/*", Shape::Graph, None), Some(turtle));
+    }
+
+    // §6.2: a client that names only a graph format still gets an answer —
+    // the default graph — rather than a 406. The earlier test above only
+    // covers the *preference* for a fuller format when one is also offered;
+    // this is the case where a graph format is all there is.
+    #[test]
+    fn a_lone_graph_format_still_serves_a_dataset_shaped_resource() {
+        let turtle = Format::from_content_type("text/turtle").unwrap();
+        assert_eq!(negotiate("text/turtle", Shape::Dataset, None), Some(turtle));
+        // q=0 still refuses it outright — this is a fallback, not an override.
+        assert_eq!(negotiate("text/turtle;q=0", Shape::Dataset, None), None);
+        // A genuinely unsupported type gets no such fallback.
+        assert_eq!(negotiate("image/png", Shape::Dataset, None), None);
     }
 }
