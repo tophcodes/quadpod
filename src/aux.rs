@@ -9,6 +9,7 @@ use oxigraph::model::Triple;
 use thiserror::Error;
 
 use crate::{
+    dataset::{Dataset, Skolemized},
     resource::{exists, serialize_for_insert, sys_graph_iri, ResourceError, SYS_PRESENT},
     space::{AuxKind, AuxUrl, GraphName, ResourceUrl},
     store::SparqlStore,
@@ -45,7 +46,12 @@ pub const AUX_SUBJECT_MISSING_MESSAGE: &str =
 /// `FILTER EXISTS` on the subject's presence marker. The guard is repeated on
 /// the clearing `DELETE` so a failed write cannot destroy what it did not
 /// replace.
+///
+/// `triples` is a client-supplied auxiliary body (an ACL commonly writes an
+/// anonymous `[] a acl:Authorization`), so it is skolemized here rather than
+/// required to already be ground.
 fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
+    use oxigraph::model::{GraphName, Quad};
     let iri = aux.graph_iri();
     let sys = sys_graph_iri(aux);
     let subject_iri = aux.subject().graph_iri();
@@ -53,7 +59,11 @@ fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
     let guard = format!(
         "FILTER EXISTS {{ GRAPH <{subject_sys}> {{ <{subject_iri}> <{SYS_PRESENT}> true }} }}"
     );
-    let body = serialize_for_insert(triples);
+    let quads: Vec<Quad> = triples.iter()
+        .map(|t| Quad::new(t.subject.clone(), t.predicate.clone(), t.object.clone(), GraphName::DefaultGraph))
+        .collect();
+    let skolemized = Skolemized::skolemize(&Dataset::new(quads));
+    let body = serialize_for_insert(&skolemized);
     format!(
         "DELETE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }} \
          WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} {guard} }}; \

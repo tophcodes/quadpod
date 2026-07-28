@@ -7,7 +7,7 @@
 //! denying). A presence marker in `urn:quadpod:sys:<iri>` removes the ambiguity.
 
 use crate::{
-    dataset::Skolemized,
+    dataset::{Dataset, Skolemized},
     rdf::{Format, RdfError},
     shelf::{ShelfKey, SYS_GRAPH_NAME, SYS_HAS_SUBGRAPH, SYS_MEDIA_TYPE},
     space::{DirectlyDeletable, DirectlyWritable, GraphName, ResourceUrl, SpaceError},
@@ -41,16 +41,19 @@ pub fn sys_graph_iri(g: &impl GraphName) -> String {
     format!("urn:quadpod:sys:{}", g.graph_iri())
 }
 
-/// Render triples as N-Triples for interpolation into an `INSERT` body.
+/// Render a ground dataset's triples as N-Triples for interpolation into an
+/// `INSERT` body, ignoring graph name.
 ///
 /// Every write path shares this so their escaping cannot diverge: oxrdf's
 /// `Display` is what escapes quotes, newlines, control characters, language
 /// tags and datatypes, and a second copy of this loop would be the place a
-/// future change forgets.
-pub(crate) fn serialize_for_insert(triples: &[Triple]) -> String {
+/// future change forgets. Taking [`Skolemized`] rather than `&[Triple]` makes
+/// this the one place the "no blank node in the store" invariant is enforced,
+/// instead of a claim every caller has to uphold on its own (§4).
+pub(crate) fn serialize_for_insert(quads: &Skolemized) -> String {
     let mut body = String::new();
-    for t in triples {
-        body.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
+    for q in quads.quads() {
+        body.push_str(&format!("{} {} {} .\n", q.subject, q.predicate, q.object));
     }
     body
 }
@@ -76,15 +79,18 @@ pub async fn put_dataset(
     dataset: &Skolemized,
     media_type: Format,
 ) -> Result<(), ResourceError> {
-    use oxigraph::model::{GraphName, NamedNode};
+    use oxigraph::model::{GraphName, NamedNode, Quad};
     let iri = r.graph_iri();
     let sys = sys_graph_iri(r);
 
-    // Split by graph name; the key is minted only here, from the pair.
-    let mut default_graph: Vec<Triple> = Vec::new();
-    let mut shelves: Vec<(ShelfKey, String, Vec<Triple>)> = Vec::new();
+    // Split by graph name; the key is minted only here, from the pair. Each
+    // bucket is re-wrapped as DefaultGraph quads because serialize_for_insert
+    // only reads subject/predicate/object — the GRAPH <...> wrapper below
+    // supplies the graph context.
+    let mut default_graph: Vec<Quad> = Vec::new();
+    let mut shelves: Vec<(ShelfKey, String, Vec<Quad>)> = Vec::new();
     for q in dataset.quads() {
-        let t = Triple { subject: q.subject.clone(), predicate: q.predicate.clone(), object: q.object.clone() };
+        let t = Quad::new(q.subject.clone(), q.predicate.clone(), q.object.clone(), GraphName::DefaultGraph);
         match &q.graph_name {
             GraphName::DefaultGraph => default_graph.push(t),
             GraphName::NamedNode(n) => {
@@ -115,9 +121,13 @@ pub async fn put_dataset(
     // although Skolemized has none today, splitting would make that a latent
     // trap for the first caller who changes it.
     update.push_str("INSERT DATA { ");
-    update.push_str(&format!("GRAPH <{iri}> {{ {} }} ", serialize_for_insert(&default_graph)));
+    let default_ground = Skolemized::ground(default_graph)
+        .expect("split from an already-ground Skolemized, so no bucket can gain a blank node");
+    update.push_str(&format!("GRAPH <{iri}> {{ {} }} ", serialize_for_insert(&default_ground)));
     for (key, _, ts) in &shelves {
-        update.push_str(&format!("GRAPH <{}> {{ {} }} ", key.graph_iri(), serialize_for_insert(ts)));
+        let ground = Skolemized::ground(ts.clone())
+            .expect("split from an already-ground Skolemized, so no bucket can gain a blank node");
+        update.push_str(&format!("GRAPH <{}> {{ {} }} ", key.graph_iri(), serialize_for_insert(&ground)));
     }
     update.push_str("}; ");
 
@@ -252,7 +262,24 @@ pub async fn registered_shelves(
     }).collect())
 }
 
+/// `triples` carries no graph name, and `serialize_for_insert` does not read
+/// one — the caller supplies it via the `GRAPH <...>` wrapper around the
+/// rendered body — so every quad is tagged [`GraphName::DefaultGraph`] here
+/// purely to satisfy [`Skolemized`]'s shape.
+fn as_quads(triples: &[Triple]) -> Vec<oxigraph::model::Quad> {
+    triples.iter()
+        .map(|t| oxigraph::model::Quad::new(
+            t.subject.clone(), t.predicate.clone(), t.object.clone(),
+            oxigraph::model::GraphName::DefaultGraph,
+        ))
+        .collect()
+}
+
 /// Replace a graph's contents and mark it present, in one update.
+///
+/// `triples` may be client-supplied (a `PUT`/`POST` body), so blank nodes are
+/// expected here and skolemized rather than rejected — [`Skolemized::ground`]
+/// is for content the caller already knows has none.
 pub async fn put_rdf(
     store: &dyn SparqlStore,
     g: &impl DirectlyWritable,
@@ -260,7 +287,8 @@ pub async fn put_rdf(
 ) -> Result<(), ResourceError> {
     let iri = g.graph_iri();
     let sys = sys_graph_iri(g);
-    let body = serialize_for_insert(triples);
+    let skolemized = Skolemized::skolemize(&Dataset::new(as_quads(triples)));
+    let body = serialize_for_insert(&skolemized);
     store
         .update(&format!(
             "DROP SILENT GRAPH <{iri}>; \
@@ -276,6 +304,12 @@ pub async fn put_rdf(
 /// [`put_rdf`]: containment and container type triples accumulate rather
 /// than replace, but must not be able to produce content without a
 /// presence marker.
+///
+/// Every caller of this function builds `triples` itself (container type and
+/// containment assertions) rather than forwarding a client body, so they are
+/// ground by construction — `.expect` names that rather than falling back to
+/// [`put_rdf`]'s silent skolemization, so a future caller that breaks the
+/// assumption fails loudly instead of planting a skolem IRI unnoticed.
 pub async fn insert_marked(
     store: &dyn SparqlStore,
     g: &impl DirectlyWritable,
@@ -283,7 +317,9 @@ pub async fn insert_marked(
 ) -> Result<(), ResourceError> {
     let iri = g.graph_iri();
     let sys = sys_graph_iri(g);
-    let body = serialize_for_insert(triples);
+    let ground = Skolemized::ground(as_quads(triples))
+        .expect("insert_marked's callers build their own triples, which are always ground");
+    let body = serialize_for_insert(&ground);
     store
         .update(&format!(
             "INSERT DATA {{ GRAPH <{iri}> {{ {body} }} }}; \
@@ -380,6 +416,22 @@ mod tests {
         let t = triples(turtle, acl.graph_iri());
         crate::aux::put(store, &acl, &t).await.unwrap();
         acl
+    }
+
+    // §4: the invariant was asserted globally and enforced in two handlers.
+    // Three other writers pass arbitrary triples, and it held only because
+    // provision_root_acl happens to write <#owner> rather than [] a
+    // acl:Authorization.
+    #[test]
+    fn server_built_content_goes_through_the_ground_constructor() {
+        use oxigraph::model::{BlankNode, Literal, NamedNode, Quad, GraphName};
+        let blank = vec![Quad::new(
+            BlankNode::default(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            Literal::new_simple_literal("x"),
+            GraphName::DefaultGraph)];
+        assert!(Skolemized::ground(blank).is_none(),
+            "a writer cannot smuggle a blank node past the constructor");
     }
 
     #[tokio::test]
