@@ -94,24 +94,55 @@ impl Dataset {
     }
 }
 
+/// The skolem namespace. Only this module writes or matches it — see
+/// `docs/constraints.md`.
+const SKOLEM_PREFIX: &str = "urn:quadpod:bnode:";
+
 impl Skolemized {
     /// §4: replace every blank node with a minted IRI, one per distinct blank
     /// node within this document, so co-reference survives — including the
     /// case where a blank node is both a graph name and a term.
-    // skeleton: the attribute goes when the body lands
-    #[allow(unused_variables)]
     pub fn skolemize(dataset: &Dataset) -> Self {
-        todo!("skeleton")
+        use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
+        let mut minted: std::collections::HashMap<String, NamedNode> = std::collections::HashMap::new();
+        let mut iri_for = |b: &oxigraph::model::BlankNode| -> NamedNode {
+            minted.entry(b.as_str().to_owned())
+                .or_insert_with(|| {
+                    NamedNode::new(format!("{SKOLEM_PREFIX}{}", uuid::Uuid::new_v4()))
+                        .expect("a uuid is IRI-safe")
+                })
+                .clone()
+        };
+        let quads = dataset.quads().iter().map(|q| {
+            let subject = match &q.subject {
+                NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::NamedNode(iri_for(b)),
+                other => other.clone(),
+            };
+            let object = match &q.object {
+                Term::BlankNode(b) => Term::NamedNode(iri_for(b)),
+                other => other.clone(),
+            };
+            let graph_name = match &q.graph_name {
+                GraphName::BlankNode(b) => GraphName::NamedNode(iri_for(b)),
+                other => other.clone(),
+            };
+            Quad { subject, predicate: q.predicate.clone(), object, graph_name }
+        }).collect();
+        Self(quads)
     }
 
     /// Server-built content that is already ground. `None` if it is not, which
     /// is the choke point replacing revision 2's per-handler enforcement:
     /// `container::ensure_container`, `add_containment` and auxiliary
     /// provisioning all come through here.
-    // skeleton: the attribute goes when the body lands
-    #[allow(unused_variables)]
     pub fn ground(quads: Vec<Quad>) -> Option<Self> {
-        todo!("skeleton")
+        use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
+        let blank = quads.iter().any(|q| {
+            matches!(q.subject, NamedOrBlankNode::BlankNode(_))
+                || matches!(q.object, Term::BlankNode(_))
+                || matches!(q.graph_name, GraphName::BlankNode(_))
+        });
+        (!blank).then_some(Self(quads))
     }
 
     pub fn quads(&self) -> &[Quad] {
@@ -122,7 +153,39 @@ impl Skolemized {
     /// derived from the skolem IRI** — a fresh label per read would break
     /// §6.4's byte-identical guarantee.
     pub fn deskolemize(&self) -> Dataset {
-        todo!("skeleton")
+        use oxigraph::model::{BlankNode, GraphName, NamedOrBlankNode, Term};
+        // The label is derived from the IRI, not generated: two reads of one
+        // stored state must produce identical bytes (§6.4).
+        fn blank_for(n: &NamedNode) -> Option<BlankNode> {
+            let suffix = n.as_str().strip_prefix(SKOLEM_PREFIX)?;
+            let label: String = suffix.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            BlankNode::new(format!("b{label}")).ok()
+        }
+        let quads = self.0.iter().map(|q| {
+            let subject = match &q.subject {
+                NamedOrBlankNode::NamedNode(n) => match blank_for(n) {
+                    Some(b) => NamedOrBlankNode::BlankNode(b),
+                    None => q.subject.clone(),
+                },
+                other => other.clone(),
+            };
+            let object = match &q.object {
+                Term::NamedNode(n) => match blank_for(n) {
+                    Some(b) => Term::BlankNode(b),
+                    None => q.object.clone(),
+                },
+                other => other.clone(),
+            };
+            let graph_name = match &q.graph_name {
+                GraphName::NamedNode(n) => match blank_for(n) {
+                    Some(b) => GraphName::BlankNode(b),
+                    None => q.graph_name.clone(),
+                },
+                other => other.clone(),
+            };
+            Quad { subject, predicate: q.predicate.clone(), object, graph_name }
+        }).collect();
+        Dataset::new(quads)
     }
 
     /// §6.1: the validator, over the stored quads *before* de-skolemization and
@@ -143,7 +206,7 @@ impl Skolemized {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxigraph::model::{Literal, NamedNode, Quad};
+    use oxigraph::model::{BlankNode, Literal, NamedNode, Quad};
 
     fn q(s: &str, o: &str, g: oxigraph::model::GraphName) -> Quad {
         Quad::new(
@@ -201,5 +264,69 @@ mod tests {
             "http://example.org/a", "x",
             NamedNode::new("urn:podcast:1").unwrap().into())]);
         assert!(!clean.uses_reserved_namespace(), "a longer NID is a different namespace");
+    }
+
+    // The case revision 2 got wrong: a blank node that is both a graph name and
+    // a term. This is the Verifiable Credentials `proof` shape, and
+    // solid/specification#291 says a server may not modify those graph names.
+    #[test]
+    fn a_blank_node_that_is_both_graph_name_and_term_keeps_its_identity() {
+        let b = BlankNode::default();
+        let ds = Dataset::new(vec![
+            // <top> :points _:b
+            Quad::new(
+                NamedNode::new("http://example.org/top").unwrap(),
+                NamedNode::new("http://example.org/points").unwrap(),
+                b.clone(),
+                oxigraph::model::GraphName::DefaultGraph,
+            ),
+            // GRAPH _:b { <s> :name "inside" }
+            q("http://example.org/s", "inside", b.clone().into()),
+        ]);
+
+        let stored = Skolemized::skolemize(&ds);
+        assert!(
+            stored.quads().iter().all(|q| !matches!(
+                q.graph_name, oxigraph::model::GraphName::BlankNode(_))),
+            "no blank node reaches the store, not even as a graph name"
+        );
+
+        let back = stored.deskolemize();
+        let graph_node = back.quads().iter()
+            .find_map(|q| match &q.graph_name {
+                oxigraph::model::GraphName::BlankNode(n) => Some(n.clone()),
+                _ => None,
+            })
+            .expect("the named graph came back blank");
+        let object_node = back.quads().iter()
+            .find_map(|q| match &q.object {
+                oxigraph::model::Term::BlankNode(n) => Some(n.clone()),
+                _ => None,
+            })
+            .expect("the object came back blank");
+        assert_eq!(graph_node, object_node, "co-reference survived the round trip");
+    }
+
+    #[test]
+    fn deskolemization_is_stable_across_reads() {
+        let b = BlankNode::default();
+        let stored = Skolemized::skolemize(&Dataset::new(vec![q(
+            "http://example.org/s", "x", b.into())]));
+        assert_eq!(stored.deskolemize(), stored.deskolemize(),
+            "a fresh label per read would break the byte-identical guarantee");
+    }
+
+    #[test]
+    fn ground_refuses_content_that_still_has_a_blank_node() {
+        let ok = vec![q("http://example.org/s", "x", oxigraph::model::GraphName::DefaultGraph)];
+        assert!(Skolemized::ground(ok).is_some());
+
+        let not_ok = vec![Quad::new(
+            BlankNode::default(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            Literal::new_simple_literal("x"),
+            oxigraph::model::GraphName::DefaultGraph,
+        )];
+        assert!(Skolemized::ground(not_ok).is_none());
     }
 }
