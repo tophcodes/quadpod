@@ -184,6 +184,14 @@ mod tests {
         )]);
         assert!(object.uses_reserved_namespace(), "as an object");
 
+        let predicate = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://example.org/a").unwrap(),
+            NamedNode::new(reserved).unwrap(),
+            Literal::new_simple_literal("x"),
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert!(predicate.uses_reserved_namespace(), "as a predicate");
+
         let graph = Dataset::new(vec![q(
             "http://example.org/a", "x",
             NamedNode::new("URN:QUADPOD:subgraph:dead").unwrap().into())]);
