@@ -128,7 +128,7 @@ Request flows top→down; three front doors share one authorization core.
         ┌──────────▼────────────┐
         │ WAC authorization core│   ← shared by all doors
         │  PRP: fetch ACL graph │   BUILD (SPARQL query + container walk)
-        │  PDP: decide          │   GLUE: manas_access_control (WacDecisionPoint) + manas_space
+        │  PDP: decide          │   BUILD (pure fn over ACL triples — see §16, ADR-1)
         └──────────┬────────────┘
                    │
         ┌──────────▼──────────┐
@@ -167,7 +167,7 @@ Request flows top→down; three front doors share one authorization core.
 |---|---|---|
 | `dpop`, `solid_oidc_types`, `webid` | token/identity verification | auth middleware; reconstruct `htu` from config |
 | `rdf_dynsyn` | Turtle/JSON-LD/… parse + serialize | conneg on read & write |
-| `manas_access_control` (`WacDecisionPoint`) + `manas_space` | **WAC decision engine** | feed it the ACL graph + request context → allow/deny; adopt its `SolidStorageSpace` URI model |
+| ~~`manas_access_control` (`WacDecisionPoint`) + `manas_space`~~ | ~~WAC decision engine~~ | **Not used.** The Plan 6 spike reversed this; the PDP is ours. See §16, ADR-1 |
 | `acp` (later) | ACP decision | same `PolicyDecisionPoint` seam, near-zero cost |
 | `object_store` | local/S3/GCS/… blob backends | `BlobStore` impl |
 | `rudof` (`shacl_validation`) (later) | SHACL/ShEx validation | optional per-container 422 |
@@ -178,10 +178,12 @@ Request flows top→down; three front doors share one authorization core.
 
 ## 8. Access Control (WAC)
 
-- **PDP consumes policies as input, not storage.** `WacDecisionPoint::resolve_grants(context,
-  acr_chain)` takes the request context + the ACL/ACR graph chain and returns granted access
-  modes. It couples only to `manas_space::SolidStorageSpace` (a typed URI/slot model), **not**
-  to `manas_repo`.
+- **PDP consumes policies as input, not storage.** `wac::pdp::decide` is a pure function of
+  ours: ACL triples plus the request context in, access modes out. No I/O, no ancestry walking,
+  no `async`. The original plan was to rent `manas_access_control`'s `WacDecisionPoint`; that
+  was reversed by the Plan 6 spike for a decisive reason — `resolve_grants` never takes an ACL
+  graph, it takes a slot chain and walks the ancestry *itself*, which inverts the PRP below.
+  See §16, ADR-1.
 - **PRP is ours.** Because resource = named graph, "fetch the ACL for `<res>`, else walk up
   containers to the root `.acl`" is a **SPARQL query** against the same store. WAC over named
   graphs stops being a slogan.
@@ -282,8 +284,14 @@ registry/provisioning, Notifications, SPARQL UPDATE, data migration from the exi
    **Implication:** Risk de-risked. Proceed with shallow reuse of these leaf crates as planned. No forking required.
 2. **WAC engine usability.** Confirm `WacDecisionPoint` + `manas_space::SolidStorageSpace` are
    usable with our own PRP (we supply the ACL chain), without dragging in `manas_repo`.
+
+   **Outcome: answered no, and the design changed.** `resolve_grants` walks the ancestry
+   itself, so it cannot be fed an ACL chain — it inverts our PRP. See §16, ADR-1.
 3. **Atomicity.** A PUT touches the data graph + container `ldp:contains` + system graph; verify
    these compose into **one atomic** SPARQL 1.1 Update on Oxigraph (and on Fuseki).
+
+   **Outcome: holds for Oxigraph, and is an implementor's obligation rather than a SPARQL
+   guarantee.** See §16, ADR-2.
 4. **Constrained-template matcher.** Confirm the chosen subset reverse-matches deterministically
    for the intended topologies.
 
@@ -292,3 +300,99 @@ registry/provisioning, Notifications, SPARQL UPDATE, data migration from the exi
 None material. Minor items intentionally deferred: exact `rudof` API surface, the specific
 external IdP to authenticate against (verify-only works against any Solid-OIDC issuer),
 provisioning UX for multi-tenant.
+
+## 16. What changed, and why
+
+Decisions that were made after this document was written, that reverse or qualify something
+it says, and that had no home of their own. They are recorded here rather than in a separate
+decision directory because this is the document they correct — a second home would give the
+contradiction a third place to live. Checkable rules go to `docs/constraints.md`; the
+reasoning stays here.
+
+### ADR-1 — Build our own WAC PDP; do not rent `manas_access_control`
+
+**Decision.** `wac::pdp::decide` is a pure function of ours, taking ACL triples plus the
+request context. `manas_access_control` and `manas_space` are not dependencies.
+
+**Alternatives considered** (Plan 6 Task 0 spike, four pre-declared criteria; verdict in
+`docs/superpowers/plans/2026-07-26-wac-enforcement.md` under "Spike Results"):
+
+- **Rent `manas_access_control`.** Rejected on the decisive criterion:
+  `WacDecisionPoint::resolve_grants` never takes an ACL graph. It takes a `SlotAcrChain` — a
+  `BoxStream` of manas `SolidResourceSlot`s — and walks the ancestry itself, which inverts the
+  PRP design and forces `decide()` to be `async` and fallible. Three of the four criteria
+  favoured renting: it compiles, `manas_repo` is behind an off-by-default feature, and the
+  oxigraph→sophia conversion is 27 lines. The fourth decided it.
+- Recorded at the time as additional cost: manas requires an explicit `a acl:Authorization`
+  (which ADR-5 deliberately does not), +80 crates including a parallel EOL http 0.2 / hyper
+  0.14 / tower 0.4 stack, a `sophia_api` 0.8-vs-0.10 trap, and a namespace bug (`acl:agent`
+  vs `acp:agent`).
+
+**What would reopen it.** manas exposing a decision entry point that takes an ACL graph rather
+than a slot chain; or ACP arriving, since the standalone `acp` crate was the original argument
+for keeping the seam.
+
+### ADR-2 — `SparqlStore` is dyn-dispatched, and `;`-sequence atomicity is an implementor's obligation
+
+**Decision.** `AppState` holds `Arc<dyn SparqlStore>`, object-safe via `async_trait`. Every
+write path assumes a `;`-separated update runs in one transaction.
+
+**Alternatives considered** (Plan 1 issue I3, escalated to and decided by the user;
+`2026-07-28-jsonld-datasets-design.md` §5.2 for the atomicity half):
+
+- **Generic `AppState<S>`** with static dispatch. Rejected: RPITIT is not object-safe, and
+  pinning `OxigraphStore` into `AppState` conflicts with §13's success criterion that the
+  backend be config-swappable.
+- **"SPARQL guarantees the sequence is atomic."** False, and worth recording as false. What
+  holds is that `BoundPreparedSparqlUpdate::execute` evaluates every operation before calling
+  `transaction.commit()`, so a runtime failure part-way through commits nothing — measured in
+  both review rounds of the dataset spec. That is a property of `OxigraphStore`.
+
+**What would reopen it.** A second `SparqlStore` implementor. `docs/constraints.md` carries
+the tripwire, and `store.rs` now states the obligation on the trait.
+
+### ADR-3 — Accept RS256 DPoP proofs; the ES256-only pin was stricter than RFC 9449
+
+**Decision.** Proofs signed RS256 are verified through a pod-owned path dispatched on the
+header `alg`, with an RFC 7638 RSA thumbprint for `cnf.jkt`. ES256 still goes to
+`dpop-verifier` untouched; `none` and HS\* stay rejected; both paths meet at `VerifiedDpop`,
+so `htu`, freshness, `cnf.jkt` and jti-last stay single-copy.
+
+**Alternatives considered** (Plan 8 Task 2; `.superpowers/sdd/rs256-support.md`):
+
+- **Keep ES256-only and skip the conformance run.** Rejected by the user: RFC 9449 permits any
+  asymmetric alg except `none`/symmetric, so the pin was stricter than the spec — and the
+  conformance harness signs RS256 unconditionally (`JwsUtils.java`, the ES256 line commented
+  out, no config switch), so the run aborted before any test executed.
+- **Configure `dpop-verifier` for RS256.** Impossible at 4.4.0, verified in source: a fixed
+  match on `(alg, jwk)` and a closed untagged `Jwk` enum with only EC-P-256 and OKP-Ed25519,
+  so an RSA JWK fails to deserialize before `alg` is read. No RSA thumbprint either.
+
+**The non-obvious part.** `cnf.jkt` used `thumbprint_ec_p256`, which is EC-specific. Widening
+the algorithms without widening the thumbprint would have silently broken proof-of-possession
+for RSA keys — worse than rejecting them.
+
+**What would reopen it.** `dpop-verifier` gaining RSA support (delete our path), or a decision
+to advertise a narrower `algs` list in the `WWW-Authenticate` challenge, which
+`wac::guard::DPOP_CHALLENGE` would then have to track.
+
+### ADR-5 — An ACL rule does not need an explicit `a acl:Authorization`
+
+**Decision.** `wac::pdp::decide` treats every subject in an ACL graph as a candidate
+authorization. The type triple is not required.
+
+**Alternatives considered** (Plan 6 Task 0, which flagged it for the Task 7 review as "MORE
+permissive than a real WAC engine — sanity-check it"; the review upheld it):
+
+- **Require the type triple**, as `manas_access_control` does. Rejected because real-world
+  ACLs frequently omit it and CSS accepts them without it: requiring it would reject policy
+  documents that every other Solid client produces, and a rejected ACL is an ACL that silently
+  does not apply.
+
+**Why it is recorded here.** It is the single most permissive choice the PDP makes, and in the
+WAC spec it sits inside a section whose surrounding model — the `<res>.acl` sibling suffix —
+has since been superseded. It reads as if it were part of the dead text. It is not.
+
+**What would reopen it.** ACP, or a conformance scenario that requires the type triple. The
+current run does not exercise one: roughly 370 WAC rows are unmeasured behind the `text/plain`
+gap.

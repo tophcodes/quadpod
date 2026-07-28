@@ -9,6 +9,20 @@ pub enum StoreError {
     Backend(String),
 }
 
+/// A SPARQL 1.1 endpoint the pod stores everything through.
+///
+/// **Obligation on every implementor: a `;`-separated update sequence is
+/// atomic.** Either every operation in it takes effect or none does. This is
+/// not something SPARQL guarantees — it is a property of the backend, and
+/// `OxigraphStore` has it because `BoundPreparedSparqlUpdate::execute`
+/// evaluates all operations before it commits.
+///
+/// Every write path depends on it and none of them can check it. A resource
+/// write drops the old content, writes the new, and marks presence in one
+/// sequence; an implementor without the property would let an interruption
+/// leave content with no presence marker (invisible forever) or a marker with
+/// no content, and there is no compile error to say so. See the parent design
+/// spec §16, ADR-2.
 #[async_trait::async_trait]
 pub trait SparqlStore: Send + Sync {
     async fn update(&self, sparql: &str) -> Result<(), StoreError>;

@@ -101,7 +101,24 @@ Entry form:
   exactly that host.
 
 There is no flag that turns the filter off globally. The blanket-permissive policy exists
-only behind `#[cfg(test)]` and cannot be constructed in a release build.
+only behind `#[cfg(test)]` and cannot be constructed in a release build. That gate is pinned
+by a rule in `docs/constraints.md`, because no test can observe its absence — tests run with
+`cfg(test)` on.
+
+### Alternatives that were rejected
+
+The line this flag draws is **named by the operator versus chosen by an attacker**, not
+private versus public IP. Three other shapes were considered and dropped:
+
+- **A global off switch** for the filter. It would open the pre-authentication fetch surface
+  to every host on earth for the sake of one.
+- **A test-only binary** that skips the filter. The conformance run has to exercise the
+  production `authenticate` path, or it measures something other than the pod.
+- **Drawing the line at private-versus-public IP ranges.** The wrong axis: a public address an
+  attacker picked is more dangerous than a private one the operator typed.
+
+Wildcards, subdomain matching or CIDR ranges would each reintroduce the attacker-chosen axis
+this design exists to exclude. That is the change that should reopen the decision.
 
 ### The honest cost
 

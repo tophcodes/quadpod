@@ -79,16 +79,22 @@ own implementation) behind a single signature — see §7.
 > real Solid resource: addressable via GET/PUT, but access to it is decided by
 > `acl:Control` on `<res>`, not by Read/Write on the ACL itself.
 
-**`.acl` is a reserved suffix, pod-wide.** Any request path ending in `.acl` is an
+**`.acl` is a reserved suffix, pod-wide.** *(Superseded — the ACL is an auxiliary under
+`/.aux`, see the blockquote above. The first and third bullets below describe the dead suffix
+model; the second one does not and is still current.)* Any request path ending in `.acl` is an
 access-control document, decided by `Control` on the path with the suffix stripped. Three
 consequences, all deliberate:
 
 - A user cannot create an ordinary resource named `notes.acl` without `acl:Control` on
   `notes` — full `Read`+`Write` on the subtree is not enough. The suffix is server
   namespace, not user namespace.
-- `wac::pdp::decide` deliberately does not require an explicit `a acl:Authorization` type
-  triple (real-world ACLs frequently omit it, and CSS accepts them without it). Every
-  subject in an `.acl` graph is therefore a candidate authorization.
+- **Still current, and independent of the suffix model:** `wac::pdp::decide` deliberately
+  does not require an explicit `a acl:Authorization` type triple (real-world ACLs frequently
+  omit it, and CSS accepts them without it). Every subject in an ACL graph is therefore a
+  candidate authorization. Recorded as ADR-5 in
+  [2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md) §16, because
+  it is the most permissive choice the PDP makes and it must not be read as part of the
+  superseded text around it.
 - **Migration note.** Plans 1–5 shipped an open pod with no enforcement. Any resource
   named `*.acl` written during that period becomes live policy the moment this plan lands:
   one containing unrelated data shadows the inherited ACL for its subject and denies
