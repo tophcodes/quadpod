@@ -185,11 +185,31 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
     }
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
 
-    for (_, _, mt) in ranked {
-        let candidate = match mt {
-            "*/*" => stored.filter(|f| usable(*f)).or_else(fallback),
-            "text/*" => Format::from_content_type("text/turtle").filter(|f| usable(*f)),
-            "application/*" => fallback(),
+    // RFC 9110 §12.5.1: q=0 means the client explicitly rejects that media
+    // range, not merely ranks it last. A named type at q=0 must also be
+    // excluded from what a wildcard elsewhere in the list resolves to —
+    // `*/*, text/turtle;q=0` means "anything but Turtle".
+    let rejected: Vec<String> = ranked.iter()
+        .filter(|(q, _, mt)| *q == 0.0 && !mt.ends_with("/*"))
+        .map(|(_, _, mt)| mt.to_ascii_lowercase())
+        .collect();
+    let not_rejected = |f: Format| !rejected.iter().any(|r| r == f.media_type());
+    let fallback_avoiding_rejected = || {
+        [ "text/turtle", "application/ld+json" ].iter()
+            .filter_map(|ct| Format::from_content_type(ct))
+            .find(|f| usable(*f) && not_rejected(*f))
+    };
+
+    for (q, _, mt) in ranked {
+        if q == 0.0 {
+            continue;
+        }
+        // Media-type tokens are case-insensitive per RFC 9110 §8.3.1, so
+        // `Text/*` must match the wildcard arms too.
+        let candidate = match mt.to_ascii_lowercase().as_str() {
+            "*/*" => stored.filter(|f| usable(*f) && not_rejected(*f)).or_else(fallback_avoiding_rejected),
+            "text/*" => Format::from_content_type("text/turtle").filter(|f| usable(*f) && not_rejected(*f)),
+            "application/*" => fallback_avoiding_rejected(),
             other => Format::from_content_type(other).filter(|f| usable(*f)),
         };
         if candidate.is_some() {
@@ -425,5 +445,25 @@ mod tests {
         // application/* must resolve to something that can serve the resource.
         assert_eq!(negotiate("application/*", Shape::Graph, None), Some(turtle));
         assert_eq!(negotiate("application/*", Shape::Dataset, None), Some(jsonld));
+    }
+
+    // RFC 9110 §12.5.1: q=0 is a refusal, not a low rank.
+    #[test]
+    fn q_zero_is_a_refusal_not_a_low_rank() {
+        let jsonld = Format::from_content_type("application/ld+json").unwrap();
+
+        assert_eq!(negotiate("text/turtle;q=0", Shape::Graph, None), None);
+        // The only nominally-acceptable entry is refused, and the other is
+        // unsupported outright — nothing left to serve.
+        assert_eq!(negotiate("image/png, text/turtle;q=0", Shape::Graph, None), None);
+        // `*/*` must not resolve to a type excluded elsewhere in the list.
+        assert_ne!(negotiate("*/*, text/turtle;q=0", Shape::Graph, None), Some(Format::from_content_type("text/turtle").unwrap()));
+        assert_eq!(negotiate("*/*, text/turtle;q=0", Shape::Graph, None), Some(jsonld));
+    }
+
+    #[test]
+    fn wildcard_matching_is_case_insensitive() {
+        let turtle = Format::from_content_type("text/turtle").unwrap();
+        assert_eq!(negotiate("Text/*", Shape::Graph, None), Some(turtle));
     }
 }
