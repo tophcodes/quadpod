@@ -3494,4 +3494,223 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/turtle");
     }
+
+    // §9.5. Folding this into the default graph would be a document rewrite —
+    // a statement in a named graph is not asserted in the default graph — and
+    // it is the obvious accidental implementation of the split.
+    #[tokio::test]
+    async fn a_graph_named_like_its_own_resource_stays_a_named_graph() {
+        let f = fixture().await;
+        let body = r#"{"@graph":[
+            {"@id":"https://pod.toph.so/c/notes",
+             "@graph":[{"@id":"http://example.org/a","http://schema.org/name":"inside"}]},
+            {"@id":"http://example.org/b","http://schema.org/name":"outside"}]}"#;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/ld+json")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/n-quads").body(Body::empty()).unwrap();
+        let out = body_string(f.app.clone().oneshot(get).await.unwrap()).await;
+        assert!(out.contains("\"inside\" <https://pod.toph.so/c/notes>"),
+            "still in its named graph, not merged into the default one: {out}");
+        assert!(out.lines().any(|l| l.contains("\"outside\"") && l.trim_end().ends_with("\" .")),
+            "and the default-graph statement is still in the default graph: {out}");
+    }
+
+    // §9.6 / §2.1. Eleven characters of relative IRI name another resource's
+    // URL. Under store-global graph names this write would land in /victim
+    // with no ACL check anywhere in the path.
+    #[tokio::test]
+    async fn naming_another_resources_url_as_a_graph_touches_nothing() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/victim")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"mine\" .")).unwrap()).await.unwrap();
+
+        let before = body_string(f.app.clone().oneshot(f.owner_request("GET", "/victim")
+            .header(header::ACCEPT, "application/n-quads").body(Body::empty()).unwrap())
+            .await.unwrap()).await;
+
+        let attack = r#"{"@graph":[{"@id":"../victim",
+            "@graph":[{"@id":"http://example.org/x","http://schema.org/name":"theirs"}]}]}"#;
+        f.app.clone().oneshot(f.owner_request("PUT", "/attacker/doc")
+            .header(header::CONTENT_TYPE, "application/ld+json")
+            .body(Body::from(attack)).unwrap()).await.unwrap();
+
+        let after = body_string(f.app.clone().oneshot(f.owner_request("GET", "/victim")
+            .header(header::ACCEPT, "application/n-quads").body(Body::empty()).unwrap())
+            .await.unwrap()).await;
+        assert_eq!(before, after, "/victim changed by a write to /attacker/doc");
+        assert!(!after.contains("theirs"));
+    }
+
+    // §9.1: an empty named graph produces no quads, so it cannot survive. The
+    // isomorphism oracle passes vacuously here — this needs a direct assertion
+    // on the response instead, or the limit stops being a decision and becomes
+    // a surprise.
+    #[tokio::test]
+    async fn an_empty_named_graph_is_documented_as_lost() {
+        let f = fixture().await;
+        let body = r#"{"@graph":[{"@id":"urn:example:empty","@graph":[]},
+            {"@id":"http://example.org/b","http://schema.org/name":"kept"}]}"#;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/ld+json")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+
+        let out = body_string(f.app.clone().oneshot(f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/trig").body(Body::empty()).unwrap())
+            .await.unwrap()).await;
+        assert!(out.contains("kept"));
+        assert!(!out.contains("urn:example:empty"),
+            "documented limit (§9.1): a graph with no quads does not round-trip");
+    }
+
+    // `current_tags` contributes no validator for a container or an
+    // auxiliary in any existing test, and nothing exercised `If-Match` on an
+    // ACL — exactly the read-modify-write pattern SolidOS uses on every
+    // write: `GET`, keep the `ETag`, `PUT` back conditionally.
+    #[tokio::test]
+    async fn if_match_on_an_acl_succeeds_with_the_right_tag_and_412s_with_the_wrong_one() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
+        let acl = format!(
+            "@prefix acl: <http://www.w3.org/ns/auth/acl#> .\n\
+             <#owner> a acl:Authorization ; acl:agent <{OWNER}> ; \
+                acl:mode acl:Control, acl:Read, acl:Write ; acl:accessTo </c/notes> ."
+        );
+        f.app.clone().oneshot(f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl.clone())).unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/.aux/c/notes.acl")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
+        let etag = res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+
+        // Read-modify-write: the ETag just fetched is handed back unchanged,
+        // and must be accepted.
+        let put_back = f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_MATCH, &etag)
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_back).await.unwrap().status(), StatusCode::CREATED,
+            "a conditional write carrying the ETag just read must succeed");
+
+        // A stale or wrong tag must not be accepted.
+        let wrong = f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_MATCH, "\"deadbeef\"")
+            .body(Body::from(
+                "@prefix acl: <http://www.w3.org/ns/auth/acl#> .\n\
+                 <#owner> a acl:Authorization ; acl:agent <https://mallory.example/card#me> ; \
+                    acl:mode acl:Control ; acl:accessTo </c/notes> ."
+            )).unwrap();
+        assert_eq!(f.app.oneshot(wrong).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    // §6.2.1's check reads `get_dataset` to decide whether an existing
+    // resource has named graphs a graph-format write would destroy. If the
+    // registry is corrupt — a shelf `sys:hasSubgraph` lists with no
+    // `sys:graphName`, the state §3.2.3 says should never occur — `get_dataset`
+    // fails closed with `InvalidIri` (pinned directly against the store in
+    // `resource.rs`). This pins that `put_impl` propagates the refusal instead
+    // of reading the store error as "no named graphs" and proceeding with
+    // exactly the overwrite the check exists to refuse.
+    #[tokio::test]
+    async fn a_corrupt_registry_refuses_the_write_instead_of_overwriting() {
+        let f = fixture().await;
+        let body = r#"{"@graph":[
+            {"@id":"https://pod.toph.so/c/notes","http://schema.org/name":"kept"},
+            {"@id":"urn:example:g1","@graph":[{"@id":"http://example.org/a","http://schema.org/name":"Alice"}]}]}"#;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/ld+json")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+        let before = f.stored("/c/notes").await;
+
+        let r = match f.url("/c/notes") {
+            Target::Resource(r) => r,
+            other => panic!("/c/notes is not a resource: {other:?}"),
+        };
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let key = crate::shelf::ShelfKey::of(&r, g.as_ref());
+        let sys = crate::resource::sys_graph_iri(&r);
+        f.store.update(&format!(
+            "DELETE DATA {{ GRAPH <{sys}> {{ <{}> <{}> <{}> }} }}",
+            key.graph_iri(), crate::shelf::SYS_GRAPH_NAME, g.as_str()
+        )).await.unwrap();
+
+        let overwrite = f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+        let res = f.app.clone().oneshot(overwrite).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST,
+            "a store error must refuse, not read as \"no named graphs\"");
+        assert_eq!(f.stored("/c/notes").await, before, "the refused write changed nothing");
+    }
+
+    // Every other `containsGraph` assertion covers only the Link headers.
+    // This one also checks that both graphs' actual content survives a
+    // dataset-format read, not merely that their names are mentioned.
+    #[tokio::test]
+    async fn two_named_graphs_both_round_trip_and_are_both_named() {
+        let f = fixture().await;
+        let body = "<urn:example:g1> { <http://example.org/alice> <http://schema.org/name> \"Alice\" }\n\
+                    <urn:example:g2> { <http://example.org/bob> <http://schema.org/name> \"Bob\" }";
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/n-quads").body(Body::empty()).unwrap();
+        let out = body_string(f.app.clone().oneshot(get).await.unwrap()).await;
+        assert!(out.contains("\"Alice\" <urn:example:g1>"), "graph g1's content survived: {out}");
+        assert!(out.contains("\"Bob\" <urn:example:g2>"), "graph g2's content survived: {out}");
+
+        let turtle_get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let links: Vec<String> = f.app.oneshot(turtle_get).await.unwrap()
+            .headers().get_all(header::LINK).iter()
+            .map(|v| v.to_str().unwrap().to_owned()).collect();
+        for g in ["urn:example:g1", "urn:example:g2"] {
+            assert!(links.iter().any(|l| l.contains("containsGraph") && l.contains(g)),
+                "{g} is missing from {links:?}");
+        }
+    }
+
+    // `has_named_graphs` counts a blank-named graph; `named_graphs` cannot
+    // name one. Only a document mixing both kinds exercises the split: the
+    // resource must still be treated as a dataset (blank-named graph withheld
+    // from a graph-format read too), but `containsGraph` can name only the
+    // IRI-named one, and a dataset format must still carry both.
+    #[tokio::test]
+    async fn a_blank_named_graph_and_an_iri_named_graph_together() {
+        let f = fixture().await;
+        let body = "_:g { <http://example.org/alice> <http://schema.org/name> \"Alice\" }\n\
+                    <urn:example:g1> { <http://example.org/bob> <http://schema.org/name> \"Bob\" }";
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "application/trig")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+
+        let get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let links: Vec<String> = res.headers().get_all(header::LINK).iter()
+            .map(|v| v.to_str().unwrap().to_owned()).collect();
+        assert!(links.iter().any(|l| l.contains("containsGraph") && l.contains("urn:example:g1")),
+            "the IRI-named graph is nameable: {links:?}");
+        assert_eq!(links.iter().filter(|l| l.contains("containsGraph")).count(), 1,
+            "the blank-named graph has no IRI a Link header can name: {links:?}");
+        assert!(!body_string(res).await.contains("Alice"),
+            "neither named graph leaked into the default graph");
+
+        let dataset_get = f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/trig").body(Body::empty()).unwrap();
+        let out = body_string(f.app.oneshot(dataset_get).await.unwrap()).await;
+        assert!(out.contains("Alice"), "the blank-named graph's content still round-trips: {out}");
+        assert!(out.contains("Bob"), "and the IRI-named graph's content: {out}");
+    }
 }
