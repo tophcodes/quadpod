@@ -12,7 +12,7 @@ use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{Dataset, Skolemized},
     resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, get_dataset, stored_media_type, ResourceError},
-    rdf::{Format, Shape, negotiate, etag},
+    rdf::{Format, Shape, negotiate},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
@@ -267,21 +267,22 @@ fn triples_of(dataset: &Dataset) -> Vec<Triple> {
 /// TriG and conditionally writes it back must not be told `412` forever
 /// because the server compared against the Turtle tag instead.
 ///
-/// Containers and auxiliaries contribute exactly one, because [`etag`] over
-/// [`get_rdf`]'s raw triples does not embed a format — every representation
-/// of theirs shares it.
+/// Containers and auxiliaries never carry a named graph (§3.4 refuses that at
+/// write time), but a client can still fetch them as any of the [`SERVABLE`]
+/// formats, so they get the same treatment: one tag per format.
+const SERVABLE: [&str; 5] = [
+    "text/turtle", "application/n-triples", "application/ld+json",
+    "application/trig", "application/n-quads",
+];
+
 async fn current_tags(store: &dyn SparqlStore, target: &Target) -> Result<Option<Vec<String>>, ResourceError> {
     if let Target::Resource(r) = target {
         let Some(stored) = get_dataset(store, r).await? else {
             return Ok(None);
         };
-        // The media types `Format::from_content_type` accepts. A format
-        // missing here can still be served but its validator would never
-        // match, which is a legitimate conditional write refused forever.
-        const SERVABLE: [&str; 5] = [
-            "text/turtle", "application/n-triples", "application/ld+json",
-            "application/trig", "application/n-quads",
-        ];
+        // A format missing from `SERVABLE` can still be served but its
+        // validator would never match, which is a legitimate conditional
+        // write refused forever.
         return Ok(Some(
             SERVABLE.iter()
                 .filter_map(|ct| Format::from_content_type(ct))
@@ -289,7 +290,27 @@ async fn current_tags(store: &dyn SparqlStore, target: &Target) -> Result<Option
                 .collect(),
         ));
     }
-    Ok(get_rdf(store, target).await?.map(|tr| vec![etag(&tr)]))
+    let Some(triples) = get_rdf(store, target).await? else {
+        return Ok(None);
+    };
+    let ground = ground_dataset(triples);
+    Ok(Some(
+        SERVABLE.iter()
+            .filter_map(|ct| Format::from_content_type(ct))
+            .map(|f| ground.etag(f))
+            .collect(),
+    ))
+}
+
+/// Lifts a container's or auxiliary's raw triples (always default-graph,
+/// always ground — §3.4 and skolemization at the write path guarantee both)
+/// into the same [`Skolemized`] type a resource's dataset is held as, so the
+/// two paths share one `etag`/`deskolemize` implementation.
+fn ground_dataset(triples: Vec<Triple>) -> Skolemized {
+    let quads: Vec<Quad> = triples.into_iter()
+        .map(|t| Quad::new(t.subject, t.predicate, t.object, oxigraph::model::GraphName::DefaultGraph))
+        .collect();
+    Skolemized::ground(quads).expect("store content is ground by construction")
 }
 
 async fn handle_put(
@@ -723,7 +744,8 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
     };
     match get_rdf(store, &target).await {
         Ok(Some(triples)) => {
-            let tag = etag(&triples);
+            let ground = ground_dataset(triples);
+            let tag = ground.etag(fmt);
             if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
                 // `Vary: Accept` on every negotiated response (§6.3), and this
                 // path negotiates as much as the resource path does.
@@ -735,10 +757,6 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
                     &target,
                 );
             }
-            let quads: Vec<Quad> = triples.into_iter()
-                .map(|t| Quad::new(t.subject, t.predicate, t.object, oxigraph::model::GraphName::DefaultGraph))
-                .collect();
-            let ground = Skolemized::ground(quads).expect("store content is ground by construction");
             let visible = ground.deskolemize();
             match fmt.serialize(&visible) {
                 Ok(bytes) => {

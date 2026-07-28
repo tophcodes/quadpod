@@ -61,8 +61,7 @@ pub async fn effective_acl(
 mod tests {
     use super::*;
     use crate::wac::pdp::{ACL_ACCESS_TO, ACL_AGENT, ACL_DEFAULT, ACL_MODE, ACL_READ};
-    use crate::{rdf, resource::put_rdf, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
-    use oxigraph::io::RdfFormat;
+    use crate::{rdf::Format, resource::put_rdf, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
 
     const ALICE: &str = "https://alice.example/card#me";
 
@@ -80,7 +79,9 @@ mod tests {
         let subject = res(subject_path);
         put_rdf(store, &subject, &[]).await.unwrap();
         let aux = subject.aux(AuxKind::Acl);
-        let t = rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, aux.graph_iri()).unwrap();
+        let t: Vec<Triple> = Format::from_content_type("text/turtle").unwrap()
+            .parse(turtle.as_bytes(), aux.graph_iri()).unwrap()
+            .quads().iter().cloned().map(Triple::from).collect();
         crate::aux::put(store, &aux, &t).await.unwrap();
     }
 
@@ -163,7 +164,9 @@ mod tests {
     async fn resource_data_is_not_mistaken_for_its_acl() {
         let store = OxigraphStore::in_memory().unwrap();
         let foo = res("/foo");
-        let t = rdf::parse(b"<#it> <http://schema.org/name> \"Toph\" .", RdfFormat::Turtle, foo.graph_iri()).unwrap();
+        let t: Vec<Triple> = Format::from_content_type("text/turtle").unwrap()
+            .parse(b"<#it> <http://schema.org/name> \"Toph\" .", foo.graph_iri()).unwrap()
+            .quads().iter().cloned().map(Triple::from).collect();
         put_rdf(&store, &foo, &t).await.unwrap();
         assert!(effective_acl(&store, &foo).await.unwrap().is_none());
     }

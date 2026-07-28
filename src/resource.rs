@@ -389,8 +389,7 @@ pub async fn delete_rdf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rdf, space::{AuxKind, AuxUrl, ResourceUrl, StorageSpace, Target}, store::OxigraphStore};
-    use oxigraph::io::RdfFormat;
+    use crate::{space::{AuxKind, AuxUrl, ResourceUrl, StorageSpace, Target}, store::OxigraphStore};
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
@@ -403,7 +402,9 @@ mod tests {
     }
 
     fn triples(turtle: &str, base: &str) -> Vec<Triple> {
-        rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, base).unwrap()
+        Format::from_content_type("text/turtle").unwrap()
+            .parse(turtle.as_bytes(), base).unwrap()
+            .quads().iter().cloned().map(Triple::from).collect()
     }
 
     /// An existing subject with an auxiliary written for it. `delete_rdf` is

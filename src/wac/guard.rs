@@ -276,11 +276,11 @@ mod tests {
         ACL_WRITE,
     };
     use crate::{
-        rdf,
+        rdf::Format,
         space::{AuxKind, StorageSpace},
         store::OxigraphStore,
     };
-    use oxigraph::io::RdfFormat;
+    use oxigraph::model::Triple;
 
     const ALICE: &str = "https://alice.example/card#me";
     const BOB: &str = "https://bob.example/card#me";
@@ -316,7 +316,9 @@ mod tests {
         let subject = resource(subject_path);
         crate::resource::insert_marked(store, &subject, &[]).await.unwrap();
         let aux = subject.aux(AuxKind::Acl);
-        let t = rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, aux.graph_iri()).unwrap();
+        let t: Vec<Triple> = Format::from_content_type("text/turtle").unwrap()
+            .parse(turtle.as_bytes(), aux.graph_iri()).unwrap()
+            .quads().iter().cloned().map(Triple::from).collect();
         crate::aux::put(store, &aux, &t).await.unwrap();
     }
 

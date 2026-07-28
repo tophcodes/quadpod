@@ -1,15 +1,11 @@
 //! What a resource *is*, and the one place blank nodes are dealt with.
 //!
-//! Skeleton for `docs/superpowers/specs/2026-07-28-jsonld-datasets-design.md`
-//! (revision 3). Signatures are fixed here so the plan's tasks fill bodies
-//! rather than deciding boundaries one file path at a time.
-//!
 //! The load-bearing distinction is between the two types below, and it is a
-//! type distinction rather than a convention because §4's invariant — *no
-//! blank node ever reaches the store* — is otherwise asserted globally and
-//! enforced locally, which is what the review found wrong in revision 2.
-//! [`Skolemized`] is the only thing the write path accepts, so "forgot to
-//! skolemize" is a compile error and not a leak.
+//! type distinction rather than a convention: §4's invariant — *no blank
+//! node ever reaches the store* — must hold everywhere, and a rule enforced
+//! locally, one call site at a time, is exactly the shape that misses one
+//! (design spec §4). [`Skolemized`] is the only thing the write path
+//! accepts, so "forgot to skolemize" is a compile error and not a leak.
 
 use crate::rdf::Format;
 use oxigraph::model::{NamedNode, Quad};
@@ -147,9 +143,9 @@ impl Skolemized {
     }
 
     /// Server-built content that is already ground. `None` if it is not, which
-    /// is the choke point replacing revision 2's per-handler enforcement:
-    /// `container::ensure_container`, `add_containment` and auxiliary
-    /// provisioning all come through here.
+    /// is the one choke point for that check: `container::ensure_container`,
+    /// `add_containment` and auxiliary provisioning all come through here,
+    /// rather than each asserting groundness on its own.
     pub fn ground(quads: Vec<Quad>) -> Option<Self> {
         use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
         let blank = quads.iter().any(|q| {
@@ -304,9 +300,9 @@ mod tests {
         assert!(!clean.uses_reserved_namespace(), "a longer NID is a different namespace");
     }
 
-    // The case revision 2 got wrong: a blank node that is both a graph name and
-    // a term. This is the Verifiable Credentials `proof` shape, and
-    // solid/specification#291 says a server may not modify those graph names.
+    // A blank node that is both a graph name and a term. This is the
+    // Verifiable Credentials `proof` shape, and solid/specification#291 says
+    // a server may not modify those graph names.
     #[test]
     fn a_blank_node_that_is_both_graph_name_and_term_keeps_its_identity() {
         let b = BlankNode::default();

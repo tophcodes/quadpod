@@ -210,8 +210,7 @@ fn has_recognized_mode(acl: &[Triple], subject: &NamedOrBlankNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rdf;
-    use oxigraph::io::RdfFormat;
+    use crate::rdf::Format;
 
     const ALICE: &str = "https://alice.example/card#me";
     const BOB: &str = "https://bob.example/card#me";
@@ -228,8 +227,10 @@ mod tests {
     const PROBE_AUTHENTICATED_AGENT: &str = "urn:sparql-pod:pdp:probe-authenticated-agent";
 
     fn acl(turtle: &str) -> Vec<Triple> {
-        rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, "https://pod.toph.so/foo.acl")
+        Format::from_content_type("text/turtle").unwrap()
+            .parse(turtle.as_bytes(), "https://pod.toph.so/foo.acl")
             .expect("test ACL parses")
+            .quads().iter().cloned().map(Triple::from).collect()
     }
 
     fn alice() -> Agent { Agent::WebId(ALICE.to_string()) }

@@ -136,8 +136,7 @@ pub async fn delete_subject(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rdf, resource::{exists, get_rdf, put_rdf}, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
-    use oxigraph::io::RdfFormat;
+    use crate::{rdf::Format, resource::{exists, get_rdf, put_rdf}, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
@@ -150,7 +149,9 @@ mod tests {
     }
 
     fn triples(turtle: &str, base: &str) -> Vec<Triple> {
-        rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, base).unwrap()
+        Format::from_content_type("text/turtle").unwrap()
+            .parse(turtle.as_bytes(), base).unwrap()
+            .quads().iter().cloned().map(Triple::from).collect()
     }
 
     /// A minimal but real ACL body, so the tests exercise the content path and
