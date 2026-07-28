@@ -100,4 +100,22 @@ mod tests {
         assert_eq!(hex.len(), 64, "full sha256, lowercase hex");
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
+
+    // The collision no separator at all admits: with nothing between the two
+    // parts, `<resource><graph>` cannot be split back apart, so the byte
+    // split can move from the resource/graph boundary to anywhere inside the
+    // concatenation — including right before a scheme, since a graph name
+    // must be an absolute IRI. Both pairs below concatenate to
+    // `https://pod.toph.so/ax:urn:1:2`.
+    #[test]
+    fn the_key_separates_pairs_no_separator_would_merge() {
+        let a = ShelfKey::of(&res("/a"), NamedNode::new("x:urn:1:2").unwrap().as_ref());
+        let b = ShelfKey::of(&res("/ax:"), NamedNode::new("urn:1:2").unwrap().as_ref());
+        assert_ne!(
+            a.graph_iri(),
+            b.graph_iri(),
+            "no separator between resource and graph name would let (/a, x:urn:1:2) and \
+             (/ax:, urn:1:2) hash to the same key"
+        );
+    }
 }
