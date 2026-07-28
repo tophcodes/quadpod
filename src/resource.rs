@@ -8,7 +8,7 @@
 
 use crate::{
     dataset::Skolemized,
-    rdf::RdfError,
+    rdf::{Format, RdfError},
     shelf::ShelfKey,
     space::{DirectlyDeletable, DirectlyWritable, GraphName, ResourceUrl, SpaceError},
     store::{SparqlStore, StoreError},
@@ -69,7 +69,7 @@ pub async fn put_dataset(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
     dataset: &Skolemized,
-    media_type: &str,
+    media_type: Format,
 ) -> Result<(), ResourceError> {
     todo!("skeleton")
 }
@@ -99,13 +99,15 @@ pub async fn delete_dataset(
 }
 
 /// §6.4: what the representation arrived as, for `*/*` and for the
-/// `mediaType` LWS requires per container member.
+/// `mediaType` LWS requires per container member. Stored as its media-type
+/// literal, returned as the type — the string form exists in the registry and
+/// nowhere else.
 // skeleton: the attribute goes when the body lands
 #[allow(unused_variables)]
 pub async fn stored_media_type(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
-) -> Result<Option<String>, ResourceError> {
+) -> Result<Option<Format>, ResourceError> {
     todo!("skeleton")
 }
 

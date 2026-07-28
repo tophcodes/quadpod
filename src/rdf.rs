@@ -1,4 +1,4 @@
-use crate::dataset::{Dataset, Skolemized};
+use crate::dataset::Dataset;
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::Triple;
 use sha2::{Digest, Sha256};
@@ -64,57 +64,80 @@ pub fn format_for_accept(accept: &str) -> Option<RdfFormat> {
     }
 }
 
-/// Whether a format can carry named graphs (§6.3). `text/turtle` and
-/// `application/n-triples` cannot; oxigraph refuses such a write outright
-/// rather than dropping the graph name, so this predicate is the difference
-/// between a designed answer and a runtime error.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
-pub fn carries_dataset(fmt: RdfFormat) -> bool {
-    todo!("skeleton")
+/// A media type this pod can read and write, and what it is capable of.
+///
+/// The point of the newtype is that "Turtle cannot carry named graphs" is
+/// stated **once**, here, instead of living in a predicate every caller has to
+/// remember to consult. It also keeps oxigraph's `RdfFormat` — an enum with
+/// variants we deliberately do not support — out of our own signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Format(RdfFormat);
+
+/// What a resource turned out to be, once read. Replaces a bare `bool`
+/// parameter that read as `negotiate(accept, true, …)` at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// A default graph and nothing else — every supported format can serve it.
+    Graph,
+    /// Carries named graphs, so a graph format serves only part of it (§6.2).
+    Dataset,
+}
+
+impl Format {
+    /// The formats this pod accepts on write, from a `Content-Type`.
+    /// Media-type tokens are case-insensitive per RFC 9110 §8.3.1.
+    // skeleton: the attribute goes when the body lands
+    #[allow(unused_variables, dead_code)]
+    pub fn from_content_type(ct: &str) -> Option<Self> {
+        todo!("skeleton")
+    }
+
+    /// What goes in the `Content-Type` of a response.
+    // skeleton: the attribute goes when the body lands
+    #[allow(dead_code)]
+    pub fn media_type(&self) -> &'static str {
+        todo!("skeleton")
+    }
+
+    /// §6.3: whether named graphs survive this format. `text/turtle` and
+    /// `application/n-triples` cannot carry them — oxigraph refuses such a
+    /// write outright rather than dropping the graph name, so this is the
+    /// difference between a designed answer and a runtime error.
+    // skeleton: the attribute goes when the body lands
+    #[allow(dead_code)]
+    pub fn carries_dataset(&self) -> bool {
+        todo!("skeleton")
+    }
+
+    // skeleton: the attribute goes when the body lands
+    #[allow(unused_variables, dead_code)]
+    pub fn parse(&self, bytes: &[u8], base_iri: &str) -> Result<Dataset, RdfError> {
+        todo!("skeleton")
+    }
+
+    /// §6.4: a deterministic function of its input. Quads are sorted before
+    /// serialization, exactly as [`etag`] sorts before hashing — one canonical
+    /// order for both, so two states that share a validator serialize
+    /// identically. Repeatability alone is not enough: oxigraph returns
+    /// `CONSTRUCT` results in insertion order.
+    // skeleton: the attribute goes when the body lands
+    #[allow(unused_variables, dead_code)]
+    pub fn serialize(&self, dataset: &Dataset) -> Result<Vec<u8>, RdfError> {
+        todo!("skeleton")
+    }
 }
 
 /// §6.3: select the highest-ranked acceptable media range the server can
 /// serve, over the whole `Accept` list with q-values — not the first
-/// recognised entry, which is what `format_for_accept` does today and which
+/// recognised entry, which is what [`format_for_accept`] does today and which
 /// answers `text/turtle, application/ld+json` with the lossy one.
 ///
-/// `stored` is the media type the representation arrived in (§6.4); `*/*`
-/// resolves to it. `None` means nothing acceptable is supported at all, which
-/// is the only remaining `406`.
+/// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
+/// it. `None` means nothing acceptable is supported at all, which is the only
+/// remaining `406`.
 // skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
-pub fn negotiate(
-    accept: &str,
-    has_named_graphs: bool,
-    stored: Option<&str>,
-) -> Option<RdfFormat> {
-    todo!("skeleton")
-}
-
-/// §4/§6.1: the validator, over the stored quads *before* de-skolemization and
-/// over the selected format. Graph names participate, or two datasets
-/// differing only in which graph a statement sits in share a validator.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
-pub fn etag_dataset(stored: &Skolemized, fmt: RdfFormat) -> String {
-    todo!("skeleton")
-}
-
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
-pub fn parse_dataset(bytes: &[u8], fmt: RdfFormat, base_iri: &str) -> Result<Dataset, RdfError> {
-    todo!("skeleton")
-}
-
-/// §6.4: a deterministic function of its input. Quads are sorted before
-/// serialization, exactly as [`etag`] sorts before hashing — one canonical
-/// order for both, so two states that share a validator serialize identically.
-/// Repeatability alone is not enough: oxigraph returns `CONSTRUCT` results in
-/// insertion order.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
-pub fn serialize_dataset(dataset: &Dataset, fmt: RdfFormat) -> Result<Vec<u8>, RdfError> {
+#[allow(unused_variables, dead_code)]
+pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
     todo!("skeleton")
 }
 

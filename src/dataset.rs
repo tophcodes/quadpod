@@ -11,6 +11,7 @@
 //! [`Skolemized`] is the only thing the write path accepts, so "forgot to
 //! skolemize" is a compile error and not a leak.
 
+use crate::rdf::Format;
 use oxigraph::model::{NamedNode, Quad};
 
 /// The reserved namespace. Every server-minted IRI lives under it, and §3.2.2
@@ -88,6 +89,20 @@ impl Skolemized {
     /// derived from the skolem IRI** — a fresh label per read would break
     /// §6.4's byte-identical guarantee.
     pub fn deskolemize(&self) -> Dataset {
+        todo!("skeleton")
+    }
+
+    /// §6.1: the validator, over the stored quads *before* de-skolemization and
+    /// over the selected format. Graph names participate, or two datasets
+    /// differing only in which graph a statement sits in share a validator.
+    ///
+    /// A method rather than a free function because the thing it identifies is
+    /// this value: hashing something else, or hashing after the blank nodes
+    /// come back, is the mistake — and both are harder to write by accident
+    /// when the hash belongs to the stored form.
+    // skeleton: the attribute goes when the body lands
+    #[allow(unused_variables)]
+    pub fn etag(&self, fmt: Format) -> String {
         todo!("skeleton")
     }
 }
