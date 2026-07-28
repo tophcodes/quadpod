@@ -43,24 +43,24 @@ Only `resource` builds a system-graph IRI.
     module header. The presence marker is what makes existence a stored fact
     rather than a triple count — the ambiguity that made an empty ACL mean the
     opposite of what its author wrote. Its safety argument is that no
-    user-addressable path can name a `urn:pod:` graph; a second place deriving
-    `urn:pod:sys:<iri>` is a second place that can scope it wrong, and the shelf
+    user-addressable path can name a `urn:quadpod:` graph; a second place deriving
+    `urn:quadpod:sys:<iri>` is a second place that can scope it wrong, and the shelf
     registry is about to write into that same graph. Quote-anchored, because
     `shelf.rs` legitimately mentions the scheme in prose.
-    check: ! rg -q '"urn:pod:sys:' src --glob '!src/resource.rs'
+    check: ! rg -q '"urn:quadpod:sys:' src --glob '!src/resource.rs'
 
 Only `shelf::ShelfKey` mints a subgraph IRI.
     → 2026-07-28-jsonld-datasets-design.md §3.1, §3.2 invariant 1. The key is a
     pure function of (resource IRI, graph name) with a `0x00` separator; a
     second place building that string by hand is how two resources come to
     share one shelf, which is a cross-resource read and write.
-    check: ! rg -q "urn:pod:subgraph" src --glob '!src/shelf.rs'
+    check: ! rg -q "urn:quadpod:subgraph" src --glob '!src/shelf.rs'
 
 Only `dataset` mints or recognises a skolem IRI.
     → §4. Skolemization preserves meaning only while the skolem IRIs occur
     nowhere else (RDF 1.1 §3.5); a second place that writes or matches
-    `urn:pod:bnode:` is a second place that can get the round trip wrong.
-    check: ! rg -q "urn:pod:bnode" src --glob '!src/dataset.rs'
+    `urn:quadpod:bnode:` is a second place that can get the round trip wrong.
+    check: ! rg -q "urn:quadpod:bnode" src --glob '!src/dataset.rs'
 
 ## Boundaries that have no compiler behind them
 

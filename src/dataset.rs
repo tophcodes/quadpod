@@ -17,14 +17,14 @@ use oxigraph::model::{NamedNode, Quad};
 /// The reserved namespace. Every server-minted IRI lives under it, and §3.2.2
 /// refuses it in request bodies — RDF 1.1 §3.5 preserves meaning only
 /// "provided that the Skolem IRIs do not occur anywhere else".
-pub const RESERVED_PREFIX: &str = "urn:pod:";
+pub const RESERVED_PREFIX: &str = "urn:quadpod:";
 
 /// A dataset as a client wrote it or will read it: blank nodes intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dataset(Vec<Quad>);
 
 /// A dataset as the store holds it: every blank node replaced by a
-/// `urn:pod:bnode:<uuid>` IRI, in triples and as graph names alike.
+/// `urn:quadpod:bnode:<uuid>` IRI, in triples and as graph names alike.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skolemized(Vec<Quad>);
 
@@ -47,9 +47,9 @@ impl Dataset {
         !self.named_graphs().is_empty()
     }
 
-    /// §3.2.2: any `urn:pod:` IRI anywhere — subject, predicate, object or
+    /// §3.2.2: any `urn:quadpod:` IRI anywhere — subject, predicate, object or
     /// graph name — is a `400`. Case-insensitive over scheme and NID, because
-    /// RFC 8141 makes both case-insensitive and `URN:POD:` denotes the same
+    /// RFC 8141 makes both case-insensitive and `URN:QUADPOD:` denotes the same
     /// namespace.
     pub fn uses_reserved_namespace(&self) -> bool {
         todo!("skeleton")

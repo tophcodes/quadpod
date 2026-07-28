@@ -88,7 +88,7 @@ storage container (`ldp:Container` + `pim:Storage`); HTTP normalizes the empty p
 |---|---|---|
 | `<res>` | User data triples (for a container: user triples **+** server-managed `ldp:contains`) | Served as the resource representation (conneg) |
 | `<res>.acl` | The ACL for `<res>` — a **first-class Solid resource** with its own URL, discoverable via `Link: rel="acl"`, GET/PUT-able, itself WAC-controlled (`acl:Control`) | User-addressable resource |
-| `urn:pod:sys:<res>` | Server-asserted bookkeeping: for blobs the `object_store` key, size, hash, content-type; ETag; timestamps | **Server-only**, never conneg'd, never in user namespace |
+| `urn:quadpod:sys:<res>` | Server-asserted bookkeeping: for blobs the `object_store` key, size, hash, content-type; ETag; timestamps | **Server-only**, never conneg'd, never in user namespace |
 
 Rationale for the split: ACL is *not* internal metadata — it is a real resource a user can
 query — so it gets its own URL/graph. Purely-internal, server-asserted triples must **not**
@@ -154,7 +154,7 @@ Request flows top→down; three front doors share one authorization core.
 - **SPARQL storage mapping** — resource ↔ named graph, container ↔ `ldp:contains`, LDP ops →
   atomic SPARQL 1.1 Update; the `SparqlStore` trait + Oxigraph impl
 - **Blob handling** — `BlobStore` trait, `object_store` impl, RDF-vs-blob router, system
-  metadata graph (`urn:pod:sys:<res>`)
+  metadata graph (`urn:quadpod:sys:<res>`)
 - **PRP** — fetch a resource's `.acl` graph + walk the container hierarchy to the root
   fallback (both are SPARQL queries)
 - **StorageSpace + URI-template matcher** (§9), threaded through everything (no hardcoded root/base-URI/owner)

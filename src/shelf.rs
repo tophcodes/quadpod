@@ -9,13 +9,13 @@
 use crate::space::ResourceUrl;
 use oxigraph::model::NamedNodeRef;
 
-/// The bookkeeping vocabulary, under `urn:pod:sys#` — the same prefix
+/// The bookkeeping vocabulary, under `urn:quadpod:sys#` — the same prefix
 /// `resource::SYS_PRESENT` already uses. The `#` is what keeps these
 /// predicate IRIs from colliding with the system-*graph* naming scheme
-/// `urn:pod:sys:<resource-iri>`.
-pub const SYS_HAS_SUBGRAPH: &str = "urn:pod:sys#hasSubgraph";
-pub const SYS_GRAPH_NAME: &str = "urn:pod:sys#graphName";
-pub const SYS_MEDIA_TYPE: &str = "urn:pod:sys#mediaType";
+/// `urn:quadpod:sys:<resource-iri>`.
+pub const SYS_HAS_SUBGRAPH: &str = "urn:quadpod:sys#hasSubgraph";
+pub const SYS_GRAPH_NAME: &str = "urn:quadpod:sys#graphName";
+pub const SYS_MEDIA_TYPE: &str = "urn:quadpod:sys#mediaType";
 
 /// A store graph holding one named graph of one resource.
 ///
@@ -27,7 +27,7 @@ pub struct ShelfKey(String);
 
 impl ShelfKey {
     /// SHA-256 over `resource-iri ‖ 0x00 ‖ graph-name`, rendered as 64 lowercase
-    /// hex characters and prefixed `urn:pod:subgraph:`.
+    /// hex characters and prefixed `urn:quadpod:subgraph:`.
     ///
     /// The separator is `0x00` because RFC 3987 excludes control characters
     /// from IRIs, so it cannot occur in either part and one pair can never be

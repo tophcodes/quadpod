@@ -156,7 +156,7 @@ Enterprise Solid Server hosts access-control resources on an entirely separate s
 ## Server-asserted facts are not auxiliary resources
 
 Creation and modification times, byte size, content hash and storage keys are **not**
-addressable and not writable. They live in an internal graph (`urn:pod:sys:<res>`) and are
+addressable and not writable. They live in an internal graph (`urn:quadpod:sys:<res>`) and are
 exposed through the HTTP headers that already exist for them — `Last-Modified`, `ETag`,
 `Content-Length`.
 
@@ -167,6 +167,32 @@ header is the interface; your graphs stay yours. The moment a server-asserted fa
 has a writable URL, a client can assert its own creation timestamp and the value is
 worthless for auditing or ordering. A read-only projection of these facts may be offered
 later; it will never be writable.
+
+## The vocabulary this pod mints
+
+One link relation is minted here, because none is registered for what it says:
+
+```
+Link: <urn:example:g1>; rel="https://quadpod.toph.so/ns#containsGraph"
+```
+
+It appears on a `GET` answered in a format that cannot carry named graphs — Turtle or
+N-Triples against a dataset-valued resource — and names a graph the response therefore does
+**not** contain. It is what makes that partial answer honest rather than silently short, and
+it is why the response is a `200` with the default graph rather than a `406`. RFC 8288 permits
+extension relations; the only requirement is an absolute IRI.
+
+`rel="alternate"` accompanies it, with `type="application/trig"` and
+`type="application/ld+json"`. That one carries its ordinary meaning — another representation
+exists — and **not** a claim about completeness; no registered relation says "this response is
+lossy", which is why `containsGraph` exists at all.
+
+**This IRI is provisional.** It is not dereferenceable yet, and it is tied to a hostname that
+may change. Moving it later is a breaking change for anything that reads it, so it gets
+settled — a permanent identifier, or a hosted document at that address — before this pod is
+deployed anywhere, and at the latest before 1.0. The internal `urn:quadpod:` namespace is a
+different thing entirely: it never leaves the server (see the design specs), while this one is
+part of the contract.
 
 ## Design rationale
 

@@ -134,20 +134,20 @@ A resource is an **RDF dataset**. Three kinds of store graph exist:
 | Store graph | Holds |
 |---|---|
 | `<resource-iri>` | the resource's default graph — unchanged from today |
-| `urn:pod:subgraph:<hex>` | one named graph of one resource |
-| `urn:pod:sys:<resource-iri>` | bookkeeping: presence marker and registry |
+| `urn:quadpod:subgraph:<hex>` | one named graph of one resource |
+| `urn:quadpod:sys:<resource-iri>` | bookkeeping: presence marker and registry |
 
 The registry lives beside the presence marker that already exists. `sys:` expands to
-`urn:pod:sys#`, matching `resource::SYS_PRESENT` (`urn:pod:sys#present`) — note the `#`,
+`urn:quadpod:sys#`, matching `resource::SYS_PRESENT` (`urn:quadpod:sys#present`) — note the `#`,
 which is what keeps predicate IRIs from colliding syntactically with the system-*graph*
-naming scheme `urn:pod:sys:<resource-iri>`:
+naming scheme `urn:quadpod:sys:<resource-iri>`:
 
 ```
 <resource>              sys:present     true .
 <resource>              sys:mediaType   "application/ld+json" .   # §6.4
-<resource>              sys:hasSubgraph <urn:pod:subgraph:8f2a…> .
-<urn:pod:subgraph:8f2a…> sys:graphName  <urn:example:g1> .      # IRI-named
-<urn:pod:subgraph:1c07…> sys:graphSkolem <urn:pod:bnode:…> .    # was a blank node (§4)
+<resource>              sys:hasSubgraph <urn:quadpod:subgraph:8f2a…> .
+<urn:quadpod:subgraph:8f2a…> sys:graphName  <urn:example:g1> .      # IRI-named
+<urn:quadpod:subgraph:1c07…> sys:graphSkolem <urn:quadpod:bnode:…> .    # was a blank node (§4)
 ```
 
 ### 3.1 Key derivation
@@ -173,13 +173,13 @@ resources land in two different shelves.
 
 1. **The key is server-minted only**, from values the server already holds. No client can
    name the shelf space.
-2. **The reserved namespace is refused at the door.** Any IRI in `urn:pod:` appearing in a
+2. **The reserved namespace is refused at the door.** Any IRI in `urn:quadpod:` appearing in a
    request body — as subject, predicate, object or graph name — is rejected with `400`. This
    is a single check in one place, and it removes a family of questions rather than answering
    them one at a time (§4 needs it for de-skolemization; §3 would otherwise need to argue
-   that a graph named `urn:pod:subgraph:…` is harmless). Its normative basis is RDF 1.1 §3.5
+   that a graph named `urn:quadpod:subgraph:…` is harmless). Its normative basis is RDF 1.1 §3.5
    (§4). **The match is case-insensitive over the scheme and NID**: RFC 8141 makes both
-   case-insensitive, so `URN:POD:bnode:…` denotes the same namespace and a literal prefix
+   case-insensitive, so `URN:QUADPOD:bnode:…` denotes the same namespace and a literal prefix
    comparison would let it through.
 3. **Content and bookkeeping appear and disappear in the same update.** No subgraph without a
    registry entry, no registry entry without a subgraph.
@@ -190,11 +190,11 @@ resources land in two different shelves.
    drop both by registry and by new key for this reason; that redundancy is what makes the
    invariant self-healing rather than merely asserted, and it must not be optimised away.
 5. **The system graph is not addressable.** No URL path resolves to it, which is the existing
-   argument for why `urn:pod:sys:` is safe today. The registry inherits it.
+   argument for why `urn:quadpod:sys:` is safe today. The registry inherits it.
 
 ### 3.3 Naming
 
-`urn:pod:` is not a registered URN namespace (RFC 8141 requires registration). This is a
+`urn:quadpod:` is not a registered URN namespace (RFC 8141 requires registration). This is a
 **deliberate deviation**: these IRIs never leave the server, are never resolved, and never
 appear in a response, and readability while debugging a bookkeeping structure is worth more
 than formal correctness nobody checks. `tag:` URIs (RFC 4151) are the named escape hatch if
@@ -217,7 +217,7 @@ Ordinary resources only. Containers and auxiliaries reject named graphs with `40
 ### 3.5 The internal vocabulary is documented, not folklore
 
 `sys:present`, `sys:hasSubgraph`, `sys:graphName`, `sys:graphSkolem` are a named, stable part
-of the design under the `urn:pod:sys#` prefix. No HTTP client ever needs them.
+of the design under the `urn:quadpod:sys#` prefix. No HTTP client ever needs them.
 
 ### 3.6 The sealed-trait invariant needs replacing
 
@@ -237,8 +237,8 @@ property the sealed trait guaranteed is restored explicitly rather than inherite
 **Revision 1 got this wrong in three ways at once, and the fix is one mechanism.**
 
 Every blank node in a `PUT` body — in triples and as a graph name — is replaced on write by a
-server-minted IRI in the reserved namespace, `urn:pod:bnode:<uuid>`. Each occurrence of the
-same blank node within one document gets the same skolem IRI. On read, every `urn:pod:bnode:`
+server-minted IRI in the reserved namespace, `urn:quadpod:bnode:<uuid>`. Each occurrence of the
+same blank node within one document gets the same skolem IRI. On read, every `urn:quadpod:bnode:`
 IRI becomes a blank node again, one per distinct skolem IRI, **with a label derived from the
 skolem IRI rather than freshly generated** — §6.4 guarantees byte-identical responses for an
 unchanged resource, and a fresh label per read would break it in Turtle and JSON-LD (measured).
@@ -253,7 +253,7 @@ invariant asserted globally and enforced locally is one refactor from being fals
 RDF 1.1 §3.5 blesses skolemization, and the exact wording is the normative basis for invariant
 3.2.2 rather than a convenience: replacing blank nodes with Skolem IRIs preserves meaning
 *"provided that the Skolem IRIs do not occur anywhere else"*. That is why a request body may
-not contain `urn:pod:` IRIs — not because tracking them would be more expensive.
+not contain `urn:quadpod:` IRIs — not because tracking them would be more expensive.
 
 The `.well-known/genid/` form the same section suggests does **not** apply here: it is
 conditional on wanting the IRIs recognisable as skolem constants *outside* the system that
@@ -298,7 +298,7 @@ cross-write determinism; this does not. It is invisible from outside — within 
 state everything is stable, which is what `If-None-Match` needs — and it applies only to
 blank-node-named graphs. IRI-named graphs keep stable keys.
 
-**What it costs.** Invariant 3.2.2: a document may not contain `urn:pod:` IRIs. Without it a
+**What it costs.** Invariant 3.2.2: a document may not contain `urn:quadpod:` IRIs. Without it a
 client could write a real IRI in the skolem namespace and get a blank node back — a visible
 rewrite of their data — and §3.5's meaning-preservation clause would not hold.
 
@@ -310,7 +310,7 @@ exists, and it has no equivalent here. So skolemization and de-skolemization app
 auxiliaries; the registry, the shelves and §5 steps 4–6 do not. The read side needs the same
 care — `get_impl` shares one path across `Resource`, `Container` and `Aux` today, and
 de-skolemization belongs where that path serialises, not inside a resource-shaped branch, or
-`GET /.aux/foo.acl` returns `<urn:pod:bnode:…>` literally.
+`GET /.aux/foo.acl` returns `<urn:quadpod:bnode:…>` literally.
 
 **A note on `PATCH`.** The day N3 Patch arrives, skolemization needs a rule for what a patch
 means against a skolemized store. Not in scope here, but it is the place this decision will
@@ -325,7 +325,7 @@ today, so this is two call sites, not one.
 1. Parse the body into a **dataset**, base IRI = the resource IRI.
 2. **Cheap rejections, immediately** — before anything expensive, because a request that
    cannot succeed must not pay for work first:
-   - any `urn:pod:` IRI anywhere in the dataset → `400` (§3.2.2);
+   - any `urn:quadpod:` IRI anywhere in the dataset → `400` (§3.2.2);
    - named graphs on a container or auxiliary → `400` (§3.4);
    - client-set containment in a container body → `409`, as today. **This check must run over
      the whole dataset, not the default graph only** — `container::body_sets_containment`
@@ -617,7 +617,7 @@ No migration is needed regardless: the pod is pre-1.0, the store is in-memory on
 
 1. **An empty named graph does not survive.** `{"@id": "urn:g", "@graph": []}` produces no
    quads, so a quad-based parser never sees it. Not closable within this model.
-2. **`urn:pod:` IRIs are refused in request bodies** (§3.2.2). A document that legitimately
+2. **`urn:quadpod:` IRIs are refused in request bodies** (§3.2.2). A document that legitimately
    wants to talk about such an IRI cannot be stored.
 3. **Blank node labels are not preserved**, only their structure and co-reference. True today
    as well.
@@ -658,7 +658,7 @@ No migration is needed regardless: the pod is pre-1.0, the store is in-memory on
 - **HTTP** — JSON-LD with a named graph in and out; TriG and N-Quads both directions;
   `Accept: text/turtle, application/ld+json` yields JSON-LD; `text/turtle` alone yields the
   default graph with both `rel="alternate"` links; `*/*` yields the stored media type;
-  `Vary: Accept` present; `400` for container, auxiliary, and a `urn:pod:` IRI in the body; the
+  `Vary: Accept` present; `400` for container, auxiliary, and a `urn:quadpod:` IRI in the body; the
   two graph-naming cases from §9.
 - **Determinism** — two `GET`s of the same stored state in the same format are byte-identical,
   **and two states that share an ETag serialize identically** (§6.4). The second is the one
@@ -666,7 +666,7 @@ No migration is needed regardless: the pod is pre-1.0, the store is in-memory on
   are equal, then confirm the bytes are. A test that only repeats a `GET` passes on the broken
   version.
 - **Auxiliaries** — an ACL containing a blank node round-trips as a blank node, not as
-  `<urn:pod:bnode:…>`, and an auxiliary write still refuses a missing subject: `aux::put`'s
+  `<urn:quadpod:bnode:…>`, and an auxiliary write still refuses a missing subject: `aux::put`'s
   guard is not bypassed by the new write path (§4).
 - **The graph-format write refusal** — `PUT` Turtle onto a resource with named graphs is `409`
   and changes nothing; the same content as TriG succeeds. Plus the `containsGraph` links on the
@@ -748,9 +748,9 @@ needs a direct assertion on the response instead.
 |---|---|---|
 | 4 | De-skolemize to "one **fresh** blank node" per skolem IRI | Fresh labels break §6.4's byte-identical guarantee in Turtle and JSON-LD (measured). The label is derived from the skolem IRI instead. One word, and it was a contradiction between two sections of the same revision. |
 | 4 | "Nothing else in the store is a blank node" | Asserted globally, enforced in two handlers; three other writers take arbitrary triples and the invariant held only because `provision_root_acl` happens to write `<#owner>` rather than `[] a acl:Authorization`. Now enforced at `serialize_for_insert`. |
-| 4, 5, 6 | (silent on auxiliaries) | A literal reading routed ACL writes through §5's unconditional drop-and-insert, losing `aux::put`'s existence guard, and left de-skolemization out of the auxiliary read path — `GET /.aux/notes.acl` would have shown `<urn:pod:bnode:…>`. |
+| 4, 5, 6 | (silent on auxiliaries) | A literal reading routed ACL writes through §5's unconditional drop-and-insert, losing `aux::put`'s existence guard, and left de-skolemization out of the auxiliary read path — `GET /.aux/notes.acl` would have shown `<urn:quadpod:bnode:…>`. |
 | 4 | §3.2.2 justified as "cheaper than tracking skolems" | RDF 1.1 §3.5 preserves meaning only *"provided that the Skolem IRIs do not occur anywhere else"* — a normative basis, not an optimisation. The `.well-known/genid/` form does not apply, being conditional on external recognisability. |
-| 3.2.2 | A prefix check on `urn:pod:` | RFC 8141 makes scheme and NID case-insensitive; `URN:POD:` would have slipped a literal comparison. |
+| 3.2.2 | A prefix check on `urn:quadpod:` | RFC 8141 makes scheme and NID case-insensitive; `URN:QUADPOD:` would have slipped a literal comparison. |
 | 6.2 | `rel="alternate"` signals that the response is lossy | It signals no such thing — IANA registers it as "a substitute for this context" and nothing reads it as a completeness claim. The graphs are now named explicitly by a minted `containsGraph` relation. |
 | 6.2 | (silent on writing back) | `GET` Turtle → edit → `PUT` Turtle destroyed every named graph with a `2xx`. The `406` of revision 2 did not have this failure; §6.2.1 closes it with a `409`, which the `containsGraph` links make actionable. |
 | 6.4 | "Deterministic" meaning repeatable | Repeatable was already true. Two states with the same order-independent ETag serialized differently, because oxigraph returns `CONSTRUCT` results in insertion order — so sorting before serializing is required, not incidental. |

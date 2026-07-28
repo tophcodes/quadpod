@@ -150,7 +150,7 @@ convey:
   because the delete cascades to that ACL. Consequence, deliberate: an agent holding
   `Write` but not `Control` cannot delete such a resource at all. Without the check, a
   narrowing ACL would be removable by exactly the agent it was written to constrain.
-- **Superseded.** The rule below predates the presence marker (`urn:pod:sys:<iri>`,
+- **Superseded.** The rule below predates the presence marker (`urn:quadpod:sys:<iri>`,
   see [2026-07-27-acl-auxiliary-model-design.md](2026-07-27-acl-auxiliary-model-design.md)
   §7 "Existence as a stored fact"): existence is no longer inferred from triple count,
   so an empty body creates a real, empty, present resource — including an empty ACL,
@@ -326,5 +326,5 @@ review**, because this is a security boundary.
   resource, `If-None-Match: *` on GET → 304, comma-separated ETag lists).
 - Carried over from Plan 3: POST to a non-container should arguably be 405 with an
   `Allow` header rather than 409; empty-body PUT creates a dangling containment link
-  (symptom of the "empty graph = absent" model, needs a `urn:pod:sys:` presence
+  (symptom of the "empty graph = absent" model, needs a `urn:quadpod:sys:` presence
   marker, due with blobs).

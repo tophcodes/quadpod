@@ -4,7 +4,7 @@
 //! store cannot distinguish an empty named graph from an absent one, and
 //! treating "no triples" as "absent" made an empty ACL mean the opposite of
 //! what its author intended (it fell back to the ancestor's rules instead of
-//! denying). A presence marker in `urn:pod:sys:<iri>` removes the ambiguity.
+//! denying). A presence marker in `urn:quadpod:sys:<iri>` removes the ambiguity.
 
 use crate::{
     dataset::Skolemized,
@@ -34,11 +34,11 @@ impl From<SpaceError> for ResourceError {
 
 /// Predicate asserting that a resource exists. Server-asserted, and therefore
 /// in the reserved system namespace rather than the user's graph.
-pub const SYS_PRESENT: &str = "urn:pod:sys#present";
+pub const SYS_PRESENT: &str = "urn:quadpod:sys#present";
 
 /// The system graph holding server-asserted facts about `g`.
 pub fn sys_graph_iri(g: &impl GraphName) -> String {
-    format!("urn:pod:sys:{}", g.graph_iri())
+    format!("urn:quadpod:sys:{}", g.graph_iri())
 }
 
 /// Render triples as N-Triples for interpolation into an `INSERT` body.
@@ -323,7 +323,7 @@ mod tests {
         // the user sees exactly what they wrote
         assert_eq!(get_rdf(&store, &foo).await.unwrap().unwrap().len(), 1);
         // and the marker is elsewhere
-        assert!(sys_graph_iri(&foo).starts_with("urn:pod:sys:"));
+        assert!(sys_graph_iri(&foo).starts_with("urn:quadpod:sys:"));
     }
 
     #[tokio::test]
@@ -379,7 +379,7 @@ mod tests {
         assert!(remaining.is_empty(), "delete_rdf should remove unmarked content too");
     }
 
-    // The ASK is scoped to `GRAPH <urn:pod:sys:{iri}>`, which is what stops a
+    // The ASK is scoped to `GRAPH <urn:quadpod:sys:{iri}>`, which is what stops a
     // user from forging someone else's presence by writing the marker
     // triple into their own graph instead of the system graph.
     #[tokio::test]

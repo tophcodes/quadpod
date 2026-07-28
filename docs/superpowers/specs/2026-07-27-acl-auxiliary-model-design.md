@@ -91,7 +91,7 @@ Consequently `AuxKind` is the single source of truth for both the routing table 
 of `Link` headers, so the two cannot drift.
 
 **Server-asserted facts are deliberately not auxiliaries.** Creation and modification
-times, size, hash, the `object_store` key: these stay in the reserved `urn:pod:sys:<res>`
+times, size, hash, the `object_store` key: these stay in the reserved `urn:quadpod:sys:<res>`
 graph (parent design §5), exposed through HTTP headers (`Last-Modified`, `ETag`,
 `Content-Length`) rather than as an addressable RDF resource. The split is by **authority,
 not by aboutness** — the moment a server-asserted fact has a writable URL, a client can
@@ -278,7 +278,7 @@ smuggled-in clause here.
 
 ## 7. Existence as a stored fact
 
-Resource existence moves out of "the user graph has at least one triple" into the reserved system graph the parent spec already defines (`urn:pod:sys:<res>`, parent design §5).
+Resource existence moves out of "the user graph has at least one triple" into the reserved system graph the parent spec already defines (`urn:quadpod:sys:<res>`, parent design §5).
 
 Why this belongs in *this* change rather than a later one: defect 4 was filed as a data-integrity defect at the end of Plan 3 and became a **security** defect the moment WAC shipped, because "resource absent" now means "ancestor policy applies". An empty ACL — the natural way to express *deny everything below here* — was answered with `201 Created` while in fact widening access. The 400-on-empty-body rules currently in `put_impl`/`post_impl` are a workaround that makes a legitimate Solid operation impossible; they are removed here.
 
@@ -325,7 +325,7 @@ Related and already documented in the current spec: `acl:default acl:Control` on
 1. **Existence witness.** `AuxUrl` could be constructible only from a proof that the subject exists (`fn aux_of(subject: &Existing<ResourceUrl>, kind: AuxKind) -> AuxUrl`), moving defect 6 into the type system too. Cost: an `Existing<T>` token threaded through call sites that currently take a URL. **Recommendation: no** — one check in the typed store wrapper, with a test, is the better trade at this size.
 2. **How far `Target` travels.** It could stop at the guard, with handlers taking the unwrapped URL types, or be matched on inside each handler. **Recommendation: into the handlers** — the match is what replaces the scattered predicates, and a handler that receives `AuxUrl` cannot accidentally treat it as a container.
 3. **`HEAD` and `Link` on denials.** Obligation 1 in §4 says the header goes on 404s. Does it also go on 401/403? Emitting it discloses only a URL the client could not use anyway, and SolidOS's fallback path can be reached from a denial too. **Recommendation: yes, emit it always.**
-4. **The system-graph read projection.** Server-asserted facts are not writable, but they should be *readable* — for clients and for the deferred `/sparql` proxy. The natural shape is a GET-only URL serving `urn:pod:sys:<res>` as Turtle, answering 405 on write. Two things need verifying against the spec text before building it, the same way the ACL-URL risk was verified: whether Solid's description resource is required to be writable (which would make `rel="describedby"` the wrong relation for a read-only server projection); what relation a read-only projection should carry instead; and — a distinction this design has so far treated loosely — whether `rel="describedby"` denotes a per-resource metadata sidecar, the *storage description resource* the Protocol defines at a storage root, or both. Those are not the same thing and must not be conflated before either is built. **Recommendation: named follow-up, not this change** — it has no caller until blobs land.
+4. **The system-graph read projection.** Server-asserted facts are not writable, but they should be *readable* — for clients and for the deferred `/sparql` proxy. The natural shape is a GET-only URL serving `urn:quadpod:sys:<res>` as Turtle, answering 405 on write. Two things need verifying against the spec text before building it, the same way the ACL-URL risk was verified: whether Solid's description resource is required to be writable (which would make `rel="describedby"` the wrong relation for a read-only server projection); what relation a read-only projection should carry instead; and — a distinction this design has so far treated loosely — whether `rel="describedby"` denotes a per-resource metadata sidecar, the *storage description resource* the Protocol defines at a storage root, or both. Those are not the same thing and must not be conflated before either is built. **Recommendation: named follow-up, not this change** — it has no caller until blobs land.
 
 ## 13. Success criteria
 
