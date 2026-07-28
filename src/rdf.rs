@@ -119,10 +119,15 @@ impl Format {
         self.0.supports_datasets()
     }
 
-    // skeleton: the attribute goes when the body lands
-    #[allow(unused_variables, dead_code)]
     pub fn parse(&self, bytes: &[u8], base_iri: &str) -> Result<Dataset, RdfError> {
-        todo!("skeleton")
+        let parser = RdfParser::from_format(self.0)
+            .with_base_iri(base_iri)
+            .map_err(|e| RdfError::Parse(e.to_string()))?;
+        let mut out = Vec::new();
+        for quad in parser.for_slice(bytes) {
+            out.push(quad.map_err(|e| RdfError::Parse(e.to_string()))?);
+        }
+        Ok(Dataset::new(out))
     }
 
     /// §6.4: a deterministic function of its input. Quads are sorted before
@@ -130,10 +135,17 @@ impl Format {
     /// order for both, so two states that share a validator serialize
     /// identically. Repeatability alone is not enough: oxigraph returns
     /// `CONSTRUCT` results in insertion order.
-    // skeleton: the attribute goes when the body lands
-    #[allow(unused_variables, dead_code)]
     pub fn serialize(&self, dataset: &Dataset) -> Result<Vec<u8>, RdfError> {
-        todo!("skeleton")
+        // Sorted for the same reason `etag` sorts: oxigraph returns CONSTRUCT
+        // results in insertion order, so without this two states that share a
+        // validator serialize differently.
+        let mut quads: Vec<_> = dataset.quads().to_vec();
+        quads.sort_by_key(|q| q.to_string());
+        let mut ser = RdfSerializer::from_format(self.0).for_writer(Vec::new());
+        for q in &quads {
+            ser.serialize_quad(q).map_err(|e| RdfError::Serialize(e.to_string()))?;
+        }
+        ser.finish().map_err(|e| RdfError::Serialize(e.to_string()))
     }
 }
 
@@ -287,5 +299,60 @@ mod tests {
         // Parameters and case are per RFC 9110 §8.3.1.
         assert_eq!(Format::from_content_type("TEXT/TURTLE; charset=utf-8"), Some(turtle));
         assert_eq!(Format::from_content_type("application/json"), None);
+    }
+
+    const NAMED_GRAPH_JSONLD: &str = r#"{
+      "@context": {"name": "http://schema.org/name"},
+      "@graph": [
+        {"@id": "http://example.org/g1",
+         "@graph": [{"@id": "http://example.org/alice", "name": "Alice"}]},
+        {"@id": "http://example.org/bob", "name": "Bob"}
+      ]
+    }"#;
+
+    #[test]
+    fn parse_keeps_the_graph_name() {
+        let jsonld = Format::from_content_type("application/ld+json").unwrap();
+        let ds = jsonld.parse(NAMED_GRAPH_JSONLD.as_bytes(), "https://pod.toph.so/c/notes").unwrap();
+
+        assert_eq!(ds.quads().len(), 2);
+        let named: Vec<_> = ds.quads().iter()
+            .filter(|q| q.graph_name != oxigraph::model::GraphName::DefaultGraph)
+            .collect();
+        assert_eq!(named.len(), 1, "one quad sits in a named graph");
+        assert_eq!(
+            named[0].graph_name.to_string(),
+            "<http://example.org/g1>",
+            "the graph name is the client's, unchanged"
+        );
+    }
+
+    // §6.4: equal meaning must give equal bytes, or a cached validator and a
+    // Range request splice mismatched content. Repeatability alone passes even
+    // on the broken version, so the two datasets here are built in opposite
+    // orders on purpose.
+    #[test]
+    fn serialization_is_canonical_not_merely_repeatable() {
+        use oxigraph::model::{Literal, NamedNode, Quad};
+        let g = NamedNode::new("http://example.org/g1").unwrap();
+        let p = NamedNode::new("http://schema.org/name").unwrap();
+        let q1 = Quad::new(
+            NamedNode::new("http://example.org/alice").unwrap(),
+            p.clone(), Literal::new_simple_literal("Alice"), g.clone());
+        let q2 = Quad::new(
+            NamedNode::new("http://example.org/bob").unwrap(),
+            p, Literal::new_simple_literal("Bob"), g);
+
+        let forward = Dataset::new(vec![q1.clone(), q2.clone()]);
+        let backward = Dataset::new(vec![q2, q1]);
+
+        for ct in ["application/trig", "application/n-quads", "application/ld+json"] {
+            let f = Format::from_content_type(ct).unwrap();
+            assert_eq!(
+                f.serialize(&forward).unwrap(),
+                f.serialize(&backward).unwrap(),
+                "{ct}: same quads in a different order must serialize identically"
+            );
+        }
     }
 }
