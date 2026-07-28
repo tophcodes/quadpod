@@ -445,6 +445,35 @@ mod tests {
         assert_eq!(got[0].predicate.as_str(), "http://schema.org/name");
     }
 
+    // §4, on the one path a client body actually takes: nothing before this
+    // test writes a blank node through `put_rdf`, so a no-op `skolemize` or a
+    // `put_rdf` that quietly dropped every triple whenever the body held a
+    // blank node would both leave the suite green. The second triple, on a
+    // named subject, is what tells a total-loss mutant apart from one that
+    // merely mishandles the blank node.
+    #[tokio::test]
+    async fn a_blank_node_in_a_client_body_is_stored_not_dropped_and_not_left_blank() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let t = triples(
+            "_:b <http://schema.org/name> \"x\" . <#it> <http://schema.org/name> \"y\" .",
+            foo.graph_iri(),
+        );
+        put_rdf(&store, &foo, &t).await.unwrap();
+
+        let got = get_rdf(&store, &foo).await.unwrap().expect("exists");
+        assert_eq!(got.len(), 2, "both triples must survive, not just the named one");
+
+        let from_blank = got
+            .iter()
+            .find(|t| matches!(&t.object, oxigraph::model::Term::Literal(l) if l.value() == "x"))
+            .expect("the triple that started on a blank node round-tripped");
+        assert!(
+            matches!(&from_blank.subject, oxigraph::model::NamedOrBlankNode::NamedNode(_)),
+            "a blank node must never reach the store as a blank node"
+        );
+    }
+
     #[tokio::test]
     async fn put_replaces_not_appends() {
         let store = OxigraphStore::in_memory().unwrap();

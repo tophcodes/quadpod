@@ -194,6 +194,38 @@ mod tests {
         assert_eq!(get_rdf(&store, &acl).await.unwrap(), Some(grant(&acl)));
     }
 
+    // §4, on `aux::put`'s client body: an ACL commonly writes an anonymous
+    // `[] a acl:Authorization`, so nothing before this test exercises that
+    // shape. A no-op `skolemize` or a write that silently dropped the
+    // blank-node triple would both leave the suite green; the second triple,
+    // on a named subject, tells a total-loss mutant apart from one that only
+    // mishandles the blank node.
+    #[tokio::test]
+    async fn a_blank_node_in_an_auxiliary_body_is_stored_not_dropped_and_not_left_blank() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        let t = triples(
+            "_:b <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> . \
+             <#owner> <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> .",
+            acl.graph_iri(),
+        );
+        put(&store, &acl, &t).await.unwrap();
+
+        let got = get_rdf(&store, &acl).await.unwrap().expect("exists");
+        assert_eq!(got.len(), 2, "both triples must survive, not just the named one");
+
+        let from_blank = got
+            .iter()
+            .find(|t| matches!(&t.object, oxigraph::model::Term::NamedNode(n) if n.as_str().ends_with("#Read")))
+            .expect("the triple that started on a blank node round-tripped");
+        assert!(
+            matches!(&from_blank.subject, oxigraph::model::NamedOrBlankNode::NamedNode(_)),
+            "a blank node must never reach the store as a blank node"
+        );
+    }
+
     // `put` replaces, it does not accumulate: an ACL is the whole policy for
     // its subject, so a second write must not leave the first one's grants
     // behind.
