@@ -9,7 +9,7 @@
 use crate::{
     dataset::Skolemized,
     rdf::{Format, RdfError},
-    shelf::ShelfKey,
+    shelf::{ShelfKey, SYS_GRAPH_NAME, SYS_HAS_SUBGRAPH, SYS_MEDIA_TYPE},
     space::{DirectlyDeletable, DirectlyWritable, GraphName, ResourceUrl, SpaceError},
     store::{SparqlStore, StoreError},
 };
@@ -63,15 +63,71 @@ pub(crate) fn serialize_for_insert(triples: &[Triple]) -> String {
 /// server-managed containment, and an auxiliary's rules would be invisible to
 /// WAC in a subgraph. Auxiliaries keep `aux::put`, whose `FILTER EXISTS` guard
 /// has no equivalent here.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
 pub async fn put_dataset(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
     dataset: &Skolemized,
     media_type: Format,
 ) -> Result<(), ResourceError> {
-    todo!("skeleton")
+    use oxigraph::model::GraphName;
+    let iri = r.graph_iri();
+    let sys = sys_graph_iri(r);
+
+    // Split by graph name; the key is minted only here, from the pair.
+    let mut default_graph: Vec<Triple> = Vec::new();
+    let mut shelves: Vec<(ShelfKey, String, Vec<Triple>)> = Vec::new();
+    for q in dataset.quads() {
+        let t = Triple { subject: q.subject.clone(), predicate: q.predicate.clone(), object: q.object.clone() };
+        match &q.graph_name {
+            GraphName::DefaultGraph => default_graph.push(t),
+            GraphName::NamedNode(n) => {
+                let key = ShelfKey::of(r, n.as_ref());
+                match shelves.iter_mut().find(|(k, _, _)| k == &key) {
+                    Some((_, _, ts)) => ts.push(t),
+                    None => shelves.push((key, n.as_str().to_owned(), vec![t])),
+                }
+            }
+            // Unreachable: Skolemized carries no blank node (§4).
+            GraphName::BlankNode(_) => return Err(ResourceError::InvalidIri),
+        }
+    }
+
+    // Both drops (§3.2 invariant 4): what the registry lists, and what we are
+    // about to write. Literal IRIs — DROP takes no variable, and DELETE WHERE
+    // empties a graph without removing it.
+    let mut update = String::new();
+    for key in registered_shelves(store, r).await? {
+        update.push_str(&format!("DROP SILENT GRAPH <{}>; ", key.graph_iri()));
+    }
+    for (key, _, _) in &shelves {
+        update.push_str(&format!("DROP SILENT GRAPH <{}>; ", key.graph_iri()));
+    }
+    update.push_str(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>; "));
+
+    // One INSERT DATA: blank nodes cannot be shared across operations, and
+    // although Skolemized has none today, splitting would make that a latent
+    // trap for the first caller who changes it.
+    update.push_str("INSERT DATA { ");
+    update.push_str(&format!("GRAPH <{iri}> {{ {} }} ", serialize_for_insert(&default_graph)));
+    for (key, _, ts) in &shelves {
+        update.push_str(&format!("GRAPH <{}> {{ {} }} ", key.graph_iri(), serialize_for_insert(ts)));
+    }
+    update.push_str("}; ");
+
+    let mut registry = format!(
+        "<{iri}> <{SYS_PRESENT}> true . <{iri}> <{SYS_MEDIA_TYPE}> \"{}\" . ",
+        media_type.media_type()
+    );
+    for (key, name, _) in &shelves {
+        registry.push_str(&format!(
+            "<{iri}> <{SYS_HAS_SUBGRAPH}> <{k}> . <{k}> <{SYS_GRAPH_NAME}> <{name}> . ",
+            k = key.graph_iri()
+        ));
+    }
+    update.push_str(&format!("INSERT DATA {{ GRAPH <{sys}> {{ {registry} }} }}"));
+
+    store.update(&update).await?;
+    Ok(())
 }
 
 /// §6 step 2: the resource graph, the registry, and one `CONSTRUCT` per shelf.
@@ -79,48 +135,107 @@ pub async fn put_dataset(
 /// shelf a triple came from — 2+N in-process queries, and no fast path that
 /// skips the shelves, because the ETag covers the resource rather than the
 /// response body.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
 pub async fn get_dataset(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
 ) -> Result<Option<Skolemized>, ResourceError> {
-    todo!("skeleton")
+    use oxigraph::model::{GraphName, NamedNode, Quad};
+    if !exists(store, r).await? {
+        return Ok(None);
+    }
+    let iri = r.graph_iri();
+    let sys = sys_graph_iri(r);
+
+    let mut quads: Vec<Quad> = store
+        .query_triples(&format!(
+            "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"
+        ))
+        .await?
+        .into_iter()
+        .map(|t| Quad::new(t.subject, t.predicate, t.object, GraphName::DefaultGraph))
+        .collect();
+
+    // One CONSTRUCT per shelf: query_triples has no graph field, so a single
+    // query cannot recover which shelf a triple came from. The graph name comes
+    // from the registry, not from the key — the key is not reversible.
+    for key in registered_shelves(store, r).await? {
+        let k = key.graph_iri();
+        let names = store.query_triples(&format!(
+            "CONSTRUCT {{ <{k}> <{SYS_GRAPH_NAME}> ?n }} \
+             WHERE {{ GRAPH <{sys}> {{ <{k}> <{SYS_GRAPH_NAME}> ?n }} }}"
+        )).await?;
+        let Some(name) = names.iter().find_map(|t| match &t.object {
+            oxigraph::model::Term::NamedNode(n) => NamedNode::new(n.as_str()).ok(),
+            _ => None,
+        }) else {
+            // A shelf with no name is the invariant of §3.2.3 broken; refusing
+            // is better than serving content under a name we invented.
+            return Err(ResourceError::InvalidIri);
+        };
+        for t in store.query_triples(&format!(
+            "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{k}> {{ ?s ?p ?o }} }}"
+        )).await? {
+            quads.push(Quad::new(t.subject, t.predicate, t.object, name.clone()));
+        }
+    }
+
+    Ok(Some(Skolemized::ground(quads).expect("the store holds no blank node")))
 }
 
 /// §7: resource graph, every registered shelf, and the system graph.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
 pub async fn delete_dataset(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
 ) -> Result<bool, ResourceError> {
-    todo!("skeleton")
+    let existed = exists(store, r).await?;
+    let iri = r.graph_iri();
+    let sys = sys_graph_iri(r);
+    let mut update = String::new();
+    for key in registered_shelves(store, r).await? {
+        update.push_str(&format!("DROP SILENT GRAPH <{}>; ", key.graph_iri()));
+    }
+    update.push_str(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>"));
+    store.update(&update).await?;
+    Ok(existed)
 }
 
 /// §6.4: what the representation arrived as, for `*/*` and for the
 /// `mediaType` LWS requires per container member. Stored as its media-type
 /// literal, returned as the type — the string form exists in the registry and
 /// nowhere else.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
 pub async fn stored_media_type(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
 ) -> Result<Option<Format>, ResourceError> {
-    todo!("skeleton")
+    let iri = r.graph_iri();
+    let sys = sys_graph_iri(r);
+    let triples = store.query_triples(&format!(
+        "CONSTRUCT {{ <{iri}> <{SYS_MEDIA_TYPE}> ?m }} \
+         WHERE {{ GRAPH <{sys}> {{ <{iri}> <{SYS_MEDIA_TYPE}> ?m }} }}"
+    )).await?;
+    Ok(triples.iter().find_map(|t| match &t.object {
+        oxigraph::model::Term::Literal(l) => Format::from_content_type(l.value()),
+        _ => None,
+    }))
 }
 
 /// §5 step 5: the shelves the registry currently lists, read *before* the
 /// write update because `DROP GRAPH` takes a literal IRI and the
 /// variable-bound alternative empties a graph without removing it.
-// skeleton: the attribute goes when the body lands
-#[allow(unused_variables)]
 pub async fn registered_shelves(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
 ) -> Result<Vec<ShelfKey>, ResourceError> {
-    todo!("skeleton")
+    let iri = r.graph_iri();
+    let sys = sys_graph_iri(r);
+    let triples = store.query_triples(&format!(
+        "CONSTRUCT {{ <{iri}> <{SYS_HAS_SUBGRAPH}> ?g }} \
+         WHERE {{ GRAPH <{sys}> {{ <{iri}> <{SYS_HAS_SUBGRAPH}> ?g }} }}"
+    )).await?;
+    Ok(triples.iter().filter_map(|t| match &t.object {
+        oxigraph::model::Term::NamedNode(n) => Some(ShelfKey::from_registry(n.as_str())),
+        _ => None,
+    }).collect())
 }
 
 /// Replace a graph's contents and mark it present, in one update.
@@ -393,5 +508,80 @@ mod tests {
         );
         put_rdf(&store, &mine, &forged).await.unwrap();
         assert!(!exists(&store, &other).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_dataset_round_trips_through_the_store() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let jsonld = crate::rdf::Format::from_content_type("application/ld+json").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let ds = Skolemized::ground(vec![
+            oxigraph::model::Quad::new(
+                oxigraph::model::NamedNode::new("https://pod.toph.so/c/notes#it").unwrap(),
+                oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+                oxigraph::model::Literal::new_simple_literal("Toph"),
+                oxigraph::model::GraphName::DefaultGraph),
+            oxigraph::model::Quad::new(
+                oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+                oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+                oxigraph::model::Literal::new_simple_literal("Alice"),
+                g.clone()),
+        ]).unwrap();
+
+        put_dataset(&store, &r, &ds, jsonld).await.unwrap();
+
+        let back = get_dataset(&store, &r).await.unwrap().expect("present");
+        assert_eq!(back.quads().len(), 2);
+        assert!(back.quads().iter().any(|q| q.graph_name == g.clone().into()),
+            "the graph name came back");
+        assert_eq!(stored_media_type(&store, &r).await.unwrap(), Some(jsonld));
+    }
+
+    // §3.2 invariant 4: a shelf the registry no longer lists is not litter, it
+    // is content the next write to the same (resource, graph name) pair would
+    // INSERT INTO — so the resource would return triples nobody wrote.
+    #[tokio::test]
+    async fn a_replacing_write_leaves_no_shelf_behind() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let with_graph = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            g.clone())]).unwrap();
+
+        put_dataset(&store, &r, &with_graph, ttl).await.unwrap();
+        assert_eq!(registered_shelves(&store, &r).await.unwrap().len(), 1);
+
+        // Replace with a document that has no named graph at all.
+        put_dataset(&store, &r, &Skolemized::ground(vec![]).unwrap(), ttl).await.unwrap();
+        assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
+
+        // And the shelf is gone, not merely emptied: write the same graph name
+        // again and it must not inherit the old triples.
+        put_dataset(&store, &r, &with_graph, ttl).await.unwrap();
+        let back = get_dataset(&store, &r).await.unwrap().unwrap();
+        assert_eq!(back.quads().len(), 1, "no resurrected content");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_shelves_too() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            g)]).unwrap();
+
+        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+        assert!(delete_dataset(&store, &r).await.unwrap(), "existed");
+        assert!(get_dataset(&store, &r).await.unwrap().is_none());
+        assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
     }
 }
