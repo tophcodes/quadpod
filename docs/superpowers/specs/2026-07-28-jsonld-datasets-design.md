@@ -147,7 +147,10 @@ naming scheme `urn:quadpod:sys:<resource-iri>`:
 <resource>              sys:mediaType   "application/ld+json" .   # §6.4
 <resource>              sys:hasSubgraph <urn:quadpod:subgraph:8f2a…> .
 <urn:quadpod:subgraph:8f2a…> sys:graphName  <urn:example:g1> .      # IRI-named
-<urn:quadpod:subgraph:1c07…> sys:graphSkolem <urn:quadpod:bnode:…> .    # was a blank node (§4)
+<urn:quadpod:subgraph:1c07…> sys:graphName  <urn:quadpod:bnode:…> .    # was a blank node (§4);
+                                                                        # deskolemize turns the
+                                                                        # skolem IRI back into a
+                                                                        # blank node on read
 ```
 
 ### 3.1 Key derivation
@@ -216,8 +219,10 @@ Ordinary resources only. Containers and auxiliaries reject named graphs with `40
 
 ### 3.5 The internal vocabulary is documented, not folklore
 
-`sys:present`, `sys:hasSubgraph`, `sys:graphName`, `sys:graphSkolem` are a named, stable part
-of the design under the `urn:quadpod:sys#` prefix. No HTTP client ever needs them.
+`sys:present`, `sys:hasSubgraph`, `sys:graphName` are a named, stable part of the design under
+the `urn:quadpod:sys#` prefix. No HTTP client ever needs them. A blank-node-named graph is
+recorded under `sys:graphName` too, with its skolem IRI as the object — `deskolemize` turns
+that IRI back into a blank node on read, so no second predicate is needed for it.
 
 ### 3.6 The sealed-trait invariant needs replacing
 

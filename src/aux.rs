@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     dataset::{Dataset, Skolemized},
-    resource::{exists, serialize_for_insert, sys_graph_iri, ResourceError, SYS_PRESENT},
+    resource::{exists, registered_shelves, serialize_for_insert, sys_graph_iri, ResourceError, SYS_PRESENT},
     space::{AuxKind, AuxUrl, GraphName, ResourceUrl},
     store::SparqlStore,
 };
@@ -102,8 +102,9 @@ pub async fn put(
     Ok(())
 }
 
-/// Delete a subject resource together with every auxiliary it may have, in a
-/// single store update. Returns whether the subject existed.
+/// Delete a subject resource together with every auxiliary it may have and
+/// every shelf its dataset registered, in a single store update. Returns
+/// whether the subject existed.
 ///
 /// The drops run unconditionally — they are `DROP SILENT`, a no-op on an
 /// absent graph — and the existence check only decides the returned boolean.
@@ -111,6 +112,13 @@ pub async fn put(
 /// place and unreported, and since this is the only cascade path that orphan
 /// would be permanent: recreating the subject would resurrect its grants.
 /// Same reasoning as [`crate::resource::delete_rdf`].
+///
+/// The shelf registry is read before any drop, and its drops are ordered
+/// before the system graph's: the registry lives in the very graph this
+/// cascade drops, and reading it after would find nothing to drop, leaving
+/// the shelves as the one part of the resource a `DELETE` cannot remove
+/// (design spec §7). A container's registry is simply empty, so the same
+/// cascade is correct for it without a branch.
 ///
 /// Graphs only. Callers remain responsible for containment: the subject's
 /// membership triple in its parent, and for a container subject its children,
@@ -120,10 +128,12 @@ pub async fn delete_subject(
     subject: &ResourceUrl,
 ) -> Result<bool, ResourceError> {
     let existed = exists(store, subject).await?;
-    let mut drops = vec![
-        format!("DROP SILENT GRAPH <{}>", subject.graph_iri()),
-        format!("DROP SILENT GRAPH <{}>", sys_graph_iri(subject)),
-    ];
+    let mut drops: Vec<String> = registered_shelves(store, subject).await?
+        .into_iter()
+        .map(|key| format!("DROP SILENT GRAPH <{}>", key.graph_iri()))
+        .collect();
+    drops.push(format!("DROP SILENT GRAPH <{}>", subject.graph_iri()));
+    drops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(subject)));
     for kind in AuxKind::ALL {
         let aux = subject.aux(*kind);
         drops.push(format!("DROP SILENT GRAPH <{}>", aux.graph_iri()));
@@ -136,7 +146,7 @@ pub async fn delete_subject(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rdf::Format, resource::{exists, get_rdf, put_rdf}, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
+    use crate::{rdf::Format, resource::{exists, get_rdf, put_dataset, put_rdf}, shelf::ShelfKey, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
@@ -370,6 +380,40 @@ mod tests {
         assert!(
             graph_contents(&store, &sys_graph_iri(&acl)).await.is_empty(),
             "orphan kept its presence marker"
+        );
+    }
+
+    // Whole-branch review, finding 1: `delete_subject` dropped the resource
+    // graph and the registry that pointed at its shelves, but never the
+    // shelves themselves — a DELETE that erased the registry's only record of
+    // them without erasing the data (design spec §7). Every assertion above
+    // reads back through `exists`/`get_rdf`, which the deleted registry makes
+    // report "gone" either way, so none of them could have caught this. This
+    // one derives the shelf's IRI the same way the write path did — through
+    // `ShelfKey::of` — and probes the store directly, bypassing the registry
+    // entirely.
+    #[tokio::test]
+    async fn deleting_a_subject_empties_its_shelves_too() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let ds = crate::dataset::Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            g.clone(),
+        )])
+        .unwrap();
+        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+        let key = ShelfKey::of(&r, g.as_ref());
+
+        assert!(delete_subject(&store, &r).await.unwrap(), "existed");
+
+        let leftover = graph_contents(&store, key.graph_iri()).await;
+        assert!(
+            leftover.is_empty(),
+            "delete_subject must drop the shelf graph itself, not just the registry that pointed at it"
         );
     }
 }

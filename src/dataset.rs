@@ -74,7 +74,7 @@ impl Dataset {
         fn reserved(iri: &str) -> bool {
             // `urn:quadpod:` — scheme and NID are case-insensitive (RFC 8141), the
             // rest of the NSS is not, and only the prefix is ours.
-            iri.len() > RESERVED_PREFIX.len()
+            iri.len() >= RESERVED_PREFIX.len()
                 && iri[..RESERVED_PREFIX.len()].eq_ignore_ascii_case(RESERVED_PREFIX)
         }
         self.0.iter().any(|q| {
@@ -298,6 +298,13 @@ mod tests {
             "http://example.org/a", "x",
             NamedNode::new("urn:podcast:1").unwrap().into())]);
         assert!(!clean.uses_reserved_namespace(), "a longer NID is a different namespace");
+
+        // §3.2.2 says *any* IRI in the namespace, and the exact prefix IRI is
+        // in it — a `>` comparison let it through as neither longer nor shorter.
+        let exact = Dataset::new(vec![q(
+            "http://example.org/a", "x",
+            NamedNode::new(RESERVED_PREFIX).unwrap().into())]);
+        assert!(exact.uses_reserved_namespace(), "the exact namespace IRI, with nothing after it");
     }
 
     // A blank node that is both a graph name and a term. This is the
