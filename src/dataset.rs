@@ -73,9 +73,13 @@ impl Dataset {
     pub fn uses_reserved_namespace(&self) -> bool {
         fn reserved(iri: &str) -> bool {
             // `urn:quadpod:` — scheme and NID are case-insensitive (RFC 8141), the
-            // rest of the NSS is not, and only the prefix is ours.
-            iri.len() >= RESERVED_PREFIX.len()
-                && iri[..RESERVED_PREFIX.len()].eq_ignore_ascii_case(RESERVED_PREFIX)
+            // rest of the NSS is not, and only the prefix is ours. `get` returns
+            // `None` rather than panicking when byte 12 is not a char boundary —
+            // `<urn:quadpodé:x>` is a legal IRI whose 13th byte (the 2-byte `é`
+            // starts at byte 11) lands mid-character — which also folds in the
+            // length check.
+            iri.get(..RESERVED_PREFIX.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_PREFIX))
         }
         self.0.iter().any(|q| {
             let subject = match &q.subject {
@@ -305,6 +309,48 @@ mod tests {
             "http://example.org/a", "x",
             NamedNode::new(RESERVED_PREFIX).unwrap().into())]);
         assert!(exact.uses_reserved_namespace(), "the exact namespace IRI, with nothing after it");
+    }
+
+    // Whole-branch review: `iri[..RESERVED_PREFIX.len()]` slices at byte 12
+    // with no char-boundary check. `<urn:quadpodé:x>` is a legal IRI oxrdf
+    // accepts, and its `é` (bytes 11-12) puts that cut point mid-character —
+    // a panic, not a `400`. Checked in all four quad positions because the
+    // guard in `reserved` is applied separately to each one.
+    #[test]
+    fn a_multi_byte_character_straddling_the_prefix_boundary_does_not_panic() {
+        let straddling = "urn:quadpodé:x";
+
+        let subject = Dataset::new(vec![Quad::new(
+            NamedNode::new(straddling).unwrap(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            Literal::new_simple_literal("x"),
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert!(!subject.uses_reserved_namespace(), "as a subject");
+
+        let predicate = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://example.org/a").unwrap(),
+            NamedNode::new(straddling).unwrap(),
+            Literal::new_simple_literal("x"),
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert!(!predicate.uses_reserved_namespace(), "as a predicate");
+
+        let object = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://example.org/a").unwrap(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            NamedNode::new(straddling).unwrap(),
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert!(!object.uses_reserved_namespace(), "as an object");
+
+        let graph = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://example.org/a").unwrap(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            Literal::new_simple_literal("x"),
+            NamedNode::new(straddling).unwrap(),
+        )]);
+        assert!(!graph.uses_reserved_namespace(), "as a graph name");
     }
 
     // A blank node that is both a graph name and a term. This is the

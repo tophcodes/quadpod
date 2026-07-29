@@ -146,7 +146,7 @@ pub async fn delete_subject(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rdf::Format, resource::{exists, get_rdf, put_dataset, put_rdf}, shelf::ShelfKey, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
+    use crate::{rdf::Format, resource::{exists, get_dataset, get_rdf, put_dataset, put_rdf, registered_shelves}, shelf::ShelfKey, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
@@ -415,5 +415,7 @@ mod tests {
             leftover.is_empty(),
             "delete_subject must drop the shelf graph itself, not just the registry that pointed at it"
         );
+        assert!(get_dataset(&store, &r).await.unwrap().is_none());
+        assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
     }
 }

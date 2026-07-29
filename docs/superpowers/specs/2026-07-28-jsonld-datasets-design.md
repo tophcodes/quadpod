@@ -591,13 +591,10 @@ storage path** (bytes, no parsing), not a reason to move RDF onto one; see §11.
 
 ## 7. Delete
 
-Read the registry, then one update dropping the resource graph, every registered shelf as a
-literal `DROP SILENT GRAPH`, and the system graph. Same shape and same caveat as §5.1.
-
-Note that `aux::delete_subject` today drops the subject graph and its system graph — the
-registry — and each auxiliary, without reading what the registry pointed at. Under this design
-that ordering destroys the only record of the shelves before they are dropped, which is
-invariant 3.2.4's failure mode exactly.
+`aux::delete_subject` is the one cascade: read the registry, then one update dropping the
+resource graph, every registered shelf as a literal `DROP SILENT GRAPH`, each auxiliary, and the
+system graph. The registry is read before it is dropped — reading it after would find nothing
+to drop, which is invariant 3.2.4's failure mode exactly. Same shape and same caveat as §5.1.
 
 ## 8. What does not change
 

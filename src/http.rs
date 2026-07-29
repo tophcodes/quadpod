@@ -1063,6 +1063,22 @@ mod tests {
         assert!(body_string(res).await.contains("schema.org/name"));
     }
 
+    // Whole-branch review: `uses_reserved_namespace` sliced an IRI at a fixed
+    // byte offset with no char-boundary check, so this body — legal Turtle,
+    // and `<urn:quadpodé:x>` is a legal IRI oxrdf accepts — panicked the
+    // handler and aborted the connection with no response at all. The
+    // response's exact status is not the point; that one comes back at all,
+    // instead of the connection dying, is.
+    #[tokio::test]
+    async fn a_multi_byte_iri_in_the_body_does_not_abort_the_connection() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<urn:quadpodé:x> <http://schema.org/name> \"x\" .")).unwrap();
+        let res = f.app.oneshot(put).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
     #[tokio::test]
     async fn get_default_accept_is_turtle() {
         let f = fixture().await;

@@ -206,23 +206,6 @@ pub async fn get_dataset(
     Ok(Some(Skolemized::ground(quads).expect("the store holds no blank node")))
 }
 
-/// §7: resource graph, every registered shelf, and the system graph.
-pub async fn delete_dataset(
-    store: &dyn SparqlStore,
-    r: &ResourceUrl,
-) -> Result<bool, ResourceError> {
-    let existed = exists(store, r).await?;
-    let iri = r.graph_iri();
-    let sys = sys_graph_iri(r);
-    let mut update = String::new();
-    for key in registered_shelves(store, r).await? {
-        update.push_str(&format!("DROP SILENT GRAPH <{}>; ", key.graph_iri()));
-    }
-    update.push_str(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>"));
-    store.update(&update).await?;
-    Ok(existed)
-}
-
 /// §6.4: what the representation arrived as, for `*/*` and for the
 /// `mediaType` LWS requires per container member. Stored as its media-type
 /// literal, returned as the type — the string form exists in the registry and
@@ -663,27 +646,9 @@ mod tests {
         assert_eq!(back.quads().len(), 1, "no resurrected content");
     }
 
-    #[tokio::test]
-    async fn delete_removes_the_shelves_too() {
-        let store = OxigraphStore::in_memory().unwrap();
-        let r = res("/c/notes");
-        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
-        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
-        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Alice"),
-            g)]).unwrap();
-
-        put_dataset(&store, &r, &ds, ttl).await.unwrap();
-        assert!(delete_dataset(&store, &r).await.unwrap(), "existed");
-        assert!(get_dataset(&store, &r).await.unwrap().is_none());
-        assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
-    }
-
     // Every assertion above reads state back through the registry
     // (`registered_shelves`, `get_dataset`, `exists`), so a shelf that got
-    // orphaned *outside* the registry is invisible to it. These three probe
+    // orphaned *outside* the registry is invisible to it. This one probes
     // the store directly, bypassing the registry entirely.
 
     // §3.2 invariant 4, probed directly. Unlike `a_replacing_write_leaves_no_shelf_behind`,
@@ -722,35 +687,6 @@ mod tests {
             "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", key_a.graph_iri()
         )).await.unwrap();
         assert!(leftover.is_empty(), "graph A's shelf must be emptied when a replacing write names graph B instead");
-    }
-
-    // Guards the read-before-drop ordering `delete_dataset` documents (§7):
-    // if the system graph were dropped before `registered_shelves` reads it,
-    // the shelf-drop list would come back empty and the shelf would survive —
-    // exactly the `aux::delete_subject` bug the module warns about. Probed
-    // directly because `registered_shelves`/`get_dataset` both read through
-    // the now-gone registry and would report "empty" either way.
-    #[tokio::test]
-    async fn delete_dataset_empties_the_shelf_probed_directly() {
-        let store = OxigraphStore::in_memory().unwrap();
-        let r = res("/c/notes");
-        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
-        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
-        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Alice"),
-            g.clone())]).unwrap();
-
-        put_dataset(&store, &r, &ds, ttl).await.unwrap();
-        let key = ShelfKey::of(&r, g.as_ref());
-
-        assert!(delete_dataset(&store, &r).await.unwrap(), "existed");
-
-        let leftover = store.query_triples(&format!(
-            "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", key.graph_iri()
-        )).await.unwrap();
-        assert!(leftover.is_empty(), "delete_dataset must drop the shelf graph itself, not just what the registry still lists");
     }
 
     // Module invariant at the top of this file: "existence is a stored fact,
