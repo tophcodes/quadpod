@@ -70,6 +70,14 @@ async fn no_route_serves_an_unauthenticated_request() {
     // is guarded like GET — but this test exists to be structural, and a verb
     // that reaches a handler belongs in the list whether or not it currently
     // shares one. Only the status is asserted: a HEAD response has no body.
+    //
+    // OPTIONS is absent on purpose, and is the only such verb. A CORS preflight
+    // carries no credentials by construction, and the answer is derived from
+    // the request URL's shape alone — it reaches no store, so it reveals
+    // nothing that routing itself does not. The exemption is from
+    // authorization, not from `classify`:
+    // `the_unallocated_reserved_namespace_serves_nothing_either` below does
+    // include OPTIONS, and holds it to the same 404.
     let methods = ["GET", "HEAD", "PUT", "POST", "DELETE"];
 
     for path in paths {
@@ -98,7 +106,10 @@ async fn no_route_serves_an_unauthenticated_request() {
 #[tokio::test]
 async fn the_unallocated_reserved_namespace_serves_nothing_either() {
     let paths = ["/.aux", "/.aux/", "/.aux/bogus/x", "/.aux/.aux/seeded.acl.acl"];
-    let methods = ["GET", "HEAD", "PUT", "POST", "DELETE"];
+    // OPTIONS belongs here even though it is exempt from the authorization
+    // sweep above: it skips the guard, not `classify`, and this is what bounds
+    // that exemption.
+    let methods = ["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS"];
 
     for path in paths {
         for method in methods {

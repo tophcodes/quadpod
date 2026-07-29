@@ -34,8 +34,8 @@ pub fn router(state: AppState) -> Router {
     // outermost: `cors_layer` sees the `401` that `auth_layer` produces, which
     // is where the CORS fields are required.
     Router::new()
-        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root))
-        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete))
+        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).options(handle_options_root))
+        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).options(handle_options))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
         .layer(axum::middleware::from_fn(cors_layer))
         .with_state(state)
@@ -143,15 +143,14 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
 /// The methods a target actually accepts, as an `Allow` field value.
 ///
 /// Derived from the router's own shape rather than a fixed list: a container
-/// is the only thing `POST` may address, the root is the only container
-/// `DELETE` refuses (`delete_impl`), and `OPTIONS` is absent because no route
-/// serves it — advertising a method the pod answers with `405` would be worse
-/// than saying nothing.
+/// is the only thing `POST` may address, and the root is the only container
+/// `DELETE` refuses (`delete_impl`). `OPTIONS` is accepted everywhere — it
+/// answers from the request URL alone and needs no representation to describe.
 fn allowed_methods(target: &Target) -> &'static str {
     match target {
-        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT",
-        Target::Container(_) => "GET, HEAD, POST, PUT, DELETE",
-        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, DELETE",
+        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT, OPTIONS",
+        Target::Container(_) => "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, DELETE, OPTIONS",
     }
 }
 
@@ -682,6 +681,48 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     }
 }
 
+/// Answer a CORS preflight — and a bare `OPTIONS`, which the suite also sends
+/// (`protocol/cors/acao-vary` omits `Access-Control-Request-Method`).
+///
+/// Deliberately unauthorized. A preflight arrives without credentials by
+/// construction, so demanding them makes a pod unusable from a browser; and
+/// the answer is derived entirely from the request URL's shape —
+/// [`allowed_methods`] takes a [`Target`] and never reaches the store — so it
+/// discloses nothing about what exists. That is the line `post_impl` already
+/// draws when it answers `409` from the path shape rather than let `POST`
+/// become an existence oracle.
+///
+/// `Access-Control-Allow-Headers` mirrors what was asked for rather than
+/// naming a fixed set: `protocol/cors/accept-acah` sends two otherwise
+/// identical preflights and requires `Accept` to be absent from the answer to
+/// the one that did not request it.
+fn options_impl(target: &Target, headers: &HeaderMap) -> Response {
+    let mut out = HeaderMap::new();
+    let methods = allowed_methods(target);
+    out.insert(header::ALLOW, HeaderValue::from_static(methods));
+    out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static(methods));
+    if let Some(requested) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
+        out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
+    }
+    (StatusCode::NO_CONTENT, out).into_response()
+}
+
+async fn handle_options(
+    State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap,
+) -> Response {
+    match classify(&st.space, &format!("/{path}")) {
+        Ok(target) => options_impl(&target, &headers),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn handle_options_root(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match classify(&st.space, "/") {
+        Ok(target) => options_impl(&target, &headers),
+        Err(status) => status.into_response(),
+    }
+}
+
 async fn handle_get(
     State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
     headers: HeaderMap,
@@ -1154,6 +1195,83 @@ mod tests {
         assert!(res.headers().get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_some());
     }
 
+    // A preflight carries no credentials by construction — the browser sends
+    // it before, and without, the credentialed request.
+    #[tokio::test]
+    async fn options_answers_without_credentials() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .header("access-control-request-method", "POST")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(body_string(res).await, "");
+    }
+
+    #[tokio::test]
+    async fn options_mirrors_exactly_the_requested_headers() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "X-CUSTOM, Content-Type")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        let allowed = res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap().to_str().unwrap();
+        assert!(allowed.contains("X-CUSTOM"), "{allowed}");
+        assert!(allowed.contains("Content-Type"), "{allowed}");
+        // The negative half: `accept-acah` asserts Accept is ABSENT when it was
+        // not requested, in an otherwise identical request. A fixed list fails
+        // one of the two.
+        assert!(!allowed.contains("Accept"), "{allowed}");
+    }
+
+    #[tokio::test]
+    async fn options_omits_allow_headers_when_none_were_requested() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(res.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS).is_none());
+    }
+
+    #[tokio::test]
+    async fn options_advertises_the_methods_the_target_accepts() {
+        let f = fixture().await;
+
+        let on_container = Request::builder().method("OPTIONS").uri("/box/")
+            .body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(on_container).await.unwrap();
+        let allow = res.headers().get(header::ALLOW).unwrap().to_str().unwrap().to_string();
+        let acam = res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS).unwrap().to_str().unwrap();
+        assert!(allow.contains("POST"), "{allow}");
+        assert!(allow.contains("OPTIONS"), "{allow}");
+        assert_eq!(allow, acam, "Allow and Access-Control-Allow-Methods must agree");
+
+        let on_resource = Request::builder().method("OPTIONS").uri("/foo")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(on_resource).await.unwrap();
+        let allow = res.headers().get(header::ALLOW).unwrap().to_str().unwrap();
+        assert!(!allow.contains("POST"), "{allow}");
+        assert!(allow.contains("OPTIONS"), "{allow}");
+    }
+
+    // `classify` still decides what a path means: the reserved namespace is not
+    // storage, and OPTIONS does not get to pretend otherwise.
+    #[tokio::test]
+    async fn options_on_the_unallocated_reserved_namespace_is_404() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/.aux/bogus/x")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn put_turtle_then_get_jsonld_negotiates() {
         let f = fixture().await;
@@ -1605,10 +1723,10 @@ mod tests {
         assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
 
         for (method, path, expected) in [
-            ("GET", "/box/", "GET, HEAD, POST, PUT, DELETE"),
-            ("HEAD", "/box/", "GET, HEAD, POST, PUT, DELETE"),
-            ("GET", "/box/doc", "GET, HEAD, PUT, DELETE"),
-            ("HEAD", "/box/doc", "GET, HEAD, PUT, DELETE"),
+            ("GET", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
+            ("HEAD", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
+            ("GET", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
+            ("HEAD", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
         ] {
             let req = f.owner_request(method, path).body(Body::empty()).unwrap();
             let res = f.app.clone().oneshot(req).await.unwrap();
@@ -1624,7 +1742,7 @@ mod tests {
         let f = fixture().await;
         let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
         let res = f.app.oneshot(get).await.unwrap();
-        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT");
+        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT, OPTIONS");
     }
 
     #[tokio::test]
