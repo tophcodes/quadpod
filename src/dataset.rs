@@ -6,10 +6,20 @@
 //! locally, one call site at a time, is exactly the shape that misses one
 //! (design spec §4). [`Skolemized`] is the only thing the write path
 //! accepts, so "forgot to skolemize" is a compile error and not a leak.
+//!
+//! It carries [`GroundQuad`], not `Quad`: the invariant is the *shape* of the
+//! term types, so a blank node in a stored quad is unwritable rather than
+//! merely unwritten. That is what makes [`skolemize`](Skolemized::skolemize)
+//! total — it cannot leak a blank node it forgot, because the target has no
+//! variant to put one in — and it is why the only fallible construction left,
+//! [`from_store`](Skolemized::from_store), sits at the store boundary, where
+//! the quads come from outside this type system and refusing them is a parse
+//! and not a self-check.
 
 use crate::rdf::Format;
-use oxigraph::model::{NamedNode, Quad};
+use oxigraph::model::{Literal, NamedNode, Quad};
 use sha2::{Digest, Sha256};
+use std::fmt;
 
 /// The reserved namespace. Every server-minted IRI lives under it, and §3.2.2
 /// refuses it in request bodies — RDF 1.1 §3.5 preserves meaning only
@@ -23,7 +33,103 @@ pub struct Dataset(Vec<Quad>);
 /// A dataset as the store holds it: every blank node replaced by a
 /// `urn:quadpod:bnode:<uuid>` IRI, in triples and as graph names alike.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Skolemized(Vec<Quad>);
+pub struct Skolemized(Vec<GroundQuad>);
+
+/// A quad with no blank node in any position — the store's currency.
+///
+/// `Quad`'s subject, object and graph name each admit a `BlankNode`, so the
+/// stored invariant could only ever be asserted about a `Quad`, and asserted
+/// facts rot. Here it is the type: there is no variant to hold a blank node,
+/// so the mistakes this replaces (skolemizing and then dropping the result,
+/// weakening the check that used to guard the constructor) stop compiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroundQuad {
+    pub subject: NamedNode,
+    pub predicate: NamedNode,
+    pub object: GroundTerm,
+    pub graph_name: GroundGraphName,
+}
+
+/// `Term` minus its blank node — the object position of a [`GroundQuad`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroundTerm {
+    NamedNode(NamedNode),
+    Literal(Literal),
+}
+
+/// `GraphName` minus its blank node. Every graph a stored quad names is
+/// named by an IRI, which is what makes
+/// [`Skolemized::named_graphs`] exhaustive where [`Dataset::named_graphs`]
+/// cannot be (§6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroundGraphName {
+    DefaultGraph,
+    NamedNode(NamedNode),
+}
+
+impl GroundQuad {
+    pub fn new(
+        subject: NamedNode,
+        predicate: NamedNode,
+        object: impl Into<GroundTerm>,
+        graph_name: impl Into<GroundGraphName>,
+    ) -> Self {
+        Self { subject, predicate, object: object.into(), graph_name: graph_name.into() }
+    }
+}
+
+impl From<NamedNode> for GroundTerm {
+    fn from(n: NamedNode) -> Self {
+        GroundTerm::NamedNode(n)
+    }
+}
+
+impl From<Literal> for GroundTerm {
+    fn from(l: Literal) -> Self {
+        GroundTerm::Literal(l)
+    }
+}
+
+impl From<NamedNode> for GroundGraphName {
+    fn from(n: NamedNode) -> Self {
+        GroundGraphName::NamedNode(n)
+    }
+}
+
+impl From<GroundGraphName> for oxigraph::model::GraphName {
+    fn from(g: GroundGraphName) -> Self {
+        match g {
+            GroundGraphName::DefaultGraph => oxigraph::model::GraphName::DefaultGraph,
+            GroundGraphName::NamedNode(n) => oxigraph::model::GraphName::NamedNode(n),
+        }
+    }
+}
+
+impl From<&GroundQuad> for Quad {
+    fn from(q: &GroundQuad) -> Self {
+        Quad::new(
+            q.subject.clone(),
+            q.predicate.clone(),
+            match &q.object {
+                GroundTerm::NamedNode(n) => oxigraph::model::Term::NamedNode(n.clone()),
+                GroundTerm::Literal(l) => oxigraph::model::Term::Literal(l.clone()),
+            },
+            q.graph_name.clone(),
+        )
+    }
+}
+
+/// N-Triples term syntax, as `Term`'s own `Display` writes it — the escaping
+/// of quotes, newlines, language tags and datatypes that
+/// `resource::serialize_for_insert` interpolates into a SPARQL body.
+impl fmt::Display for GroundTerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GroundTerm::NamedNode(n) => n.fmt(f),
+            GroundTerm::Literal(l) => l.fmt(f),
+        }
+    }
+}
 
 impl Dataset {
     pub fn new(quads: Vec<Quad>) -> Self {
@@ -57,11 +163,13 @@ impl Dataset {
     /// name counts, which is why this reads the quads rather than asking
     /// [`named_graphs`](Self::named_graphs), whose list is narrower on purpose.
     ///
-    /// This is what §3.4 refuses on containers and auxiliaries and what §6.2
-    /// calls a dataset. Defining it as "`named_graphs` is non-empty" makes
-    /// `GRAPH _:g { … }` invisible to every one of those decisions, and that
-    /// shape — a blank node that is both graph name and term — is the deployed
-    /// Verifiable Credentials `proof` pattern §4 exists for.
+    /// This is what §3.4 refuses on containers and auxiliaries, asked of a
+    /// body on its way in. Defining it as "`named_graphs` is non-empty" makes
+    /// `GRAPH _:g { … }` invisible to that decision, and that shape — a blank
+    /// node that is both graph name and term — is the deployed Verifiable
+    /// Credentials `proof` pattern §4 exists for. On the way back out the
+    /// question is asked of [`Skolemized`], where it cannot come apart from
+    /// the list at all.
     pub fn has_named_graphs(&self) -> bool {
         self.0.iter().any(|q| q.graph_name != oxigraph::model::GraphName::DefaultGraph)
     }
@@ -114,9 +222,21 @@ impl Dataset {
 const SKOLEM_PREFIX: &str = "urn:quadpod:bnode:";
 
 impl Skolemized {
+    /// Quads the caller already holds in ground form — server-built content
+    /// (`container::ensure_container`, `add_containment`) and the buckets
+    /// `resource::put_dataset` splits a stored dataset into. Total, because
+    /// [`GroundQuad`] can carry nothing this type would have to refuse.
+    pub fn new(quads: Vec<GroundQuad>) -> Self {
+        Self(quads)
+    }
+
     /// §4: replace every blank node with a minted IRI, one per distinct blank
     /// node within this document, so co-reference survives — including the
     /// case where a blank node is both a graph name and a term.
+    ///
+    /// The only conversion from client data, and it is total in both
+    /// directions of the word: every input maps, and no input can map to
+    /// something that still holds a blank node.
     pub fn skolemize(dataset: &Dataset) -> Self {
         use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
         let mut minted: std::collections::HashMap<String, NamedNode> = std::collections::HashMap::new();
@@ -128,40 +248,87 @@ impl Skolemized {
                 })
                 .clone()
         };
-        let quads = dataset.quads().iter().map(|q| {
-            let subject = match &q.subject {
-                NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::NamedNode(iri_for(b)),
-                other => other.clone(),
-            };
-            let object = match &q.object {
-                Term::BlankNode(b) => Term::NamedNode(iri_for(b)),
-                other => other.clone(),
-            };
-            let graph_name = match &q.graph_name {
-                GraphName::BlankNode(b) => GraphName::NamedNode(iri_for(b)),
-                other => other.clone(),
-            };
-            Quad { subject, predicate: q.predicate.clone(), object, graph_name }
+        let quads = dataset.quads().iter().map(|q| GroundQuad {
+            subject: match &q.subject {
+                NamedOrBlankNode::NamedNode(n) => n.clone(),
+                NamedOrBlankNode::BlankNode(b) => iri_for(b),
+            },
+            predicate: q.predicate.clone(),
+            object: match &q.object {
+                Term::NamedNode(n) => GroundTerm::NamedNode(n.clone()),
+                Term::BlankNode(b) => GroundTerm::NamedNode(iri_for(b)),
+                Term::Literal(l) => GroundTerm::Literal(l.clone()),
+            },
+            graph_name: match &q.graph_name {
+                GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
+                GraphName::NamedNode(n) => GroundGraphName::NamedNode(n.clone()),
+                GraphName::BlankNode(b) => GroundGraphName::NamedNode(iri_for(b)),
+            },
         }).collect();
         Self(quads)
     }
 
-    /// Server-built content that is already ground. `None` if it is not, which
-    /// is the one choke point for that check: `container::ensure_container`,
-    /// `add_containment` and auxiliary provisioning all come through here,
-    /// rather than each asserting groundness on its own.
-    pub fn ground(quads: Vec<Quad>) -> Option<Self> {
+    /// Quads read back out of the store. `None` when one of them is not
+    /// ground, which is the store disagreeing with §4 — corruption, not a
+    /// caller mistake, and the callers say so with `expect`.
+    ///
+    /// This is the only fallible way into the type, and it is a **parse**:
+    /// `query_triples` hands back oxigraph's `Term`, outside this module's
+    /// type system, and something has to decide what it is. Nothing on the
+    /// write path may call it — client data goes through
+    /// [`skolemize`](Self::skolemize), server-built data through
+    /// [`new`](Self::new) — because a check that runs on our own values is
+    /// the check that quietly stops running.
+    pub fn from_store(quads: Vec<Quad>) -> Option<Self> {
         use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
-        let blank = quads.iter().any(|q| {
-            matches!(q.subject, NamedOrBlankNode::BlankNode(_))
-                || matches!(q.object, Term::BlankNode(_))
-                || matches!(q.graph_name, GraphName::BlankNode(_))
-        });
-        (!blank).then_some(Self(quads))
+        quads.into_iter().map(|q| {
+            Some(GroundQuad {
+                subject: match q.subject {
+                    NamedOrBlankNode::NamedNode(n) => n,
+                    NamedOrBlankNode::BlankNode(_) => return None,
+                },
+                predicate: q.predicate,
+                object: match q.object {
+                    Term::NamedNode(n) => GroundTerm::NamedNode(n),
+                    Term::Literal(l) => GroundTerm::Literal(l),
+                    Term::BlankNode(_) => return None,
+                },
+                graph_name: match q.graph_name {
+                    GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
+                    GraphName::NamedNode(n) => GroundGraphName::NamedNode(n),
+                    GraphName::BlankNode(_) => return None,
+                },
+            })
+        }).collect::<Option<Vec<_>>>().map(Self)
     }
 
-    pub fn quads(&self) -> &[Quad] {
+    pub fn quads(&self) -> &[GroundQuad] {
         &self.0
+    }
+
+    /// The graphs this dataset names, in no particular order — **all** of
+    /// them, unlike [`Dataset::named_graphs`], because a stored graph name is
+    /// an IRI by construction. Every dataset decision the read and write paths
+    /// make (§6.2's shape, §6.2.1's refusal, the `containsGraph` count) is
+    /// taken over this list rather than the visible one, where a graph the
+    /// client named with a blank node would be missing from it.
+    pub fn named_graphs(&self) -> Vec<NamedNode> {
+        let mut seen: Vec<NamedNode> = Vec::new();
+        for q in &self.0 {
+            if let GroundGraphName::NamedNode(n) = &q.graph_name {
+                if !seen.contains(n) {
+                    seen.push(n.clone());
+                }
+            }
+        }
+        seen
+    }
+
+    /// Whether this is a dataset rather than a lone default graph. Cannot
+    /// disagree with [`named_graphs`](Self::named_graphs), which is the whole
+    /// point: on the visible side the two questions come apart.
+    pub fn has_named_graphs(&self) -> bool {
+        self.0.iter().any(|q| q.graph_name != GroundGraphName::DefaultGraph)
     }
 
     /// §4: back to blank nodes, one per distinct skolem IRI, **with a label
@@ -177,26 +344,23 @@ impl Skolemized {
             BlankNode::new(format!("b{label}")).ok()
         }
         let quads = self.0.iter().map(|q| {
-            let subject = match &q.subject {
-                NamedOrBlankNode::NamedNode(n) => match blank_for(n) {
-                    Some(b) => NamedOrBlankNode::BlankNode(b),
-                    None => q.subject.clone(),
-                },
-                other => other.clone(),
+            let subject = match blank_for(&q.subject) {
+                Some(b) => NamedOrBlankNode::BlankNode(b),
+                None => NamedOrBlankNode::NamedNode(q.subject.clone()),
             };
             let object = match &q.object {
-                Term::NamedNode(n) => match blank_for(n) {
+                GroundTerm::NamedNode(n) => match blank_for(n) {
                     Some(b) => Term::BlankNode(b),
-                    None => q.object.clone(),
+                    None => Term::NamedNode(n.clone()),
                 },
-                other => other.clone(),
+                GroundTerm::Literal(l) => Term::Literal(l.clone()),
             };
             let graph_name = match &q.graph_name {
-                GraphName::NamedNode(n) => match blank_for(n) {
+                GroundGraphName::NamedNode(n) => match blank_for(n) {
                     Some(b) => GraphName::BlankNode(b),
-                    None => q.graph_name.clone(),
+                    None => GraphName::NamedNode(n.clone()),
                 },
-                other => other.clone(),
+                GroundGraphName::DefaultGraph => GraphName::DefaultGraph,
             };
             Quad { subject, predicate: q.predicate.clone(), object, graph_name }
         }).collect();
@@ -212,7 +376,7 @@ impl Skolemized {
     /// come back, is the mistake — and both are harder to write by accident
     /// when the hash belongs to the stored form.
     pub fn etag(&self, fmt: Format) -> String {
-        let mut lines: Vec<String> = self.0.iter().map(|q| q.to_string()).collect();
+        let mut lines: Vec<String> = self.0.iter().map(|q| Quad::from(q).to_string()).collect();
         lines.sort();
         let mut h = Sha256::new();
         h.update(fmt.media_type().as_bytes());
@@ -232,6 +396,16 @@ mod tests {
 
     fn q(s: &str, o: &str, g: oxigraph::model::GraphName) -> Quad {
         Quad::new(
+            NamedNode::new(s).unwrap(),
+            NamedNode::new("http://schema.org/name").unwrap(),
+            Literal::new_simple_literal(o),
+            g,
+        )
+    }
+
+    /// The same quad in stored form.
+    fn gq(s: &str, o: &str, g: GroundGraphName) -> GroundQuad {
+        GroundQuad::new(
             NamedNode::new(s).unwrap(),
             NamedNode::new("http://schema.org/name").unwrap(),
             Literal::new_simple_literal(o),
@@ -371,13 +545,11 @@ mod tests {
             q("http://example.org/s", "inside", b.clone().into()),
         ]);
 
+        // That no blank node reaches the store, not even as a graph name, is
+        // no longer assertable here: `GroundGraphName` has no variant to
+        // compare against. What is still worth pinning is that the identity
+        // survives the round trip — see `tests/unrepresentable.rs`.
         let stored = Skolemized::skolemize(&ds);
-        assert!(
-            stored.quads().iter().all(|q| !matches!(
-                q.graph_name, oxigraph::model::GraphName::BlankNode(_))),
-            "no blank node reaches the store, not even as a graph name"
-        );
-
         let back = stored.deskolemize();
         let graph_node = back.quads().iter()
             .find_map(|q| match &q.graph_name {
@@ -403,10 +575,14 @@ mod tests {
             "a fresh label per read would break the byte-identical guarantee");
     }
 
+    // The store is the one source of quads this module cannot type-check on
+    // the way in, so `from_store` is a parse: a blank node coming back out is
+    // §4 broken underneath us, and reading it as an ordinary quad would put
+    // it back on the read path as if it had always been there.
     #[test]
-    fn ground_refuses_content_that_still_has_a_blank_node() {
+    fn from_store_refuses_content_that_still_has_a_blank_node() {
         let ok = vec![q("http://example.org/s", "x", oxigraph::model::GraphName::DefaultGraph)];
-        assert!(Skolemized::ground(ok).is_some());
+        assert!(Skolemized::from_store(ok).is_some());
 
         let not_ok = vec![Quad::new(
             BlankNode::default(),
@@ -414,7 +590,7 @@ mod tests {
             Literal::new_simple_literal("x"),
             oxigraph::model::GraphName::DefaultGraph,
         )];
-        assert!(Skolemized::ground(not_ok).is_none());
+        assert!(Skolemized::from_store(not_ok).is_none());
     }
 
     #[test]
@@ -442,7 +618,7 @@ mod tests {
         // Collect all skolem IRIs in the stored dataset
         let skolem_iris: Vec<String> = stored.quads().iter()
             .filter_map(|q| match &q.object {
-                oxigraph::model::Term::NamedNode(n) => {
+                GroundTerm::NamedNode(n) => {
                     if n.as_str().starts_with("urn:quadpod:bnode:") {
                         Some(n.as_str().to_string())
                     } else {
@@ -474,8 +650,8 @@ mod tests {
         let g1 = NamedNode::new("http://example.org/g1").unwrap();
         let g2 = NamedNode::new("http://example.org/g2").unwrap();
 
-        let in_g1 = Skolemized::ground(vec![q("http://example.org/s", "x", g1.into())]).unwrap();
-        let in_g2 = Skolemized::ground(vec![q("http://example.org/s", "x", g2.into())]).unwrap();
+        let in_g1 = Skolemized::new(vec![gq("http://example.org/s", "x", g1.into())]);
+        let in_g2 = Skolemized::new(vec![gq("http://example.org/s", "x", g2.into())]);
 
         assert_ne!(in_g1.etag(jsonld), in_g2.etag(jsonld),
             "same triple, different graph — a shared validator would serve the wrong one");
@@ -492,12 +668,11 @@ mod tests {
     #[test]
     fn the_etag_is_order_independent() {
         let jsonld = Format::from_content_type("application/ld+json").unwrap();
-        let g = oxigraph::model::GraphName::DefaultGraph;
-        let q1 = q("http://example.org/a", "A", g.clone());
-        let q2 = q("http://example.org/b", "B", g);
+        let q1 = gq("http://example.org/a", "A", GroundGraphName::DefaultGraph);
+        let q2 = gq("http://example.org/b", "B", GroundGraphName::DefaultGraph);
 
-        let forward = Skolemized::ground(vec![q1.clone(), q2.clone()]).unwrap();
-        let backward = Skolemized::ground(vec![q2, q1]).unwrap();
+        let forward = Skolemized::new(vec![q1.clone(), q2.clone()]);
+        let backward = Skolemized::new(vec![q2, q1]);
 
         assert_eq!(forward.etag(jsonld), backward.etag(jsonld),
             "same quads in a different order must share a validator");

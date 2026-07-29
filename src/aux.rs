@@ -398,13 +398,12 @@ mod tests {
         let r = res("/c/notes");
         let ttl = Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
-        let ds = crate::dataset::Skolemized::ground(vec![oxigraph::model::Quad::new(
+        let ds = crate::dataset::Skolemized::new(vec![crate::dataset::GroundQuad::new(
             oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
             oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
             oxigraph::model::Literal::new_simple_literal("Alice"),
             g.clone(),
-        )])
-        .unwrap();
+        )]);
         put_dataset(&store, &r, &ds, ttl).await.unwrap();
         let key = ShelfKey::of(&r, g.as_ref());
 

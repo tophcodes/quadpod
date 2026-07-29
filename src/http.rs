@@ -310,7 +310,7 @@ fn ground_dataset(triples: Vec<Triple>) -> Skolemized {
     let quads: Vec<Quad> = triples.into_iter()
         .map(|t| Quad::new(t.subject, t.predicate, t.object, oxigraph::model::GraphName::DefaultGraph))
         .collect();
-    Skolemized::ground(quads).expect("store content is ground by construction")
+    Skolemized::from_store(quads).expect("store content is ground by construction")
 }
 
 async fn handle_put(
@@ -376,9 +376,8 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
                 // Over the stored quads, where every graph name is an IRI. A
                 // graph the client named with a blank node is destroyed by
                 // this write just as surely, and the de-skolemized view shows
-                // it as a blank node again — invisible to `named_graphs`.
-                let stored_shape = Dataset::new(existing.quads().to_vec());
-                if stored_shape.has_named_graphs() {
+                // it as a blank node again — invisible to `Dataset::named_graphs`.
+                if existing.has_named_graphs() {
                     // Only IRI names go in the message: a blank-named graph
                     // has no name the client ever wrote, and the IRI the
                     // server minted for it is not the client's to see
@@ -387,7 +386,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
                     let named = existing.deskolemize().named_graphs();
                     let mut parts: Vec<String> =
                         named.iter().map(|n| n.as_str().to_owned()).collect();
-                    let blank_named = stored_shape.named_graphs().len() - parts.len();
+                    let blank_named = existing.named_graphs().len() - parts.len();
                     if blank_named > 0 {
                         parts.push(format!("{blank_named} named by a blank node"));
                     }
@@ -676,12 +675,11 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // What is withheld is decided on the **stored** quads, where every graph
     // name is an IRI (§4) and no graph is invisible; what can be *named* comes
     // from the visible view, further down. The de-skolemized view shows a
-    // blank-node graph name as a blank node again, which `named_graphs` cannot
-    // list, so deriving the shape from it would leave that decision resting on
-    // the narrower of the two questions. §6.1 puts the ETag before
+    // blank-node graph name as a blank node again, which `Dataset::named_graphs`
+    // cannot list, so deriving the shape from it would leave that decision
+    // resting on the narrower of the two questions. §6.1 puts the ETag before
     // de-skolemization for the same reason.
-    let stored_shape = Dataset::new(stored.quads().to_vec());
-    let shape = if stored_shape.has_named_graphs() { Shape::Dataset } else { Shape::Graph };
+    let shape = if stored.has_named_graphs() { Shape::Dataset } else { Shape::Graph };
     let stored_type = stored_media_type(store, r).await.ok().flatten();
     let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), shape, stored_type) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
@@ -707,7 +705,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // Only when something was actually left out — an ordinary graph-shaped
     // resource served as Turtle has nothing to point `alternate` at, and
     // must not carry these headers just because Turtle itself is lossy.
-    if !fmt.carries_dataset() && stored_shape.has_named_graphs() {
+    if !fmt.carries_dataset() && stored.has_named_graphs() {
         // `containsGraph` names what a client would recognise, so it is drawn
         // from the visible view: a graph the client named with a blank node
         // has no IRI it ever wrote, and the IRI the server minted for it is

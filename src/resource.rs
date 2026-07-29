@@ -7,7 +7,7 @@
 //! denying). A presence marker in `urn:quadpod:sys:<iri>` removes the ambiguity.
 
 use crate::{
-    dataset::{Dataset, Skolemized},
+    dataset::{Dataset, GroundGraphName, GroundQuad, Skolemized},
     rdf::{Format, RdfError},
     shelf::{ShelfKey, SYS_GRAPH_NAME, SYS_HAS_SUBGRAPH, SYS_MEDIA_TYPE},
     space::{DirectlyDeletable, DirectlyWritable, GraphName, ResourceUrl, SpaceError},
@@ -47,9 +47,10 @@ pub fn sys_graph_iri(g: &impl GraphName) -> String {
 /// Every write path shares this so their escaping cannot diverge: oxrdf's
 /// `Display` is what escapes quotes, newlines, control characters, language
 /// tags and datatypes, and a second copy of this loop would be the place a
-/// future change forgets. Taking [`Skolemized`] rather than `&[Triple]` makes
-/// this the one place the "no blank node in the store" invariant is enforced,
-/// instead of a claim every caller has to uphold on its own (§4).
+/// future change forgets. Taking [`Skolemized`] rather than `&[Triple]` is
+/// what makes "no blank node in the store" (§4) a property of the argument
+/// type at every write path, rather than a claim each caller upholds on its
+/// own.
 pub(crate) fn serialize_for_insert(quads: &Skolemized) -> String {
     let mut body = String::new();
     for q in quads.quads() {
@@ -79,29 +80,30 @@ pub async fn put_dataset(
     dataset: &Skolemized,
     media_type: Format,
 ) -> Result<(), ResourceError> {
-    use oxigraph::model::{GraphName, NamedNode, Quad};
+    use oxigraph::model::NamedNode;
     let iri = r.graph_iri();
     let sys = sys_graph_iri(r);
 
     // Split by graph name; the key is minted only here, from the pair. Each
-    // bucket is re-wrapped as DefaultGraph quads because serialize_for_insert
+    // bucket is re-wrapped as default-graph quads because serialize_for_insert
     // only reads subject/predicate/object — the GRAPH <...> wrapper below
     // supplies the graph context.
-    let mut default_graph: Vec<Quad> = Vec::new();
-    let mut shelves: Vec<(ShelfKey, String, Vec<Quad>)> = Vec::new();
+    let mut default_graph: Vec<GroundQuad> = Vec::new();
+    let mut shelves: Vec<(ShelfKey, String, Vec<GroundQuad>)> = Vec::new();
     for q in dataset.quads() {
-        let t = Quad::new(q.subject.clone(), q.predicate.clone(), q.object.clone(), GraphName::DefaultGraph);
+        let t = GroundQuad::new(
+            q.subject.clone(), q.predicate.clone(), q.object.clone(),
+            GroundGraphName::DefaultGraph,
+        );
         match &q.graph_name {
-            GraphName::DefaultGraph => default_graph.push(t),
-            GraphName::NamedNode(n) => {
+            GroundGraphName::DefaultGraph => default_graph.push(t),
+            GroundGraphName::NamedNode(n) => {
                 let key = ShelfKey::of(r, n.as_ref());
                 match shelves.iter_mut().find(|(k, _, _)| k == &key) {
                     Some((_, _, ts)) => ts.push(t),
                     None => shelves.push((key, n.as_str().to_owned(), vec![t])),
                 }
             }
-            // Unreachable: Skolemized carries no blank node (§4).
-            GraphName::BlankNode(_) => return Err(ResourceError::InvalidIri),
         }
     }
 
@@ -117,16 +119,13 @@ pub async fn put_dataset(
     }
     update.push_str(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>; "));
 
-    // One INSERT DATA: blank nodes cannot be shared across operations, and
-    // although Skolemized has none today, splitting would make that a latent
-    // trap for the first caller who changes it.
+    // One INSERT DATA holding every graph: §5's replacement is one operation,
+    // not one per shelf.
     update.push_str("INSERT DATA { ");
-    let default_ground = Skolemized::ground(default_graph)
-        .expect("split from an already-ground Skolemized, so no bucket can gain a blank node");
+    let default_ground = Skolemized::new(default_graph);
     update.push_str(&format!("GRAPH <{iri}> {{ {} }} ", serialize_for_insert(&default_ground)));
     for (key, _, ts) in &shelves {
-        let ground = Skolemized::ground(ts.clone())
-            .expect("split from an already-ground Skolemized, so no bucket can gain a blank node");
+        let ground = Skolemized::new(ts.clone());
         update.push_str(&format!("GRAPH <{}> {{ {} }} ", key.graph_iri(), serialize_for_insert(&ground)));
     }
     update.push_str("}; ");
@@ -203,7 +202,7 @@ pub async fn get_dataset(
         }
     }
 
-    Ok(Some(Skolemized::ground(quads).expect("the store holds no blank node")))
+    Ok(Some(Skolemized::from_store(quads).expect("the store holds no blank node")))
 }
 
 /// §6.4: what the representation arrived as, for `*/*` and for the
@@ -247,8 +246,8 @@ pub async fn registered_shelves(
 
 /// `triples` carries no graph name, and `serialize_for_insert` does not read
 /// one — the caller supplies it via the `GRAPH <...>` wrapper around the
-/// rendered body — so every quad is tagged [`GraphName::DefaultGraph`] here
-/// purely to satisfy [`Skolemized`]'s shape.
+/// rendered body — so every quad is tagged `GraphName::DefaultGraph` here
+/// purely to satisfy [`Dataset`]'s shape.
 fn as_quads(triples: &[Triple]) -> Vec<oxigraph::model::Quad> {
     triples.iter()
         .map(|t| oxigraph::model::Quad::new(
@@ -261,8 +260,8 @@ fn as_quads(triples: &[Triple]) -> Vec<oxigraph::model::Quad> {
 /// Replace a graph's contents and mark it present, in one update.
 ///
 /// `triples` may be client-supplied (a `PUT`/`POST` body), so blank nodes are
-/// expected here and skolemized rather than rejected — [`Skolemized::ground`]
-/// is for content the caller already knows has none.
+/// expected here and skolemized rather than rejected — [`insert_marked`] is
+/// the path for content that is ground before it arrives.
 pub async fn put_rdf(
     store: &dyn SparqlStore,
     g: &impl DirectlyWritable,
@@ -282,27 +281,26 @@ pub async fn put_rdf(
     Ok(())
 }
 
-/// Insert triples into a graph without replacing what is there, marking it
+/// Insert quads into a graph without replacing what is there, marking it
 /// present in the same update. This is the additive counterpart to
 /// [`put_rdf`]: containment and container type triples accumulate rather
 /// than replace, but must not be able to produce content without a
 /// presence marker.
 ///
-/// Every caller of this function builds `triples` itself (container type and
-/// containment assertions) rather than forwarding a client body, so they are
-/// ground by construction — `.expect` names that rather than falling back to
-/// [`put_rdf`]'s silent skolemization, so a future caller that breaks the
-/// assumption fails loudly instead of planting a skolem IRI unnoticed.
+/// Takes [`GroundQuad`] rather than `Triple` because every caller builds its
+/// own assertions (container type, containment) from IRIs it just minted,
+/// instead of forwarding a client body. Saying that in the parameter type
+/// leaves a future caller with a client body no way to reach here without
+/// either skolemizing it first or using [`put_rdf`], which is the choice that
+/// used to be made by an `.expect` at run time.
 pub async fn insert_marked(
     store: &dyn SparqlStore,
     g: &impl DirectlyWritable,
-    triples: &[Triple],
+    quads: &[GroundQuad],
 ) -> Result<(), ResourceError> {
     let iri = g.graph_iri();
     let sys = sys_graph_iri(g);
-    let ground = Skolemized::ground(as_quads(triples))
-        .expect("insert_marked's callers build their own triples, which are always ground");
-    let body = serialize_for_insert(&ground);
+    let body = serialize_for_insert(&Skolemized::new(quads.to_vec()));
     store
         .update(&format!(
             "INSERT DATA {{ GRAPH <{iri}> {{ {body} }} }}; \
@@ -390,6 +388,24 @@ mod tests {
             .quads().iter().cloned().map(Triple::from).collect()
     }
 
+    /// The same fixture in the form `insert_marked` takes. Turtle is
+    /// client-shaped text, so it reaches ground form the way a client body
+    /// does; these fixtures hold no blank node, so nothing is rewritten.
+    fn ground_triples(turtle: &str, base: &str) -> Vec<GroundQuad> {
+        Skolemized::skolemize(&Dataset::new(as_quads(&triples(turtle, base))))
+            .quads().to_vec()
+    }
+
+    /// `<s> schema:name "o"` in graph `g`, stored form.
+    fn gq(s: &str, o: &str, g: GroundGraphName) -> GroundQuad {
+        GroundQuad::new(
+            oxigraph::model::NamedNode::new(s).unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal(o),
+            g,
+        )
+    }
+
     /// An existing subject with an auxiliary written for it. `delete_rdf` is
     /// bounded to auxiliaries — a subject is deleted by `aux::delete_subject`,
     /// which cascades — so the deletion tests below exercise it on one, built
@@ -402,21 +418,10 @@ mod tests {
         acl
     }
 
-    // §4: the invariant was asserted globally and enforced in two handlers.
-    // Three other writers pass arbitrary triples, and it held only because
-    // provision_root_acl happens to write <#owner> rather than [] a
-    // acl:Authorization.
-    #[test]
-    fn server_built_content_goes_through_the_ground_constructor() {
-        use oxigraph::model::{BlankNode, Literal, NamedNode, Quad, GraphName};
-        let blank = vec![Quad::new(
-            BlankNode::default(),
-            NamedNode::new("http://schema.org/name").unwrap(),
-            Literal::new_simple_literal("x"),
-            GraphName::DefaultGraph)];
-        assert!(Skolemized::ground(blank).is_none(),
-            "a writer cannot smuggle a blank node past the constructor");
-    }
+    // §4's "a writer cannot smuggle a blank node past the constructor" had a
+    // test here while `Skolemized` wrapped `Quad`. `insert_marked` now takes
+    // `&[GroundQuad]`, so the expression that smuggles one does not compile —
+    // see `tests/unrepresentable.rs`.
 
     #[tokio::test]
     async fn put_then_get_roundtrips_triples() {
@@ -524,8 +529,8 @@ mod tests {
     async fn insert_marked_accumulates_not_replaces() {
         let store = OxigraphStore::in_memory().unwrap();
         let foo = res("/foo");
-        insert_marked(&store, &foo, &triples("<#a> <http://schema.org/name> \"A\" .", foo.graph_iri())).await.unwrap();
-        insert_marked(&store, &foo, &triples("<#b> <http://schema.org/name> \"B\" .", foo.graph_iri())).await.unwrap();
+        insert_marked(&store, &foo, &ground_triples("<#a> <http://schema.org/name> \"A\" .", foo.graph_iri())).await.unwrap();
+        insert_marked(&store, &foo, &ground_triples("<#b> <http://schema.org/name> \"B\" .", foo.graph_iri())).await.unwrap();
         let got = get_rdf(&store, &foo).await.unwrap().unwrap();
         assert_eq!(got.len(), 2, "second insert_marked should add, not replace");
     }
@@ -534,7 +539,7 @@ mod tests {
     async fn insert_marked_writes_a_presence_marker() {
         let store = OxigraphStore::in_memory().unwrap();
         let foo = res("/foo");
-        insert_marked(&store, &foo, &triples("<#it> <http://schema.org/name> \"x\" .", foo.graph_iri())).await.unwrap();
+        insert_marked(&store, &foo, &ground_triples("<#it> <http://schema.org/name> \"x\" .", foo.graph_iri())).await.unwrap();
         assert!(exists(&store, &foo).await.unwrap());
         // A resource is removed by the cascade, not by `delete_rdf`.
         assert!(crate::aux::delete_subject(&store, &foo).await.unwrap());
@@ -595,18 +600,10 @@ mod tests {
         let r = res("/c/notes");
         let jsonld = crate::rdf::Format::from_content_type("application/ld+json").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
-        let ds = Skolemized::ground(vec![
-            oxigraph::model::Quad::new(
-                oxigraph::model::NamedNode::new("https://pod.toph.so/c/notes#it").unwrap(),
-                oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-                oxigraph::model::Literal::new_simple_literal("Toph"),
-                oxigraph::model::GraphName::DefaultGraph),
-            oxigraph::model::Quad::new(
-                oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-                oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-                oxigraph::model::Literal::new_simple_literal("Alice"),
-                g.clone()),
-        ]).unwrap();
+        let ds = Skolemized::new(vec![
+            gq("https://pod.toph.so/c/notes#it", "Toph", GroundGraphName::DefaultGraph),
+            gq("http://example.org/alice", "Alice", g.clone().into()),
+        ]);
 
         put_dataset(&store, &r, &ds, jsonld).await.unwrap();
 
@@ -626,17 +623,13 @@ mod tests {
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
-        let with_graph = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Alice"),
-            g.clone())]).unwrap();
+        let with_graph = Skolemized::new(vec![gq("http://example.org/alice", "Alice", g.clone().into())]);
 
         put_dataset(&store, &r, &with_graph, ttl).await.unwrap();
         assert_eq!(registered_shelves(&store, &r).await.unwrap().len(), 1);
 
         // Replace with a document that has no named graph at all.
-        put_dataset(&store, &r, &Skolemized::ground(vec![]).unwrap(), ttl).await.unwrap();
+        put_dataset(&store, &r, &Skolemized::new(vec![]), ttl).await.unwrap();
         assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
 
         // And the shelf is gone, not merely emptied: write the same graph name
@@ -667,16 +660,8 @@ mod tests {
         let a = oxigraph::model::NamedNode::new("urn:example:a").unwrap();
         let b = oxigraph::model::NamedNode::new("urn:example:b").unwrap();
 
-        let with_a = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Alice"),
-            a.clone())]).unwrap();
-        let with_b = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/bob").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Bob"),
-            b)]).unwrap();
+        let with_a = Skolemized::new(vec![gq("http://example.org/alice", "Alice", a.clone().into())]);
+        let with_b = Skolemized::new(vec![gq("http://example.org/bob", "Bob", b.into())]);
 
         put_dataset(&store, &r, &with_a, ttl).await.unwrap();
         let key_a = ShelfKey::of(&r, a.as_ref());
@@ -699,7 +684,7 @@ mod tests {
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
 
-        put_dataset(&store, &r, &Skolemized::ground(vec![]).unwrap(), ttl).await.unwrap();
+        put_dataset(&store, &r, &Skolemized::new(vec![]), ttl).await.unwrap();
 
         assert!(exists(&store, &r).await.unwrap(), "a graphless dataset write must still mark presence");
         assert!(get_dataset(&store, &r).await.unwrap().is_some());
@@ -716,11 +701,7 @@ mod tests {
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:valid-name").unwrap();
-        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Alice"),
-            g.clone())]).unwrap();
+        let ds = Skolemized::new(vec![gq("http://example.org/alice", "Alice", g.clone().into())]);
 
         put_dataset(&store, &r, &ds, ttl).await.unwrap();
 
@@ -738,16 +719,8 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
-        let first = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Alice"),
-            oxigraph::model::GraphName::DefaultGraph)]).unwrap();
-        let second = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/bob").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Bob"),
-            oxigraph::model::GraphName::DefaultGraph)]).unwrap();
+        let first = Skolemized::new(vec![gq("http://example.org/alice", "Alice", GroundGraphName::DefaultGraph)]);
+        let second = Skolemized::new(vec![gq("http://example.org/bob", "Bob", GroundGraphName::DefaultGraph)]);
 
         put_dataset(&store, &r, &first, ttl).await.unwrap();
         put_dataset(&store, &r, &second, ttl).await.unwrap();
@@ -755,7 +728,7 @@ mod tests {
         let back = get_dataset(&store, &r).await.unwrap().unwrap();
         assert_eq!(back.quads().len(), 1, "second default-graph write should replace, not accumulate");
         assert!(
-            matches!(&back.quads()[0].object, oxigraph::model::Term::Literal(l) if l.value() == "Bob"),
+            matches!(&back.quads()[0].object, crate::dataset::GroundTerm::Literal(l) if l.value() == "Bob"),
             "read-back must be the second write's content, not the first's"
         );
     }
@@ -771,11 +744,7 @@ mod tests {
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
-        let ds = Skolemized::ground(vec![oxigraph::model::Quad::new(
-            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
-            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
-            oxigraph::model::Literal::new_simple_literal("Alice"),
-            g.clone())]).unwrap();
+        let ds = Skolemized::new(vec![gq("http://example.org/alice", "Alice", g.clone().into())]);
 
         put_dataset(&store, &r, &ds, ttl).await.unwrap();
 

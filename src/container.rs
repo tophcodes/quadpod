@@ -1,4 +1,5 @@
 use crate::{
+    dataset::{GroundGraphName, GroundQuad},
     resource::{insert_marked, ResourceError},
     space::{ContainerUrl, GraphName},
     store::SparqlStore,
@@ -36,11 +37,11 @@ pub async fn ensure_container(
 ) -> Result<(), ResourceError> {
     let iri = node(c.graph_iri())?;
     let rdf_type = node(RDF_TYPE)?;
-    let triples = [
-        Triple::new(iri.clone(), rdf_type.clone(), node(LDP_CONTAINER)?),
-        Triple::new(iri, rdf_type, node(LDP_BASIC_CONTAINER)?),
+    let quads = [
+        GroundQuad::new(iri.clone(), rdf_type.clone(), node(LDP_CONTAINER)?, GroundGraphName::DefaultGraph),
+        GroundQuad::new(iri, rdf_type, node(LDP_BASIC_CONTAINER)?, GroundGraphName::DefaultGraph),
     ];
-    insert_marked(store, c, &triples).await
+    insert_marked(store, c, &quads).await
 }
 
 /// Record `child_iri` as a member of `parent`. The IRI is a `GraphName`'s at
@@ -53,8 +54,9 @@ pub async fn add_containment(
     store: &dyn SparqlStore, parent: &ContainerUrl, child_iri: &str,
 ) -> Result<(), ResourceError> {
     let p = node(parent.graph_iri())?;
-    let triples = [Triple::new(p, node(LDP_CONTAINS)?, node(child_iri)?)];
-    insert_marked(store, parent, &triples).await
+    let quads = [GroundQuad::new(
+        p, node(LDP_CONTAINS)?, node(child_iri)?, GroundGraphName::DefaultGraph)];
+    insert_marked(store, parent, &quads).await
 }
 
 pub async fn remove_containment(

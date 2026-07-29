@@ -1,6 +1,7 @@
-//! Why six of Plan 6's seven defect classes cannot recur.
+//! Why six of Plan 6's seven defect classes cannot recur, and what else the
+//! type system decides here.
 //!
-//! Four are gone at the type level and have no runtime test, because the
+//! Five are gone at the type level and have no runtime test, because the
 //! expression that would exercise them does not compile:
 //!
 //! * **Slug escalation.** The only struct literal that produces an `AuxUrl`
@@ -35,6 +36,25 @@
 //!   it. (The brief for this task described `authorize_and_materialize` as
 //!   the *only* consumer of `ancestors`; that overstates it, so this doc
 //!   states the weaker, true claim instead.)
+//! * **A blank node in the store.** `dataset::Skolemized` wraps
+//!   `dataset::GroundQuad`, whose subject is a `NamedNode`, object a
+//!   `GroundTerm` (`NamedNode | Literal`) and graph name a `GroundGraphName`
+//!   (`NamedNode | DefaultGraph`) — no position has a variant that holds one.
+//!   Every write path takes that type: `resource::serialize_for_insert` is the
+//!   only renderer of an `INSERT` body and `resource::insert_marked` the only
+//!   additive writer, and neither accepts a `Quad`. So the three ways §4 used
+//!   to be breakable — skolemizing and discarding the result, weakening the
+//!   groundness check that guarded the constructor, or a new writer never
+//!   calling it — are now a type error rather than a silent leak.
+//!
+//!   Two things this does *not* make impossible, and both stay tested.
+//!   `Skolemized::from_store` parses quads coming back out of the store, which
+//!   is the one source outside this type system; it answers `None` on a blank
+//!   node (`dataset.rs`'s `from_store_refuses_content_that_still_has_a_blank_node`).
+//!   And a caller may still choose the wrong conversion for client data —
+//!   dropping a body instead of skolemizing it is a decision, not a broken
+//!   invariant, so `http.rs` tests what a `PUT` with a blank node actually
+//!   stores.
 //! * **Orphaned auxiliary.** `resource::delete_rdf` is bounded to
 //!   `impl DirectlyDeletable` (`src/resource.rs:141-144`), and
 //!   `DirectlyDeletable` is implemented only for `AuxUrl` (`src/space.rs:181`)
