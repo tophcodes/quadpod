@@ -16,6 +16,73 @@ fn media_type(ct: &str) -> &str {
     ct.split(';').next().unwrap_or("").trim()
 }
 
+/// A media type this pod stores and echoes back.
+///
+/// [`Format`] answers "can I parse this as RDF?" and its `media_type` is a
+/// `&'static str`, so every `Content-Type` the RDF path emits is safe by
+/// construction. A non-RDF resource's type comes from the client and reaches
+/// two interpolation sites — a SPARQL literal and a response header — so it
+/// needs a constructor that can refuse.
+///
+/// RFC 9110 §5.6.2: `token "/" token`, optionally followed by `; token=token`
+/// parameters. Quoted-string parameter values are refused rather than escaped:
+/// the tchar set contains neither `"` nor `\`, so a value that passes here
+/// cannot leave the SPARQL literal it is interpolated into, and that safety is
+/// a property of the alphabet rather than of a correct escape at every site.
+/// The cost is that `multipart/...; boundary="--x"` is rejected, which is
+/// acceptable because multipart is a request encoding rather than a stored
+/// representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaType(String);
+
+/// RFC 9110 §5.6.2 tchar.
+fn is_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+                        | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
+}
+
+impl MediaType {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let mut parts = s.split(';');
+        let (ty, sub) = parts.next()?.trim().split_once('/')?;
+        if !is_token(ty) || !is_token(sub) {
+            return None;
+        }
+        for p in parts {
+            let (name, value) = p.trim().split_once('=')?;
+            if !is_token(name) || !is_token(value) {
+                return None;
+            }
+        }
+        Some(Self(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// `type/subtype`, lowercased, parameters dropped — what an `Accept`
+    /// comparison is made against, since media-type tokens are
+    /// case-insensitive (RFC 9110 §8.3.1) but parameter values need not be.
+    pub fn essence(&self) -> String {
+        media_type(&self.0).to_ascii_lowercase()
+    }
+}
+
+impl From<Format> for MediaType {
+    fn from(f: Format) -> Self {
+        Self(f.media_type().to_owned())
+    }
+}
+
 /// A media type this pod can read and write, and what it is capable of.
 ///
 /// The point of the newtype is that "Turtle cannot carry named graphs" is
@@ -388,5 +455,53 @@ mod tests {
         // Still scoped by its type, and still refusable.
         assert_eq!(negotiate("text/*, text/turtle;q=0", Shape::Dataset, None), None);
         assert_eq!(negotiate("image/*", Shape::Dataset, None), None);
+    }
+
+    #[test]
+    fn media_type_accepts_what_rfc_9110_calls_a_media_type() {
+        assert_eq!(MediaType::parse("text/plain").unwrap().as_str(), "text/plain");
+        assert_eq!(
+            MediaType::parse("text/plain; charset=utf-8").unwrap().as_str(),
+            "text/plain; charset=utf-8",
+            "a token parameter is kept verbatim — it is what the client declared"
+        );
+        assert_eq!(MediaType::parse("  image/png  ").unwrap().as_str(), "image/png");
+        // Tokens are case-insensitive, so comparison uses the lowercased
+        // essence while the stored form keeps the client's spelling.
+        assert_eq!(MediaType::parse("Image/PNG").unwrap().essence(), "image/png");
+        assert_eq!(
+            MediaType::parse("text/plain; charset=utf-8").unwrap().essence(),
+            "text/plain",
+            "essence drops parameters"
+        );
+    }
+
+    // The reason this type exists. The stored form is interpolated into a
+    // `"`-delimited SPARQL literal, so a value that cannot contain `"` or `\`
+    // is safe by its alphabet rather than by a correct escape at every site.
+    // RFC 9110 §5.6.2's tchar set contains neither, so refusing everything
+    // outside it is the whole defence.
+    #[test]
+    fn media_type_refuses_anything_that_could_leave_a_sparql_literal() {
+        for bad in [
+            r#"text/plain; boundary="x""#,   // quoted-string parameter
+            r#"text/plain"; x="#,            // a bare quote
+            r"text/plain\",                  // a backslash
+            "text/plain\u{7f}",              // DEL, a CTL
+            "text/plain\nX-Evil: 1",         // LF, if it ever reached us
+            "textplain",                     // no slash
+            "/plain",                        // empty type
+            "text/",                         // empty subtype
+            "",                              // nothing at all
+            "text/plain; charset",           // parameter with no value
+        ] {
+            assert!(MediaType::parse(bad).is_none(), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_format_is_also_a_media_type() {
+        let ttl = Format::from_content_type("text/turtle").unwrap();
+        assert_eq!(MediaType::from(ttl).as_str(), "text/turtle");
     }
 }
