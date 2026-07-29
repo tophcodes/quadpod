@@ -19,12 +19,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use oxigraph::io::RdfFormat;
 use oxigraph::model::{NamedOrBlankNode, Term};
 
 use super::safe_fetch::{guarded_get, FetchPolicy};
 use super::AuthError;
-use crate::rdf;
+use crate::rdf::Format;
 
 /// The Solid-OIDC predicate a WebID profile document uses to declare which
 /// issuer(s) are authorized to mint tokens on its behalf.
@@ -126,12 +125,15 @@ impl WebIdIssuerVerifier for HttpWebIdIssuers {
         .await?;
         let fmt = content_type
             .as_deref()
-            .and_then(rdf::format_for_content_type)
-            .unwrap_or(RdfFormat::Turtle);
-        let triples = rdf::parse(body.as_bytes(), fmt, doc_url)
+            .and_then(Format::from_content_type)
+            .unwrap_or_else(|| {
+                Format::from_content_type("text/turtle").expect("text/turtle is always supported")
+            });
+        let dataset = fmt
+            .parse(body.as_bytes(), doc_url)
             .map_err(|e| AuthError::FetchBlocked(format!("invalid profile document: {e}")))?;
 
-        Ok(triples.iter().any(|t| {
+        Ok(dataset.quads().iter().any(|t| {
             matches!(&t.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == webid)
                 && t.predicate.as_str() == SOLID_OIDC_ISSUER
                 && matches!(&t.object, Term::NamedNode(n) if issuer_matches(n.as_str(), issuer))

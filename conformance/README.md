@@ -11,9 +11,9 @@ starts, it stops.
 
 ## Current status
 
-The full suite runs and a report lands on disk. As of `ef49c5d`: **41 features,
-652 scenarios, 37 passed, 615 failed**. One gap — no non-RDF resources —
-accounts for 540 of those 615. The triage lives in
+The full suite runs and a report lands on disk. As of `1fe4953`: **41 features,
+652 scenarios, 43 passed, 609 failed**. One gap — no non-RDF resources —
+accounts for 540 of those 609. The triage lives in
 [`docs/conformance-findings.md`](../docs/conformance-findings.md).
 
 ## What it starts

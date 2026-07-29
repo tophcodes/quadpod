@@ -18,6 +18,34 @@ Two consecutive runs produced identical counts. The numbers below are reproducib
 | karate (everything that ran) | 41 | 652 | 37 | 615 |
 | harness's MUST-linked subset | 38 | 649 | 33 | 608 |
 
+## Second run — after Plan 9 (dataset-valued resources)
+
+| | |
+|---|---|
+| **Date** | 2026-07-29 |
+| **Pod commit** | `1fe4953` |
+
+| | Features | Scenarios | Passed | Failed |
+|---|---|---|---|---|
+| karate (everything that ran) | 41 | 652 | 43 | 609 |
+
+Same 41 features, same 652 scenarios — nothing aborted or got skipped that used to run.
+Passed rose by 6, not the 1 that Plan 9 alone accounts for. All three of Bucket 3's
+defects are gone, not just D3:
+
+- **D3** (named graphs dropped on write) is the one Plan 9 fixed:
+  `content-negotiation-named-graphs` (its one active scenario, at line 16) now passes.
+- **D1** (`POST` ignoring `Link: rel="type"`) and **D2** (no `Allow` on GET/HEAD) were
+  already fixed, by `0336247` and `3cb0723` — both land after `ef49c5d`, the commit the
+  first run measured, and neither run had re-measured the suite since. They are not part
+  of this plan; they surface here because this is the first conformance run since they
+  landed.
+
+Bucket 3 is therefore **0 scenarios**, and the totals reconcile exactly:
+`615 (bucket 1 + 2 + 3 + 4 at first run) − 1 (D3) − 1 (D1) − 4 (D2) = 609`, which is what
+this run measured. No other feature's pass/fail count moved — checked against every row in
+Buckets 1 and 2 individually, not just the aggregate.
+
 The harness's own `ResultLogger` counts only scenarios attached to a MUST requirement; the
 karate totals count every scenario in every feature that ran. Use the karate row — it is
 what `reports/report.html` shows.
@@ -161,9 +189,9 @@ surfacing as `409` instead of `201`.
 
 ---
 
-## Bucket 3 — Defect (6 scenarios)
+## Bucket 3 — Defect (0 scenarios — all three resolved as of the second run, above)
 
-### D1 — `POST` ignores `Link: rel="type"`, so containers cannot be created by POST
+### D1 — RESOLVED (`0336247`) — `POST` ignored `Link: rel="type"`, so containers could not be created by POST
 
 `slash-semantics-exclude:65` (1 scenario). `post_impl` never reads the `Link` header
 (`src/http.rs:370-406`); `container::child_name` always yields a slash-free segment, so a POST
@@ -177,7 +205,7 @@ POST /c/  Link: <http://www.w3.org/ns/ldp#BasicContainer>; rel="type"  Content-T
 The POST itself succeeds (line 63 passes); only `assert childContainerUrl.endsWith('/')` fails.
 This also silently costs the two "POST with a Slug should conflict" halves of the same feature.
 
-### D2 — no `Allow` header on GET/HEAD
+### D2 — RESOLVED (`3cb0723`) — no `Allow` header on GET/HEAD
 
 `read-method-allow:12`, `:19`, `:26`, `:33` (4 scenarios). The spec makes this a MUST; the pod
 emits no `Allow` header anywhere.
@@ -189,29 +217,29 @@ GET /c/   (authenticated)  → 200, no Allow header    # expected Allow to conta
 Cheapest item on the whole list. Filed as a defect rather than a gap because it was never a
 deliberate omission — unlike `WAC-Allow`, which is a feature.
 
-### D3 — JSON-LD named graphs are dropped on write
+### D3 — RESOLVED (Plan 9) — JSON-LD named graphs were dropped on write
 
-`content-negotiation-named-graphs:16` (1 scenario). `rdf::parse` iterates quads and discards
-`q.graph_name`, flattening everything into the resource's single graph
-(`src/rdf.rs:66-80`). A JSON-LD *dataset* round-trips as its merged triples.
+`content-negotiation-named-graphs:16` (1 scenario). `rdf::parse` used to iterate quads and
+discard `q.graph_name`, flattening everything into the resource's single graph. Plan 9
+replaced the graph-only parse/serialize/ETag path with `Format` and `Skolemized`, which
+carry graph names through the whole round trip (design spec §3, §4, §6).
 
 ```
 PUT /c/x.json  Content-Type: application/ld+json   (body contains an @graph with a named graph)
 GET /c/x.json  Accept: application/ld+json
-→ 200, but parse(response).contains(expected) is false — the graph names are gone
+→ 200, and parse(response).contains(expected) is now true
 ```
 
-`content-negotiation-turtle` (2/2) and `content-negotiation-jsonld` (2/2) both pass, so plain
-Turtle↔JSON-LD negotiation is fine. This is specifically about quads. It may deserve
-reclassifying as a deliberate "one graph per resource" limit — that is a decision, and it has
-not been made.
+`content-negotiation-turtle` (2/2) and `content-negotiation-jsonld` (2/2) both still pass, so
+plain Turtle↔JSON-LD negotiation is unaffected.
 
 ---
 
 ## Bucket 4 — Unclassified (0 scenarios)
 
-Every one of the 615 failures was attributed to a named cause, verified against either the
-harness log's response line or the pod's source. Nothing left over.
+Every one of the first run's 615 failures was attributed to a named cause, verified against
+either the harness log's response line or the pod's source. Nothing left over. As of the
+second run, 609 remain — see the reconciliation above.
 
 ---
 

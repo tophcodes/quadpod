@@ -30,23 +30,25 @@ async fn app() -> axum::Router {
     let Target::Resource(seeded) = space.resolve("/seeded").unwrap() else {
         unreachable!("/seeded is a resource path")
     };
-    let t = sparql_pod::rdf::parse(
-        b"<#it> <http://schema.org/name> \"seed\" .",
-        oxigraph::io::RdfFormat::Turtle,
-        seeded.graph_iri(),
-    ).unwrap();
+    let turtle = sparql_pod::rdf::Format::from_content_type("text/turtle").unwrap();
+    let t: Vec<oxigraph::model::Triple> = turtle
+        .parse(b"<#it> <http://schema.org/name> \"seed\" .", seeded.graph_iri())
+        .unwrap()
+        .quads().iter().cloned().map(oxigraph::model::Triple::from).collect();
     sparql_pod::resource::put_rdf(store.as_ref(), &seeded, &t).await.unwrap();
     let acl = seeded.aux(sparql_pod::space::AuxKind::Acl);
-    let acl_triples = sparql_pod::rdf::parse(
-        format!(
-            "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
-             <http://www.w3.org/ns/auth/acl#accessTo> <{}> ; \
-             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> .",
-            seeded.graph_iri(),
-        ).as_bytes(),
-        oxigraph::io::RdfFormat::Turtle,
-        acl.graph_iri(),
-    ).unwrap();
+    let acl_triples: Vec<oxigraph::model::Triple> = turtle
+        .parse(
+            format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <{}> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> .",
+                seeded.graph_iri(),
+            ).as_bytes(),
+            acl.graph_iri(),
+        )
+        .unwrap()
+        .quads().iter().cloned().map(oxigraph::model::Triple::from).collect();
     sparql_pod::aux::put(store.as_ref(), &acl, &acl_triples).await.unwrap();
 
     router(AppState {

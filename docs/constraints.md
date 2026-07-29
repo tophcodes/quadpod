@@ -91,3 +91,19 @@ Only `dataset` mints or recognises a skolem IRI.
     `.parent()`) but not a recursive re-derivation, and single-hop `.parent()`
     calls are legitimate everywhere.
     check: ! rg -qU '(while|for)[^;{]*\.parent\(\)' src --glob '!src/space.rs'
+
+There is one content-negotiation path, one parser and one ETag.
+    → 2026-07-28-jsonld-datasets-design.md §6.3, §6.1. `Format` and
+    `negotiate` replaced `format_for_content_type` / `format_for_accept` /
+    `rdf::parse` / `rdf::serialize` / `rdf::etag`. Two of each is how the
+    Turtle path and the dataset path drift apart, and drift here is silent:
+    both answer, one answers wrong.
+    check: ! rg -q 'fn (format_for_accept|format_for_content_type)\b' src
+
+No `#[allow]` attributes in `src/`.
+    → Plan 6 Task 1 recorded this as a global constraint, and it was
+    load-bearing once already: it forced a plan-mandated `Result<String, ()>`
+    (which trips `clippy::result_unit_err`) to become a named error type. The
+    dataset skeleton suspended it deliberately, with `// skeleton:` comments;
+    this rule is what removes them.
+    check: ! rg -q '#\[allow' src

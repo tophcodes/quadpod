@@ -21,13 +21,12 @@
 //! `POD_RESET_ROOT_ACL`) can get back in without ever going through HTTP
 //! authorization at all.
 
-use oxigraph::io::RdfFormat;
-use oxigraph::model::NamedNode;
+use oxigraph::model::{NamedNode, Triple};
 
 use crate::{
     aux::{self, AuxError},
     container::ensure_container,
-    rdf,
+    rdf::Format,
     resource::{exists, ResourceError},
     space::{AuxKind, GraphName, StorageSpace},
     store::SparqlStore,
@@ -80,7 +79,10 @@ pub async fn provision_root_acl(
          <{ACL_DEFAULT}> <{root_iri}> ; \
          <{ACL_MODE}> <{ACL_READ}>, <{ACL_WRITE}>, <{ACL_CONTROL}> ."
     );
-    let triples = rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, acl.graph_iri())?;
+    let dataset = Format::from_content_type("text/turtle")
+        .expect("text/turtle is always supported")
+        .parse(turtle.as_bytes(), acl.graph_iri())?;
+    let triples: Vec<Triple> = dataset.quads().iter().cloned().map(Triple::from).collect();
 
     match aux::put(store, &acl, &triples).await {
         Ok(()) => Ok(()),

@@ -147,7 +147,10 @@ naming scheme `urn:quadpod:sys:<resource-iri>`:
 <resource>              sys:mediaType   "application/ld+json" .   # §6.4
 <resource>              sys:hasSubgraph <urn:quadpod:subgraph:8f2a…> .
 <urn:quadpod:subgraph:8f2a…> sys:graphName  <urn:example:g1> .      # IRI-named
-<urn:quadpod:subgraph:1c07…> sys:graphSkolem <urn:quadpod:bnode:…> .    # was a blank node (§4)
+<urn:quadpod:subgraph:1c07…> sys:graphName  <urn:quadpod:bnode:…> .    # was a blank node (§4);
+                                                                        # deskolemize turns the
+                                                                        # skolem IRI back into a
+                                                                        # blank node on read
 ```
 
 ### 3.1 Key derivation
@@ -216,8 +219,10 @@ Ordinary resources only. Containers and auxiliaries reject named graphs with `40
 
 ### 3.5 The internal vocabulary is documented, not folklore
 
-`sys:present`, `sys:hasSubgraph`, `sys:graphName`, `sys:graphSkolem` are a named, stable part
-of the design under the `urn:quadpod:sys#` prefix. No HTTP client ever needs them.
+`sys:present`, `sys:hasSubgraph`, `sys:graphName` are a named, stable part of the design under
+the `urn:quadpod:sys#` prefix. No HTTP client ever needs them. A blank-node-named graph is
+recorded under `sys:graphName` too, with its skolem IRI as the object — `deskolemize` turns
+that IRI back into a blank node on read, so no second predicate is needed for it.
 
 ### 3.6 The sealed-trait invariant needs replacing
 
@@ -421,8 +426,8 @@ a `Link` header naming the formats that carry the whole thing.**
 200 OK
 Content-Type: text/turtle
 Vary: Accept
-Link: <urn:example:g1>; rel="https://pod.toph.so/ns#containsGraph"
-Link: <urn:example:g2>; rel="https://pod.toph.so/ns#containsGraph"
+Link: <urn:example:g1>; rel="https://quadpod.toph.so/ns#containsGraph"
+Link: <urn:example:g2>; rel="https://quadpod.toph.so/ns#containsGraph"
 Link: <https://pod.toph.so/c/notes>; rel="alternate"; type="application/trig"
 Link: <https://pod.toph.so/c/notes>; rel="alternate"; type="application/ld+json"
 ```
@@ -586,13 +591,10 @@ storage path** (bytes, no parsing), not a reason to move RDF onto one; see §11.
 
 ## 7. Delete
 
-Read the registry, then one update dropping the resource graph, every registered shelf as a
-literal `DROP SILENT GRAPH`, and the system graph. Same shape and same caveat as §5.1.
-
-Note that `aux::delete_subject` today drops the subject graph and its system graph — the
-registry — and each auxiliary, without reading what the registry pointed at. Under this design
-that ordering destroys the only record of the shelves before they are dropped, which is
-invariant 3.2.4's failure mode exactly.
+`aux::delete_subject` is the one cascade: read the registry, then one update dropping the
+resource graph, every registered shelf as a literal `DROP SILENT GRAPH`, each auxiliary, and the
+system graph. The registry is read before it is dropped — reading it after would find nothing
+to drop, which is invariant 3.2.4's failure mode exactly. Same shape and same caveat as §5.1.
 
 ## 8. What does not change
 

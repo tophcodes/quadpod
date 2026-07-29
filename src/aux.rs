@@ -9,7 +9,8 @@ use oxigraph::model::Triple;
 use thiserror::Error;
 
 use crate::{
-    resource::{exists, serialize_for_insert, sys_graph_iri, ResourceError, SYS_PRESENT},
+    dataset::{Dataset, Skolemized},
+    resource::{exists, registered_shelves, serialize_for_insert, sys_graph_iri, ResourceError, SYS_PRESENT},
     space::{AuxKind, AuxUrl, GraphName, ResourceUrl},
     store::SparqlStore,
 };
@@ -45,7 +46,12 @@ pub const AUX_SUBJECT_MISSING_MESSAGE: &str =
 /// `FILTER EXISTS` on the subject's presence marker. The guard is repeated on
 /// the clearing `DELETE` so a failed write cannot destroy what it did not
 /// replace.
+///
+/// `triples` is a client-supplied auxiliary body (an ACL commonly writes an
+/// anonymous `[] a acl:Authorization`), so it is skolemized here rather than
+/// required to already be ground.
 fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
+    use oxigraph::model::{GraphName, Quad};
     let iri = aux.graph_iri();
     let sys = sys_graph_iri(aux);
     let subject_iri = aux.subject().graph_iri();
@@ -53,7 +59,11 @@ fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
     let guard = format!(
         "FILTER EXISTS {{ GRAPH <{subject_sys}> {{ <{subject_iri}> <{SYS_PRESENT}> true }} }}"
     );
-    let body = serialize_for_insert(triples);
+    let quads: Vec<Quad> = triples.iter()
+        .map(|t| Quad::new(t.subject.clone(), t.predicate.clone(), t.object.clone(), GraphName::DefaultGraph))
+        .collect();
+    let skolemized = Skolemized::skolemize(&Dataset::new(quads));
+    let body = serialize_for_insert(&skolemized);
     format!(
         "DELETE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }} \
          WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} {guard} }}; \
@@ -92,8 +102,9 @@ pub async fn put(
     Ok(())
 }
 
-/// Delete a subject resource together with every auxiliary it may have, in a
-/// single store update. Returns whether the subject existed.
+/// Delete a subject resource together with every auxiliary it may have and
+/// every shelf its dataset registered, in a single store update. Returns
+/// whether the subject existed.
 ///
 /// The drops run unconditionally — they are `DROP SILENT`, a no-op on an
 /// absent graph — and the existence check only decides the returned boolean.
@@ -101,6 +112,13 @@ pub async fn put(
 /// place and unreported, and since this is the only cascade path that orphan
 /// would be permanent: recreating the subject would resurrect its grants.
 /// Same reasoning as [`crate::resource::delete_rdf`].
+///
+/// The shelf registry is read before any drop, and its drops are ordered
+/// before the system graph's: the registry lives in the very graph this
+/// cascade drops, and reading it after would find nothing to drop, leaving
+/// the shelves as the one part of the resource a `DELETE` cannot remove
+/// (design spec §7). A container's registry is simply empty, so the same
+/// cascade is correct for it without a branch.
 ///
 /// Graphs only. Callers remain responsible for containment: the subject's
 /// membership triple in its parent, and for a container subject its children,
@@ -110,10 +128,12 @@ pub async fn delete_subject(
     subject: &ResourceUrl,
 ) -> Result<bool, ResourceError> {
     let existed = exists(store, subject).await?;
-    let mut drops = vec![
-        format!("DROP SILENT GRAPH <{}>", subject.graph_iri()),
-        format!("DROP SILENT GRAPH <{}>", sys_graph_iri(subject)),
-    ];
+    let mut drops: Vec<String> = registered_shelves(store, subject).await?
+        .into_iter()
+        .map(|key| format!("DROP SILENT GRAPH <{}>", key.graph_iri()))
+        .collect();
+    drops.push(format!("DROP SILENT GRAPH <{}>", subject.graph_iri()));
+    drops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(subject)));
     for kind in AuxKind::ALL {
         let aux = subject.aux(*kind);
         drops.push(format!("DROP SILENT GRAPH <{}>", aux.graph_iri()));
@@ -126,8 +146,7 @@ pub async fn delete_subject(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rdf, resource::{exists, get_rdf, put_rdf}, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
-    use oxigraph::io::RdfFormat;
+    use crate::{rdf::Format, resource::{exists, get_dataset, get_rdf, put_dataset, put_rdf, registered_shelves}, shelf::ShelfKey, space::{AuxKind, StorageSpace, Target}, store::OxigraphStore};
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
@@ -140,7 +159,9 @@ mod tests {
     }
 
     fn triples(turtle: &str, base: &str) -> Vec<Triple> {
-        rdf::parse(turtle.as_bytes(), RdfFormat::Turtle, base).unwrap()
+        Format::from_content_type("text/turtle").unwrap()
+            .parse(turtle.as_bytes(), base).unwrap()
+            .quads().iter().cloned().map(Triple::from).collect()
     }
 
     /// A minimal but real ACL body, so the tests exercise the content path and
@@ -182,6 +203,38 @@ mod tests {
         put(&store, &acl, &grant(&acl)).await.unwrap();
         assert!(exists(&store, &acl).await.unwrap());
         assert_eq!(get_rdf(&store, &acl).await.unwrap(), Some(grant(&acl)));
+    }
+
+    // §4, on `aux::put`'s client body: an ACL commonly writes an anonymous
+    // `[] a acl:Authorization`, so nothing before this test exercises that
+    // shape. A no-op `skolemize` or a write that silently dropped the
+    // blank-node triple would both leave the suite green; the second triple,
+    // on a named subject, tells a total-loss mutant apart from one that only
+    // mishandles the blank node.
+    #[tokio::test]
+    async fn a_blank_node_in_an_auxiliary_body_is_stored_not_dropped_and_not_left_blank() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        let t = triples(
+            "_:b <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> . \
+             <#owner> <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> .",
+            acl.graph_iri(),
+        );
+        put(&store, &acl, &t).await.unwrap();
+
+        let got = get_rdf(&store, &acl).await.unwrap().expect("exists");
+        assert_eq!(got.len(), 2, "both triples must survive, not just the named one");
+
+        let from_blank = got
+            .iter()
+            .find(|t| matches!(&t.object, oxigraph::model::Term::NamedNode(n) if n.as_str().ends_with("#Read")))
+            .expect("the triple that started on a blank node round-tripped");
+        assert!(
+            matches!(&from_blank.subject, oxigraph::model::NamedOrBlankNode::NamedNode(_)),
+            "a blank node must never reach the store as a blank node"
+        );
     }
 
     // `put` replaces, it does not accumulate: an ACL is the whole policy for
@@ -328,5 +381,41 @@ mod tests {
             graph_contents(&store, &sys_graph_iri(&acl)).await.is_empty(),
             "orphan kept its presence marker"
         );
+    }
+
+    // Whole-branch review, finding 1: `delete_subject` dropped the resource
+    // graph and the registry that pointed at its shelves, but never the
+    // shelves themselves — a DELETE that erased the registry's only record of
+    // them without erasing the data (design spec §7). Every assertion above
+    // reads back through `exists`/`get_rdf`, which the deleted registry makes
+    // report "gone" either way, so none of them could have caught this. This
+    // one derives the shelf's IRI the same way the write path did — through
+    // `ShelfKey::of` — and probes the store directly, bypassing the registry
+    // entirely.
+    #[tokio::test]
+    async fn deleting_a_subject_empties_its_shelves_too() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/c/notes");
+        let ttl = Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let ds = crate::dataset::Skolemized::ground(vec![oxigraph::model::Quad::new(
+            oxigraph::model::NamedNode::new("http://example.org/alice").unwrap(),
+            oxigraph::model::NamedNode::new("http://schema.org/name").unwrap(),
+            oxigraph::model::Literal::new_simple_literal("Alice"),
+            g.clone(),
+        )])
+        .unwrap();
+        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+        let key = ShelfKey::of(&r, g.as_ref());
+
+        assert!(delete_subject(&store, &r).await.unwrap(), "existed");
+
+        let leftover = graph_contents(&store, key.graph_iri()).await;
+        assert!(
+            leftover.is_empty(),
+            "delete_subject must drop the shelf graph itself, not just the registry that pointed at it"
+        );
+        assert!(get_dataset(&store, &r).await.unwrap().is_none());
+        assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
     }
 }
