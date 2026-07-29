@@ -263,7 +263,7 @@ Worth stating, because several of these were flagged as suspects before the run:
 | anonymous `401` rows in `authentication/header` | 5 / 6, `WWW-Authenticate` present |
 
 **The new auxiliary URL shape works.** The harness's `PREPARE SERVER` step created a container
-and set an ACL on it through the `Link`-advertised `/.aux/acl/{path}` URL, and the four
+and set an ACL on it through the `Link`-advertised `/.aux/{path}.acl` URL, and the four
 `wac-allow` features exercise ACL writes and reads repeatedly with every access decision
 correct. **No failure in this run traces to the ACL URL shape.**
 

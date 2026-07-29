@@ -71,8 +71,10 @@ certificate.
    `--allow-insecure-host` naming the CSS.
    **No ACL is written anywhere**: the pod provisions its own root ACL for the
    owner at boot. The suite's CSS script `PUT`s `<root>/.acl`, which here would
-   be an ordinary resource write that silently achieves nothing — ACLs live at
-   `/.aux/acl/{path}` and are found through the `Link` header.
+   be an ordinary resource write that silently achieves nothing — ACLs live in
+   the reserved `/.aux/` namespace, as `/.aux/{path}.acl` (`/foo` → `/.aux/foo.acl`,
+   `/box/` → `/.aux/box/.acl`, the root → `/.aux/.acl`), and are found through
+   the `Link` header.
 7. Runs the harness against the `protocol` and `web-access-control` manifests
    — the two the harness's own `application.yaml` links by default. The
    `sparql-update` manifest stays off; it is commented out upstream and this
