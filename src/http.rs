@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
-    http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
+    http::{StatusCode, HeaderMap, HeaderValue, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{Dataset, Skolemized},
@@ -29,11 +29,60 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     // axum 0.8 wildcard capture syntax: "/{*path}" (NOT the old "/*path").
+    //
+    // `Router::layer` wraps everything built so far, so the LAST call is the
+    // outermost: `cors_layer` sees the `401` that `auth_layer` produces, which
+    // is where the CORS fields are required.
     Router::new()
         .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root))
         .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
+        .layer(axum::middleware::from_fn(cors_layer))
         .with_state(state)
+}
+
+/// The response headers a browser may read off a cross-origin response.
+///
+/// Enumerated rather than `*` because a wildcard names nothing a client can act
+/// on, and because every field here is one some handler on this pod actually
+/// emits. Both properties are asserted: `protocol/cors/enumerate-headers`
+/// requires the header to be present and to differ from `*`.
+const EXPOSED_HEADERS: &str =
+    "Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
+
+/// Reflect a request's `Origin` onto its response.
+///
+/// Wraps `auth_layer` rather than sitting inside it: the CORS fields are
+/// required on the `401` that layer produces for an anonymous request
+/// (`protocol/cors/simple-requests`), and a layer inside it never sees that
+/// response.
+///
+/// No `Access-Control-Allow-Credentials`. This pod authenticates from an
+/// `Authorization` header, which CORS treats as a request header to allow, not
+/// as a credential to flag; the flag exists for cookies and TLS client
+/// certificates, neither of which this pod accepts. That is what makes
+/// reflecting an arbitrary origin safe here — the browser attaches no
+/// credential of its own, so a foreign page can only send a token it already
+/// holds, and a page holding the token never needed CORS to use it. Setting the
+/// flag is the change that would make ambient authority usable against this
+/// pod.
+pub async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let origin = req.headers().get(header::ORIGIN).cloned();
+    let mut res = next.run(req).await;
+    let Some(origin) = origin else { return res };
+    let h = res.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    // `append`, not `insert`: a negotiated read has already set `Vary: Accept`,
+    // and replacing it would make a cache serve the wrong representation in
+    // order to satisfy a CORS assertion. The spelling matters too — the suite
+    // compares this field value as a case-sensitive string, and
+    // `header::ORIGIN` is lowercase.
+    h.append(header::VARY, HeaderValue::from_static("Origin"));
+    h.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static(EXPOSED_HEADERS),
+    );
+    res
 }
 
 /// Classify a request path, or answer it outright.
@@ -1041,6 +1090,68 @@ mod tests {
     async fn calling_fixture_twice_panics_instead_of_hanging() {
         let _first = fixture().await;
         let _second = fixture().await;
+    }
+
+    #[tokio::test]
+    async fn no_origin_means_no_cors_headers() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(res.headers().get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_origin_is_reflected_and_vary_keeps_accept() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://app.example"
+        );
+        // Both, and `Origin` with a capital O: the suite compares the field
+        // value as a case-sensitive string.
+        let vary: Vec<&str> = res.headers().get_all(header::VARY)
+            .iter().map(|v| v.to_str().unwrap()).collect();
+        assert!(vary.contains(&"Accept"), "{vary:?}");
+        assert!(vary.contains(&"Origin"), "{vary:?}");
+    }
+
+    #[tokio::test]
+    async fn expose_headers_is_enumerated_and_not_a_wildcard() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        let exposed = res.headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS).unwrap().to_str().unwrap();
+        assert_ne!(exposed, "*");
+        assert!(exposed.contains("ETag"), "{exposed}");
+        assert!(exposed.contains("WAC-Allow"), "{exposed}");
+    }
+
+    // The reason the middleware wraps `auth_layer` instead of sitting inside
+    // it: `protocol/cors/simple-requests` asserts the CORS fields on an
+    // anonymous request, which this pod answers 401.
+    #[tokio::test]
+    async fn cors_headers_survive_a_401() {
+        let f = fixture().await;
+        let get = Request::builder().method("GET").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://app.example"
+        );
+        assert!(res.headers().get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_some());
     }
 
     #[tokio::test]
