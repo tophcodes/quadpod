@@ -3629,6 +3629,46 @@ mod tests {
         assert_eq!(f.app.oneshot(wrong).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
     }
 
+    // Unifying container and auxiliary ETags onto `Skolemized::etag` made
+    // them format-aware (RFC 9110 §8.8.1): Turtle and JSON-LD renderings of
+    // the same container are different representations, so they must not
+    // share a validator — and the same representation, fetched twice, must.
+    #[tokio::test]
+    async fn a_containers_etag_tracks_the_selected_format() {
+        let f = fixture().await;
+
+        let turtle = f.app.clone().oneshot(f.owner_request("GET", "/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let turtle_tag = turtle.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+
+        let jsonld = f.app.clone().oneshot(f.owner_request("GET", "/")
+            .header(header::ACCEPT, "application/ld+json").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let jsonld_tag = jsonld.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+
+        assert_ne!(turtle_tag, jsonld_tag,
+            "Turtle and JSON-LD are different representations (RFC 9110 §8.8.1) and must not share an ETag");
+
+        let turtle_again = f.app.clone().oneshot(f.owner_request("GET", "/")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let turtle_again_tag = turtle_again.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(turtle_tag, turtle_again_tag, "same format, same content → same ETag");
+
+        // RFC 9110 §13.1.1: `If-Match` matches *any* current representation,
+        // not just the one the server would negotiate by default — so a
+        // write carrying the JSON-LD-negotiated tag must be accepted too.
+        let put = f.app.clone().oneshot(f.owner_request("PUT", "/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::IF_MATCH, &jsonld_tag)
+            .body(Body::from(
+                "<https://pod.toph.so/> <http://purl.org/dc/terms/title> \"root\" .",
+            )).unwrap()).await.unwrap();
+        assert_eq!(put.status(), StatusCode::CREATED,
+            "If-Match must accept a tag negotiated for any servable format, not only the default");
+    }
+
     // §6.2.1's check reads `get_dataset` to decide whether an existing
     // resource has named graphs a graph-format write would destroy. If the
     // registry is corrupt — a shelf `sys:hasSubgraph` lists with no

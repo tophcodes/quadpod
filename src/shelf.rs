@@ -1,10 +1,10 @@
 //! Where one named graph of one resource is stored, and the bookkeeping that
 //! names it back.
 //!
-//! Skeleton for the storage model of §3. The key is server-minted from values
-//! the server already holds, which is what makes the same graph name in two
-//! resources land in two different shelves — §2.1's decision expressed as an
-//! address rather than as a rule someone has to remember.
+//! The storage model of §3. The key is server-minted from values the server
+//! already holds, which is what makes the same graph name in two resources
+//! land in two different shelves — §2.1's decision expressed as an address
+//! rather than as a rule someone has to remember.
 
 use crate::space::{GraphName, ResourceUrl};
 use oxigraph::model::NamedNodeRef;
