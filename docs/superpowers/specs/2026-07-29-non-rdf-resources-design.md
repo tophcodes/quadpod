@@ -1,7 +1,7 @@
 # Non-RDF Resources — Bytes Beside the Triples — Design
 
 **Date:** 2026-07-29
-**Status:** Proposed (pre-implementation), revision 1
+**Status:** Proposed (pre-implementation), revision 2
 **Author:** Christopher Mühl (with Claude)
 **Parent spec:** [2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md)
 **Origin:** `docs/conformance-findings.md` rank 1 — 540 of 609 conformance failures, named
@@ -95,31 +95,55 @@ replaced behind the pod's back, the pod serves the new bytes under a freshly com
 correct `ETag`. Nothing in the graph has become false, because nothing in the graph talks
 about the bytes.
 
-### 3.2 The key is derived, and stored nowhere
+### 3.2 The key is derived, and it mirrors the URL
 
-`BlobKey::of(&ResourceUrl)` = `sha256(resource iri)`, hex, as an `object_store::Path`. A
-pure function of the resource URL, in one place, exactly as `ShelfKey` is a pure function of
-(resource IRI, graph name).
+`BlobKey::of(&ResourceUrl)` = the resource's path with its leading `/` removed, as an
+`object_store::Path` built through `Path::from`. `/photos/cat.png` is stored at
+`photos/cat.png`. A pure function of the resource URL, in one place, exactly as `ShelfKey`
+is a pure function of (resource IRI, graph name).
 
-Deriving rather than minting is what makes the failure modes in §5.1 and §7 self-healing: an
-interrupted write or an interrupted delete leaves an object at a key the *next* write to the
-same URL computes again and overwrites. An opaque minted key — the parent spec's
-`sys:storageKey` — would leak an object nobody can find, and would need a sweep to reclaim.
-Nothing here needs one.
+**Derived rather than minted** is the load-bearing half. It is what makes the failure modes
+in §5.1 and §7 self-healing: an interrupted write or delete leaves an object at a key the
+*next* write to the same URL computes again and overwrites. An opaque minted key — the
+parent spec's `sys:storageKey` — would leak an object nobody can find, and would need a
+sweep to reclaim. Nothing here needs one. It also lets the delete path compute the key
+without reading anything first, removing one read-then-write window from a layer that
+already carries several.
 
-It also means the delete path computes the key without reading anything first, which removes
-one read-then-write window from a layer that already carries several.
+**Mirroring rather than hashing** is the other half, and it buys two things a `sha256` key
+would not. The backing store is legible: `ls` and `find` work, a misfiled object is visible
+as a misfiled object, and debugging does not begin by computing a digest. And it is the
+prerequisite for serving a pod over a directory that already exists — see §13, where that
+is a separate plan rather than a promise.
 
-The cost, recorded rather than hidden: individual objects cannot be relocated within a
-backend. A whole-backend migration (copy every key, repoint the config) still works, because
-keys are stable across backends. Per-object relocation would need a recorded key, and that
-is the trade §14 documents against the parent spec.
+`Path::from` percent-encodes problematic segments per RFC 1738 and enforces the invariants
+that matter here: no `.` or `..` segments, no empty segments, no ASCII control characters.
+Traversal is therefore not reachable — `..` is encoded, not honoured. For ordinary names the
+encoded form is the name itself, which is the case legibility is for.
+
+Three limits follow from mirroring, and they are real rather than theoretical. With a hash
+key every legal resource URL had a legal key; with a mirrored key some do not:
+
+- A path segment over **255 bytes** exceeds what most filesystems accept, and a whole path
+  over **1024 bytes** exceeds what most object stores accept (`object_store`'s own wording).
+  Both are legal in a URL. A write whose key would exceed either is refused with `414`
+  before anything is stored.
+- On a case-insensitive filesystem two URLs differing only in case collide. Irrelevant on
+  Linux, recorded in §11 rather than discovered later.
+- `LocalFileSystem` creates parent directories on write and does not remove them on delete,
+  so an emptied container can leave an empty directory behind. Cosmetic, and named so nobody
+  reads it as a leak.
+
+Individual objects still cannot be relocated within a backend — that follows from *derived*,
+not from *mirrored*. A whole-backend migration (copy every key, repoint the config) works,
+because keys are identical across backends.
 
 Guarded by a new constraint in the family that already holds `sys:`, `subgraph:` and
 `bnode:`:
 
 ```
-Only `blob::BlobKey` derives an object key.
+Only `blob::BlobKey` builds an object key.
+    check: ! rg -q 'Path::(from|parse)' src --glob '!src/blob.rs'
 ```
 
 ### 3.3 The kind marker is explicit, not inferred
@@ -203,7 +227,7 @@ selects:
 | Config | `object_store` type | Notes |
 |---|---|---|
 | `memory` (default) | `InMemory` | Mirrors `OxigraphStore::in_memory()`. The pod stays uniformly ephemeral — blobs are exactly as durable as triples, which is to say not at all. |
-| `local:<path>` | `LocalFileSystem` | |
+| `local:<path>` | `LocalFileSystem` | The directory mirrors the URL tree (§3.2), so it can be read, backed up and debugged with ordinary tools. |
 | `s3:<bucket>` | `AmazonS3` | A custom endpoint is also the **Ceph RGW** case: RGW is S3-compatible, so it needs no backend code of its own. |
 
 The default matters. Any durable blob backend beside an in-memory triple store would make
@@ -380,6 +404,7 @@ agree.
 | Non-RDF body on `Target::Aux` | `415` | §8.5 |
 | `Link: rel="type"` container + non-RDF body | `400` | §8.5 |
 | Body exceeds `--max-body-bytes` | `413` | §8.4 |
+| Key would exceed a segment or path length limit | `414` | §3.2 |
 | `Accept` excludes the stored media type | `406` | §6.1 |
 
 `500` rather than `502` for a backend failure: `put_status` already maps
@@ -436,6 +461,14 @@ space.
 - An object orphaned by an interrupted write or delete is reclaimed only by a later write to
   the same URL. There is no sweep.
 - Individual objects cannot be relocated within a backend (§3.2).
+- A path segment over 255 bytes, or a whole path over 1024 bytes, is a legal URL this pod
+  cannot store: `414` (§3.2).
+- On a case-insensitive filesystem, two URLs differing only in case collide on one object.
+- An emptied container can leave an empty directory behind on `LocalFileSystem`.
+- The mirrored tree holds **blobs only**. RDF resources are stored as parsed triples (parent
+  spec §5), so a directory listing shows the tree with holes where the RDF resources are.
+  This is the property that separates this pod from a file server with a search index beside
+  it, and it is not a defect to be fixed by also writing RDF to disk.
 
 ## 12. Testing
 
@@ -466,6 +499,15 @@ defence is to say in advance what each test would catch.
    disappears on delete.
 9. **`content-type-reject`** — `PUT` and `POST` with a body and no `Content-Type` give
    `400`.
+10. **The key mirrors the URL** — `PUT /photos/cat.png` puts the object at exactly
+    `photos/cat.png`, asserted against the `BlobStore`, not against a round trip. A round
+    trip passes under any injective key function, including a hash, so it cannot tell
+    mirroring from hashing — which is the whole property §3.2 chose.
+11. **Traversal** — a resource path containing `..` (if `StorageSpace::resolve` admits one)
+    reaches the backend as an encoded segment, never as a directory ascent. Asserted on the
+    key, not on the response status: a `400` from somewhere upstream would make this pass
+    while proving nothing about `BlobKey`.
+12. **Over-long key** — a segment beyond 255 bytes gives `414` and stores nothing.
 
 Success criteria: `cargo clippy --all-targets` clean, `arch-check` 0 rot including the new
 key constraint, and a conformance run with an updated findings document.
@@ -481,6 +523,27 @@ since ~370 WAC rows are unmeasured today.
   matching, so this is an extension rather than a rebuild. It is also the point at which
   §3.4's "compute the validator from the bytes" is worth re-litigating, since serving a range
   should not require reading the whole object.
+- **Serving a pod over a directory that already exists.** The shape NSS and CSS's file
+  backend have: point the server at a folder and get a pod over it. §3.2's mirrored key is
+  the prerequisite and is why this stays an extension rather than a rewrite — but it is a
+  different feature, because it makes the filesystem a **source of truth** rather than a
+  backing store, and that collides with decisions already in force. Whoever writes that plan
+  starts from these, rather than rediscovering them:
+
+  - **Media type.** A file that was never `PUT` has no declared type, so it would have to be
+    guessed from the extension. Parent spec §5 says the opposite in as many words — *"URL is
+    identity; the extension is just a name, not a format selector"*, *"format on write =
+    `Content-Type` header"*. That decision has to be reopened, not worked around.
+  - **Containment.** Directories would be containers and `ldp:contains` would come from the
+    directory listing, where today it is server-managed and stored. Two sources for one
+    question is the drift this project's constraints exist to prevent.
+  - **`/.aux/`.** A real directory named `.aux` in the served folder collides with the
+    reserved segment. And a scanned directory carries no ACLs at all, so everything falls
+    back to the root ACL — which is the first thing to answer, not the last, for a folder
+    someone serves casually.
+  - **Drift after the scan.** An initial walk populates presence markers and media types;
+    what happens when the disk changes afterwards is a separate decision (inotify, a rescan
+    policy, or accepting drift and saying so).
 - **`OPTIONS`, `WAC-Allow`, CORS, `PATCH`.** Ranks 2–6 of the findings. Several become
   measurable only once this lands.
 - **Orphan collection.** §3.2's derived key makes it unnecessary for correctness; a backend
@@ -514,3 +577,13 @@ Adjacent, and deliberately not folded in: that same passage promises exposure th
 `Last-Modified` as well, which this pod emits nowhere today. `ObjectMeta::last_modified`
 would supply it for a blob without storing anything — consistent with §3.1's rule — but it is
 a separate gap that predates this design and applies to RDF resources too.
+
+## 15. What changed, and why
+
+### Revision 2
+
+| § | Revision 1 said | Why it was wrong |
+|---|---|---|
+| 3.2 | The key is `sha256(resource iri)` | It made the backing store unreadable. A hash key means `ls` shows a wall of hex, a misfiled object is indistinguishable from a correct one, and debugging starts by computing a digest. Mirroring the URL path costs three named limits (§11) and buys a store that ordinary tools can inspect. The half of §3.2 that carries the argument — *derived*, not *minted* — is unchanged; only the derivation function is different, so self-healing and the read-free delete survive intact. |
+| 13 | Serving a pod over an existing directory was not mentioned | It is the reason mirroring is worth its limits, and it is a different feature: it makes the filesystem a source of truth rather than a backing store. Left as a separate plan, but with the three decisions it must reopen written down, so the next session starts from them rather than rediscovering them. |
+| 11 | — | The mirrored tree holds blobs only. Stated because a legible directory invites the assumption that it is complete, and it is not: RDF lives in the store as triples. |
