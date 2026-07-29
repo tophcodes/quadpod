@@ -25,32 +25,55 @@ fn media_type(ct: &str) -> &str {
 /// needs a constructor that can refuse.
 ///
 /// RFC 9110 §5.6.2: `token "/" token`, optionally followed by `; token=token`
-/// parameters. Quoted-string parameter values are refused rather than escaped:
-/// the tchar set contains neither `"` nor `\`, so a value that passes here
-/// cannot leave the SPARQL literal it is interpolated into, and that safety is
-/// a property of the alphabet rather than of a correct escape at every site.
-/// The cost is that `multipart/...; boundary="--x"` is rejected, which is
-/// acceptable because multipart is a request encoding rather than a stored
-/// representation.
+/// parameters. Every byte of the trimmed input is checked against tchar plus
+/// `/`, `;`, `=`, and space before the `type/subtype` shape is parsed, so the
+/// stored string can never contain a byte outside that alphabet — not even
+/// one sitting at a boundary a structural parse would trim away first.
+/// Quoted-string parameter values are refused rather than escaped: the
+/// alphabet contains neither `"` nor `\`, so a value that passes here cannot
+/// leave the SPARQL literal it is interpolated into, and that safety is a
+/// property of the alphabet the stored string is drawn from, not of a
+/// correct escape at every site. The cost is that `multipart/...;
+/// boundary="--x"` is rejected, which is acceptable because multipart is a
+/// request encoding rather than a stored representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaType(String);
 
 /// RFC 9110 §5.6.2 tchar.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+                | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
 fn is_token(t: &str) -> bool {
-    !t.is_empty()
-        && t.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
-                        | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
-                )
-        })
+    !t.is_empty() && t.bytes().all(is_tchar)
+}
+
+/// tchar plus the `/`, `;`, `=`, and space bytes the grammar uses to
+/// delimit tokens from one another.
+fn is_media_type_byte(b: u8) -> bool {
+    is_tchar(b) || matches!(b, b'/' | b';' | b'=' | b' ')
 }
 
 impl MediaType {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
+        // Every byte of the input must be in the media-type alphabet before
+        // it is parsed structurally. This is what makes the alphabet claim
+        // literally true: the structural parse below trims each segment
+        // before validating it, so a stray whitespace or control byte sitting
+        // right at a `;` or `=` boundary would otherwise be trimmed away
+        // before `is_token` ever sees it, yet still survive into the stored
+        // string. Neither check subsumes the other — this one catches a rogue
+        // byte hiding at a trimmed boundary, the structural parse below
+        // catches a malformed `type/subtype` or a valueless parameter.
+        if !s.bytes().all(is_media_type_byte) {
+            return None;
+        }
         let mut parts = s.split(';');
         let (ty, sub) = parts.next()?.trim().split_once('/')?;
         if !is_token(ty) || !is_token(sub) {
@@ -494,6 +517,10 @@ mod tests {
             "text/",                         // empty subtype
             "",                              // nothing at all
             "text/plain; charset",           // parameter with no value
+            "text/plain;\ncharset=utf8",     // LF hiding at a segment boundary
+            "text/plain;\rcharset=utf8",     // CR hiding at a segment boundary
+            "text/plain;\tcharset=utf8",     // tab hiding at a segment boundary
+            "text/plain; charset =\tutf8",   // whitespace straddling `=`
         ] {
             assert!(MediaType::parse(bad).is_none(), "must refuse {bad:?}");
         }
