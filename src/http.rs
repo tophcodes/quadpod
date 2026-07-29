@@ -16,7 +16,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize}, pdp, Mode}};
+    wac::{guard::{authorize, authorize_and_materialize}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -160,6 +160,44 @@ fn with_allow(mut res: Response, target: &Target) -> Response {
     res.headers_mut().insert(
         header::ALLOW,
         allowed_methods(target).parse().expect("method list is header-safe"),
+    );
+    res
+}
+
+/// `WAC-Allow` as WAC defines it: what the requester may do on this resource,
+/// and what an anonymous caller may do.
+///
+/// Both groups always appear. An empty group is `public=""` and not an omitted
+/// group — the field parses into a list per group, and an absent group does not
+/// yield the empty list a client (or the conformance suite) reads it as.
+///
+/// Modes are read through [`AccessModes::allows`], so a grant of `acl:Write`
+/// reports `append` beside `write`. That is WAC's own subsumption rule, and the
+/// suite pins it: its `read/write/append` case is checked for set equality, so
+/// an answer missing `append` fails it.
+fn wac_allow_value(decision: &Decision) -> String {
+    fn group(m: AccessModes) -> String {
+        [(Mode::Read, "read"), (Mode::Write, "write"),
+         (Mode::Append, "append"), (Mode::Control, "control")]
+            .iter()
+            .filter(|(mode, _)| m.allows(*mode))
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    format!("user=\"{}\",public=\"{}\"", group(decision.user), group(decision.public))
+}
+
+/// The headers every successful read carries: the auxiliary advertisements,
+/// the `Allow` Protocol §4.1 makes a MUST on `GET`/`HEAD`, and `WAC-Allow`.
+///
+/// One helper rather than three nested calls at four sites, so a read path
+/// added later cannot pick up two of the three and still look right.
+fn with_read_headers(res: Response, target: &Target, decision: &Decision) -> Response {
+    let mut res = with_allow(with_aux_links(res, target), target);
+    res.headers_mut().insert(
+        "wac-allow",
+        wac_allow_value(decision).parse().expect("mode names are header-safe"),
     );
     res
 }
@@ -744,11 +782,12 @@ async fn handle_get_root(
 
 async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Read).await {
-        return with_aux_links(res, &target);
-    }
+    let decision = match authorize(store, &agent, &target, Mode::Read).await {
+        Ok(d) => d,
+        Err(res) => return with_aux_links(res, &target),
+    };
     let Target::Resource(r) = &target else {
-        return legacy_graph_read(st, agent, target, headers).await; // containers, auxiliaries
+        return legacy_graph_read(st, &decision, target, headers).await; // containers, auxiliaries
     };
     // §6.1: read everything first — the ETag covers the resource, not the
     // body, so the shelves are read even when only the default graph will be
@@ -779,8 +818,8 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         let mut out = HeaderMap::new();
         out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
         out.insert(header::VARY, "Accept".parse().expect("static"));
-        return with_allow(with_aux_links(
-            (StatusCode::NOT_MODIFIED, out).into_response(), &target), &target);
+        return with_read_headers(
+            (StatusCode::NOT_MODIFIED, out).into_response(), &target, &decision);
     }
     // §6.2: a graph format gets the default graph, and is told what it missed.
     let served = if fmt.carries_dataset() { visible.clone() } else { visible.default_graph_only() };
@@ -814,7 +853,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             ).parse().expect("static"));
         }
     }
-    with_allow(with_aux_links((out, bytes).into_response(), &target), &target)
+    with_read_headers((out, bytes).into_response(), &target, &decision)
 }
 
 /// The pre-dataset read path: containers and auxiliaries, whose graph never
@@ -825,7 +864,9 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
 /// and `aux::put` — an ACL may legitimately contain `[]` — so the matching
 /// step out belongs here, the one place this shared path serializes, rather
 /// than inside a resource-shaped branch (design spec §4).
-async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers: HeaderMap) -> Response {
+async fn legacy_graph_read(
+    st: AppState, decision: &Decision, target: Target, headers: HeaderMap,
+) -> Response {
     let store = st.store.as_ref();
     let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), Shape::Graph, None) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
@@ -840,9 +881,8 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
                 let mut out = HeaderMap::new();
                 out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
                 out.insert(header::VARY, "Accept".parse().expect("static"));
-                return with_allow(
-                    with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target),
-                    &target,
+                return with_read_headers(
+                    (StatusCode::NOT_MODIFIED, out).into_response(), &target, decision,
                 );
             }
             let visible = ground.deskolemize();
@@ -852,7 +892,7 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
                     headers.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
                     headers.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
                     headers.insert(header::VARY, "Accept".parse().expect("static"));
-                    with_allow(with_aux_links((headers, bytes).into_response(), &target), &target)
+                    with_read_headers((headers, bytes).into_response(), &target, decision)
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
@@ -1270,6 +1310,57 @@ mod tests {
             .body(Body::empty()).unwrap();
         let res = f.app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    // The root ACL grants the owner Read/Write/Control and nobody else
+    // anything, so this pins three things at once: both groups are always
+    // present, an empty group is `""` rather than omitted, and `write` reports
+    // `append` alongside it.
+    #[tokio::test]
+    async fn wac_allow_reports_both_groups_and_appends_with_write() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("wac-allow").unwrap().to_str().unwrap(),
+            "user=\"read write append control\",public=\"\""
+        );
+    }
+
+    // A resource's own ACL replaces inheritance entirely, which is why the
+    // owner's group here is the narrower set this document grants and not the
+    // root ACL's.
+    #[tokio::test]
+    async fn wac_allow_reports_public_read_when_the_acl_grants_it() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        let acl = format!(
+            "<#public> <http://www.w3.org/ns/auth/acl#agentClass> <http://xmlns.com/foaf/0.1/Agent> ; \
+                       <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> ; \
+                       <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> . \
+             <#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                      <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> ; \
+                      <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                                                           <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_acl = f.owner_request("PUT", "/.aux/foo.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        let status = f.app.clone().oneshot(put_acl).await.unwrap().status();
+        assert!(status.is_success(), "writing the ACL returned {status}");
+
+        let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("wac-allow").unwrap().to_str().unwrap(),
+            "user=\"read control\",public=\"read\""
+        );
     }
 
     #[tokio::test]
