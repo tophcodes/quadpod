@@ -895,11 +895,23 @@ Fix the one caller inside this module's own tests
 (`assert_eq!(stored_media_type(&store, &r).await.unwrap(), Some(jsonld))`) to compare against
 `Some(crate::rdf::MediaType::from(jsonld))`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+Fix the one production caller, `get_impl` (`src/http.rs:683`). It feeds `negotiate`, which
+still takes an `Option<Format>` because the RDF read path still chooses between five
+renderings; narrowing happens at the call site:
 
-Run: `nix develop -c cargo test --lib resource 2>&1 | tail -10`
-Expected: PASS. `src/http.rs` will not compile yet — that is Task 8. Use `--lib` and expect
-the compile error to name only `http.rs`; if it names anything else, fix that first.
+```rust
+    let stored_type = stored_media_type(store, r)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| Format::from_content_type(m.as_str()));
+```
+
+- [ ] **Step 4: Run the whole suite**
+
+Run: `nix develop -c cargo test 2>&1 | tail -10`
+Expected: PASS. The crate must build at the end of this task — a task that leaves `src/`
+uncompilable has no testable deliverable.
 
 - [ ] **Step 5: Verify the write-order test bites**
 
