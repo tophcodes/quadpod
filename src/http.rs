@@ -12,7 +12,7 @@ use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{triples_of, Dataset, Skolemized},
     resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, ResourceError},
-    rdf::{Format, MediaType, Shape, negotiate, accept_allows},
+    rdf::{Format, MediaType, RdfVersion, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
@@ -396,24 +396,36 @@ async fn current_tags(
         };
         // A format missing from `SERVABLE` can still be served but its
         // validator would never match, which is a legitimate conditional
-        // write refused forever.
-        return Ok(Some(
-            SERVABLE.iter()
-                .filter_map(|ct| Format::from_content_type(ct))
-                .map(|f| stored.etag(f))
-                .collect(),
-        ));
+        // write refused forever. The same holds one axis over: a resource has
+        // one validator per *(format, served version)*, so a 1.2 client's
+        // `If-Match` needs its pair listed here too.
+        return Ok(Some(etag_candidates(&stored)));
     }
     let Some(triples) = get_rdf(store, target).await? else {
         return Ok(None);
     };
     let ground = ground_dataset(triples);
-    Ok(Some(
-        SERVABLE.iter()
-            .filter_map(|ct| Format::from_content_type(ct))
-            .map(|f| ground.etag(f))
-            .collect(),
-    ))
+    Ok(Some(etag_candidates(&ground)))
+}
+
+/// Every validator this stored state could legitimately have been served
+/// with: each servable format, at RDF 1.1 and at the state's own version.
+///
+/// The version comes from [`Dataset::rdf_version`] via de-skolemization
+/// rather than from a second classifier over the stored quads — one
+/// classifier is a rule (`docs/constraints.md`), and this is the caller that
+/// would most naturally have broken it.
+fn etag_candidates(stored: &Skolemized) -> Vec<String> {
+    let held = stored.deskolemize().rdf_version();
+    let versions = if held == RdfVersion::Rdf11 {
+        vec![RdfVersion::Rdf11]
+    } else {
+        vec![RdfVersion::Rdf11, held]
+    };
+    SERVABLE.iter()
+        .filter_map(|ct| Format::from_content_type(ct))
+        .flat_map(|f| versions.iter().map(move |v| stored.etag(f, *v)))
+        .collect()
 }
 
 /// Lifts a container's or auxiliary's raw triples (always default-graph,
@@ -1194,7 +1206,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), shape, stored_type) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
-    let tag = stored.etag(fmt);
+    let tag = stored.etag(fmt, RdfVersion::Rdf11);
     if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
         let mut out = HeaderMap::new();
         out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
@@ -1255,7 +1267,7 @@ async fn legacy_graph_read(
     match get_rdf(store, &target).await {
         Ok(Some(triples)) => {
             let ground = ground_dataset(triples);
-            let tag = ground.etag(fmt);
+            let tag = ground.etag(fmt, RdfVersion::Rdf11);
             if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
                 // `Vary: Accept` on every negotiated response (§6.3), and this
                 // path negotiates as much as the resource path does.

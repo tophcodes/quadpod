@@ -493,11 +493,18 @@ impl Skolemized {
     /// this value: hashing something else, or hashing after the blank nodes
     /// come back, is the mistake — and both are harder to write by accident
     /// when the hash belongs to the stored form.
-    pub fn etag(&self, fmt: Format) -> String {
+    pub fn etag(&self, fmt: Format, served: RdfVersion) -> String {
         let mut lines: Vec<String> = self.0.iter().map(|q| Quad::from(q).to_string()).collect();
         lines.sort();
         let mut h = Sha256::new();
         h.update(fmt.media_type().as_bytes());
+        h.update(b"\n");
+        // The version participates for the same reason the format does: one
+        // stored state has more than one representation, and RFC 9110 §8.8.1
+        // forbids them sharing a strong validator. Without this the 1.1
+        // projection and the full 1.2 representation are indistinguishable to
+        // a conditional request.
+        h.update(served.label().as_bytes());
         h.update(b"\n");
         for l in &lines {
             h.update(l.as_bytes());
@@ -511,6 +518,21 @@ impl Skolemized {
 mod tests {
     use super::*;
     use oxigraph::model::{BlankNode, Literal, NamedNode, Quad};
+
+    /// §9: two representations of one state must not share a strong
+    /// validator (RFC 9110 §8.8.1) — the same rule the selected *format*
+    /// already answers to, one axis over.
+    #[test]
+    fn the_served_version_changes_the_etag() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![q("http://e/s", "v", GraphName::DefaultGraph)]);
+        let stored = Skolemized::skolemize(&ds);
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        assert_ne!(
+            stored.etag(fmt, RdfVersion::Rdf11),
+            stored.etag(fmt, RdfVersion::Rdf12),
+        );
+    }
 
     /// §7's silent-failure case. A blank node inside a triple term must
     /// skolemize like any other, or the round trip and the ETag come apart
@@ -927,11 +949,11 @@ mod tests {
         let in_g1 = Skolemized::new(vec![gq("http://example.org/s", "x", g1.into())]);
         let in_g2 = Skolemized::new(vec![gq("http://example.org/s", "x", g2.into())]);
 
-        assert_ne!(in_g1.etag(jsonld), in_g2.etag(jsonld),
+        assert_ne!(in_g1.etag(jsonld, RdfVersion::Rdf11), in_g2.etag(jsonld, RdfVersion::Rdf11),
             "same triple, different graph — a shared validator would serve the wrong one");
-        assert_ne!(in_g1.etag(jsonld), in_g1.etag(trig),
+        assert_ne!(in_g1.etag(jsonld, RdfVersion::Rdf11), in_g1.etag(trig, RdfVersion::Rdf11),
             "different representations are different entities (RFC 9110 §8.8.1)");
-        assert_eq!(in_g1.etag(jsonld), in_g1.etag(jsonld), "stable between reads");
+        assert_eq!(in_g1.etag(jsonld, RdfVersion::Rdf11), in_g1.etag(jsonld, RdfVersion::Rdf11), "stable between reads");
     }
 
     // Every other etag test uses a single-quad dataset, so it can't tell
@@ -948,7 +970,7 @@ mod tests {
         let forward = Skolemized::new(vec![q1.clone(), q2.clone()]);
         let backward = Skolemized::new(vec![q2, q1]);
 
-        assert_eq!(forward.etag(jsonld), backward.etag(jsonld),
+        assert_eq!(forward.etag(jsonld, RdfVersion::Rdf11), backward.etag(jsonld, RdfVersion::Rdf11),
             "same quads in a different order must share a validator");
     }
 }
