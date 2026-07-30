@@ -2436,6 +2436,7 @@ dependencies = [
  "josekit",
  "object_store",
  "oxigraph",
+ "oxttl",
  "reqwest",
  "serde_json",
  "sha2 0.11.0",
