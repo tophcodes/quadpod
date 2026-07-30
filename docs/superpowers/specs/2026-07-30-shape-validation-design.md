@@ -34,8 +34,14 @@ Two version traps, both avoided by depending on `rudof_lib` alone:
 - `rudof` 0.1.12 is an abandoned earlier line, and upstream warns that 0.2.19–0.3.0 shipped
   broken. 0.3.7 is the floor.
 
-The default feature is `sparql`, which pulls `sparql_service`. It is off: validation runs in
-the engine's native mode against triples we hand it, not against a remote endpoint.
+The default feature is `sparql`, which pulls `sparql_service`. It is off — but that alone does
+not keep validation off the network: `ShaclValidationMode::Native` still executes SHACL-SPARQL
+(`sh:sparql`/`sh:select`/`sh:ask`) through the oxigraph evaluator that `http-client` brings into
+the tree regardless of that feature, `SERVICE <http://…>` included, and returns whatever comes
+back as `sh:value` in the report. What actually keeps this off the network is that
+`shapes::load` refuses to hand rudof a shapes graph that mentions any of those three predicates
+(§8) — checked against the parsed graph, not the query text, because a blocklist over SPARQL is
+not a defence.
 
 Built here: the binding lookup, the choice of data graph, the placement in the write path, the
 severity-to-status mapping, and the read view.
@@ -59,6 +65,14 @@ the refusal has to be ours and has to come after parsing.
 This design therefore refuses triple terms in `Format::parse` with a `400`. Only the object
 position can hold one — subjects are `NamedOrBlankNode` — so it is one check in the pod's one
 parser, and every `Dataset` downstream is free of them by construction.
+
+The same feature unification reaches a second parser this design adds: `oxttl`'s N3 parser,
+which `patch::Patch::parse` uses for a `text/n3` `PATCH` body. A patch never goes through
+`Format::parse` — it builds no `Dataset` at all, only patterns over one it never materializes
+(§5.4) — so the refusal above does not cover it, and a triple term in a patch's insertions or deletions would otherwise reach the
+store by a route the RDF-1.1 non-goal never anticipated. The refusal is therefore needed a
+second time, on the N3 path, checked against `N3Term::Triple(_)` the same way `Format::parse`
+checks `Term::Triple(_)`, and for the same `400`.
 
 **Deliberately not decided here: whether this pod should speak RDF 1.2 at all.** Storing
 triple terms is a coherent thing to want, and RDF 1.2 is distinguishable from 1.1 in three
@@ -216,7 +230,34 @@ wants refusal there should say `sh:Violation`.
   no business refusing one, and a shape that could would be a way to lock an ACL.
 - **Blob bodies.** There are no triples to validate. A blob write into a constrained container
   therefore always succeeds, which is a hole only for constraints about the container — and
-  those are out of scope (§3.4, §8).
+  those are out of scope (§3.4, §8). For the same reason, `GET /path?validate` on a blob answers
+  `404`: there is no report for a representation SHACL never saw (§6, §7).
+
+### 5.4 `PATCH`
+
+`PATCH` did not exist when this design's write path was written, and it is a third route into
+the store that neither `put_impl` nor `post_impl` covers. Left alone, a shape bound to a
+container constrains what a `PUT` or a `POST` may write there and nothing at all about what a
+`PATCH` may turn it into.
+
+Validating the *result* of a patch is not available at the cost §5.1 relies on. A patch is
+applied as one SPARQL update whose `WHERE` clause carries the deletion-presence check (the N3
+Patch design's §6) — the graph it produces never exists as a `Dataset` in this process, so there
+is nothing to hand `shapes::validate`. Validating only the insertions would be cheap, but wrong:
+a `sh:Violation` can be produced by a deletion as readily as by an insertion — removing the one
+triple that satisfied an `sh:minCount`, say — so a check that saw only what was added would pass
+patches it should refuse.
+
+So a shape-constrained container refuses every `PATCH` outright: `409`, with a message naming
+the container as shape-constrained and pointing at `PUT` as the way to write a validated
+representation. The check runs after the patch body has parsed — a malformed patch still earns
+its own `400`/`422` — and after `authorize` — an unauthorized caller learns nothing more than it
+already would have.
+
+An auxiliary is exempt for the same reason §5.3 exempts it from validation on `PUT`/`POST`: an
+ACL is never validated, and a shape must not be able to lock one. `patch_shape_conflict` mirrors
+`enforce_shape`'s target-to-container resolution and returns immediately for `Target::Aux`, so a
+`PATCH` to `/.aux/…` is unaffected by whatever shape its subject's container binds.
 
 ## 6. Read path — `GET /path?validate`
 
@@ -269,8 +310,11 @@ there is no constraint.
 | findings below `sh:Violation` only | the write's ordinary `201`/`204`, plus `Link: </path?validate>; rel="describedby"` |
 | no findings | the write's ordinary response, no extra header |
 | binding names a resource that does not exist, is a blob of an unsupported type, names more than one document, or does not parse as SHACL | `409`, naming the unusable constraint document |
+| binding names a constraint document that uses SHACL-SPARQL (§8) | `409`, naming the unusable constraint document |
 | the validation engine itself fails | `500` |
+| `PATCH` on a resource whose container binds a shape (§5.4) | `409`, naming the container as shape-constrained |
 | `?validate` on an unconstrained or absent resource | `404` |
+| `?validate` on an existing blob | `404` (§5.3) |
 
 The `500` row is what keeps the `409` honest. Of everything that can go wrong between reading
 the binding and holding a report, exactly one step touches client-authored content: parsing
@@ -321,6 +365,13 @@ until it is fixed — see §10.
 - **Ad-hoc validation** (`?validate=<shapeIri>`). It would need the shape IRI restricted to
   pod-local resources resolved through the store — never dereferenced, or it is an SSRF vector
   the `auth::safe_fetch` policy exists to prevent — and `acl:Read` on the shape.
+- **SHACL-SPARQL** (`sh:sparql`, `sh:select`, `sh:ask`). `ShaclValidationMode::Native` executes
+  these regardless of the `sparql` cargo feature (§2), which turns a shapes document into an
+  SSRF primitive with the response echoed back as `sh:value` — reachable even from a
+  pre-authentication write, and entirely outside `auth::safe_fetch`. `shapes::load` refuses any
+  shapes graph mentioning one of the three predicates, so this pod validates SHACL Core only.
+  Federating a query under this pod's own `FetchPolicy` is the shape a supported version of this
+  would take; tracked as issue #6.
 
 ## 9. Testing
 
@@ -348,10 +399,22 @@ Properties, each of which must be shown to fail before the code that makes it ho
 - **A broken constraint document bricks its container** until the binding is fixed or removed.
   Deliberate: failing open would disable a policy silently, which is the failure mode a
   validation feature exists to prevent.
-- **Validation cost is paid per write.** It is bounded by the size of the written body; no
-  store read is added to the write path.
+- **Validation cost is paid per write**, and one store read comes with it: the binding lookup
+  asks the parent container's graph for `ldp:constrainedBy` on the container's own IRI. That
+  query is bounded — it never returns the container's membership — so the cost does not grow
+  with the number of members, but it is a round trip on every RDF write, including on a pod
+  where no container binds anything.
+- **A container cannot be shape-checked on the type triple it asserts about itself.** The read
+  view validates what the client wrote, so it strips the `rdf:type ldp:Container` pair the
+  server asserts on the container's own IRI (§6). A client that writes that same triple is
+  indistinguishable from the server having written it — one stored triple, no provenance — so
+  a shape targeting it sees nothing at `?validate` even though the write path saw it. Type
+  triples about any other subject survive.
 - **Nothing constrains a container's shape as a whole** — not its member count, not its member
   types. `ldp:contains` is never in a data graph here (§3.4, §8).
+- **SHACL Core only.** No SPARQL-based constraints, targets, rules or update executables
+  (`sh:sparql`, `sh:select`, `sh:ask`, `sh:construct`, `sh:update`) and no SPARQL-based
+  constraint components — `shapes::load` refuses a shapes graph that mentions any of them (§8).
 - **Named graphs in a body are never validated** (§3.4). A dataset-valued resource is checked
   on its default graph only, so a shape cannot reach what a client put in a named graph.
 - **`?validate` is reachable by any agent with `acl:Read`**, and repeated calls are repeated
@@ -362,6 +425,9 @@ Properties, each of which must be shown to fail before the code that makes it ho
   SHACL-conformant servers always refuse violations will be surprised by a warn-only shape.
 - **Whoever can write a container can constrain it.** Under the single-user v1 topology this
   is the owner; it is an access-control property to revisit before multi-tenant.
+- **A shape-constrained container does not accept `PATCH`** (§5.4). There is no partial update
+  into a container bound to a shape — every write there is a full representation through `PUT`,
+  because a patch's effect never exists as a `Dataset` for the engine to check.
 
 ## 11. Deltas against documents already in force
 

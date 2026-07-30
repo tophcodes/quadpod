@@ -3,3 +3,4 @@
 .direnv/
 /conformance/.run/
 /conformance/reports/
+.claude/

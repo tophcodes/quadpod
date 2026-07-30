@@ -95,6 +95,9 @@ pub async fn provision_root_acl(
         Err(AuxError::SubjectMissing) => {
             unreachable!("the root container was just ensured to exist")
         }
+        // Unreachable by construction: `put` writes the auxiliary, so it never
+        // asks for one that is already there.
+        Err(AuxError::Missing) => unreachable!("put does not require an existing auxiliary"),
     }
 }
 

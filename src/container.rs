@@ -16,6 +16,41 @@ pub fn body_sets_containment(triples: &[Triple]) -> bool {
     triples.iter().any(|t| t.predicate.as_str() == LDP_CONTAINS)
 }
 
+/// `triples` minus the two things this pod adds to a container's stored
+/// graph on write: `ldp:contains` (accumulated by [`add_containment`]) and
+/// the `rdf:type` pair [`ensure_container`] asserts about `container_iri`,
+/// the container's own IRI. What remains is exactly the graph a `PUT`/`POST`
+/// into this container was validated against — shape validation runs on the
+/// client's own body, before either is added
+/// (2026-07-30-shape-validation-design.md §3.4).
+///
+/// The `rdf:type` pair is filtered only on `container_iri`: `ensure_container`
+/// never asserts it about any other subject, so a client-authored `<other> a
+/// ldp:Container` — which the write path validated and accepted — must
+/// survive here too. `ldp:contains` stays subject-agnostic: a client body
+/// carrying it is rejected by `body_sets_containment` before it is ever
+/// stored, so no client-authored occurrence reaches this function.
+pub fn without_server_managed(triples: Vec<Triple>, container_iri: &str) -> Vec<Triple> {
+    triples
+        .into_iter()
+        .filter(|t| {
+            if t.predicate.as_str() == LDP_CONTAINS {
+                return false;
+            }
+            let subject_is_container = matches!(&t.subject,
+                oxigraph::model::NamedOrBlankNode::NamedNode(n) if n.as_str() == container_iri);
+            if t.predicate.as_str() == RDF_TYPE && subject_is_container {
+                if let oxigraph::model::Term::NamedNode(n) = &t.object {
+                    if n.as_str() == LDP_CONTAINER || n.as_str() == LDP_BASIC_CONTAINER {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 /// A `NamedNode` for an IRI that already passed through `StorageSpace`, or
 /// for one of the vocabulary constants above. Both are known-valid; the
 /// checked constructor is used anyway so a future caller that is neither
@@ -146,6 +181,27 @@ mod tests {
 
     fn iri(path: &str) -> String {
         sp().resolve(path).unwrap().graph_iri().to_string()
+    }
+
+    /// The `rdf:type` pair is filtered on the container's own subject only —
+    /// `ensure_container` never asserts it about any other subject, so a
+    /// client-authored type triple on a different subject in the same graph
+    /// (`<#x>` here) must survive, exactly as `body_sets_containment` already
+    /// keeps `ldp:contains` out of the client's own writes so it can stay
+    /// subject-agnostic.
+    #[test]
+    fn without_server_managed_strips_the_type_pair_only_on_the_containers_own_subject() {
+        let c = iri("/notes/");
+        let other = format!("{c}#x");
+        let subject = |s: &str| NamedNode::new(s).unwrap();
+        let triples = vec![
+            Triple::new(subject(&c), subject(RDF_TYPE), subject(LDP_CONTAINER)),
+            Triple::new(subject(&c), subject(RDF_TYPE), subject(LDP_BASIC_CONTAINER)),
+            Triple::new(subject(&other), subject(RDF_TYPE), subject(LDP_CONTAINER)),
+        ];
+        let out = without_server_managed(triples, &c);
+        assert_eq!(out, vec![Triple::new(subject(&other), subject(RDF_TYPE), subject(LDP_CONTAINER))],
+            "only the container's own rdf:type pair is server-managed; <#x>'s survives");
     }
 
     #[tokio::test]

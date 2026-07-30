@@ -3907,6 +3907,7 @@ dependencies = [
  "josekit",
  "object_store",
  "oxigraph",
+ "oxttl",
  "reqwest 0.13.4",
  "rudof_lib",
  "serde_json",

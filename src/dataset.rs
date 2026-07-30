@@ -30,6 +30,23 @@ pub const RESERVED_PREFIX: &str = "urn:quadpod:";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dataset(Vec<Quad>);
 
+/// Whether an IRI is the server's rather than a client's.
+///
+/// The one recogniser of the reserved namespace, so a caller holding terms
+/// rather than a [`Dataset`] — an N3 Patch document, whose IRIs must be checked
+/// before any binding is substituted (`2026-07-30-n3-patch-design.md` §6.3) —
+/// asks here instead of matching the prefix itself.
+///
+/// `urn:quadpod:` — scheme and NID are case-insensitive (RFC 8141), the rest of
+/// the NSS is not, and only the prefix is ours. `get` returns `None` rather than
+/// panicking when byte 12 is not a char boundary — `<urn:quadpodé:x>` is a legal
+/// IRI whose 13th byte (the 2-byte `é` starts at byte 11) lands mid-character —
+/// which also folds in the length check.
+pub fn is_reserved_iri(iri: &str) -> bool {
+    iri.get(..RESERVED_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_PREFIX))
+}
+
 /// A dataset as the store holds it: every blank node replaced by a
 /// `urn:quadpod:bnode:<uuid>` IRI, in triples and as graph names alike.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,35 +293,23 @@ impl Dataset {
         self.0.iter().any(|q| q.graph_name != oxigraph::model::GraphName::DefaultGraph)
     }
 
-    /// §3.2.2: any `urn:quadpod:` IRI anywhere — subject, predicate, object or
-    /// graph name — is a `400`. Case-insensitive over scheme and NID, because
-    /// RFC 8141 makes both case-insensitive and `URN:QUADPOD:` denotes the same
-    /// namespace.
+    /// §3.2.2: any reserved IRI anywhere — subject, predicate, object or graph
+    /// name — is a `400`.
     pub fn uses_reserved_namespace(&self) -> bool {
-        fn reserved(iri: &str) -> bool {
-            // `urn:quadpod:` — scheme and NID are case-insensitive (RFC 8141), the
-            // rest of the NSS is not, and only the prefix is ours. `get` returns
-            // `None` rather than panicking when byte 12 is not a char boundary —
-            // `<urn:quadpodé:x>` is a legal IRI whose 13th byte (the 2-byte `é`
-            // starts at byte 11) lands mid-character — which also folds in the
-            // length check.
-            iri.get(..RESERVED_PREFIX.len())
-                .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_PREFIX))
-        }
         self.0.iter().any(|q| {
             let subject = match &q.subject {
-                oxigraph::model::NamedOrBlankNode::NamedNode(n) => reserved(n.as_str()),
+                oxigraph::model::NamedOrBlankNode::NamedNode(n) => is_reserved_iri(n.as_str()),
                 _ => false,
             };
             let object = match &q.object {
-                oxigraph::model::Term::NamedNode(n) => reserved(n.as_str()),
+                oxigraph::model::Term::NamedNode(n) => is_reserved_iri(n.as_str()),
                 _ => false,
             };
             let graph = match &q.graph_name {
-                oxigraph::model::GraphName::NamedNode(n) => reserved(n.as_str()),
+                oxigraph::model::GraphName::NamedNode(n) => is_reserved_iri(n.as_str()),
                 _ => false,
             };
-            subject || object || graph || reserved(q.predicate.as_str())
+            subject || object || graph || is_reserved_iri(q.predicate.as_str())
         })
     }
 
