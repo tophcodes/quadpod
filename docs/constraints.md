@@ -164,10 +164,17 @@ Only `shapes` reads the constraint binding.
     outright: its `#[cfg(test)]` fixtures `PUT` a Turtle body to set a binding
     up, which is data, not a read, but it is still the IRI in text — so the
     second conjunct pins today's count instead, and a new occurrence anywhere
-    in the file, reader or fixture, goes red. The third conjunct is what
-    stops the import: `LDP_CONSTRAINED_BY` stays private, so nothing outside
-    `shapes.rs` can name it to compare against.
-    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs | wc -l)" = 6 ] && ! rg -q 'pub const LDP_CONSTRAINED_BY' src/shapes.rs
+    in the file, reader or fixture, goes red. The count includes one
+    non-fixture occurrence: the `422` refusal's own `Link:
+    rel="…ldp#constrainedBy"` header (§3.1) — the response naming the shape
+    that refused it is not a second *read* of the binding, since it is built
+    from the `Shape` `shapes::load` already returned, but it is one more
+    place this file spells the IRI, so it counts here rather than being
+    carved out like the fixtures are. The third conjunct is what stops the
+    import: `LDP_CONSTRAINED_BY` stays private, so nothing outside
+    `shapes.rs` can name it to compare against — and `pub(crate)` counts as
+    exported for this purpose, so the pattern below matches both.
+    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs | wc -l)" = 7 ] && ! rg -q 'pub(\(crate\))? const LDP_CONSTRAINED_BY' src/shapes.rs
 
 The query string is read in exactly one place.
     → §6. `?validate` is the only query parameter this pod gives meaning to,

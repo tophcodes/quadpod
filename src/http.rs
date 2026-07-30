@@ -545,18 +545,26 @@ async fn enforce_shape(
         Ok(Some(s)) => s,
         Err(e) => return Err(shape_status(e)),
     };
-    let report = match crate::shapes::validate(&shapes, dataset) {
+    let report = match crate::shapes::validate(&shapes.turtle, dataset) {
         Ok(r) => r,
         Err(e) => return Err(shape_status(e)),
     };
     if report.refuses() {
         let body = turtle_bytes(&report.into_dataset());
-        return Err((
+        let mut res = (
             StatusCode::UNPROCESSABLE_ENTITY,
             [(header::CONTENT_TYPE, "text/turtle")],
             body,
         )
-            .into_response());
+            .into_response();
+        // §3.1: the shape is the document that explains the refusal, so the
+        // refusal names it.
+        if let Ok(v) = HeaderValue::from_str(&format!(
+            "<{}>; rel=\"http://www.w3.org/ns/ldp#constrainedBy\"", shapes.iri
+        )) {
+            res.headers_mut().append(header::LINK, v);
+        }
+        return Err(res);
     }
     Ok(if report.is_empty() { None } else { Some(report) })
 }
@@ -1063,19 +1071,32 @@ async fn validate_view(
     };
     // `target`'s own content — what the shape is validated against.
     let dataset = match &target {
+        // §5.3: a blob has no triples, so it is never validated — the same
+        // "no report here" answer as an unconstrained resource, not a
+        // vacuous `sh:conforms true` for a representation SHACL never saw.
+        Target::Resource(r) if matches!(kind_of(store, r).await, Ok(Some(Kind::Binary(_)))) =>
+            return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
         Target::Resource(r) => match get_dataset(store, r).await {
             Ok(Some(d)) => d.deskolemize(),
             Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
             Err(e) => return (put_status(&e), e.to_string()).into_response(),
         },
         Target::Container(c) => match get_rdf(store, c).await {
-            Ok(Some(t)) => ground_dataset(t).deskolemize(),
+            // Minus what this pod adds on write — `ldp:contains` and the
+            // type triples `ensure_container` asserts — so this is exactly
+            // the graph a write into `c` was validated against (§3.4). The
+            // full stored graph would let a shape targeting those
+            // server-managed triples report `Violation` here while every
+            // write into `c` keeps succeeding, which is a contradiction no
+            // client can act on (§10: `ldp:contains` is never in a data
+            // graph here).
+            Ok(Some(t)) => ground_dataset(container::without_server_managed(t)).deskolemize(),
             Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
             Err(e) => return (put_status(&e), e.to_string()).into_response(),
         },
         Target::Aux(_) => unreachable!("an auxiliary already returned above"),
     };
-    let report = match crate::shapes::validate(&shapes, &dataset) {
+    let report = match crate::shapes::validate(&shapes.turtle, &dataset) {
         Ok(r) => r,
         Err(e) => return shape_status(e),
     };
@@ -4828,16 +4849,24 @@ mod tests {
 
     /// The shapes document, and a container bound to it. Returns nothing;
     /// both are ordinary resources afterwards.
+    /// Binds `shape_ttl`, stored at `shape_path`, to `container_path` — the
+    /// one place this file spells `ldp:constrainedBy` to set a binding up
+    /// (data, not a read; see `docs/constraints.md`).
+    async fn bind_shape(f: &Fixture, container_path: &str, shape_path: &str, shape_ttl: &str) {
+        f.put_turtle(shape_path, shape_ttl).await;
+        f.put_turtle(container_path, &format!(
+            "<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so{shape_path}> ."
+        )).await;
+    }
+
     async fn bind_note_shape(f: &Fixture) {
-        f.put_turtle("/shapes/note", r#"
+        bind_shape(f, "/notes/", "/shapes/note", r#"
             @prefix sh: <http://www.w3.org/ns/shacl#> .
             @prefix schema: <http://schema.org/> .
             <http://example.org/NoteShape> a sh:NodeShape ;
               sh:targetClass schema:NoteDigitalDocument ;
               sh:property [ sh:path schema:name ; sh:minCount 1 ; sh:severity sh:Violation ] .
         "#).await;
-        f.put_turtle("/notes/", "<> <http://www.w3.org/ns/ldp#constrainedBy> \
-            <https://pod.toph.so/shapes/note> .").await;
     }
 
     #[tokio::test]
@@ -4858,6 +4887,24 @@ mod tests {
 
         assert!(f.get_turtle("/notes/n1").await.contains("first"),
             "the refused write must not have replaced the stored representation");
+    }
+
+    /// §3.1: a `422` names the shape that explains the refusal, so a client
+    /// can fetch it rather than being told only that something failed.
+    #[tokio::test]
+    async fn a_refused_write_names_the_shape_in_a_link_header() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let link = res.headers().get(header::LINK).expect("a Link header naming the shape")
+            .to_str().unwrap().to_owned();
+        assert!(link.contains("/shapes/note"), "expected the shape's own IRI: {link}");
+        assert!(link.contains("constrainedBy"), "expected the constrainedBy relation: {link}");
     }
 
     /// §5.1: validation runs before the traversal that adds the containment
@@ -5196,6 +5243,47 @@ mod tests {
         let body = body_string(res).await;
         assert!(body.contains("ValidationReport"));
         assert!(!body.contains("resultSeverity"), "the shape has no target, so nothing is flagged: {body}");
+    }
+
+    /// §3.4/§10: `ldp:contains` is never in a data graph, so a container that
+    /// was accepted at write time — its own body carried no members — must
+    /// still conform at `?validate` after the ancestor walk adds one. A
+    /// shape targeting `ldp:contains` directly on the container's own IRI is
+    /// what would trip if the read path validated the full stored graph
+    /// instead of what the write path actually checked.
+    #[tokio::test]
+    async fn validate_view_on_a_container_matches_what_its_write_was_validated_against() {
+        let f = fixture().await;
+        bind_shape(&f, "/", "/shapes/no-members", r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ldp: <http://www.w3.org/ns/ldp#> .
+            <http://example.org/NoMembersShape> a sh:NodeShape ;
+              sh:targetNode <https://pod.toph.so/notes/> ;
+              sh:property [ sh:path ldp:contains ; sh:maxCount 0 ; sh:severity sh:Violation ] .
+        "#).await;
+        f.put_turtle("/notes/", "<> <http://purl.org/dc/terms/title> \"notes\" .").await;
+        f.put_turtle("/notes/n1", "<> <http://schema.org/name> \"x\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/", "validate")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        assert!(!body.contains("resultSeverity"),
+            "the write into /notes/ was accepted, so ?validate must agree: {body}");
+    }
+
+    /// §5.3: a blob is never validated — `?validate` on one answers `404`,
+    /// the same "no report here" a resource never validated at all gets, not
+    /// a vacuous `200, sh:conforms true` for a representation SHACL never saw.
+    #[tokio::test]
+    async fn validate_view_on_a_blob_is_404() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_blob("/notes/pic.png", "image/png", &b"\x89PNG"[..]).await;
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/pic.png", "validate")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     /// An auxiliary is never validated, whatever its subject's shape says —

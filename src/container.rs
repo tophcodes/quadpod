@@ -16,6 +16,31 @@ pub fn body_sets_containment(triples: &[Triple]) -> bool {
     triples.iter().any(|t| t.predicate.as_str() == LDP_CONTAINS)
 }
 
+/// `triples` minus the two things this pod adds to a container's stored
+/// graph on write: `ldp:contains` (accumulated by [`add_containment`]) and
+/// the `rdf:type` pair [`ensure_container`] asserts. What remains is exactly
+/// the graph a `PUT`/`POST` into this container was validated against —
+/// shape validation runs on the client's own body, before either is added
+/// (2026-07-30-shape-validation-design.md §3.4).
+pub fn without_server_managed(triples: Vec<Triple>) -> Vec<Triple> {
+    triples
+        .into_iter()
+        .filter(|t| {
+            if t.predicate.as_str() == LDP_CONTAINS {
+                return false;
+            }
+            if t.predicate.as_str() == RDF_TYPE {
+                if let oxigraph::model::Term::NamedNode(n) = &t.object {
+                    if n.as_str() == LDP_CONTAINER || n.as_str() == LDP_BASIC_CONTAINER {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 /// A `NamedNode` for an IRI that already passed through `StorageSpace`, or
 /// for one of the vocabulary constants above. Both are known-valid; the
 /// checked constructor is used anyway so a future caller that is neither
