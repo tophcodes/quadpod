@@ -1084,7 +1084,12 @@ async fn validate_view(
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
     match fmt.serialize(&report.into_dataset()) {
-        Ok(bytes) => ([(header::CONTENT_TYPE, fmt.media_type())], bytes).into_response(),
+        Ok(bytes) => {
+            let mut out = HeaderMap::new();
+            out.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
+            out.insert(header::VARY, "Accept".parse().expect("static"));
+            (out, bytes).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -5158,5 +5163,58 @@ mod tests {
             .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(body_string(res).await.contains("schema.org/name"));
+    }
+
+    #[tokio::test]
+    async fn validate_view_response_varies_on_accept() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"ok\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/n1", "validate")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get(header::VARY).unwrap(), "Accept");
+    }
+
+    /// A container's shape lookup uses its own parent, exactly as a PUT to
+    /// the container does — here the root, which binds the shape that
+    /// `/notes/` itself is validated against.
+    #[tokio::test]
+    async fn validate_view_on_a_container_uses_its_own_parent() {
+        let f = fixture().await;
+        f.put_turtle("/shapes/any", "@prefix sh: <http://www.w3.org/ns/shacl#> . \
+            <http://example.org/S> a sh:NodeShape .").await;
+        f.put_turtle("/", "<> <http://www.w3.org/ns/ldp#constrainedBy> \
+            <https://pod.toph.so/shapes/any> .").await;
+        f.put_turtle("/notes/", "<> <http://purl.org/dc/terms/title> \"notes\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/", "validate")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        assert!(body.contains("ValidationReport"));
+        assert!(!body.contains("resultSeverity"), "the shape has no target, so nothing is flagged: {body}");
+    }
+
+    /// An auxiliary is never validated, whatever its subject's shape says —
+    /// both the ACL and the subject it governs exist here, so the 404 proves
+    /// the rule rather than an absent resource answering incidentally.
+    #[tokio::test]
+    async fn validate_view_on_an_auxiliary_is_404() {
+        let f = fixture().await;
+        f.put_turtle("/notes/n1", "<> <http://schema.org/name> \"x\" .").await;
+        let body = format!(
+            "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/notes/n1> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put = put_acl(&f, "/notes/n1", &body).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/.aux/notes/n1.acl", "validate")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }
