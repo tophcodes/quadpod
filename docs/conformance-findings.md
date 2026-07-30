@@ -261,6 +261,99 @@ remains, folded into rank 6 above). `accept-acah` and `enumerate-headers`, by co
 *are* the interaction: both build the same fixture but also assert CORS headers, so both
 needed the merge specifically.
 
+## Fifth run — after the `Vary` fix (`9d47b1a`)
+
+| | |
+|---|---|
+| **Date** | 2026-07-30 |
+| **Pod commit** | `9d47b1a` (the merged tree above plus this one fix) |
+
+| | Features | Scenarios | Passed | Failed |
+|---|---|---|---|---|
+| karate (everything that ran) | 41 | 652 | 567 | 85 |
+
+Same 41 features, same 652 scenarios as every prior run. This is a re-measurement of the
+merged tree above plus one commit, not a sixth parallel slice: `9d47b1a` fixed the `Vary`
+defect the merged run filed (Bucket 3, now resolved below) — `cors_layer` now joins
+`Origin` into the handler's existing `Vary` value as one field line instead of appending
+a second line. 27 → 29 of 41 features now pass every scenario, 12 (was 14) have at least
+one failure: `cors/simple-requests` and `cors/acao-vary` flip to fully green;
+`cors/preflight-requests` gains two passes but still has one failure, so it stays in the
+failing column. Exactly the 10 scenarios the finding predicted moved, and nothing else
+did:
+
+| Feature | Fourth run | Fifth run | Δ |
+|---|---|---|---|
+| `cors/simple-requests` | 6/10 | **10/10** | +4 |
+| `cors/acao-vary` | 8/12 | **12/12** | +4 |
+| `cors/preflight-requests` | 1/4 | **3/4** | +2 |
+
+`557 + 10 = 567`. Verified against `conformance/.run/harness.log` and
+`conformance/.run/karate/karate-reports/karate-summary-json.txt` for this run: every other
+feature's pass/fail split — including both `write-access-*` and `read-access-*` line
+numbers within `wac/protected-operation` — matches the fourth run exactly, not assumed
+from the arithmetic.
+
+### The 85 residual failures, reconciled feature by feature
+
+| Cause | Scenarios | Bucket | Status |
+|---|---|---|---|
+| No `PATCH` route | 66 | 1 | unchanged gap |
+| `DELETE` of a container/fictive resource via inherited-only access | 6 | 2 + 3 | unchanged (3 defect, 3 pending-decision) |
+| `POST` into a container whose grant is `accessTo`-only | 6 | 3 | unchanged |
+| `post-target-not-found` (ancestor materialization) | 4 | 2 | unchanged since the first run |
+| CORS/`OPTIONS` scheme-rewrite redirect, unreachable over `http` | 2 | 1 | unchanged in kind |
+| `containment:122` (trailing-slash pair) | 1 | 2 | unchanged since the first run |
+| **Total** | **85** | | |
+
+`66 + 6 + 6 + 4 + 2 + 1 = 85`. The `Vary` row that used to sit here is gone outright, not
+folded into another cause — see Bucket 3. Every other row's count is identical to the
+merged run's table above; only the `Vary` line was removed.
+
+Feature-by-feature, only three rows changed from the merged run's list:
+
+- **`cors/simple-requests` (10/10)** — the four `Vary` failures (`:53` ×2, `:71` ×2) are
+  gone. Fully passing; moved to "What passed" below.
+- **`cors/acao-vary` (12/12)** — the four `Vary` failures (`:28` ×2, `:58` ×2) are gone.
+  Fully passing; moved to "What passed" below.
+- **`cors/preflight-requests` (3/4)** — the two `Vary` failures at `:36` are gone; `:51`
+  still fails, and it is the same `@http-redirect` shape as `cors/preflight:28`: `[301,
+  308]` expected, `204` returned, because this pod is dialled over `http` in the harness
+  and the scheme-rewrite the scenario relies on is a no-op. Confirmed directly in
+  `harness.log` for this run — `:51` is the only `ERROR` line left under this feature.
+
+Every other feature's failing lines are byte-for-byte the same as the merged run —
+confirmed against `harness.log` line by line for `post-target-not-found`, `preflight`,
+`content-type-reject`, `containment`, `authentication/header`, and all six
+`wac/protected-operation` features, including the exact scenario-line numbers cited in
+the merged run's reconciliation above. None of them touch `Vary`, so none of them had
+anywhere to move.
+
+`45 (write-access-*) + 30 (read-access-*) = 75` of the 85 still sit inside
+`wac/protected-operation`, unchanged; the other 10 are `post-target-not-found` 4,
+`preflight` 1, `preflight-requests` 1, `content-type-reject` 1, `containment` 2, `header`
+1 (`4+1+1+1+2+1 = 10`). `75 + 10 = 85`.
+
+### The ranking, rederived
+
+With `Vary` resolved, `PATCH` is more dominant than ever — it is now **78% of every
+remaining failure** (66 of 85), up from 69% in the merged run. What used to be rank 2
+(`Vary`, 10) is gone outright rather than replaced; second and third place are now a
+genuine tie, both inherited from the blob-alone measurement and both worth 6 scenarios:
+
+| Rank | Gap | Scenarios | Bucket | Note |
+|---|---|---|---|---|
+| 1 | **`PATCH` not implemented** | **66** | 1 | dominant residual cause, more so now that `Vary` is gone |
+| 2 | **`DELETE` via inherited-only access** | **6** | 2 + 3 | tied with rank 2 below (3 defect, 3 pending-decision) |
+| 2 | **`POST` into an `accessTo`-only container** | **6** | 3 | tied with rank 2 above |
+| 4 | **`post-target-not-found`** | **4** | 2 | unchanged since the first run |
+| 5 | **CORS/`OPTIONS` scheme-rewrite redirect (needs `https`)** | **2** | 1 | unchanged in kind |
+| 6 | **`containment:122`, trailing-slash pair** | **1** | 2 | unchanged since the first run |
+
+`66 + 6 + 6 + 4 + 2 + 1 = 85`. Honestly: there is no second-place gap on its own anymore —
+just two 6-scenario defects, neither larger than the other, both already filed in Bucket 3
+and unrelated to this fix.
+
 ---
 
 ## Bucket 1 — Expected gap (68 scenarios, as of the merged run)
@@ -323,16 +416,18 @@ Not reachable without an `https` deployment — unchanged in kind since the firs
 newly measured in the second feature because `preflight-requests` used to abort on its
 `text/plain` fixture.
 
-### CORS response headers — RESOLVED except one defect (see Bucket 3)
+### CORS response headers — RESOLVED, including `Vary` (see Bucket 3)
 
 `access-control-headers`, `accept-acah`, and `enumerate-headers` — 10 of 38 `cors/*`
 scenarios — pass every case, including `Access-Control-Allow-Origin`,
 `Access-Control-Expose-Headers` (present and not `*`), and `Access-Control-Allow-Headers`
 mirroring what was requested. Every `Access-Control-Allow-Origin` and
 `Access-Control-Expose-Headers` assertion in the other four `cors/*` features also
-passes. What remains — 10 scenarios across `simple-requests`, `preflight-requests`, and
-`acao-vary` — is a single defect in how `Vary` is emitted, not a missing header; see
-Bucket 3.
+passes. What remained after the merged run — 10 scenarios across `simple-requests`,
+`preflight-requests`, and `acao-vary` — was a single defect in how `Vary` was emitted, not
+a missing header; `9d47b1a` fixed it, and `simple-requests`/`acao-vary` are now fully
+green (see Bucket 3 and the fifth run above). The only `cors/*` failures left are the two
+`@http-redirect` scenarios noted above, unrelated to response headers.
 
 ### `PATCH` — 66 scenarios (unchanged)
 
@@ -400,7 +495,7 @@ ancestor-materialisation decision, surfacing as `409` instead of `201`.
 
 ---
 
-## Bucket 3 — Defect (19 scenarios failing)
+## Bucket 3 — Defect (9 scenarios failing)
 
 ### `content-type-reject` — RESOLVED (Plan 10) — reclassified from Bucket 2, and fixed
 
@@ -477,26 +572,31 @@ The `fictive` counterpart of this test — same setup, `DELETE` of a resource th
 never created rather than an existing container — fails for a different reason (`404`
 instead of `403`, not an incorrect allow); it is filed in Bucket 2 above.
 
-### CORS `Vary` header ships as two separate header lines — 10 scenarios, new this run
+### CORS `Vary` header shipped as two separate lines — RESOLVED (`9d47b1a`) — was 10 scenarios
 
 `protocol/cors/simple-requests:53` (×2), `:71` (×2); `protocol/cors/preflight-requests:36`
 (×2); `protocol/cors/acao-vary:28` (×2), `:58` (×2).
 
 | | |
 |---|---|
-| **Test wants** | On a CORS-eligible, content-negotiated `GET`/`HEAD`, one `Vary` header whose value contains `Origin` (alongside `Accept`) |
-| **Pod does** | Sends `Access-Control-Allow-Origin` and `Access-Control-Expose-Headers` correctly, but the response the harness reads back has `Vary: Accept` only |
-| **Why** | `cors_layer` (`src/http.rs:73-90`) is deliberately the outermost layer so it can add CORS fields after the handler has already set `Vary: Accept` for content negotiation (§6.3). Its comment says why it uses `append` rather than `insert`: "a negotiated read has already set `Vary: Accept`, and replacing it would make a cache serve the wrong representation." But `HeaderMap::append` (`src/http.rs:84`) adds a *second, separate* `Vary` header line rather than combining the value into the existing one. RFC 9110 permits a recipient to treat repeated header fields as equivalent to one comma-joined field, but the harness's HTTP client reads only the first `Vary` line it receives — `Accept` — and never sees `Origin`. Confirmed by the per-scenario report for `cors/simple-requests:53`: the request does send `Origin`, and `Access-Control-Allow-Origin`/`Access-Control-Expose-Headers` both pass (proving `cors_layer` ran and reached the `Vary` line), yet the `Vary` assertion still fails on the split header. |
+| **Test wanted** | On a CORS-eligible, content-negotiated `GET`/`HEAD`, one `Vary` header whose value contains `Origin` (alongside `Accept`) |
+| **Pod did** | Sent `Access-Control-Allow-Origin` and `Access-Control-Expose-Headers` correctly, but the response the harness read back had `Vary: Accept` only |
+| **Why** | `cors_layer` (`src/http.rs:73-90`) is deliberately the outermost layer so it can add CORS fields after the handler has already set `Vary: Accept` for content negotiation (§6.3). Its comment said why it used `append` rather than `insert`: "a negotiated read has already set `Vary: Accept`, and replacing it would make a cache serve the wrong representation." But `HeaderMap::append` added a *second, separate* `Vary` header line rather than combining the value into the existing one. RFC 9110 §5.3 permits a recipient to treat repeated header fields as equivalent to one comma-joined field, but the harness's HTTP client reads only the first `Vary` line it receives — `Accept` — and never sees `Origin`. Confirmed by the per-scenario report for `cors/simple-requests:53`: the request did send `Origin`, and `Access-Control-Allow-Origin`/`Access-Control-Expose-Headers` both passed (proving `cors_layer` ran and reached the `Vary` line), yet the `Vary` assertion still failed on the split header. This is the record of why a two-line `Vary` is a defect and not a legal-but-unusual choice: RFC 9110 permits repeating a list-valued field, but a client that reads the first line and stops sees half the list — and the conformance harness is exactly such a client. |
 
-Genuinely new: previously unmeasurable in `main` alone (CORS features that reach this
-code path build a `text/plain` fixture and aborted on `415`) and unmeasurable in
-`feat/non-rdf-resources` alone (the CORS headers this defect concerns did not exist on
-that tree at all). Explains why `access-control-headers`, `accept-acah`, and
-`enumerate-headers` are fully passing while `simple-requests`, `preflight-requests`, and
-`acao-vary` are not: only the latter three exercise a `GET`/`HEAD` where content
+Genuinely new when first measured: previously unmeasurable in `main` alone (CORS features
+that reach this code path build a `text/plain` fixture and aborted on `415`) and
+unmeasurable in `feat/non-rdf-resources` alone (the CORS headers this defect concerns did
+not exist on that tree at all). It explained why `access-control-headers`, `accept-acah`,
+and `enumerate-headers` were fully passing while `simple-requests`, `preflight-requests`,
+and `acao-vary` were not: only the latter three exercise a `GET`/`HEAD` where content
 negotiation has already written a `Vary: Accept` before `cors_layer` appends `Origin`.
-The fix is to combine the value into the existing `Vary` header rather than append a
-second line — the intent the code comment already states, not met by the method it uses.
+
+**Fixed by `9d47b1a`**: `cors_layer` now reads whatever `Vary` value is already present,
+splits it on commas, adds `Origin` only if it is not already listed, and writes the whole
+set back with a single `insert` — one field line, e.g. `Vary: Accept, Origin`, instead of
+two. Re-run confirms all 10 scenarios now pass: `cors/simple-requests` and `cors/acao-vary`
+are `10/10` and `12/12`; the two `Vary` failures at `preflight-requests:36` are gone (see
+the fifth run above).
 
 ---
 
@@ -504,11 +604,14 @@ second line — the intent the code comment already states, not met by the metho
 
 Every one of the first run's 615 failures was attributed to a named cause, verified
 against either the harness log's response line or the pod's source. As of the second run,
-609 remained, all attributed. As of the merged run, all 95 remaining failures are
-attributed above — cross-checked against `conformance/.run/harness.log`'s response lines
-and the per-scenario detail in `conformance/.run/karate/karate-reports/*.html` for every
-one of the 14 features with a failure, not sampled. `66 + 10 + 6 + 6 + 4 + 2 + 1 = 95`;
-nothing left over.
+609 remained, all attributed. As of the merged run, all 95 remaining failures were
+attributed — cross-checked against `conformance/.run/harness.log`'s response lines and the
+per-scenario detail in `conformance/.run/karate/karate-reports/*.html` for every one of
+the 14 features with a failure, not sampled. As of the fifth run, `9d47b1a` removed the
+`Vary` cause outright (10 scenarios) rather than folding it into another one, leaving 85 —
+`66 + 6 + 6 + 4 + 2 + 1 = 85` — re-verified the same way against this run's own
+`harness.log` and `karate-summary-json.txt`, feature by feature, for all 12 features with
+a failure. Nothing left over.
 
 ---
 
@@ -535,6 +638,8 @@ nothing left over.
 | `cors/access-control-headers` | 6 / 6 |
 | `cors/accept-acah` | 3 / 3 |
 | `cors/enumerate-headers` | 1 / 1 |
+| `cors/simple-requests` | 10 / 10 (as of the fifth run — `9d47b1a`) |
+| `cors/acao-vary` | 12 / 12 (as of the fifth run — `9d47b1a`) |
 | anonymous `401` rows in `authentication/header` | 5 / 6, `WWW-Authenticate` present |
 
 **The new auxiliary URL shape works, including for blobs.** The harness's
@@ -542,8 +647,8 @@ nothing left over.
 `Link`-advertised `/.aux/{path}.acl` URL, and the five `wac-allow` features exercise ACL
 writes and reads repeatedly with every access decision correct. **No failure in this run
 traces to the ACL URL shape or to the blob path specifically** — every blob-involving
-failure traces to `PATCH`, `POST`, `DELETE`, or the `Vary` gaps above, which apply
-identically to RDF resources.
+failure traces to `PATCH`, `POST`, or `DELETE`, all of which apply identically to RDF
+resources. `Vary` was the fourth such gap; `9d47b1a` fixed it (see Bucket 3).
 
 **WAC access decisions are correct for the large majority of newly-measured cases.** 434
 of the 540 scenarios the non-RDF work unblocked — 80% — pass outright.

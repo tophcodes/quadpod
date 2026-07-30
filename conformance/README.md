@@ -12,10 +12,11 @@ starts, it stops.
 ## Current status
 
 The full suite runs and a report lands on disk. As of the merge of the blob and
-header slices: **41 features, 652 scenarios, 557 passed, 95 failed** — 27 features
-fully green. Non-RDF resources unblocked 540 previously-untestable scenarios, and
-the `WAC-Allow`/`OPTIONS`/CORS slice cleared most of what remained behind them.
-The largest remaining gap is `PATCH`, which this pod does not implement at all.
+header slices plus the `Vary` fix (`9d47b1a`): **41 features, 652 scenarios, 567
+passed, 85 failed** — 29 features fully green. Non-RDF resources unblocked 540
+previously-untestable scenarios, and the `WAC-Allow`/`OPTIONS`/CORS slice cleared
+most of what remained behind them. The largest remaining gap is `PATCH`, which
+this pod does not implement at all.
 The triage lives in
 [`docs/conformance-findings.md`](../docs/conformance-findings.md).
 
