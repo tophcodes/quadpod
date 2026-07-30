@@ -170,7 +170,7 @@ Request flows top→down; three front doors share one authorization core.
 | ~~`manas_access_control` (`WacDecisionPoint`) + `manas_space`~~ | ~~WAC decision engine~~ | **Not used.** The Plan 6 spike reversed this; the PDP is ours. See §16, ADR-1 |
 | `acp` (later) | ACP decision | same `PolicyDecisionPoint` seam, near-zero cost |
 | `object_store` | local/S3/GCS/… blob backends | `BlobStore` impl |
-| `rudof` (`shacl_validation`) (later) | SHACL/ShEx validation | optional per-container 422 |
+| `rudof_lib` 0.3.7 | SHACL/ShEx validation | optional per-container 422 |
 | `oxigraph` | the store | behind `SparqlStore`, over SPARQL 1.1 Protocol |
 
 **Mental model:** we build *how Solid maps onto a quad store*; we rent every *frozen spec*
@@ -240,17 +240,17 @@ template); the matcher is still built so the seam exists.
   external Solid viewer (SolidOS / Data Kitchen) pointed at the resource; the viewer bundle is
   static (proxy/CDN), not in the binary. Off by default (Solid mandates only Turtle + JSON-LD).
 - **Per-container SHACL/ShEx** — attach a shape to specific containers via `ldp:constrainedBy`;
-  violating writes get 422. Off by default (mandatory validation would break generic Solid-app
-  interop). Backed by `rudof`. For now, authoring integrity stays in the write pipelines.
+  violating writes get 422. Off unless a container binds a shape (mandatory validation would
+  break generic Solid-app interop). Backed by `rudof`.
 
 ## 12. v1 Scope
 
 **In:** core LDP CRUD, containers, conneg (Turtle/JSON-LD), ETags/conditional requests,
 N3-Patch, WAC (PRP+PDP), verify-only Solid-OIDC/DPoP auth, blob storage via `object_store`,
 `SparqlStore` over Oxigraph, `StorageSpace`/template matcher (single zero-var space),
-public-URL-aware minting, CORS for browser Solid apps.
+public-URL-aware minting, CORS for browser Solid apps, SHACL validation.
 
-**Deferred (seams only):** `/sparql` read proxy, HTML view, SHACL module, ACP, multi-tenant
+**Deferred (seams only):** `/sparql` read proxy, HTML view, ACP, multi-tenant
 registry/provisioning, Notifications, SPARQL UPDATE, data migration from the existing pod.
 
 ## 13. Success Criteria

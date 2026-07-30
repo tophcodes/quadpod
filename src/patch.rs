@@ -33,6 +33,11 @@ pub enum PatchError {
     /// IRI (§6.3).
     #[error("the urn:quadpod: namespace is reserved")]
     Reserved,
+    /// Carries an RDF 1.2 triple term — `400`, the same answer
+    /// [`crate::rdf::Format::parse`] gives the same construct in any other
+    /// body. This pod's wire contract is RDF 1.1.
+    #[error("RDF 1.2 triple terms are not accepted; this pod stores RDF 1.1")]
+    Rdf12TripleTerm,
 }
 
 /// One position of a triple pattern: ground, or the `n`th variable.
@@ -344,6 +349,13 @@ fn term(t: &N3Term, names: &mut Renumber, binding: Binding) -> Result<PatternTer
             Binding::Bind => Ok(PatternTerm::Var(names.bind(&format!("_:{}", b.as_str())))),
             Binding::Lookup => Err(PatchError::Shape("a blank node in insertions or deletions")),
         },
+        // The N3 parser understands RDF 1.2 because a dependency turns
+        // oxigraph's `rdf-12` on and Cargo unifies features crate-wide. The
+        // wire contract is RDF 1.1 (root spec §3), so the refusal is here —
+        // this is `text/n3`'s half of the rule `Format::parse` applies to
+        // every other body, and a patch is the only way into the store that
+        // does not go through that parser.
+        N3Term::Triple(_) => Err(PatchError::Rdf12TripleTerm),
     }
 }
 

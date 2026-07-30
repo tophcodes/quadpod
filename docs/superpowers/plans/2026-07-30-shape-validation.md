@@ -17,8 +17,163 @@
 - The data graph is the written body's **default graph**, alone (§3.4). No store read enters the write path.
 - This feature mints no vocabulary. `ldp:constrainedBy` and `sh:severity` are the whole interface.
 - A constraint document outside this pod's storage space is unsupported — shapes are never fetched over the network (§8).
-- After every task: `cargo test` passes and `arch-check` reports 0 violated, 0 broken.
+- After every task: `nix develop -c cargo test` passes and `arch-check` reports 0 violated, 0 broken.
 - Commit at the end of every task. Conventional commits.
+
+---
+
+### Task 0: Refuse RDF 1.2 triple terms at the parser
+
+**Why this task exists:** `rudof_lib` transitively enables oxigraph's `rdf-12` feature — unconditionally, through `rudof_rdf` and `sparql_service`, confirmed with `cargo tree -e features -i oxrdf`. Cargo unifies features project-wide, so adding the dependency (Task 1 Step 1) does two things beyond adding SHACL: `oxrdf::Term` gains a `Triple(_)` variant, and **the Turtle parser starts accepting RDF 1.2 syntax**. Measured, not assumed:
+
+```
+Input:  <http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .
+Output: ACCEPTED 1 quad(s)
+```
+
+The root spec's §3 non-goal — *"No RDF-star / RDF 1.2 on the wire — Solid is RDF-1.1-anchored"* — would otherwise stop holding silently. This task makes it hold because it is checked. `oxttl` 0.2.3 has no version switch, so the check is ours and it goes after parsing.
+
+**Files:**
+- Modify: `src/rdf.rs` (`RdfError`, `Format::parse`), `src/dataset.rs` (two exhaustive matches)
+- Test: `src/rdf.rs` and `src/http.rs`, each in its own `mod tests`
+
+**Interfaces:**
+- Consumes: nothing from earlier tasks — this is the first task
+- Produces: `RdfError::Rdf12TripleTerm`, and the invariant that **a `Dataset` built by `Format::parse` never holds a `Term::Triple`**. Tasks 1–5 rely on that invariant and never re-check it.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `src/rdf.rs`'s `mod tests`:
+
+```rust
+    /// RDF 1.2 triple terms are refused, so the wire contract stays RDF 1.1
+    /// even though the linked parser understands more (root spec §3).
+    #[test]
+    fn a_triple_term_is_refused() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = b"<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .";
+        assert!(matches!(
+            fmt.parse(ttl, "http://e/"),
+            Err(RdfError::Rdf12TripleTerm)
+        ));
+    }
+
+    /// The refusal is about triple terms, not about the syntax being new:
+    /// ordinary RDF 1.1 still parses.
+    #[test]
+    fn an_ordinary_triple_still_parses() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = b"<http://e/s> <http://e/p> <http://e/o> .";
+        assert_eq!(fmt.parse(ttl, "http://e/").unwrap().quads().len(), 1);
+    }
+```
+
+In `src/http.rs`'s `mod tests`:
+
+```rust
+    #[tokio::test]
+    async fn a_put_carrying_a_triple_term_is_a_400() {
+        let f = fixture().await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> ."
+            )).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `nix develop -c cargo test --lib rdf::tests::a_triple_term_is_refused`
+Expected: FAIL — at this point the crate does not compile at all, because Task 1's dependency is already in `Cargo.toml` and `src/dataset.rs` has two non-exhaustive matches (`E0004`). That compile error **is** the first failure; fix it in Step 3 and the test failure appears underneath it.
+
+- [ ] **Step 3: Close the two matches in `src/dataset.rs`**
+
+In `Skolemized::skolemize`, the object match gains:
+
+```rust
+                Term::Triple(_) => unreachable!(
+                    "Format::parse refuses RDF 1.2 triple terms, and every Dataset \
+                     skolemized here came from it"
+                ),
+```
+
+In `Skolemized::from_store`, the object match gains an arm consistent with its neighbours, which already decline what they cannot represent:
+
+```rust
+                    Term::Triple(_) => return None,
+```
+
+`unreachable!` with a justifying message is house style here (`src/rdf.rs:62`). The two arms differ on purpose: `skolemize` sees only client bodies, which Step 4 filters; `from_store` sees whatever the store holds, which this pod does not control on its own.
+
+- [ ] **Step 4: Refuse triple terms in `Format::parse`**
+
+Add the variant to `RdfError`:
+
+```rust
+    #[error("RDF 1.2 triple terms are not accepted; this pod stores RDF 1.1")]
+    Rdf12TripleTerm,
+```
+
+and the check in `Format::parse`, after the parse loop and before `Ok(Dataset::new(out))`:
+
+```rust
+        // The linked oxigraph has `rdf-12` on — a transitive dependency turns
+        // it on and Cargo unifies features crate-wide — so the parser accepts
+        // RDF 1.2. The wire contract is RDF 1.1 (root spec §3), and this is
+        // what keeps that true rather than incidental. Only the object can be
+        // a triple term; subjects are `NamedOrBlankNode`.
+        if out.iter().any(|q| matches!(q.object, Term::Triple(_))) {
+            return Err(RdfError::Rdf12TripleTerm);
+        }
+```
+
+Map `Rdf12TripleTerm` to the same status the existing parse failure produces (`400`) — find that mapping rather than adding a second one.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `nix develop -c cargo test --lib rdf::tests` then `nix develop -c cargo test --lib http::tests::a_put_carrying_a_triple_term_is_a_400`
+Expected: PASS.
+
+- [ ] **Step 6: Add the constraint**
+
+In `docs/constraints.md`, under a new `## RDF version` heading:
+
+```markdown
+The wire contract is RDF 1.1, and it is checked rather than assumed.
+    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-shape-validation-design.md §2.1.
+    `rudof_lib` turns on oxigraph's `rdf-12` feature transitively, and Cargo
+    unifies features crate-wide, so the linked parser accepts RDF 1.2 whether
+    this pod wants it or not. Before that dependency the non-goal held because
+    nothing had enabled the feature — an accident, not a property. `oxttl` has
+    no version switch, so the refusal is ours and lives in the one parser.
+    check: rg -q 'Term::Triple\(_\)' src/rdf.rs
+```
+
+- [ ] **Step 7: Run the whole suite and the checks**
+
+Run: `nix develop -c cargo test && arch-check`
+Expected: suite green, `14 checked, 0 violated, 0 broken`.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock src/rdf.rs src/dataset.rs src/http.rs docs/constraints.md
+git commit -m "feat: refuse RDF 1.2 triple terms, so the RDF 1.1 contract is checked"
+```
+
+`Cargo.toml` and `Cargo.lock` belong in this commit: the dependency is what introduces `Term::Triple` and therefore what makes this task necessary. An unused dependency compiles fine on its own.
+
+**`src/lib.rs` must NOT be in this commit, and neither must `src/shapes.rs`.** They belong together — `pub mod shapes;` without the file it names is `error[E0583]: file not found for module`, so committing the declaration alone leaves a commit that does not build on a fresh checkout, breaking `git bisect` and per-commit CI even though the working directory still compiles. Task 1 adds both in one commit. Verify before moving on:
+
+```bash
+git worktree add --detach /tmp/verify-task0 HEAD && \
+  (cd /tmp/verify-task0 && nix develop -c cargo check) && \
+  git worktree remove /tmp/verify-task0
+```
+
+A `cargo check` in your own working directory cannot catch this — the untracked file is still sitting there.
 
 ---
 
@@ -148,7 +303,7 @@ mod tests {
 
 - [ ] **Step 4: Run the tests to verify they fail**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: FAIL — `cannot find function validate in this scope`, `cannot find type ShapeError`.
 
 - [ ] **Step 5: Write the implementation**
@@ -270,12 +425,12 @@ If `Dataset` exposes its quads under a different accessor than `quads()`, use th
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 7: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green, `13 checked, 0 violated, 0 broken`.
 
 - [ ] **Step 8: Commit**
@@ -399,7 +554,7 @@ If `triples_of` is private to `http.rs`, move it to `dataset.rs` as `pub(crate) 
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: FAIL — `cannot find function load in this scope`.
 
 - [ ] **Step 3: Write the implementation**
@@ -467,12 +622,12 @@ pub async fn load(
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 6: Commit**
@@ -533,23 +688,23 @@ Add to `mod tests` in `src/http.rs`:
             "the refused write must not have replaced the stored representation");
     }
 
-    /// §5.1: validation runs before the ancestor walk, so a refusal leaves no
-    /// container behind for a resource that was never created.
+    /// §5.1: validation runs before the traversal that adds the containment
+    /// triple, so a refusal leaves the container exactly as it was — no
+    /// `ldp:contains` pointing at a resource that was never created.
     #[tokio::test]
-    async fn a_refused_deep_write_creates_no_ancestor() {
+    async fn a_refused_write_adds_no_containment() {
         let f = fixture().await;
         bind_note_shape(&f).await;
 
-        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/2026/n1")
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
             .unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-        let res = f.app.clone().oneshot(f.owner_request("GET", "/notes/2026/")
-            .body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND,
-            "the refused write materialized an ancestor container");
+        let listing = f.get_turtle("/notes/").await;
+        assert!(!listing.contains("/notes/n1"),
+            "the refused write left a containment triple behind: {listing}");
     }
 
     #[tokio::test]
@@ -648,12 +803,49 @@ Add to `mod tests` in `src/http.rs`:
     }
 ```
 
-`a_binding_does_not_reach_a_grandchild` contradicts `a_refused_deep_write_creates_no_ancestor` unless the container the binding is read from is the resource's **direct** parent. Both tests are wanted: the first pins §3.2, the second pins §5.1. Make them pass by reading the binding from `r.parent()`, and by having the second test bind the shape on `/notes/2026/` as well — adjust that test to `f.put_turtle("/notes/2026/", …)` before the refused write if the ancestor must exist for the binding to be found. Prefer the version that keeps §5.1's property observable.
+A note on what §5.1 is observable *through*, because it is easy to test the wrong thing. Because the binding does not inherit (§3.2), the container that refuses a write is always the target's direct parent — which must exist to hold the binding. A refused write therefore never had missing ancestors to materialize, and a test that asserts "no ancestor container was created" would pass no matter where validation sits. What `authorize_and_materialize` *does* add for a target that does not exist yet is the containment triple at the level above (`wac::guard`, the `is_member` branch). That triple is the observable: place validation after the walk and a `422` leaves `<container> ldp:contains <target>` pointing at a resource that was never created. `a_refused_write_adds_no_containment` is the test that fails when the ordering is wrong.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: FAIL — the violating write returns `201`, not `422`.
+
+- [ ] **Step 3a: Split the error type so a server fault is not blamed on the author**
+
+`shapes::validate` currently maps all five of its rudof failures to `ShapeError::Unparsable`, whose message promises the constraint document could not be read. Only one of them is about that document. Add a variant to `src/shapes.rs`:
+
+```rust
+    #[error("the validation engine failed: {0}")]
+    Engine(String),
+```
+
+and re-map inside `validate`:
+
+| step | variant |
+|---|---|
+| serializing the body for the engine | `Engine` |
+| `load_data` — parsing this pod's own serialization | `Engine` |
+| `load_shacl_shapes` | `Unparsable` |
+| `validate_shacl` | `Engine` |
+| `serialize_shacl_validation_results` | `Engine` |
+| parsing the report back | `Engine` |
+
+Exactly one step touches client-authored content; the rest are this pod's own work on its own output. Add a test pinning the split:
+
+```rust
+    /// A shapes document that is not SHACL is the author's problem; nothing
+    /// else in this function is.
+    #[test]
+    fn an_engine_failure_is_not_reported_as_an_unreadable_document() {
+        let body = turtle("<> a <http://schema.org/NoteDigitalDocument> .");
+        assert!(matches!(
+            validate("this is not turtle {{{", &body),
+            Err(ShapeError::Unparsable(_))
+        ));
+    }
+```
+
+That test already exists under the name `an_unparsable_shapes_document_is_an_error`; rename it rather than adding a duplicate, so the name says which half of the split it pins.
 
 - [ ] **Step 3: Write the enforcement helper**
 
@@ -682,14 +874,11 @@ async fn enforce_shape(
     let shapes = match crate::shapes::load(st.store.as_ref(), &st.space, &container).await {
         Ok(None) => return Ok(None),
         Ok(Some(s)) => s,
-        Err(crate::shapes::ShapeError::Resource(e)) => {
-            return Err((put_status(&e), e.to_string()).into_response())
-        }
-        Err(e) => return Err((StatusCode::CONFLICT, e.to_string()).into_response()),
+        Err(e) => return Err(shape_status(e)),
     };
     let report = match crate::shapes::validate(&shapes, dataset) {
         Ok(r) => r,
-        Err(e) => return Err((StatusCode::CONFLICT, e.to_string()).into_response()),
+        Err(e) => return Err(shape_status(e)),
     };
     if report.refuses() {
         let body = turtle_bytes(&report.into_dataset());
@@ -701,6 +890,25 @@ async fn enforce_shape(
             .into_response());
     }
     Ok(if report.is_empty() { None } else { Some(report) })
+}
+
+/// The response a shape lookup or validation failure earns.
+///
+/// The split is whose fault it is. Only parsing the constraint document reads
+/// something an author wrote, so only that is a `409` telling them to fix it;
+/// the engine failing, or this pod failing to serialize or re-read its own
+/// output, is a `500`. One function, so the two cannot drift apart.
+fn shape_status(e: crate::shapes::ShapeError) -> Response {
+    use crate::shapes::ShapeError;
+    let message = e.to_string();
+    let status = match &e {
+        ShapeError::Resource(r) => put_status(r),
+        ShapeError::Engine(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ShapeError::Unparsable(_) | ShapeError::Unsupported(_) | ShapeError::Missing => {
+            StatusCode::CONFLICT
+        }
+    };
+    (status, message).into_response()
 }
 
 /// A dataset as Turtle, for an error body. Not negotiated: `Accept` describes
@@ -743,12 +951,12 @@ fn report_link(target: &Target, mut res: Response) -> Response {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: PASS.
 
 - [ ] **Step 6: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 7: Commit**
@@ -805,7 +1013,7 @@ git commit -m "feat: refuse a PUT that violates its container's shape"
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib http::tests::a_violating_post_is_refused_and_creates_nothing`
+Run: `nix develop -c cargo test --lib http::tests::a_violating_post_is_refused_and_creates_nothing`
 Expected: FAIL — status is `201`.
 
 - [ ] **Step 3: Call `enforce_shape` from `post_impl`**
@@ -823,12 +1031,12 @@ Blob branches skip it exactly as in `put_impl`: the `Repr::Blob` arm never reach
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: PASS.
 
 - [ ] **Step 5: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 6: Commit**
@@ -949,7 +1157,7 @@ Replace `BOB` with whatever the existing tests call the non-owner WebID — grep
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib http::tests::validate_view`
+Run: `nix develop -c cargo test --lib http::tests::validate_view`
 Expected: FAIL — the resource's own representation comes back instead of a report.
 
 - [ ] **Step 3: Route the query parameter**
@@ -1038,12 +1246,12 @@ async fn validate_view(
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: PASS.
 
 - [ ] **Step 6: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 7: Commit**

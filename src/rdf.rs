@@ -10,6 +10,8 @@ pub enum RdfError {
     Serialize(String),
     #[error("unsupported media type")]
     UnsupportedType,
+    #[error("RDF 1.2 triple terms are not accepted; this pod stores RDF 1.1")]
+    Rdf12TripleTerm,
 }
 
 fn media_type(ct: &str) -> &str {
@@ -172,12 +174,21 @@ impl Format {
     }
 
     pub fn parse(&self, bytes: &[u8], base_iri: &str) -> Result<Dataset, RdfError> {
+        use oxigraph::model::Term;
         let parser = RdfParser::from_format(self.0)
             .with_base_iri(base_iri)
             .map_err(|e| RdfError::Parse(e.to_string()))?;
         let mut out = Vec::new();
         for quad in parser.for_slice(bytes) {
             out.push(quad.map_err(|e| RdfError::Parse(e.to_string()))?);
+        }
+        // The linked oxigraph has `rdf-12` on — a transitive dependency turns
+        // it on and Cargo unifies features crate-wide — so the parser accepts
+        // RDF 1.2. The wire contract is RDF 1.1 (root spec §3), and this is
+        // what keeps that true rather than incidental. Only the object can be
+        // a triple term; subjects are `NamedOrBlankNode`.
+        if out.iter().any(|q| matches!(q.object, Term::Triple(_))) {
+            return Err(RdfError::Rdf12TripleTerm);
         }
         Ok(Dataset::new(out))
     }
@@ -346,6 +357,27 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
 mod tests {
     use super::*;
     use oxigraph::model::{GraphName, Literal, NamedNode, Quad};
+
+    /// RDF 1.2 triple terms are refused, so the wire contract stays RDF 1.1
+    /// even though the linked parser understands more (root spec §3).
+    #[test]
+    fn a_triple_term_is_refused() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = b"<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .";
+        assert!(matches!(
+            fmt.parse(ttl, "http://e/"),
+            Err(RdfError::Rdf12TripleTerm)
+        ));
+    }
+
+    /// The refusal is about triple terms, not about the syntax being new:
+    /// ordinary RDF 1.1 still parses.
+    #[test]
+    fn an_ordinary_triple_still_parses() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = b"<http://e/s> <http://e/p> <http://e/o> .";
+        assert_eq!(fmt.parse(ttl, "http://e/").unwrap().quads().len(), 1);
+    }
 
     // Not superseded by the JSON-LD-named-graph tests below: this pins that
     // a plain, default-graph dataset still round-trips through both formats.

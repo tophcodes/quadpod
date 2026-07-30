@@ -93,6 +93,20 @@ Only `blob::BlobKey` builds an object key.
     published operator promise with nothing else enforcing it.
     check: rg -qU '#\[cfg\(test\)\]\s*\n\s*pub fn permissive' src/auth/safe_fetch.rs
 
+Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
+    → 2026-07-30-shape-validation-design.md §2.1. `rudof_lib` pulls
+    `http-client` into the tree, which gives a bare `SparqlEvaluator::new()`
+    a live `SERVICE` handler by default — a capability this pod's own
+    server-authored queries never use and nothing here should be able to
+    reach for. The compiler does not require the opt-out:
+    `.without_default_http_service_handler()` is a builder call a future
+    query site can simply omit and still compile. `SparqlEvaluator` also
+    implements `Default`, so `SparqlEvaluator::default()` constructs the same
+    live-`SERVICE` evaluator and must count as a construction site too — a
+    check pinned to `::new()` alone is a check a rewrite to `::default()`
+    walks straight past while staying green.
+    check: [ "$(rg -o 'SparqlEvaluator::(new|default)\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
+
 `SparqlStore` has exactly one implementor.
     → 2026-07-24-sparql-solid-pod-design.md §16 ADR-2;
     2026-07-28-jsonld-datasets-design.md §5.2. A tripwire, not a prohibition:
@@ -167,3 +181,57 @@ The `Accept` header is parsed in exactly one place.
     reader cannot avoid rewriting, which is what makes this fail against a real
     violation rather than against a naming convention.
     check: [ "$(rg -o 'strip_prefix\("q="\)' src | wc -l)" = 1 ]
+
+## Shape validation
+
+Only `shapes` reads the constraint binding.
+    → 2026-07-30-shape-validation-design.md §3.1, §3.2. The binding is what
+    decides whether a write is checked at all; a second reader is a second
+    answer to "is this container constrained", and the one that says no wins
+    silently. The lookup is also the seam a shape-tree binding would replace
+    (§8), which only stays a second lookup while there is exactly one. Three
+    conjuncts, because a second reader can take three different shapes: it can
+    spell the IRI itself (bare-quoted, as `container.rs` spells
+    `LDP_CONTAINS`'s value, or angle-bracketed inside a SPARQL string, as
+    every other metadata read in this crate does); or it can skip the spelling
+    entirely by importing `LDP_CONSTRAINED_BY` and comparing against that.
+    `src/http.rs` is excluded from the first conjunct rather than cleared
+    outright: its `#[cfg(test)]` fixtures `PUT` a Turtle body to set a binding
+    up, which is data, not a read, but it is still the IRI in text — so the
+    second conjunct pins today's count instead, and a new occurrence anywhere
+    in the file, reader or fixture, goes red. The count includes one
+    non-fixture occurrence: the `422` refusal's own `Link:
+    rel="…ldp#constrainedBy"` header (§3.1) — the response naming the shape
+    that refused it is not a second *read* of the binding, since it is built
+    from the `Shape` `shapes::load` already returned, but it is one more
+    place this file spells the IRI, so it counts here rather than being
+    carved out like the fixtures are. The third conjunct is what stops the
+    import: `LDP_CONSTRAINED_BY` stays private, so nothing outside
+    `shapes.rs` can name it to compare against — and any restricted-visibility
+    modifier (`pub(crate)`, `pub(super)`, `pub(in path)`) counts as exported
+    for this purpose, since `shapes` is a top-level module and `pub(super)`
+    is exactly `pub(crate)` here, so the pattern below matches all of them.
+    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs | wc -l)" = 7 ] && ! rg -q 'pub(\([^)]*\))? const LDP_CONSTRAINED_BY' src/shapes.rs
+
+The query string is read in exactly one place.
+    → §6. `?validate` is the only query parameter this pod gives meaning to,
+    and the reason it is safe is that it changes no path and therefore no WAC
+    target. A second reader elsewhere is behaviour hidden behind a parameter
+    that no URL shows and no ACL names.
+    check: [ "$(rg -o 'RawQuery' src | wc -l)" = 5 ]
+
+## RDF version
+
+The wire contract is RDF 1.1, and it is checked rather than assumed — in both parsers that can
+build a `Dataset`, not just the first.
+    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-shape-validation-design.md §2.1.
+    `rudof_lib` turns on oxigraph's `rdf-12` feature transitively, and Cargo
+    unifies features crate-wide, so every parser built on `oxttl` accepts RDF
+    1.2 whether this pod wants it or not. Before that dependency the non-goal
+    held because nothing had enabled the feature — an accident, not a
+    property. `oxttl` has no version switch, so the refusal is ours. It has to
+    be in two places because a patch is the only way into the store that does
+    not go through `Format::parse`: a `text/n3` body reaches
+    `patch::Patch::parse` instead, which builds no `Dataset` and so sits
+    outside a refusal that lived only in `rdf.rs`.
+    check: rg -q 'Term::Triple\(_\)' src/rdf.rs && rg -q 'N3Term::Triple\(_\)' src/patch.rs

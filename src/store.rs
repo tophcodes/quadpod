@@ -64,6 +64,7 @@ impl SparqlStore for OxigraphStore {
 
     async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, StoreError> {
         let results = SparqlEvaluator::new()
+            .without_default_http_service_handler()
             .parse_query(sparql)
             .map_err(|e| StoreError::Backend(e.to_string()))?
             .on_store(&self.inner)
@@ -79,6 +80,7 @@ impl SparqlStore for OxigraphStore {
 
     async fn ask(&self, sparql: &str) -> Result<bool, StoreError> {
         let results = SparqlEvaluator::new()
+            .without_default_http_service_handler()
             .parse_query(sparql)
             .map_err(|e| StoreError::Backend(e.to_string()))?
             .on_store(&self.inner)
@@ -92,6 +94,7 @@ impl SparqlStore for OxigraphStore {
 
     async fn query_solutions(&self, sparql: &str) -> Result<Vec<QuerySolution>, StoreError> {
         let results = SparqlEvaluator::new()
+            .without_default_http_service_handler()
             .parse_query(sparql)
             .map_err(|e| StoreError::Backend(e.to_string()))?
             .on_store(&self.inner)

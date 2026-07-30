@@ -17,7 +17,7 @@
 //! and not a self-check.
 
 use crate::rdf::Format;
-use oxigraph::model::{Literal, NamedNode, Quad};
+use oxigraph::model::{Literal, NamedNode, Quad, Triple};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -222,6 +222,14 @@ impl Dataset {
     }
 }
 
+/// A dataset's quads as triples, graph name dropped. Used only where the
+/// caller has already established there is no graph name worth keeping —
+/// either every quad is already in the default graph, or (the containment
+/// check) the graph name is exactly what must not hide anything from it.
+pub(crate) fn triples_of(dataset: &Dataset) -> Vec<Triple> {
+    dataset.quads().iter().cloned().map(Triple::from).collect()
+}
+
 /// The skolem namespace. Only this module writes or matches it — see
 /// `docs/constraints.md`.
 const SKOLEM_PREFIX: &str = "urn:quadpod:bnode:";
@@ -263,6 +271,10 @@ impl Skolemized {
                 Term::NamedNode(n) => GroundTerm::NamedNode(n.clone()),
                 Term::BlankNode(b) => GroundTerm::NamedNode(iri_for(b)),
                 Term::Literal(l) => GroundTerm::Literal(l.clone()),
+                Term::Triple(_) => unreachable!(
+                    "Format::parse refuses RDF 1.2 triple terms, and every Dataset \
+                     skolemized here came from it"
+                ),
             },
             graph_name: match &q.graph_name {
                 GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
@@ -297,6 +309,7 @@ impl Skolemized {
                     Term::NamedNode(n) => GroundTerm::NamedNode(n),
                     Term::Literal(l) => GroundTerm::Literal(l),
                     Term::BlankNode(_) => return None,
+                    Term::Triple(_) => return None,
                 },
                 graph_name: match q.graph_name {
                     GraphName::DefaultGraph => GroundGraphName::DefaultGraph,

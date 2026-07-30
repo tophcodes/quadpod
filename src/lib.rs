@@ -8,6 +8,7 @@ pub mod http;
 pub mod patch;
 pub mod rdf;
 pub mod resource;
+pub mod shapes;
 pub mod shelf;
 pub mod space;
 pub mod sparql;

@@ -549,7 +549,7 @@ pub async fn registered_shelves(
 /// one — the caller supplies it via the `GRAPH <...>` wrapper around the
 /// rendered body — so every quad is tagged `GraphName::DefaultGraph` here
 /// purely to satisfy [`Dataset`]'s shape.
-fn as_quads(triples: &[Triple]) -> Vec<oxigraph::model::Quad> {
+pub(crate) fn as_quads(triples: &[Triple]) -> Vec<oxigraph::model::Quad> {
     triples.iter()
         .map(|t| oxigraph::model::Quad::new(
             t.subject.clone(), t.predicate.clone(), t.object.clone(),
