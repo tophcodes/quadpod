@@ -22,6 +22,10 @@ use crate::{
 pub enum AuxError {
     #[error("the auxiliary's subject resource does not exist")]
     SubjectMissing,
+    /// The subject is there; the auxiliary itself is not. Only operations that
+    /// require an existing auxiliary report this — [`put`] writes one instead.
+    #[error("the auxiliary resource does not exist")]
+    Missing,
     #[error(transparent)]
     Resource(#[from] ResourceError),
 }
@@ -115,17 +119,38 @@ pub async fn put(
     Ok(())
 }
 
-/// Apply a patch to an auxiliary. Fails when its subject does not exist, for
-/// the same reason [`put`] does.
+/// Apply a patch to an auxiliary that already exists. A patch does not create
+/// one: an absent auxiliary is [`AuxError::Missing`], or
+/// [`AuxError::SubjectMissing`] when the subject it would belong to is absent
+/// too — the case [`put`] refuses for the same reason.
 ///
-/// The guard is the one [`conditional_put_update`] uses, folded into the
-/// patch's own `WHERE` so the precondition and the write stay one operation.
-/// The `exists` call afterwards only decides what the caller is told.
+/// That check runs *before* the patch, where [`put`]'s runs after. A check
+/// that can only refuse is safe against an interleaved `DELETE`; the
+/// two-round-trip objection in [`conditional_put_update`] is about a check
+/// that then writes. It has to run first, because afterwards the two ways a
+/// patch can leave the auxiliary absent — it was never there, or the subject
+/// was deleted under the write — are indistinguishable, and the first is not
+/// a missing subject.
+///
+/// The write itself carries the guard [`conditional_put_update`] uses, folded
+/// into the patch's own `WHERE` so the precondition and the write stay one
+/// operation. The `exists` call afterwards is what the guard's suppression
+/// looks like from here: an auxiliary that was present before the update and
+/// is gone after went with its subject's delete cascade, so nothing landed
+/// and the caller is told the subject is missing rather than that the patch
+/// applied.
 pub async fn patch(
     store: &dyn SparqlStore,
     aux: &AuxUrl,
     patch: &crate::patch::Patch,
 ) -> Result<PatchResult, AuxError> {
+    if !exists(store, aux).await? {
+        return Err(if exists(store, aux.subject()).await? {
+            AuxError::Missing
+        } else {
+            AuxError::SubjectMissing
+        });
+    }
     let result =
         crate::resource::patch_guarded(store, aux, patch, &subject_present_guard(aux)).await?;
     if !exists(store, aux).await? {

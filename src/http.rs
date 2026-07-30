@@ -548,8 +548,10 @@ async fn patch_impl(
     // An auxiliary is written through `aux`, whose subject-existence guard is
     // what keeps a policy document off a path that names nothing, and it
     // answers the same `404` `put_impl` does when the subject is gone. It
-    // takes its own branch here because it has no existence check of its own
-    // to run below: the guard is inside its update.
+    // takes its own branch here because the `exists` check below is not the
+    // one it needs: §7's creation path is closed for an auxiliary as well, and
+    // `aux::patch` refuses an absent one itself, with a body that says which
+    // of the two is missing.
     let r = match &target {
         Target::Resource(r) => r,
         Target::Container(c) => c.as_resource(),
@@ -558,6 +560,9 @@ async fn patch_impl(
                 Ok(result) => patch_response(result, &patch),
                 Err(AuxError::SubjectMissing) => {
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
+                }
+                Err(e @ AuxError::Missing) => {
+                    (StatusCode::NOT_FOUND, e.to_string()).into_response()
                 }
                 Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
             }
@@ -898,6 +903,9 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
                 Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(&target)),
                 Err(AuxError::SubjectMissing) =>
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
+                // Unreachable: `put` writes the auxiliary, so it never asks
+                // for one that is already there.
+                Err(AuxError::Missing) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                 Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
             }
         }
@@ -5166,6 +5174,101 @@ mod tests {
             !stored.iter().any(|t| t.to_string().contains("#bob") && t.to_string().ends_with("#Control>")),
             "a refused patch must not have granted anything: {stored:?}"
         );
+    }
+
+    // The converse of the test above, and the only one that pins §8's skip of
+    // the §9 mode check: `authorize` substituted Control for the auxiliary, so
+    // an agent holding Control and nothing else is exactly who may rewrite the
+    // policy. Asking §9's question again would demand Append on top of
+    // Control — which Control does not subsume — and refuse them. The owner's
+    // own ACL grants Read, Write and Control together, so no test using it can
+    // tell the skip from its absence.
+    #[tokio::test]
+    async fn control_alone_may_patch_an_acl() {
+        let f = fixture().await;
+        let carol = "https://carol.example/card#me";
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let acl = profile_acl(&format!(
+            "<#carol> <http://www.w3.org/ns/auth/acl#agent> <{carol}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        ));
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let carol_app = f.app_also_trusting(carol);
+        let req = f.sign(
+            Request::builder().method("PATCH").uri("/.aux/profile.acl"),
+            carol, "PATCH", "/.aux/profile.acl",
+        )
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:inserts { <#carol> <http://www.w3.org/ns/auth/acl#mode> \
+                                   <http://www.w3.org/ns/auth/acl#Append> . } .\n")))
+            .unwrap();
+        assert_eq!(carol_app.oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+        let stored = f.stored("/.aux/profile.acl").await.expect("the ACL exists");
+        assert!(
+            stored.iter().any(|t| t.to_string().ends_with("#Append>")),
+            "the patch an agent with Control may make must land: {stored:?}"
+        );
+    }
+
+    // A patch does not create an auxiliary. The subject is present here, so
+    // the subject-missing `404` would be a false statement about the store —
+    // and an insert-only patch, whose `WHERE` the subject guard satisfies,
+    // would otherwise leave its triples in a graph nothing marks present.
+    #[tokio::test]
+    async fn patching_an_absent_acl_whose_subject_exists_is_404_and_writes_nothing() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = patch_n3(&f, "/.aux/profile.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Control> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_string(res).await, AuxError::Missing.to_string(),
+            "the subject exists, so the subject-missing body would be untrue");
+
+        assert!(f.stored("/.aux/profile.acl").await.is_none());
+        // Not just unmarked: `stored` gates on the presence marker, so it
+        // reports `None` for a graph full of triples nobody ever made present.
+        let iri = f.url("/.aux/profile.acl").graph_iri().to_string();
+        let leftover = f.store
+            .query_triples(&format!(
+                "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"
+            ))
+            .await
+            .unwrap();
+        assert!(leftover.is_empty(), "the refused patch wrote into the ACL graph: {leftover:?}");
+    }
+
+    // The other face of the same defect: a patch whose conditions match
+    // nothing returns before touching the store, and an existence question
+    // asked afterwards would turn that `409` into a `404` about a resource
+    // that is right there.
+    #[tokio::test]
+    async fn a_patch_matching_nothing_at_an_acl_is_409_not_404() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(profile_acl(""))).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let res = patch_n3(&f, "/.aux/profile.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?a <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Append> . } ;\n\
+               solid:inserts { ?a <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Write> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

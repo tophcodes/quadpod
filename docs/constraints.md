@@ -147,6 +147,10 @@ Only `aux` patches an auxiliary.
     without the subject-existence guard plants a policy document on a path that
     no longer exists — permanent, because nearest-ACL-wins then hands it out.
     The type system cannot express "guarded" here; this check can.
+    What the grep pins is narrower than the sentence above it: that no other
+    file names the symbol at all, doc comment included — it does not stop
+    `aux.rs` itself from passing an empty guard, and `aux::patch`'s tests are
+    what pin that the guard is there.
     check: ! rg -q 'patch_guarded' src --glob '!src/aux.rs' --glob '!src/resource.rs'
 
 The `Accept` header is parsed in exactly one place.
