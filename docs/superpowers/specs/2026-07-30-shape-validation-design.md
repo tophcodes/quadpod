@@ -222,7 +222,8 @@ wants refusal there should say `sh:Violation`.
   no business refusing one, and a shape that could would be a way to lock an ACL.
 - **Blob bodies.** There are no triples to validate. A blob write into a constrained container
   therefore always succeeds, which is a hole only for constraints about the container — and
-  those are out of scope (§3.4, §8).
+  those are out of scope (§3.4, §8). For the same reason, `GET /path?validate` on a blob answers
+  `404`: there is no report for a representation SHACL never saw (§6, §7).
 
 ## 6. Read path — `GET /path?validate`
 
@@ -275,8 +276,10 @@ there is no constraint.
 | findings below `sh:Violation` only | the write's ordinary `201`/`204`, plus `Link: </path?validate>; rel="describedby"` |
 | no findings | the write's ordinary response, no extra header |
 | binding names a resource that does not exist, is a blob of an unsupported type, names more than one document, or does not parse as SHACL | `409`, naming the unusable constraint document |
+| binding names a constraint document that uses SHACL-SPARQL (§8) | `409`, naming the unusable constraint document |
 | the validation engine itself fails | `500` |
 | `?validate` on an unconstrained or absent resource | `404` |
+| `?validate` on an existing blob | `404` (§5.3) |
 
 The `500` row is what keeps the `409` honest. Of everything that can go wrong between reading
 the binding and holding a report, exactly one step touches client-authored content: parsing
@@ -365,9 +368,9 @@ Properties, each of which must be shown to fail before the code that makes it ho
   store read is added to the write path.
 - **Nothing constrains a container's shape as a whole** — not its member count, not its member
   types. `ldp:contains` is never in a data graph here (§3.4, §8).
-- **SHACL Core only.** No SPARQL-based constraints, targets or rules (`sh:sparql`, `sh:select`,
-  `sh:ask`) and no SPARQL-based constraint components — `shapes::load` refuses a shapes graph
-  that mentions any of them (§8).
+- **SHACL Core only.** No SPARQL-based constraints, targets, rules or update executables
+  (`sh:sparql`, `sh:select`, `sh:ask`, `sh:construct`, `sh:update`) and no SPARQL-based
+  constraint components — `shapes::load` refuses a shapes graph that mentions any of them (§8).
 - **Named graphs in a body are never validated** (§3.4). A dataset-valued resource is checked
   on its default graph only, so a shape cannot reach what a client put in a named graph.
 - **`?validate` is reachable by any agent with `acl:Read`**, and repeated calls are repeated

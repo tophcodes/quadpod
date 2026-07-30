@@ -100,8 +100,12 @@ Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     server-authored queries never use and nothing here should be able to
     reach for. The compiler does not require the opt-out:
     `.without_default_http_service_handler()` is a builder call a future
-    query site can simply omit and still compile.
-    check: [ "$(rg -o 'SparqlEvaluator::new\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
+    query site can simply omit and still compile. `SparqlEvaluator` also
+    implements `Default`, so `SparqlEvaluator::default()` constructs the same
+    live-`SERVICE` evaluator and must count as a construction site too — a
+    check pinned to `::new()` alone is a check a rewrite to `::default()`
+    walks straight past while staying green.
+    check: [ "$(rg -o 'SparqlEvaluator::(new|default)\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
 
 `SparqlStore` has exactly one implementor.
     → 2026-07-24-sparql-solid-pod-design.md §16 ADR-2;
@@ -172,9 +176,11 @@ Only `shapes` reads the constraint binding.
     place this file spells the IRI, so it counts here rather than being
     carved out like the fixtures are. The third conjunct is what stops the
     import: `LDP_CONSTRAINED_BY` stays private, so nothing outside
-    `shapes.rs` can name it to compare against — and `pub(crate)` counts as
-    exported for this purpose, so the pattern below matches both.
-    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs | wc -l)" = 7 ] && ! rg -q 'pub(\(crate\))? const LDP_CONSTRAINED_BY' src/shapes.rs
+    `shapes.rs` can name it to compare against — and any restricted-visibility
+    modifier (`pub(crate)`, `pub(super)`, `pub(in path)`) counts as exported
+    for this purpose, since `shapes` is a top-level module and `pub(super)`
+    is exactly `pub(crate)` here, so the pattern below matches all of them.
+    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs | wc -l)" = 7 ] && ! rg -q 'pub(\([^)]*\))? const LDP_CONSTRAINED_BY' src/shapes.rs
 
 The query string is read in exactly one place.
     → §6. `?validate` is the only query parameter this pod gives meaning to,
