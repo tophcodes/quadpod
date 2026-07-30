@@ -90,8 +90,19 @@ impl SparqlStore for OxigraphStore {
         }
     }
 
-    async fn query_solutions(&self, _sparql: &str) -> Result<Vec<QuerySolution>, StoreError> {
-        todo!()
+    async fn query_solutions(&self, sparql: &str) -> Result<Vec<QuerySolution>, StoreError> {
+        let results = SparqlEvaluator::new()
+            .parse_query(sparql)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .on_store(&self.inner)
+            .execute()
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let QueryResults::Solutions(solutions) = results else {
+            return Err(StoreError::Backend("expected SELECT/solution results".into()));
+        };
+        solutions
+            .map(|s| s.map_err(|e| StoreError::Backend(e.to_string())))
+            .collect()
     }
 }
 
@@ -141,5 +152,30 @@ mod tests {
             "ASK { GRAPH <https://pod.toph.so/foo> { \
              <https://pod.toph.so/foo#it> <http://schema.org/name> \"Nope\" } }",
         ).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn query_solutions_returns_one_row_per_mapping() {
+        let store = OxigraphStore::in_memory().unwrap();
+        store.update(
+            "INSERT DATA { GRAPH <https://pod.toph.so/foo> { \
+             <https://pod.toph.so/foo#a> <http://schema.org/name> \"one\" . \
+             <https://pod.toph.so/foo#b> <http://schema.org/name> \"two\" } }",
+        ).await.unwrap();
+
+        let rows = store.query_solutions(
+            "SELECT ?s WHERE { GRAPH <https://pod.toph.so/foo> { ?s <http://schema.org/name> ?n } }",
+        ).await.unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // LIMIT is honoured, which is what makes counting cheap.
+        let capped = store.query_solutions(
+            "SELECT ?s WHERE { GRAPH <https://pod.toph.so/foo> { ?s <http://schema.org/name> ?n } } LIMIT 1",
+        ).await.unwrap();
+        assert_eq!(capped.len(), 1);
+
+        // A query of the wrong shape is an error, not an empty answer — the
+        // same line `query_triples` and `ask` already draw.
+        assert!(store.query_solutions("ASK { ?s ?p ?o }").await.is_err());
     }
 }
