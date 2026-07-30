@@ -810,6 +810,43 @@ A note on what §5.1 is observable *through*, because it is easy to test the wro
 Run: `nix develop -c cargo test --lib http::tests`
 Expected: FAIL — the violating write returns `201`, not `422`.
 
+- [ ] **Step 3a: Split the error type so a server fault is not blamed on the author**
+
+`shapes::validate` currently maps all five of its rudof failures to `ShapeError::Unparsable`, whose message promises the constraint document could not be read. Only one of them is about that document. Add a variant to `src/shapes.rs`:
+
+```rust
+    #[error("the validation engine failed: {0}")]
+    Engine(String),
+```
+
+and re-map inside `validate`:
+
+| step | variant |
+|---|---|
+| serializing the body for the engine | `Engine` |
+| `load_data` — parsing this pod's own serialization | `Engine` |
+| `load_shacl_shapes` | `Unparsable` |
+| `validate_shacl` | `Engine` |
+| `serialize_shacl_validation_results` | `Engine` |
+| parsing the report back | `Engine` |
+
+Exactly one step touches client-authored content; the rest are this pod's own work on its own output. Add a test pinning the split:
+
+```rust
+    /// A shapes document that is not SHACL is the author's problem; nothing
+    /// else in this function is.
+    #[test]
+    fn an_engine_failure_is_not_reported_as_an_unreadable_document() {
+        let body = turtle("<> a <http://schema.org/NoteDigitalDocument> .");
+        assert!(matches!(
+            validate("this is not turtle {{{", &body),
+            Err(ShapeError::Unparsable(_))
+        ));
+    }
+```
+
+That test already exists under the name `an_unparsable_shapes_document_is_an_error`; rename it rather than adding a duplicate, so the name says which half of the split it pins.
+
 - [ ] **Step 3: Write the enforcement helper**
 
 Add to `src/http.rs`, near `check_conditionals`:
@@ -837,14 +874,11 @@ async fn enforce_shape(
     let shapes = match crate::shapes::load(st.store.as_ref(), &st.space, &container).await {
         Ok(None) => return Ok(None),
         Ok(Some(s)) => s,
-        Err(crate::shapes::ShapeError::Resource(e)) => {
-            return Err((put_status(&e), e.to_string()).into_response())
-        }
-        Err(e) => return Err((StatusCode::CONFLICT, e.to_string()).into_response()),
+        Err(e) => return Err(shape_status(e)),
     };
     let report = match crate::shapes::validate(&shapes, dataset) {
         Ok(r) => r,
-        Err(e) => return Err((StatusCode::CONFLICT, e.to_string()).into_response()),
+        Err(e) => return Err(shape_status(e)),
     };
     if report.refuses() {
         let body = turtle_bytes(&report.into_dataset());
@@ -856,6 +890,25 @@ async fn enforce_shape(
             .into_response());
     }
     Ok(if report.is_empty() { None } else { Some(report) })
+}
+
+/// The response a shape lookup or validation failure earns.
+///
+/// The split is whose fault it is. Only parsing the constraint document reads
+/// something an author wrote, so only that is a `409` telling them to fix it;
+/// the engine failing, or this pod failing to serialize or re-read its own
+/// output, is a `500`. One function, so the two cannot drift apart.
+fn shape_status(e: crate::shapes::ShapeError) -> Response {
+    use crate::shapes::ShapeError;
+    let message = e.to_string();
+    let status = match &e {
+        ShapeError::Resource(r) => put_status(r),
+        ShapeError::Engine(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ShapeError::Unparsable(_) | ShapeError::Unsupported(_) | ShapeError::Missing => {
+            StatusCode::CONFLICT
+        }
+    };
+    (status, message).into_response()
 }
 
 /// A dataset as Turtle, for an error body. Not negotiated: `Accept` describes

@@ -268,8 +268,18 @@ there is no constraint.
 | any `sh:Violation` result | `422`, body is the report, `Link: <shape>; rel="…ldp#constrainedBy"` |
 | findings below `sh:Violation` only | the write's ordinary `201`/`204`, plus `Link: </path?validate>; rel="describedby"` |
 | no findings | the write's ordinary response, no extra header |
-| binding names a resource that does not exist, is a blob of an unsupported type, or does not parse as SHACL | `409`, naming the unusable constraint document |
+| binding names a resource that does not exist, is a blob of an unsupported type, names more than one document, or does not parse as SHACL | `409`, naming the unusable constraint document |
+| the validation engine itself fails | `500` |
 | `?validate` on an unconstrained or absent resource | `404` |
+
+The `500` row is what keeps the `409` honest. Of everything that can go wrong between reading
+the binding and holding a report, exactly one step touches client-authored content: parsing
+the shapes document. The rest — serializing the body for the engine, the engine's own
+validation run, serializing the report, parsing it back — are this pod's own work on its own
+output, and a failure there is a server fault. Reporting it as `409` would tell an author
+their document is broken when it is not, and make a container look bricked when nothing about
+it is wrong. The distinction is carried in the error type rather than reconstructed at the
+edge, so the two cannot drift.
 
 The `409` fails closed. A container whose constraint document is broken refuses every write
 until it is fixed — see §10.
