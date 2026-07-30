@@ -4951,6 +4951,12 @@ mod tests {
         async fn ask(&self, sparql: &str) -> Result<bool, crate::store::StoreError> {
             self.inner.ask(sparql).await
         }
+        /// Delegated, not pinned: this double exists to fail *writes*, and
+        /// answering anything else here would make it quietly also a test of
+        /// version refusal.
+        fn rdf_version(&self) -> crate::rdf::RdfVersion {
+            self.inner.rdf_version()
+        }
     }
 
     /// The `describedby` link falls out of a tail that `Target::Resource`'s
