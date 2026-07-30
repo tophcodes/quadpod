@@ -97,6 +97,12 @@ is declared inside the data, which makes it a per-write client choice rather tha
 policy. The choice is therefore the server's, and this design makes it once: **the data graph
 is the body being written, alone.**
 
+Precisely: the body's **default graph**. SHACL Core validates one graph, and a dataset-valued
+body (§6.2 of the datasets design) has several. Unioning them would validate a document the
+author never wrote and would make a shape's meaning depend on how many graphs a client
+happened to send; the default graph is the one every serialization can carry and the one
+`Dataset::default_graph_only` already names.
+
 That is the common denominator of the shape languages. A ShEx schema checks a node against a
 shape through a ShapeMap and has no notion of a container's aggregate state at all, so a
 document-scoped binding is the only one both languages can mean the same thing by. Widening
@@ -288,6 +294,8 @@ Properties, each of which must be shown to fail before the code that makes it ho
   store read is added to the write path.
 - **Nothing constrains a container's shape as a whole** — not its member count, not its member
   types. `ldp:contains` is never in a data graph here (§3.4, §8).
+- **Named graphs in a body are never validated** (§3.4). A dataset-valued resource is checked
+  on its default graph only, so a shape cannot reach what a client put in a named graph.
 - **`?validate` is reachable by any agent with `acl:Read`**, and repeated calls are repeated
   validation work. There is no rate limit in this pod.
 - **The report describes now, not then.** A report fetched after a later write describes the
