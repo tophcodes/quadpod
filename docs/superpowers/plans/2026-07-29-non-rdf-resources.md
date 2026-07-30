@@ -1624,7 +1624,7 @@ start rather than silently falling back."
     async fn a_non_rdf_body_on_an_auxiliary_is_a_415() {
         let f = fixture().await;
         f.put_turtle("/subject", "").await;
-        let res = f.app.clone().oneshot(f.owner_request("PUT", "/.aux/acl/subject")
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/.aux/subject.acl")
             .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from("x")).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -2008,7 +2008,7 @@ In `src/http.rs`'s `mod tests`:
     async fn wac_governs_a_blob_exactly_as_it_governs_a_graph() {
         let f = fixture().await;
         f.put_blob("/secret.txt", "text/plain", b"s3cret").await;
-        f.put_turtle("/.aux/acl/secret.txt", &format!(
+        f.put_turtle("/.aux/secret.txt.acl", &format!(
             "@prefix acl: <http://www.w3.org/ns/auth/acl#> . \
              <#owner> a acl:Authorization ; \
                acl:agent <{OWNER}> ; \
