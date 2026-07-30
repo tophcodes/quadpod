@@ -208,14 +208,6 @@ impl Format {
     }
 }
 
-/// §6.3: select the highest-ranked acceptable media range the server can
-/// serve, over the whole `Accept` list with q-values, rather than the first
-/// recognised entry — which would answer `text/turtle, application/ld+json`
-/// with the lossy one.
-///
-/// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
-/// it. `None` means nothing acceptable is supported at all, which is the only
-/// remaining `406`.
 /// The `Accept` list, highest quality first with earlier entries breaking a
 /// tie, as `(q, position, media range)`.
 ///
@@ -272,6 +264,14 @@ pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
     matches!(best, Some((_, q)) if q > 0.0)
 }
 
+/// §6.3: select the highest-ranked acceptable media range the server can
+/// serve, over the whole `Accept` list with q-values, rather than the first
+/// recognised entry — which would answer `text/turtle, application/ld+json`
+/// with the lossy one.
+///
+/// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
+/// it. `None` means nothing acceptable is supported at all, which is the only
+/// remaining `406`.
 pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
     let usable = |f: Format| shape == Shape::Graph || f.carries_dataset();
     let fallback = || {
