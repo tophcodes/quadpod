@@ -216,6 +216,62 @@ impl Format {
 /// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
 /// it. `None` means nothing acceptable is supported at all, which is the only
 /// remaining `406`.
+/// The `Accept` list, highest quality first with earlier entries breaking a
+/// tie, as `(q, position, media range)`.
+///
+/// **The only place this header is parsed.** [`negotiate`] and
+/// [`accept_allows`] ask different questions of it — which format to render
+/// into, and whether one fixed type is admissible — but a second copy of the
+/// q-value parse is how the two come to disagree about `q=0`.
+fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
+    let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
+    for (i, part) in accept.split(',').enumerate() {
+        let mut bits = part.split(';');
+        let mt = bits.next().unwrap_or("").trim();
+        let q = bits
+            .filter_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
+            .next()
+            .unwrap_or(1.0);
+        ranked.push((q, i, mt));
+    }
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+    });
+    ranked
+}
+
+/// §6.1: whether `accept` admits a resource whose only representation is `mt`.
+///
+/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
+/// makes a more specific media range override a less specific one, so the
+/// decision is by specificity rather than by order or by the highest q.
+pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
+    let accept = accept.trim();
+    if accept.is_empty() {
+        return true;
+    }
+    let essence = mt.essence();
+    let ty = essence.split('/').next().unwrap_or("");
+    let type_wildcard = format!("{ty}/*");
+    let mut best: Option<(u8, f32)> = None;
+    for (q, _, range) in ranked_accept(accept) {
+        let range = range.to_ascii_lowercase();
+        let specificity = if range == essence {
+            3
+        } else if range == type_wildcard {
+            2
+        } else if range == "*/*" {
+            1
+        } else {
+            continue;
+        };
+        if best.is_none_or(|(s, _)| specificity > s) {
+            best = Some((specificity, q));
+        }
+    }
+    matches!(best, Some((_, q)) if q > 0.0)
+}
+
 pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
     let usable = |f: Format| shape == Shape::Graph || f.carries_dataset();
     let fallback = || {
@@ -228,18 +284,7 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
         return stored.filter(|f| usable(*f)).or_else(fallback);
     }
 
-    // (quality, order) — highest quality wins, earlier entry breaks a tie.
-    let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
-    for (i, part) in accept.split(',').enumerate() {
-        let mut bits = part.split(';');
-        let mt = bits.next().unwrap_or("").trim();
-        let q = bits
-            .filter_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
-            .next()
-            .unwrap_or(1.0);
-        ranked.push((q, i, mt));
-    }
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+    let ranked = ranked_accept(accept);
 
     // RFC 9110 §12.5.1: q=0 means the client explicitly rejects that media
     // range, not merely ranks it last. A named type at q=0 must also be
@@ -556,5 +601,40 @@ mod tests {
         let mt = MediaType::parse("text/plain; charset=utf-8").unwrap();
         assert_eq!(mt.header_value().to_str().unwrap(), "text/plain; charset=utf-8");
         assert_eq!(mt.header_value().to_str().unwrap(), mt.as_str());
+    }
+
+    // §6.1: a blob has one representation, so this is an acceptability test
+    // and not a resolver. The cases are the ones `negotiate` already handles,
+    // which is precisely why they must not be answered by a second parse.
+    #[test]
+    fn accept_allows_admits_or_refuses_a_single_representation() {
+        let png = MediaType::parse("image/png").unwrap();
+        let txt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+
+        assert!(accept_allows("", &png), "no Accept header means no constraint");
+        assert!(accept_allows("*/*", &png));
+        assert!(accept_allows("image/*", &png));
+        assert!(accept_allows("image/png", &png));
+        assert!(accept_allows("Image/PNG", &png), "ranges are case-insensitive");
+        assert!(accept_allows("text/turtle, image/png;q=0.1", &png));
+        // Parameters do not take part in the match; the essence does.
+        assert!(accept_allows("text/plain", &txt));
+
+        assert!(!accept_allows("text/turtle", &png));
+        assert!(!accept_allows("text/*", &png));
+    }
+
+    // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
+    // overrides a less specific one — so the answer cannot be derived from
+    // order or from the highest q alone.
+    #[test]
+    fn accept_allows_honours_q_zero_and_specificity() {
+        let png = MediaType::parse("image/png").unwrap();
+
+        assert!(!accept_allows("image/png;q=0", &png));
+        assert!(!accept_allows("*/*, image/png;q=0", &png), "specific overrides */*");
+        assert!(!accept_allows("image/png;q=0, */*", &png), "and order does not matter");
+        assert!(accept_allows("*/*;q=0, image/png", &png), "and it works the other way");
+        assert!(!accept_allows("image/*;q=0, */*", &png), "type/* overrides */*");
     }
 }
