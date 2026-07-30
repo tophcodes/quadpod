@@ -52,7 +52,7 @@ pub fn router(state: AppState) -> Router {
 /// emits. Both properties are asserted: `protocol/cors/enumerate-headers`
 /// requires the header to be present and to differ from `*`.
 const EXPOSED_HEADERS: &str =
-    "Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
+    "Accept-Patch, Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
 
 /// Reflect a request's `Origin` onto its response.
 ///
@@ -171,19 +171,24 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
 /// answers from the request URL alone and needs no representation to describe.
 fn allowed_methods(target: &Target) -> &'static str {
     match target {
-        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT, OPTIONS",
-        Target::Container(_) => "GET, HEAD, POST, PUT, DELETE, OPTIONS",
-        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, DELETE, OPTIONS",
+        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT, PATCH, OPTIONS",
+        Target::Container(_) => "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, PATCH, DELETE, OPTIONS",
     }
 }
 
+/// The one patch format this pod accepts. Protocol §5.3 makes advertising it a
+/// MUST, and it travels with `Allow` because both answer "what may I do here?".
+const ACCEPT_PATCH: &str = "text/n3";
+
 /// Attach [`allowed_methods`] to a read that succeeded — Protocol §4.1 makes
-/// it a MUST on `GET`/`HEAD`.
+/// it a MUST on `GET`/`HEAD` — alongside `Accept-Patch`.
 fn with_allow(mut res: Response, target: &Target) -> Response {
     res.headers_mut().insert(
         header::ALLOW,
         allowed_methods(target).parse().expect("method list is header-safe"),
     );
+    res.headers_mut().insert("accept-patch", HeaderValue::from_static(ACCEPT_PATCH));
     res
 }
 
@@ -1193,6 +1198,7 @@ fn options_impl(target: &Target, headers: &HeaderMap) -> Response {
     let methods = allowed_methods(target);
     out.insert(header::ALLOW, HeaderValue::from_static(methods));
     out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static(methods));
+    out.insert("accept-patch", HeaderValue::from_static(ACCEPT_PATCH));
     if let Some(requested) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
         out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
     }
@@ -1787,6 +1793,48 @@ mod tests {
         assert_ne!(exposed, "*");
         assert!(exposed.contains("ETag"), "{exposed}");
         assert!(exposed.contains("WAC-Allow"), "{exposed}");
+    }
+
+    #[tokio::test]
+    async fn allow_and_accept_patch_advertise_the_method() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        // Every target shape, because `allowed_methods` has three arms and a
+        // fix to one of them is not a fix to the others.
+        for path in ["/c/thing", "/c/", "/"] {
+            let get = f.app.clone().oneshot(f.owner_request("GET", path)
+                .header(header::ACCEPT, "text/turtle")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(get.status(), StatusCode::OK, "GET {path}");
+            let allow = get.headers()[header::ALLOW].to_str().unwrap();
+            assert!(allow.contains("PATCH"), "GET {path} Allow: {allow}");
+            assert_eq!(
+                get.headers()["accept-patch"].to_str().unwrap(), "text/n3",
+                "GET {path}"
+            );
+
+            let opt = f.app.clone().oneshot(Request::builder()
+                .method("OPTIONS").uri(path).body(Body::empty()).unwrap()).await.unwrap();
+            let allow = opt.headers()[header::ALLOW].to_str().unwrap();
+            assert!(allow.contains("PATCH"), "OPTIONS {path} Allow: {allow}");
+            let acam = opt.headers()[header::ACCESS_CONTROL_ALLOW_METHODS].to_str().unwrap();
+            assert!(acam.contains("PATCH"), "OPTIONS {path} ACAM: {acam}");
+            assert_eq!(opt.headers()["accept-patch"].to_str().unwrap(), "text/n3");
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_patch_is_exposed_to_cross_origin_readers() {
+        let f = fixture().await;
+        f.put_turtle("/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/thing")
+            .header(header::ORIGIN, "https://app.example")
+            .header(header::ACCEPT, "text/turtle")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let exposed = res.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS].to_str().unwrap();
+        assert!(exposed.contains("Accept-Patch"), "{exposed}");
     }
 
     // The reason the middleware wraps `auth_layer` instead of sitting inside
@@ -2492,10 +2540,10 @@ mod tests {
         assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
 
         for (method, path, expected) in [
-            ("GET", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
-            ("HEAD", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
-            ("GET", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
-            ("HEAD", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
+            ("GET", "/box/", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+            ("HEAD", "/box/", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+            ("GET", "/box/doc", "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"),
+            ("HEAD", "/box/doc", "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"),
         ] {
             let req = f.owner_request(method, path).body(Body::empty()).unwrap();
             let res = f.app.clone().oneshot(req).await.unwrap();
@@ -2511,7 +2559,7 @@ mod tests {
         let f = fixture().await;
         let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
         let res = f.app.oneshot(get).await.unwrap();
-        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT, OPTIONS");
+        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT, PATCH, OPTIONS");
     }
 
     #[tokio::test]
