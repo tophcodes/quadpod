@@ -92,6 +92,14 @@ still be true and still be actionable by clients. That is the property that make
 Trees association (`Link: rel="…shapetrees#managedBy"`) is server-emitted, so it does not
 exist at all until a server implements it.
 
+**One binding, or none.** A container graph carrying more than one `ldp:constrainedBy` is
+refused with the same `409` an unusable constraint document gets (§7). The alternative —
+picking one — has no honest tie-breaker: the triples come back from a `CONSTRUCT` with no
+`ORDER BY`, so "the first one" is an artefact of the store's term ordering rather than
+anything the author expressed, and which shape governs a container would be unpredictable
+across backends. Two bindings mean the author stated two policies and the server cannot know
+which; that is the same not-knowing that makes a broken document fail closed.
+
 Both readings of LDP §4.2.1.6 are served by one mechanism. Fedora uses `constrainedBy` on a
 failure response to point at the document explaining the refusal; CSS's design proposal uses
 it to name the shape to validate against. Here the shape *is* the document that explains the

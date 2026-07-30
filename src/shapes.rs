@@ -128,16 +128,39 @@ pub async fn load(
     space: &StorageSpace,
     container: &ContainerUrl,
 ) -> Result<Option<String>, ShapeError> {
+    // `Ok(None)` covers two different states of `container` — one that
+    // exists but carries no binding, and one that does not exist at all —
+    // because both mean the same thing to a caller: nothing constrains
+    // writes here.
     let Some(triples) = get_rdf(store, container).await? else {
         return Ok(None);
     };
-    let Some(iri) = triples.iter().find_map(|t| match &t.object {
-        oxigraph::model::Term::NamedNode(n) if t.predicate.as_str() == LDP_CONSTRAINED_BY => {
-            Some(n.as_str().to_owned())
+    let bindings: Vec<String> = triples
+        .iter()
+        .filter_map(|t| match &t.object {
+            oxigraph::model::Term::NamedNode(n) if t.predicate.as_str() == LDP_CONSTRAINED_BY => {
+                Some(n.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    // Exactly one binding, or none — never a pick among several. The
+    // triples come back from a `CONSTRUCT` with no `ORDER BY`, so "the
+    // first one" would be an artefact of the store's term ordering rather
+    // than anything the author expressed. Two bindings mean the author
+    // stated two policies and the server cannot know which; that is the
+    // same not-knowing that makes a broken document fail closed (§3.1).
+    let iri = match bindings.as_slice() {
+        [] => return Ok(None),
+        [iri] => iri.clone(),
+        _ => {
+            return Err(ShapeError::Unsupported(format!(
+                "{} carries {} ldp:constrainedBy bindings ({}), not one",
+                container.graph_iri(),
+                bindings.len(),
+                bindings.join(", "),
+            )))
         }
-        _ => None,
-    }) else {
-        return Ok(None);
     };
 
     // `strip_prefix` alone confuses `https://pod.toph.so/x` with
@@ -149,6 +172,16 @@ pub async fn load(
     let Some(rest) = iri.strip_prefix(&base).filter(|r| r.starts_with('/')) else {
         return Err(ShapeError::Unsupported(iri));
     };
+    // `resolve` documents that it always receives an already
+    // percent-decoded path from the HTTP layer; `rest` is a raw,
+    // never-decoded substring of a client-authored IRI that was stored
+    // verbatim in this container's graph. That mismatch is sound here
+    // because nothing downstream decodes `rest` either: the resource it
+    // resolves to has a graph IRI built byte-for-byte from `rest`, so it is
+    // byte-identical to the IRI the client wrote. Two distinct stored IRIs
+    // therefore always resolve to two distinct graphs — no percent-encoding
+    // variant can alias one stored binding onto a graph a different IRI
+    // names.
     let Ok(Target::Resource(r)) = space.resolve(rest) else {
         return Err(ShapeError::Unsupported(iri));
     };
@@ -157,7 +190,14 @@ pub async fn load(
         None => Err(ShapeError::Missing),
         Some(Kind::Binary(mt)) => Err(ShapeError::Unsupported(mt.as_str().to_owned())),
         Some(Kind::Rdf) => {
-            let triples = get_rdf(store, &r).await?.unwrap_or_default();
+            // `kind_of` and this read are two separate store reads, so the
+            // document can be deleted in between. Falling back to an empty
+            // shapes graph here would make the write it was meant to
+            // constrain pass trivially — an empty SHACL graph conforms
+            // unconditionally — turning a fail-closed feature fail-open.
+            // Report the same `Missing` a document that was never there
+            // reports, rather than tolerate the race.
+            let triples = get_rdf(store, &r).await?.ok_or(ShapeError::Missing)?;
             let dataset = Dataset::new(as_quads(&triples));
             let bytes = turtle()
                 .serialize(&dataset)
@@ -328,6 +368,25 @@ mod tests {
         assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Missing)));
     }
 
+    /// Two bindings on one container state two policies, and the server has
+    /// no honest way to choose between them (§3.1) — refused, not resolved
+    /// by whichever triple the store happens to return first.
+    #[tokio::test]
+    async fn two_bindings_on_one_container_are_unsupported() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/a>, <https://pod.toph.so/shapes/b> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+        assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
+    }
+
     /// A shape is never fetched over the network (§8), so a foreign IRI is
     /// refused rather than resolved.
     #[tokio::test]
@@ -348,8 +407,11 @@ mod tests {
 
     /// The classic prefix-confusion bug: `https://pod.toph.so.evil.example/x`
     /// starts with `https://pod.toph.so` as a byte string, but is a different
-    /// origin entirely. A bare `strip_prefix` would treat it as in-pod; the
-    /// remainder must begin with `/` for the origins to actually match.
+    /// origin entirely. Without the `starts_with('/')` guard, the stripped
+    /// remainder — `.evil.example/x` — happens to still get refused, by
+    /// `StorageSpace::resolve`'s unrelated rooted-path check. The guard
+    /// exists so the origin boundary is stated here, at the point it
+    /// matters, rather than relying on that incidental rejection elsewhere.
     #[tokio::test]
     async fn a_domain_confusable_constraint_document_is_unsupported() {
         let store = OxigraphStore::in_memory().unwrap();
