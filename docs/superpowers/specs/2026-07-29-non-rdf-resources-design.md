@@ -134,6 +134,12 @@ key every legal resource URL had a legal key; with a mirrored key some do not:
   so an emptied container can leave an empty directory behind. Cosmetic, and named so nobody
   reads it as a leak.
 
+A container URL and its slash-pair counterpart do not collide either: `Path::from` drops a
+trailing empty segment, so `photos/` and `photos` would otherwise mirror to the same key.
+`BlobKey::of` refuses a path ending in `/` outright rather than minting it — a container is
+never a blob, so there is no key to mint, and `aux::delete_subject` skips the backend
+round-trip entirely on a container delete.
+
 Individual objects still cannot be relocated within a backend — that follows from *derived*,
 not from *mirrored*. A whole-backend migration (copy every key, repoint the config) works,
 because keys are identical across backends.
@@ -221,14 +227,17 @@ that to be an implementation rather than a rewrite.
 
 ### 4.2 Backends
 
-`ObjectStoreBlobs(Arc<dyn ObjectStore>)` is the only implementor in this plan. Config
+`ObjectStoreBlobs(Arc<dyn ObjectStore>)` is the only implementor in this plan. `Config::blobs`
 selects:
 
 | Config | `object_store` type | Notes |
 |---|---|---|
 | `memory` (default) | `InMemory` | Mirrors `OxigraphStore::in_memory()`. The pod stays uniformly ephemeral — blobs are exactly as durable as triples, which is to say not at all. |
 | `local:<path>` | `LocalFileSystem` | The directory mirrors the URL tree (§3.2), so it can be read, backed up and debugged with ordinary tools. |
-| `s3:<bucket>` | `AmazonS3` | A custom endpoint is also the **Ceph RGW** case: RGW is S3-compatible, so it needs no backend code of its own. |
+
+An `s3:<bucket>` backend is deliberately out of scope — see §13 — even though `object_store`'s
+`AmazonS3` needs no backend code of its own, and a custom endpoint would cover the
+S3-compatible **Ceph RGW** case for free.
 
 The default matters. Any durable blob backend beside an in-memory triple store would make
 blobs outlive the RDF that describes them, which is a worse state than losing both.
@@ -268,10 +277,13 @@ both read `PUT` that way, and it is what CSS does.
 **RDF → blob** is free: step 2 above already drops the resource graph, the shelves and the
 system graph, which is the entire RDF state.
 
-**Blob → RDF** needs `put_dataset` to gain an unconditional `blobs.delete` before its own
-teardown. Unconditional because deleting an absent object succeeds (§4), so no existence
-check is needed and none is wanted — a check plus a delete is two round-trips with a window
-between them. This is the only place the RDF path knows the blob path exists.
+**Blob → RDF** needs `put_dataset` to gain an unconditional `blobs.delete` after its own
+teardown, for the same reason as §7: an interrupted delete leaves an object no marker points
+at, which the next write to the same URL overwrites, where the reverse order would leave the
+resource marked `BinaryResource` with no object behind it. Unconditional because deleting an
+absent object succeeds (§4), so no existence check is needed and none is wanted — a check plus
+a delete is two round-trips with a window between them. This is the only place the RDF path
+knows the blob path exists.
 
 ## 6. Read path
 
@@ -546,6 +558,23 @@ since ~370 WAC rows are unmeasured today.
     policy, or accepting drift and saying so).
 - **`OPTIONS`, `WAC-Allow`, CORS, `PATCH`.** Ranks 2–6 of the findings. Several become
   measurable only once this lands.
+- **An `s3:<bucket>` backend.** `object_store`'s `AmazonS3` needs no backend code of its own —
+  a custom endpoint also covers the S3-compatible Ceph RGW case — but `Config::blobs` refuses
+  to start with anything but `memory` or `local:<dir>`. Credentials, region and endpoint
+  override are config plumbing, a separate decision from the storage model this design fixes.
+- **A compile-time-validated `sparql!` macro.** Every update this pod issues is built by
+  string concatenation, so a malformed one surfaces as a runtime `StoreError::Backend` and no
+  type catches it. A proc-macro on the `sqlx::query!` pattern — parsing the query at build
+  time with `spargebra` — would. That is a new guarantee rather than ergonomics, which is what
+  separates it from the cosmetic version (relief from `format!`'s `{{`/`}}` doubling), and the
+  cosmetic version is not worth having.
+
+  The condition that makes any such macro safe here: **the SPARQL text must stay a source
+  literal.** Half the rules in `docs/constraints.md` are `rg` over `src/` of the form "only
+  this file may build that string". A macro that assembles a query from fragments moves those
+  sites into the expansion, where the check cannot see them — putting the guard and the
+  guarded on opposite sides of macro expansion. A `sqlx`-style macro keeps the whole query
+  visible and does not have this problem; a builder-style one does.
 - **Orphan collection.** §3.2's derived key makes it unnecessary for correctness; a backend
   accumulating dead objects across many interrupted writes is an operational concern, not a
   correctness one.

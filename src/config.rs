@@ -69,6 +69,22 @@ pub struct Config {
         default_missing_value = "true"
     )]
     pub reset_root_acl: bool,
+
+    /// Where non-RDF resource bytes live. `memory` keeps them in process,
+    /// matching the triple store, so the pod is uniformly ephemeral rather
+    /// than making blobs outlive the triples describing them.
+    /// `local:<dir>` mirrors the URL tree under `<dir>`, so it can be read and
+    /// backed up with ordinary tools.
+    #[arg(long, env = "POD_BLOB_STORE", default_value = "memory")]
+    pub blob_store: String,
+
+    /// Largest request body accepted, in bytes, for every write path. axum
+    /// applies a 2 MiB default of its own when nothing is set; naming it here
+    /// makes a `413` a statement about this pod rather than a framework
+    /// artefact. The body is buffered whole in memory, which is the real
+    /// ceiling behind this number.
+    #[arg(long, env = "POD_MAX_BODY_BYTES", default_value_t = 64 * 1024 * 1024)]
+    pub max_body_bytes: usize,
 }
 
 impl Config {
@@ -126,6 +142,24 @@ impl Config {
         NamedNode::new(&self.owner_webid)
             .map(|_| self.owner_webid.clone())
             .map_err(|_| InvalidOwnerWebId)
+    }
+
+    /// The blob backend this process will use, or the operator-facing reason
+    /// it cannot be built. Refusing to start beats starting with a backend
+    /// that silently differs from the one configured.
+    pub fn blobs(&self) -> Result<std::sync::Arc<dyn crate::blob::BlobStore>, String> {
+        let spec = self.blob_store.trim();
+        if spec == "memory" {
+            return Ok(std::sync::Arc::new(crate::blob::ObjectStoreBlobs::in_memory()));
+        }
+        if let Some(dir) = spec.strip_prefix("local:") {
+            return crate::blob::ObjectStoreBlobs::local(std::path::Path::new(dir))
+                .map(|b| std::sync::Arc::new(b) as std::sync::Arc<dyn crate::blob::BlobStore>)
+                .map_err(|e| format!("--blob-store local: {e}"));
+        }
+        Err(format!(
+            "--blob-store: expected `memory` or `local:<dir>`, got `{spec}`"
+        ))
     }
 }
 
@@ -333,5 +367,31 @@ mod tests {
             "--reset-root-acl", "off",
         ]).unwrap();
         assert!(!c.reset_root_acl);
+    }
+
+    #[test]
+    fn blob_store_selects_a_backend_and_refuses_an_unknown_one() {
+        let mut cfg = Config::parse_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+        assert_eq!(cfg.blob_store, "memory", "the default matches the in-memory triple store");
+        assert!(cfg.blobs().is_ok());
+
+        let dir = std::env::temp_dir().join(format!("sparql-pod-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cfg.blob_store = format!("local:{}", dir.display());
+        assert!(cfg.blobs().is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+
+        cfg.blob_store = "s3:bucket".into();
+        assert!(cfg.blobs().is_err(), "an unimplemented backend must refuse to start");
+        cfg.blob_store = "nonsense".into();
+        assert!(cfg.blobs().is_err());
+    }
+
+    // axum's own default is 2 MiB and already applies to every write path.
+    // Making it a flag is what turns a 413 into a decision.
+    #[test]
+    fn max_body_bytes_has_an_explicit_default() {
+        let cfg = Config::parse_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+        assert_eq!(cfg.max_body_bytes, 64 * 1024 * 1024);
     }
 }

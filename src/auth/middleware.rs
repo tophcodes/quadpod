@@ -184,10 +184,12 @@ mod tests {
     fn app_with(resolver: Arc<dyn crate::auth::jwks::JwksResolver>) -> Router {
         let state = crate::http::AppState {
             store: Arc::new(OxigraphStore::in_memory().unwrap()),
+            blobs: Arc::new(crate::blob::ObjectStoreBlobs::in_memory()),
             space: StorageSpace::new("https://pod.toph.so/").unwrap(),
             resolver,
             webid_verifier: Arc::new(crate::auth::webid_issuer::StaticWebIdIssuers::new()),
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
+            max_body_bytes: 64 * 1024 * 1024,
         };
         Router::new().route("/{*path}", get(whoami))
             .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))

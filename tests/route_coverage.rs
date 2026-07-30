@@ -53,10 +53,12 @@ async fn app() -> axum::Router {
 
     router(AppState {
         store,
+        blobs: Arc::new(sparql_pod::blob::ObjectStoreBlobs::in_memory()),
         space,
         resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
         webid_verifier: Arc::new(StaticWebIdIssuers::new()),
         auth_config: Arc::new(AuthConfig::default()),
+        max_body_bytes: 64 * 1024 * 1024,
     })
 }
 

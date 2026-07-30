@@ -27,7 +27,7 @@
 | File | Responsibility | Change |
 |---|---|---|
 | `src/blob.rs` | `BlobKey` (the only place an object key is built), the `BlobStore` trait and its `object_store` implementation | **new** |
-| `src/rdf.rs` | `MediaType`, `ranked_accept` (the only `Accept` parser), `accept_allows` alongside `negotiate` | modify |
+| `src/rdf.rs` | `MediaType`, `sparql::Literal`'s one caller, `ranked_accept` (the only `Accept` parser), later `accept_allows` alongside `negotiate` | modify |
 | `src/resource.rs` | `put_blob`, `kind_of`, `stored_media_type` returning `MediaType`, blob teardown inside `put_dataset` | modify |
 | `src/aux.rs` | blob teardown inside the one delete cascade | modify |
 | `src/config.rs` | `--blob-store`, `--max-body-bytes` | modify |
@@ -211,6 +211,278 @@ property of the alphabet rather than of an escape at every call site."
 
 ---
 
+### Task 1b: make an unescaped SPARQL literal and an unsafe header value unrepresentable
+
+Inserted after Task 1, before Task 2. Two small newtypes closing two classes of "a raw string
+reaches a place where its alphabet matters", so later tasks cannot reopen them.
+
+**Files:**
+- Create: `src/sparql.rs`
+- Modify: `src/rdf.rs` (`MediaType`), `src/resource.rs:126-136` (`put_dataset`'s registry
+  string), `src/lib.rs`, `docs/constraints.md`
+- Test: `src/sparql.rs` `mod tests`, `src/rdf.rs` `mod tests`
+
+**Interfaces:**
+- Produces: `pub struct sparql::Literal` with `sparql::Literal::new(&oxigraph::model::Literal)
+  -> Literal` and `impl std::fmt::Display`; `MediaType::header_value(&self) ->
+  http::HeaderValue` (infallible).
+
+## Why, before what
+
+Scoping check run before writing this task: `rg -n '\\"\{' src` finds **exactly one**
+quote-delimited SPARQL literal interpolation in the whole codebase — `src/resource.rs:134`,
+the media type. Every other SPARQL interpolation is `<{iri}>`, where the IRI comes from the
+sealed `space::GraphName` trait (a constraint already guards that), from `shelf::ShelfKey`, or
+is validated through `NamedNode::new` at `src/resource.rs:144`. Literals inside user data go
+through oxrdf's `Display` in `serialize_for_insert`, which is the escaper this project already
+trusts.
+
+So this task builds a newtype for one call site today and one more that Task 4 adds — and
+**deliberately builds nothing else**. A general "SPARQL fragment" layer would be machinery for
+two callers, which this project's own rules forbid. What makes the rule stick is not the type
+but the constraint check in step 6: a type does not stop anyone writing
+`format!("\"{}\"", s)`, and the check does.
+
+The second half is smaller and has a named victim: the plan's Task 8 contains
+`mt.as_str().parse().expect("a MediaType is header-safe")` — a `.expect` asserting an
+invariant that a *different* type is supposed to guarantee. If `MediaType` carries the
+`HeaderValue` it validated, that `.expect` has nothing to assert and disappears.
+
+## Step 1: Write the failing tests
+
+Create `src/sparql.rs` with only this test module (implementation comes in step 3):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxigraph::model::Literal as OxLiteral;
+
+    // The escaping is oxrdf's, not ours — this pins that we render through it
+    // rather than beside it. A second escaper is how two write paths come to
+    // disagree about one backslash.
+    #[test]
+    fn a_literal_renders_quoted_and_escaped() {
+        assert_eq!(Literal::new(&OxLiteral::new_simple_literal("plain")).to_string(), "\"plain\"");
+
+        for raw in ["has \" quote", "has \\ backslash", "has \n newline", "has \r return"] {
+            let rendered = Literal::new(&OxLiteral::new_simple_literal(raw)).to_string();
+            let inner = &rendered[1..rendered.len() - 1];
+            assert!(
+                !inner.contains('"') || inner.contains("\\\""),
+                "{raw:?} rendered as {rendered:?}: a bare quote would close the literal"
+            );
+            assert!(!inner.contains('\n') && !inner.contains('\r'),
+                "{raw:?} rendered as {rendered:?}: a raw newline is not legal in STRING_LITERAL2");
+        }
+    }
+
+    // The whole point: what comes out can be concatenated into an update and
+    // still parse. Asserted by round-tripping through the store, not by
+    // eyeballing the string — a rendering that merely *looks* escaped but is
+    // not would pass a string comparison against a hand-written expectation.
+    #[tokio::test]
+    async fn a_rendered_literal_survives_an_actual_insert() {
+        use crate::store::{OxigraphStore, SparqlStore};
+        let store = OxigraphStore::in_memory().unwrap();
+        let nasty = "x\" . } DROP ALL ; INSERT DATA { GRAPH <urn:evil> { <urn:a> <urn:b> \"pwned";
+        let lit = Literal::new(&OxLiteral::new_simple_literal(nasty));
+
+        store.update(&format!(
+            "INSERT DATA {{ GRAPH <urn:test:g> {{ <urn:test:s> <urn:test:p> {lit} }} }}"
+        )).await.unwrap();
+
+        let back = store.query_triples(
+            "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <urn:test:g> { ?s ?p ?o } }"
+        ).await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert!(
+            matches!(&back[0].object, oxigraph::model::Term::Literal(l) if l.value() == nasty),
+            "the value must come back exactly, not truncated at the quote"
+        );
+        // The injected DROP ALL must not have run.
+        assert!(store.ask("ASK { GRAPH <urn:evil> { ?s ?p ?o } }").await.unwrap() == false,
+            "the payload was executed as syntax rather than stored as data");
+    }
+}
+```
+
+Add to `src/rdf.rs`'s `mod tests`:
+
+```rust
+    // A MediaType that parsed is a header value that exists. No call site
+    // should have to assert that with an `.expect`.
+    #[test]
+    fn a_media_type_carries_its_header_value() {
+        let mt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+        assert_eq!(mt.header_value().to_str().unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(mt.header_value().to_str().unwrap(), mt.as_str());
+    }
+```
+
+## Step 2: Run tests to verify they fail
+
+Run: `nix develop -c cargo test --lib sparql 2>&1 | tail -20` and
+`nix develop -c cargo test --lib rdf::tests::a_media_type_carries 2>&1 | tail -20`
+
+Expected: FAIL — `sparql` is not a module; `header_value` does not exist.
+
+## Step 3: Write `src/sparql.rs`
+
+Add `pub mod sparql;` to `src/lib.rs` (alphabetical).
+
+```rust
+//! Values that may be interpolated into a SPARQL update or query.
+//!
+//! The store is written by string concatenation, so a value whose alphabet is
+//! not established is a value that can leave its delimiter and continue the
+//! update as syntax. This module holds the types that make that
+//! unrepresentable for the one shape where the delimiter is a quote.
+//!
+//! IRIs need no type here: every `<...>` interpolation in this crate is fed by
+//! `space::GraphName` (sealed), by `shelf::ShelfKey`, or by a name already
+//! validated through `NamedNode::new`.
+
+use std::fmt;
+
+/// A literal, rendered with its quotes and escapes.
+///
+/// The escaping is oxrdf's: `oxigraph::model::Literal`'s `Display` produces the
+/// N-Triples form, which is what `resource::serialize_for_insert` already
+/// relies on for every triple this pod writes. Rendering through it rather than
+/// beside it is the point — a second escaper is a second thing to get right,
+/// and the two would drift silently because both would still produce output.
+pub struct Literal(String);
+
+impl Literal {
+    pub fn new(value: &oxigraph::model::Literal) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+```
+
+Check what `oxigraph::model::Literal`'s `Display` actually emits for a simple literal — if it
+already includes the surrounding quotes, `Literal::new` stores it as-is and `Display` writes
+it through, as above. If it does **not**, add the quotes in `new` and say so in the doc
+comment. Let the tests tell you; do not assume.
+
+## Step 4: Give `MediaType` its header value
+
+In `src/rdf.rs`, change `MediaType` to carry both forms, built by the one constructor:
+
+```rust
+pub struct MediaType {
+    raw: String,
+    header: http::HeaderValue,
+}
+```
+
+`parse` builds the `HeaderValue` after the alphabet check and returns `None` if it fails.
+Given the alphabet (tchars plus `/`, `;`, `=`, space — all visible ASCII) it cannot fail, but
+handling it is what removes the `.expect`, and a `None` here is the correct answer anyway.
+
+```rust
+    /// The `Content-Type` header for this media type. Infallible: the value was
+    /// built and checked by the only constructor, so no call site has to assert
+    /// it.
+    pub fn header_value(&self) -> http::HeaderValue {
+        self.header.clone()
+    }
+```
+
+`as_str` returns `&self.raw`. `essence` is unchanged. `From<Format>` must go through `parse`
+rather than constructing the struct directly, so there is still exactly one path in — if
+`parse` on a `Format`'s own media type could ever fail, that is a bug worth panicking on, so
+`.expect("a Format's media type is a valid media type")` is correct there and is not the kind
+of `.expect` this task removes.
+
+Derive `PartialEq`/`Eq` on the field that carries identity (`raw`) — if `#[derive]` on the
+struct compares both fields that is fine too, since they are built together; state which you
+chose and why in one line.
+
+`http` is already in the dependency tree via axum. If it is not a direct dependency, add
+`http = "1"` to `Cargo.toml` — check `Cargo.lock` for the version axum resolved and match it.
+
+## Step 5: Use the type at the one call site
+
+`src/resource.rs:126-136`, `put_dataset`'s registry string, currently:
+
+```rust
+    let mut registry = format!(
+        "<{iri}> <{SYS_PRESENT}> true . <{iri}> <{SYS_MEDIA_TYPE}> \"{}\" . ",
+        media_type.media_type()
+    );
+```
+
+becomes a `crate::sparql::Literal` built from an `oxigraph::model::Literal` over
+`media_type.media_type()`, interpolated **without** hand-written quotes.
+
+## Step 6: Add the constraint that makes the rule stick
+
+A type does not stop anyone writing `format!("\"{}\"", s)`. The check does. Append to
+`docs/constraints.md` under "Storage addressing":
+
+```markdown
+A SPARQL literal is never interpolated by hand.
+    → 2026-07-29-non-rdf-resources-design.md §8.2; `sparql::Literal`. Every
+    `<...>` interpolation in this crate is fed by a sealed or validated type, so
+    the IRI half needs no rule; the quote half had exactly one site and no rule
+    at all. A hand-written `"{}"` is a value that can close its own literal and
+    continue the update as syntax, and it fails by executing rather than by
+    erroring.
+    check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs'
+```
+
+`src/http.rs` is excluded because its `\"{` matches are HTTP `Link` and `Warning` header
+construction, not SPARQL — verify that is still true when you add the rule
+(`rg -n '\\"\{' src/http.rs`) and, if any SPARQL has appeared there, narrow the check instead
+of widening the exclusion.
+
+**Demonstrate it goes red:** add `let _ = format!("\"{}\"", "x");` to `src/resource.rs`, run
+`arch-check --only 'SPARQL literal'`, confirm a non-zero exit, then remove it. `docs/constraints.md`
+requires this of every rule it carries.
+
+## Step 7: Full verification and commit
+
+```bash
+nix develop -c cargo test          # all green, output pristine
+nix develop -c cargo clippy --all-targets   # clean
+nix develop -c cargo build 2>&1 | grep -i warning   # nothing
+arch-check                         # 0 rot, now including the new rule
+rg -n '#\[allow' src               # no hits
+```
+
+```bash
+git add src/sparql.rs src/rdf.rs src/resource.rs src/lib.rs docs/constraints.md Cargo.toml Cargo.lock
+git commit -m "feat: make an unescaped SPARQL literal unrepresentable
+
+The store is written by string concatenation, so a literal whose alphabet is
+not established can close its own quote and continue the update as syntax —
+failing by executing rather than by erroring. sparql::Literal renders through
+oxrdf's escaper, the one this pod already trusts for every triple it writes,
+rather than beside it.
+
+MediaType now carries the HeaderValue its constructor validated, so no call
+site has to assert header-safety with an .expect on another type's invariant."
+```
+
+## Out of scope
+
+- Any general "SPARQL fragment" or IRI newtype. The IRI half is already covered by the sealed
+  `GraphName` trait and its existing constraint; building a type for it would be a second
+  guard over the same property.
+- Touching `serialize_for_insert`. It already renders through oxrdf's `Display`; wrapping that
+  in a newtype would add a layer without adding a guarantee.
+
+
+---
+
 ### Task 2: one `Accept` parser, two consumers
 
 `negotiate` parses the `Accept` list inline. A blob needs the same parse to answer a different question, and writing it twice is the drift `docs/constraints.md` names. The ranking moves out; both become consumers (§6.1).
@@ -221,51 +493,25 @@ property of the alphabet rather than of an escape at every call site."
 
 **Interfaces:**
 - Consumes: `MediaType` from Task 1.
-- Produces: `pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool`.
+- Produces: `fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)>` — private to `rdf.rs`,
+  consumed by `negotiate` here and by `accept_allows` in Task 8.
+
+`accept_allows` itself lands in Task 8, with the read path that calls it. A `pub(crate)`
+function with no production caller is a `dead_code` warning, and this build is warning-free
+by rule — so the acceptability test cannot ship six tasks ahead of its consumer.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-    // §6.1: a blob has one representation, so this is an acceptability test
-    // and not a resolver. The cases are the ones `negotiate` already handles,
-    // which is precisely why they must not be answered by a second parse.
-    #[test]
-    fn accept_allows_admits_or_refuses_a_single_representation() {
-        let png = MediaType::parse("image/png").unwrap();
-        let txt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+There is no new test to write here. The extraction is behaviour-preserving, and
+`negotiate`'s existing suite — `q=0` as a refusal, wildcard scoping, case-insensitivity, the
+two-pass dataset fallback — is exactly what says so. Adding a test for `ranked_accept` itself
+would assert the shape of a private helper rather than any behaviour a caller can observe.
 
-        assert!(accept_allows("", &png), "no Accept header means no constraint");
-        assert!(accept_allows("*/*", &png));
-        assert!(accept_allows("image/*", &png));
-        assert!(accept_allows("image/png", &png));
-        assert!(accept_allows("Image/PNG", &png), "ranges are case-insensitive");
-        assert!(accept_allows("text/turtle, image/png;q=0.1", &png));
-        // Parameters do not take part in the match; the essence does.
-        assert!(accept_allows("text/plain", &txt));
+- [ ] **Step 2: Confirm the existing suite is green before you touch anything**
 
-        assert!(!accept_allows("text/turtle", &png));
-        assert!(!accept_allows("text/*", &png));
-    }
-
-    // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
-    // overrides a less specific one — so the answer cannot be derived from
-    // order or from the highest q alone.
-    #[test]
-    fn accept_allows_honours_q_zero_and_specificity() {
-        let png = MediaType::parse("image/png").unwrap();
-
-        assert!(!accept_allows("image/png;q=0", &png));
-        assert!(!accept_allows("*/*, image/png;q=0", &png), "specific overrides */*");
-        assert!(!accept_allows("image/png;q=0, */*", &png), "and order does not matter");
-        assert!(accept_allows("*/*;q=0, image/png", &png), "and it works the other way");
-        assert!(!accept_allows("image/*;q=0, */*", &png), "type/* overrides */*");
-    }
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `nix develop -c cargo test --lib rdf::tests::accept_allows 2>&1 | tail -20`
-Expected: FAIL — `cannot find function accept_allows in this scope`.
+Run: `nix develop -c cargo test --lib rdf 2>&1 | tail -5`
+Expected: PASS. This is the baseline the extraction must not move.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -275,10 +521,11 @@ In `src/rdf.rs`, add before `negotiate`:
 /// The `Accept` list, highest quality first with earlier entries breaking a
 /// tie, as `(q, position, media range)`.
 ///
-/// **The only place this header is parsed.** [`negotiate`] and
-/// [`accept_allows`] ask different questions of it — which format to render
-/// into, and whether one fixed type is admissible — but a second copy of the
-/// q-value parse is how the two come to disagree about `q=0`.
+/// **The only place this header is parsed.** [`negotiate`] asks it which
+/// format to render into; a resource with a single representation asks it
+/// whether that one type is admissible. Those are different questions, but a
+/// second copy of the q-value parse is how the two come to disagree about
+/// `q=0`.
 fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
     let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
     for (i, part) in accept.split(',').enumerate() {
@@ -296,37 +543,6 @@ fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
     ranked
 }
 
-/// §6.1: whether `accept` admits a resource whose only representation is `mt`.
-///
-/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
-/// makes a more specific media range override a less specific one, so the
-/// decision is by specificity rather than by order or by the highest q.
-pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
-    let accept = accept.trim();
-    if accept.is_empty() {
-        return true;
-    }
-    let essence = mt.essence();
-    let ty = essence.split('/').next().unwrap_or("");
-    let type_wildcard = format!("{ty}/*");
-    let mut best: Option<(u8, f32)> = None;
-    for (q, _, range) in ranked_accept(accept) {
-        let range = range.to_ascii_lowercase();
-        let specificity = if range == essence {
-            3
-        } else if range == type_wildcard {
-            2
-        } else if range == "*/*" {
-            1
-        } else {
-            continue;
-        };
-        if best.is_none_or(|(s, _)| specificity > s) {
-            best = Some((specificity, q));
-        }
-    }
-    matches!(best, Some((_, q)) if q > 0.0)
-}
 ```
 
 Then replace the inline ranking inside `negotiate` — the block from
@@ -345,24 +561,17 @@ Run: `nix develop -c cargo test --lib rdf 2>&1 | tail -5`
 Expected: PASS. Every pre-existing negotiation test must still pass — the extraction is
 behaviour-preserving, and those tests are what says so.
 
-- [ ] **Step 5: Verify the specificity test bites**
-
-Temporarily replace `accept_allows`'s body with a version that returns
-`ranked_accept(accept).iter().any(|(q, _, r)| *q > 0.0 && (*r == "*/*" || *r == essence))`.
-Run `nix develop -c cargo test --lib rdf::tests::accept_allows_honours`. Expected: FAIL on
-`"*/*, image/png;q=0"`. Revert.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/rdf.rs
-git commit -m "refactor: one Accept parser, two consumers
+git commit -m "refactor: one Accept parser, one consumer so far
 
 A blob has a single representation, so 'does the client accept it?' is a
 different question from 'which format do I render into?'. Both parse the
 same header, and two q-value parses is how they come to disagree about q=0
 — which docs/constraints.md already names as the failure mode. ranked_accept
-is the one parser; negotiate and accept_allows consume it."
+is the one parser; the second consumer arrives with the blob read path."
 ```
 
 ---
@@ -450,6 +659,15 @@ mod tests {
         // legal URLs, which is the mirror-image bug.
         let at_limit = "a".repeat(255);
         assert!(BlobKey::of(&res(&format!("/{at_limit}"))).is_some());
+
+        // `~` is legal and unescaped in a URL, and `object_store` encodes it
+        // anyway, so the raw length and the stored length differ by 3x. The
+        // limits are measured on what is stored, so both halves matter: 255
+        // raw `~` is 765 encoded bytes and must be refused, and 85 of them is
+        // 255 encoded bytes and must not be — a check that simply rejected
+        // every `~` would pass the first half alone.
+        assert!(BlobKey::of(&res(&format!("/{}", "~".repeat(255)))).is_none());
+        assert!(BlobKey::of(&res(&format!("/{}", "~".repeat(85)))).is_some());
     }
 
     #[tokio::test]
@@ -544,16 +762,19 @@ impl BlobKey {
     ///
     /// `Path::from` percent-encodes segments the backends treat as
     /// problematic, so a relative segment never reaches the backend as a
-    /// directory ascent.
+    /// directory ascent. That same encoding can expand a segment to up to
+    /// three times its raw length, so the limits are measured on the
+    /// encoded `Path`, not on the raw URL path.
     pub fn of(r: &ResourceUrl) -> Option<Self> {
         let rel = r.path().trim_start_matches('/');
-        if rel.len() > MAX_PATH_BYTES {
+        let path = Path::from(rel);
+        if path.as_ref().len() > MAX_PATH_BYTES {
             return None;
         }
-        if rel.split('/').any(|s| s.len() > MAX_SEGMENT_BYTES) {
+        if path.parts().any(|p| p.as_ref().len() > MAX_SEGMENT_BYTES) {
             return None;
         }
-        Some(Self(Path::from(rel)))
+        Some(Self(path))
     }
 
     pub fn as_str(&self) -> &str {
@@ -1278,9 +1499,17 @@ when it is crossed; without this the flag could be read, stored and never applie
     async fn a_body_over_the_configured_limit_is_a_413() {
         let f = fixture_with_body_limit(64).await;
 
-        let res = f.app.clone().oneshot(f.owner_request("PUT", "/small.txt")
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from(vec![b'x'; 32])).unwrap()).await.unwrap();
+        // Turtle, not text/plain, for the under-limit half: the blob dispatch
+        // in `put_impl` does not exist yet, so a non-RDF write is still `415`
+        // at this point in the branch. The over-limit half below keeps
+        // `text/plain` deliberately — `DefaultBodyLimit` is enforced when the
+        // handler's `Bytes` extractor runs, and axum resolves every extractor
+        // before the handler body, so the size check fires before
+        // `Format::from_content_type` is ever consulted.
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/small")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#a> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
 
         let res = f.app.clone().oneshot(f.owner_request("PUT", "/big.txt")
@@ -1395,7 +1624,7 @@ start rather than silently falling back."
     async fn a_non_rdf_body_on_an_auxiliary_is_a_415() {
         let f = fixture().await;
         f.put_turtle("/subject", "").await;
-        let res = f.app.clone().oneshot(f.owner_request("PUT", "/.aux/acl/subject")
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/.aux/subject.acl")
             .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from("x")).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -1511,7 +1740,7 @@ fn classify_body(headers: &HeaderMap, body: &Bytes, target: &Target) -> Result<R
 }
 ```
 
-Add `use crate::rdf::{Format, MediaType, Shape, accept_allows, negotiate};` to the imports and
+Add `use crate::rdf::{Format, MediaType, Shape, negotiate};` to the imports and
 `use crate::resource::{… , put_blob, kind_of, Kind};`.
 
 - [ ] **Step 4: Rewire `put_impl`**
@@ -1654,10 +1883,57 @@ conflated with 'unsupported'."
 - Test: `src/http.rs` `mod tests`
 
 **Interfaces:**
-- Consumes: `kind_of`, `Kind`, `accept_allows`, `BlobStore::get`.
-- Produces: `fn blob_etag(&[u8]) -> String` in `src/http.rs`.
+- Consumes: `kind_of`, `Kind`, `BlobStore::get`, `ranked_accept` (Task 2), `MediaType`.
+- Produces: `pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool` in
+  `src/rdf.rs`; `fn blob_etag(&[u8]) -> String` in `src/http.rs`.
+
+`accept_allows` lands here rather than in Task 2 because this is the task that gives it a
+production caller. Shipping it earlier would be a `dead_code` warning in a build that is
+warning-free by rule.
 
 - [ ] **Step 1: Write the failing tests**
+
+In `src/rdf.rs`'s `mod tests`:
+
+```rust
+    // §6.1: a blob has one representation, so this is an acceptability test
+    // and not a resolver. The cases are the ones `negotiate` already handles,
+    // which is precisely why they must not be answered by a second parse.
+    #[test]
+    fn accept_allows_admits_or_refuses_a_single_representation() {
+        let png = MediaType::parse("image/png").unwrap();
+        let txt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+
+        assert!(accept_allows("", &png), "no Accept header means no constraint");
+        assert!(accept_allows("*/*", &png));
+        assert!(accept_allows("image/*", &png));
+        assert!(accept_allows("image/png", &png));
+        assert!(accept_allows("Image/PNG", &png), "ranges are case-insensitive");
+        assert!(accept_allows("text/turtle, image/png;q=0.1", &png));
+        // Parameters do not take part in the match; the essence does.
+        assert!(accept_allows("text/plain", &txt));
+
+        assert!(!accept_allows("text/turtle", &png));
+        assert!(!accept_allows("text/*", &png));
+    }
+
+    // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
+    // overrides a less specific one — so the answer cannot be derived from
+    // order or from the highest q alone.
+    #[test]
+    fn accept_allows_honours_q_zero_and_specificity() {
+        let png = MediaType::parse("image/png").unwrap();
+
+        assert!(!accept_allows("image/png;q=0", &png));
+        assert!(!accept_allows("*/*, image/png;q=0", &png), "specific overrides */*");
+        assert!(!accept_allows("image/png;q=0, */*", &png), "and order does not matter");
+        assert!(accept_allows("*/*;q=0, image/png", &png), "and it works the other way");
+        assert!(!accept_allows("image/*;q=0, */*", &png), "type/* overrides */*");
+    }
+```
+```
+
+In `src/http.rs`'s `mod tests`:
 
 ```rust
     // §3.4: the validator is computed from the served bytes, so the same bytes
@@ -1732,7 +2008,7 @@ conflated with 'unsupported'."
     async fn wac_governs_a_blob_exactly_as_it_governs_a_graph() {
         let f = fixture().await;
         f.put_blob("/secret.txt", "text/plain", b"s3cret").await;
-        f.put_turtle("/.aux/acl/secret.txt", &format!(
+        f.put_turtle("/.aux/secret.txt.acl", &format!(
             "@prefix acl: <http://www.w3.org/ns/auth/acl#> . \
              <#owner> a acl:Authorization ; \
                acl:agent <{OWNER}> ; \
@@ -1773,7 +2049,45 @@ Add these `Fixture` helpers next to the existing ones:
 Run: `nix develop -c cargo test --lib http 2>&1 | tail -30`
 Expected: FAIL — `get_impl` runs the dataset path and answers `404` or `500` for a blob.
 
-- [ ] **Step 3: Write the read path**
+- [ ] **Step 3: Write `accept_allows`**
+
+In `src/rdf.rs`, directly after `ranked_accept`:
+
+```rust
+/// §6.1: whether `accept` admits a resource whose only representation is `mt`.
+///
+/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
+/// makes a more specific media range override a less specific one, so the
+/// decision is by specificity rather than by order or by the highest q.
+pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
+    let accept = accept.trim();
+    if accept.is_empty() {
+        return true;
+    }
+    let essence = mt.essence();
+    let ty = essence.split('/').next().unwrap_or("");
+    let type_wildcard = format!("{ty}/*");
+    let mut best: Option<(u8, f32)> = None;
+    for (q, _, range) in ranked_accept(accept) {
+        let range = range.to_ascii_lowercase();
+        let specificity = if range == essence {
+            3
+        } else if range == type_wildcard {
+            2
+        } else if range == "*/*" {
+            1
+        } else {
+            continue;
+        };
+        if best.is_none_or(|(s, _)| specificity > s) {
+            best = Some((specificity, q));
+        }
+    }
+    matches!(best, Some((_, q)) if q > 0.0)
+}
+```
+
+- [ ] **Step 3b: Write the read path**
 
 Add above `get_impl`:
 
@@ -1845,12 +2159,9 @@ async fn blob_read(st: AppState, target: Target, headers: HeaderMap, mt: MediaTy
     if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
         return with_allow(with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target), &target);
     }
-    out.insert(
-        header::CONTENT_TYPE,
-        // Every byte came through `MediaType::parse`, which admits only RFC
-        // 9110 tchars plus `/`, `;`, `=` and space.
-        mt.as_str().parse().expect("a MediaType is header-safe"),
-    );
+    // `MediaType` carries the `HeaderValue` its constructor validated, so
+    // there is nothing here to assert.
+    out.insert(header::CONTENT_TYPE, mt.header_value());
     with_allow(with_aux_links((out, bytes).into_response(), &target), &target)
 }
 ```
@@ -1880,9 +2191,16 @@ format; add that a binary resource has a single representation and therefore a s
 Run: `nix develop -c cargo test 2>&1 | tail -10`
 Expected: PASS, including Task 7's byte-fidelity test.
 
-- [ ] **Step 6: Verify the Accept test bites**
+- [ ] **Step 6: Verify the Accept tests bite, both of them**
 
-Temporarily make `blob_read` skip the `accept_allows` check. Run
+Specificity first — this is the one most likely to be wrong. Temporarily replace
+`accept_allows`'s body with
+`ranked_accept(accept).iter().any(|(q, _, r)| *q > 0.0 && (*r == "*/*" || *r == essence))`.
+Run `nix develop -c cargo test --lib rdf::tests::accept_allows_honours`. Expected: FAIL on
+`"*/*, image/png;q=0"` — RFC 9110 §12.5.1 makes a more specific range override a less
+specific one, so neither order nor highest-q gives the right answer. Revert.
+
+Then the wiring. Temporarily make `blob_read` skip the `accept_allows` check. Run
 `nix develop -c cargo test --lib http::tests::accept_decides`. Expected: FAIL on the
 refusing half. Then make it `return NOT_ACCEPTABLE` unconditionally: expected FAIL on the
 admitting half. Revert.

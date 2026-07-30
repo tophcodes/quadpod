@@ -155,18 +155,38 @@ Enterprise Solid Server hosts access-control resources on an entirely separate s
 
 ## Server-asserted facts are not auxiliary resources
 
-Creation and modification times, byte size, content hash and storage keys are **not**
-addressable and not writable. They live in an internal graph (`urn:quadpod:sys:<res>`) and are
-exposed through the HTTP headers that already exist for them — `Last-Modified`, `ETag`,
-`Content-Length`.
+Existence, the kind of representation, and the media type it arrived as are **not**
+addressable and not writable. They live in an internal graph (`urn:quadpod:sys:<res>`), and a
+client reads them off the response rather than off a URL: existence as the status code (a
+`200` or a `304` rather than a `404`), the media type as `Content-Type`, and the kind through
+no header of its own — no response carries a promise of it. Today, every media type this pod
+recognises as RDF names an RDF resource, and anything else names a binary one, so a client can
+correlate kind with `Content-Type` in practice. That correlation is not a guarantee: the pod's
+own storage layer stores the kind as a fact independent of the media type precisely because
+`application/rdf+xml` is a plausible future addition to what this pod parses as RDF, and the
+day it lands, every resource already stored under that type would answer with the same
+`Content-Type` it always has while silently changing kind underneath a client that inferred
+one from the other.
+
+For a binary resource `Content-Type` is the stored media type exactly, because there is one
+representation. For an RDF resource it is the negotiated one: a graph stored as Turtle and
+fetched with `Accept: application/ld+json` answers `application/ld+json`. The stored value is
+what `*/*` resolves to, not a promise about every response.
+
+Byte size and content hash live nowhere: with a swappable blob backend, the pod does not
+exclusively own the bytes behind a resource, so a stored size or hash would go silently false
+the moment anything else writes into the same bucket. `Content-Length` and `ETag` are computed
+from the bytes themselves instead. The storage key is derived from the resource's own URL
+rather than recorded.
 
 The split is by authority, not by subject matter. An auxiliary holds what *you* assert about
 a resource; these are what the *server* asserts about it. This pod also never writes
 association triples into your data — no `seeAlso` pointing at an ACL, nothing. The `Link`
-header is the interface; your graphs stay yours. The moment a server-asserted fact
-has a writable URL, a client can assert its own creation timestamp and the value is
-worthless for auditing or ordering. A read-only projection of these facts may be offered
-later; it will never be writable.
+header is the interface; your graphs stay yours. The moment a server-asserted fact has a
+writable URL it stops being server-asserted: a client could declare its own resource binary
+while storing triples, or claim a media type the bytes are not in, and every reader
+downstream would believe it. A read-only projection of these facts may be offered later; it
+will never be writable.
 
 ## The vocabulary this pod mints
 

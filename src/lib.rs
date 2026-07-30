@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod aux;
+pub mod blob;
 pub mod config;
 pub mod container;
 pub mod dataset;
@@ -8,5 +9,6 @@ pub mod rdf;
 pub mod resource;
 pub mod shelf;
 pub mod space;
+pub mod sparql;
 pub mod store;
 pub mod wac;

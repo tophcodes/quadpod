@@ -16,6 +16,106 @@ fn media_type(ct: &str) -> &str {
     ct.split(';').next().unwrap_or("").trim()
 }
 
+/// A media type this pod stores and echoes back.
+///
+/// [`Format`] answers "can I parse this as RDF?" and its `media_type` is a
+/// `&'static str`, so every `Content-Type` the RDF path emits is safe by
+/// construction. A non-RDF resource's type comes from the client and reaches
+/// two interpolation sites — a SPARQL literal and a response header — so it
+/// needs a constructor that can refuse.
+///
+/// RFC 9110 §5.6.2: `token "/" token`, optionally followed by `; token=token`
+/// parameters. Every byte of the trimmed input is checked against tchar plus
+/// `/`, `;`, `=`, and space before the `type/subtype` shape is parsed, so the
+/// stored string can never contain a byte outside that alphabet — not even
+/// one sitting at a boundary a structural parse would trim away first.
+/// Quoted-string parameter values are refused rather than escaped: the
+/// alphabet contains neither `"` nor `\`, so a value that passes here cannot
+/// leave the SPARQL literal it is interpolated into, and that safety is a
+/// property of the alphabet the stored string is drawn from, not of a
+/// correct escape at every site. The cost is that `multipart/...;
+/// boundary="--x"` is rejected, which is acceptable because multipart is a
+/// request encoding rather than a stored representation.
+///
+/// Carries its `http::HeaderValue` alongside the raw string, both built by
+/// the one constructor. `#[derive(PartialEq, Eq)]` compares both fields
+/// rather than `raw` alone, which is fine: the two are always built together
+/// by `parse`, so they never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaType {
+    raw: String,
+    header: http::HeaderValue,
+}
+
+/// RFC 9110 §5.6.2 tchar.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+                | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+fn is_token(t: &str) -> bool {
+    !t.is_empty() && t.bytes().all(is_tchar)
+}
+
+/// tchar plus the `/`, `;`, `=`, and space bytes the grammar uses to
+/// delimit tokens from one another.
+fn is_media_type_byte(b: u8) -> bool {
+    is_tchar(b) || matches!(b, b'/' | b';' | b'=' | b' ')
+}
+
+impl MediaType {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        // Every byte of the input must be in the media-type alphabet before
+        // it is parsed structurally. This is what makes the alphabet claim
+        // literally true: the structural parse below trims each segment
+        // before validating it, so a stray whitespace or control byte sitting
+        // right at a `;` or `=` boundary would otherwise be trimmed away
+        // before `is_token` ever sees it, yet still survive into the stored
+        // string. Neither check subsumes the other — this one catches a rogue
+        // byte hiding at a trimmed boundary, the structural parse below
+        // catches a malformed `type/subtype` or a valueless parameter.
+        if !s.bytes().all(is_media_type_byte) {
+            return None;
+        }
+        let mut parts = s.split(';');
+        let (ty, sub) = parts.next()?.trim().split_once('/')?;
+        if !is_token(ty) || !is_token(sub) {
+            return None;
+        }
+        for p in parts {
+            let (name, value) = p.trim().split_once('=')?;
+            if !is_token(name) || !is_token(value) {
+                return None;
+            }
+        }
+        let header = http::HeaderValue::from_str(s).ok()?;
+        Some(Self { raw: s.to_owned(), header })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// The `Content-Type` header for this media type. Infallible: the value
+    /// was built and checked by the only constructor, so no call site has to
+    /// assert it.
+    pub fn header_value(&self) -> http::HeaderValue {
+        self.header.clone()
+    }
+
+    /// `type/subtype`, lowercased, parameters dropped — what an `Accept`
+    /// comparison is made against, since media-type tokens are
+    /// case-insensitive (RFC 9110 §8.3.1) but parameter values need not be.
+    pub fn essence(&self) -> String {
+        media_type(&self.raw).to_ascii_lowercase()
+    }
+}
+
 /// A media type this pod can read and write, and what it is capable of.
 ///
 /// The point of the newtype is that "Turtle cannot carry named graphs" is
@@ -101,6 +201,62 @@ impl Format {
     }
 }
 
+/// The `Accept` list, highest quality first with earlier entries breaking a
+/// tie, as `(q, position, media range)`.
+///
+/// **The only place this header is parsed.** [`negotiate`] asks it which
+/// format to render into; [`accept_allows`] asks it whether a resource's one
+/// representation is admissible. Those are different questions, but a second
+/// copy of the q-value parse is how the two come to disagree about `q=0`.
+fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
+    let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
+    for (i, part) in accept.split(',').enumerate() {
+        let mut bits = part.split(';');
+        let mt = bits.next().unwrap_or("").trim();
+        let q = bits
+            .filter_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
+            .next()
+            .unwrap_or(1.0);
+        ranked.push((q, i, mt));
+    }
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+    });
+    ranked
+}
+
+/// §6.1: whether `accept` admits a resource whose only representation is `mt`.
+///
+/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
+/// makes a more specific media range override a less specific one, so the
+/// decision is by specificity rather than by order or by the highest q.
+pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
+    let accept = accept.trim();
+    if accept.is_empty() {
+        return true;
+    }
+    let essence = mt.essence();
+    let ty = essence.split('/').next().unwrap_or("");
+    let type_wildcard = format!("{ty}/*");
+    let mut best: Option<(u8, f32)> = None;
+    for (q, _, range) in ranked_accept(accept) {
+        let range = range.to_ascii_lowercase();
+        let specificity = if range == essence {
+            3
+        } else if range == type_wildcard {
+            2
+        } else if range == "*/*" {
+            1
+        } else {
+            continue;
+        };
+        if best.is_none_or(|(s, _)| specificity > s) {
+            best = Some((specificity, q));
+        }
+    }
+    matches!(best, Some((_, q)) if q > 0.0)
+}
+
 /// §6.3: select the highest-ranked acceptable media range the server can
 /// serve, over the whole `Accept` list with q-values, rather than the first
 /// recognised entry — which would answer `text/turtle, application/ld+json`
@@ -121,18 +277,7 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
         return stored.filter(|f| usable(*f)).or_else(fallback);
     }
 
-    // (quality, order) — highest quality wins, earlier entry breaks a tie.
-    let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
-    for (i, part) in accept.split(',').enumerate() {
-        let mut bits = part.split(';');
-        let mt = bits.next().unwrap_or("").trim();
-        let q = bits
-            .filter_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
-            .next()
-            .unwrap_or(1.0);
-        ranked.push((q, i, mt));
-    }
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+    let ranked = ranked_accept(accept);
 
     // RFC 9110 §12.5.1: q=0 means the client explicitly rejects that media
     // range, not merely ranks it last. A named type at q=0 must also be
@@ -388,5 +533,101 @@ mod tests {
         // Still scoped by its type, and still refusable.
         assert_eq!(negotiate("text/*, text/turtle;q=0", Shape::Dataset, None), None);
         assert_eq!(negotiate("image/*", Shape::Dataset, None), None);
+    }
+
+    #[test]
+    fn media_type_accepts_what_rfc_9110_calls_a_media_type() {
+        assert_eq!(MediaType::parse("text/plain").unwrap().as_str(), "text/plain");
+        assert_eq!(
+            MediaType::parse("text/plain; charset=utf-8").unwrap().as_str(),
+            "text/plain; charset=utf-8",
+            "a token parameter is kept verbatim — it is what the client declared"
+        );
+        assert_eq!(MediaType::parse("  image/png  ").unwrap().as_str(), "image/png");
+        // Tokens are case-insensitive, so comparison uses the lowercased
+        // essence while the stored form keeps the client's spelling.
+        assert_eq!(MediaType::parse("Image/PNG").unwrap().essence(), "image/png");
+        assert_eq!(
+            MediaType::parse("text/plain; charset=utf-8").unwrap().essence(),
+            "text/plain",
+            "essence drops parameters"
+        );
+    }
+
+    // The reason this type exists. The stored form is interpolated into a
+    // `"`-delimited SPARQL literal, so a value that cannot contain `"` or `\`
+    // is safe by its alphabet rather than by a correct escape at every site.
+    // RFC 9110 §5.6.2's tchar set contains neither, so refusing everything
+    // outside it is the whole defence.
+    #[test]
+    fn media_type_refuses_anything_that_could_leave_a_sparql_literal() {
+        for bad in [
+            r#"text/plain; boundary="x""#,   // quoted-string parameter
+            r#"text/plain"; x="#,            // a bare quote
+            r"text/plain\",                  // a backslash
+            "text/plain\u{7f}",              // DEL, a CTL
+            "text/plain\nX-Evil: 1",         // LF, if it ever reached us
+            "textplain",                     // no slash
+            "/plain",                        // empty type
+            "text/",                         // empty subtype
+            "",                              // nothing at all
+            "text/plain; charset",           // parameter with no value
+            "text/plain;\ncharset=utf8",     // LF hiding at a segment boundary
+            "text/plain;\rcharset=utf8",     // CR hiding at a segment boundary
+            "text/plain;\tcharset=utf8",     // tab hiding at a segment boundary
+            "text/plain; charset =\tutf8",   // whitespace straddling `=`
+        ] {
+            assert!(MediaType::parse(bad).is_none(), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_format_is_also_a_media_type() {
+        let ttl = Format::from_content_type("text/turtle").unwrap();
+        assert_eq!(MediaType::parse(ttl.media_type()).unwrap().as_str(), "text/turtle");
+    }
+
+    // A MediaType that parsed is a header value that exists. No call site
+    // should have to assert that with an `.expect`.
+    #[test]
+    fn a_media_type_carries_its_header_value() {
+        let mt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+        assert_eq!(mt.header_value().to_str().unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(mt.header_value().to_str().unwrap(), mt.as_str());
+    }
+
+    // §6.1: a blob has one representation, so this is an acceptability test
+    // and not a resolver. The cases are the ones `negotiate` already handles,
+    // which is precisely why they must not be answered by a second parse.
+    #[test]
+    fn accept_allows_admits_or_refuses_a_single_representation() {
+        let png = MediaType::parse("image/png").unwrap();
+        let txt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+
+        assert!(accept_allows("", &png), "no Accept header means no constraint");
+        assert!(accept_allows("*/*", &png));
+        assert!(accept_allows("image/*", &png));
+        assert!(accept_allows("image/png", &png));
+        assert!(accept_allows("Image/PNG", &png), "ranges are case-insensitive");
+        assert!(accept_allows("text/turtle, image/png;q=0.1", &png));
+        // Parameters do not take part in the match; the essence does.
+        assert!(accept_allows("text/plain", &txt));
+
+        assert!(!accept_allows("text/turtle", &png));
+        assert!(!accept_allows("text/*", &png));
+    }
+
+    // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
+    // overrides a less specific one — so the answer cannot be derived from
+    // order or from the highest q alone.
+    #[test]
+    fn accept_allows_honours_q_zero_and_specificity() {
+        let png = MediaType::parse("image/png").unwrap();
+
+        assert!(!accept_allows("image/png;q=0", &png));
+        assert!(!accept_allows("*/*, image/png;q=0", &png), "specific overrides */*");
+        assert!(!accept_allows("image/png;q=0, */*", &png), "and order does not matter");
+        assert!(accept_allows("*/*;q=0, image/png", &png), "and it works the other way");
+        assert!(!accept_allows("image/*;q=0, */*", &png), "type/* overrides */*");
     }
 }

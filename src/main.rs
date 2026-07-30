@@ -48,12 +48,21 @@ async fn main() {
             "--allow-insecure-host: private-IP and https-only checks are waived for these hosts"
         );
     }
+    let blobs = match cfg.blobs() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let state = AppState {
         store: Arc::new(OxigraphStore::in_memory().expect("store")),
+        blobs,
         space,
         resolver: Arc::new(HttpJwksResolver::new(fetch_policy.clone())),
         webid_verifier: Arc::new(HttpWebIdIssuers::new(fetch_policy)),
         auth_config: Arc::new(cfg.auth_config()),
+        max_body_bytes: cfg.max_body_bytes,
     };
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
         .await.expect("provision root container");
