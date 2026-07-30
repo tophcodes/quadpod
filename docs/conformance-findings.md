@@ -359,12 +359,14 @@ and unrelated to this fix.
 | | |
 |---|---|
 | **Date** | 2026-07-30 |
-| **Pod commit** | `d485135976795d0f5a6029a8f69029462b1993dd` (the fifth run's tree plus the N3 Patch work, [design](../superpowers/specs/2026-07-30-n3-patch-design.md)) |
+| **Pod commit** | `d485135976795d0f5a6029a8f69029462b1993dd` (the fifth run's tree plus the N3 Patch work, [design](../superpowers/specs/2026-07-30-n3-patch-design.md)), **re-measured at `83f270e`** |
 
 | | Features | Scenarios | Passed | Failed |
 |---|---|---|---|---|
 | karate (everything that ran) | 41 | 652 | 632 | 20 |
 | harness's MUST-linked subset | 38 | 649 | 621 | 20 |
+
+Four whole-branch review fixes landed after this run — a container's LDP type is re-asserted after a patch, a formula predicate whose object names no formula is refused, and two guards gained the tests that pin them. The suite was run again at `83f270e` and produced the identical **632 / 20**, with the same seven failing features at the same counts, so every number below holds for the branch as it merges rather than only for the commit it was first measured at.
 
 Same 41 features, same 652 scenarios as every prior run. **34 of the 41 now pass every
 scenario and 7 have at least one failure**, against 29 and 12 in the fifth run. 85 residual
