@@ -364,8 +364,17 @@ Properties, each of which must be shown to fail before the code that makes it ho
 - **A broken constraint document bricks its container** until the binding is fixed or removed.
   Deliberate: failing open would disable a policy silently, which is the failure mode a
   validation feature exists to prevent.
-- **Validation cost is paid per write.** It is bounded by the size of the written body; no
-  store read is added to the write path.
+- **Validation cost is paid per write**, and one store read comes with it: the binding lookup
+  asks the parent container's graph for `ldp:constrainedBy` on the container's own IRI. That
+  query is bounded — it never returns the container's membership — so the cost does not grow
+  with the number of members, but it is a round trip on every RDF write, including on a pod
+  where no container binds anything.
+- **A container cannot be shape-checked on the type triple it asserts about itself.** The read
+  view validates what the client wrote, so it strips the `rdf:type ldp:Container` pair the
+  server asserts on the container's own IRI (§6). A client that writes that same triple is
+  indistinguishable from the server having written it — one stored triple, no provenance — so
+  a shape targeting it sees nothing at `?validate` even though the write path saw it. Type
+  triples about any other subject survive.
 - **Nothing constrains a container's shape as a whole** — not its member count, not its member
   types. `ldp:contains` is never in a data graph here (§3.4, §8).
 - **SHACL Core only.** No SPARQL-based constraints, targets, rules or update executables
