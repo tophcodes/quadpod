@@ -228,7 +228,7 @@ mod tests {
 
     fn acl(turtle: &str) -> Vec<Triple> {
         Format::from_content_type("text/turtle").unwrap()
-            .parse(turtle.as_bytes(), "https://pod.toph.so/foo.acl")
+            .parse(turtle.as_bytes(), "https://pod.toph.so/foo.acl", crate::rdf::RdfVersion::Rdf11)
             .expect("test ACL parses")
             .quads().iter().cloned().map(Triple::from).collect()
     }

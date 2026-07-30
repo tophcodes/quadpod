@@ -81,7 +81,10 @@ pub async fn provision_root_acl(
     );
     let dataset = Format::from_content_type("text/turtle")
         .expect("text/turtle is always supported")
-        .parse(turtle.as_bytes(), acl.graph_iri())?;
+        // RDF 1.1, because this pod authors the string: the root ACL is not
+        // client data, and an edit to it should not be able to introduce 1.2
+        // without the declaration the wire path would have required.
+        .parse(turtle.as_bytes(), acl.graph_iri(), crate::rdf::RdfVersion::Rdf11)?;
     let triples: Vec<Triple> = dataset.quads().iter().cloned().map(Triple::from).collect();
 
     match aux::put(store, &acl, &triples).await {

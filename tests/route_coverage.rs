@@ -32,7 +32,11 @@ async fn app() -> axum::Router {
     };
     let turtle = sparql_pod::rdf::Format::from_content_type("text/turtle").unwrap();
     let t: Vec<oxigraph::model::Triple> = turtle
-        .parse(b"<#it> <http://schema.org/name> \"seed\" .", seeded.graph_iri())
+        .parse(
+            b"<#it> <http://schema.org/name> \"seed\" .",
+            seeded.graph_iri(),
+            sparql_pod::rdf::RdfVersion::Rdf11,
+        )
         .unwrap()
         .quads().iter().cloned().map(oxigraph::model::Triple::from).collect();
     sparql_pod::resource::put_rdf(store.as_ref(), &seeded, &t).await.unwrap();
@@ -46,6 +50,7 @@ async fn app() -> axum::Router {
                 seeded.graph_iri(),
             ).as_bytes(),
             acl.graph_iri(),
+            sparql_pod::rdf::RdfVersion::Rdf11,
         )
         .unwrap()
         .quads().iter().cloned().map(oxigraph::model::Triple::from).collect();

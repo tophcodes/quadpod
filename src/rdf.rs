@@ -240,7 +240,19 @@ impl Format {
         self.0.supports_datasets()
     }
 
-    pub fn parse(&self, bytes: &[u8], base_iri: &str) -> Result<Dataset, RdfError> {
+    /// `declared` is what the representation claimed, read from its
+    /// `Content-Type` by [`RdfVersion::from_media_type`] — the only reader of
+    /// that parameter. A body richer than its own declaration is refused:
+    /// the document contradicts what it said about itself, which is a
+    /// malformed request rather than an unsupported one.
+    ///
+    /// Callers that are not the wire pass [`RdfVersion::Rdf12`]. The version
+    /// contract is a property of the wire, not of parsing — refusing 1.2 in a
+    /// fetched WebID document or in this pod's own validation report would
+    /// add a failure mode with nothing behind it.
+    pub fn parse(&self, bytes: &[u8], base_iri: &str, declared: RdfVersion)
+        -> Result<Dataset, RdfError>
+    {
         let parser = RdfParser::from_format(self.0)
             .with_base_iri(base_iri)
             .map_err(|e| RdfError::Parse(e.to_string()))?;
@@ -251,15 +263,13 @@ impl Format {
         let parsed = Dataset::new(out);
         // `Cargo.toml` declares oxigraph's `rdf-12`, so the parser accepts
         // both of RDF 1.2's additions — triple terms *and* directional
-        // language-tagged strings. The refusal asks
-        // [`Dataset::rdf_version`], the one classifier, rather than matching
-        // on a term kind here: matching caught triple terms and let every
-        // directional literal through, which made the wire contract half
-        // true. Until the declared version is threaded through this
-        // signature, the contract is RDF 1.1 for everyone.
+        // language-tagged strings. The check asks [`Dataset::rdf_version`],
+        // the one classifier, rather than matching on a term kind here:
+        // matching caught triple terms and let every directional literal
+        // through, which is what made the wire contract half true.
         let found = parsed.rdf_version();
-        if found > RdfVersion::Rdf11 {
-            return Err(RdfError::UnsupportedRdfVersion { found, allowed: RdfVersion::Rdf11 });
+        if found > declared {
+            return Err(RdfError::UnsupportedRdfVersion { found, allowed: declared });
         }
         Ok(parsed)
     }
@@ -487,7 +497,7 @@ mod tests {
         let fmt = Format::from_content_type("text/turtle").unwrap();
         let ttl = b"<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .";
         assert!(matches!(
-            fmt.parse(ttl, "http://e/"),
+            fmt.parse(ttl, "http://e/", crate::rdf::RdfVersion::Rdf11),
             Err(RdfError::UnsupportedRdfVersion { found: RdfVersion::Rdf12, .. })
         ));
     }
@@ -501,7 +511,7 @@ mod tests {
         let fmt = Format::from_content_type("text/turtle").unwrap();
         let ttl = br#"<http://e/s> <http://e/p> "hello"@en--ltr ."#;
         assert!(matches!(
-            fmt.parse(ttl, "http://e/"),
+            fmt.parse(ttl, "http://e/", crate::rdf::RdfVersion::Rdf11),
             Err(RdfError::UnsupportedRdfVersion { found: RdfVersion::Rdf12Basic, .. })
         ));
     }
@@ -512,7 +522,7 @@ mod tests {
     fn an_ordinary_triple_still_parses() {
         let fmt = Format::from_content_type("text/turtle").unwrap();
         let ttl = b"<http://e/s> <http://e/p> <http://e/o> .";
-        assert_eq!(fmt.parse(ttl, "http://e/").unwrap().quads().len(), 1);
+        assert_eq!(fmt.parse(ttl, "http://e/", crate::rdf::RdfVersion::Rdf11).unwrap().quads().len(), 1);
     }
 
     // Not superseded by the JSON-LD-named-graph tests below: this pins that
@@ -529,9 +539,9 @@ mod tests {
         )]);
 
         let ttl = turtle.serialize(&ds).unwrap();
-        let via_ttl = turtle.parse(&ttl, "https://pod.toph.so/foo").unwrap();
+        let via_ttl = turtle.parse(&ttl, "https://pod.toph.so/foo", crate::rdf::RdfVersion::Rdf11).unwrap();
         let jsonld_bytes = jsonld.serialize(&via_ttl).unwrap();
-        let via_json = jsonld.parse(&jsonld_bytes, "https://pod.toph.so/foo").unwrap();
+        let via_json = jsonld.parse(&jsonld_bytes, "https://pod.toph.so/foo", crate::rdf::RdfVersion::Rdf11).unwrap();
 
         assert_eq!(via_json.quads().len(), 1);
         assert_eq!(via_json.quads()[0].predicate.as_str(), "http://schema.org/name");
@@ -573,7 +583,7 @@ mod tests {
     #[test]
     fn parse_keeps_the_graph_name() {
         let jsonld = Format::from_content_type("application/ld+json").unwrap();
-        let ds = jsonld.parse(NAMED_GRAPH_JSONLD.as_bytes(), "https://pod.toph.so/c/notes").unwrap();
+        let ds = jsonld.parse(NAMED_GRAPH_JSONLD.as_bytes(), "https://pod.toph.so/c/notes", crate::rdf::RdfVersion::Rdf11).unwrap();
 
         assert_eq!(ds.quads().len(), 2);
         let named: Vec<_> = ds.quads().iter()

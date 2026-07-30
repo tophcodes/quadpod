@@ -168,14 +168,23 @@ The query string is read in exactly one place.
 
 ## RDF version
 
-The wire contract is RDF 1.1, and it is checked over both of RDF 1.2's additions.
-    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-rdf12-design.md §2, §3.1.
-    `rudof_lib` turned oxigraph's `rdf-12` feature on transitively; `Cargo.toml`
-    now declares it outright, so the capability is this crate's own fact rather
-    than a dependency's private choice. RDF 1.2 adds triple terms **and**
-    directional language-tagged strings, and the original check saw only the
-    first — a directional literal is a `Term::Literal` and walked past a match
-    on `Term::Triple` into storage. The rule was therefore half true from the
-    day it was written. `Dataset::rdf_version` is the one classifier both
-    halves now go through, which is what makes the refusal total.
-    check: rg -q 'fn rdf_version\(&self\) -> RdfVersion' src/dataset.rs
+The RDF version of a dataset is classified in exactly one place.
+    → 2026-07-30-rdf12-design.md §3.1, §10. The write-side refusal and the
+    read-side projection ask the same question, and two classifiers is how
+    they drift apart — silently, because both answer and one answers wrong.
+    That already happened once: the refusal this replaced matched
+    `Term::Triple` and never looked at `Literal::direction`, so every
+    directional language-tagged string walked into storage while the rule
+    above it claimed the wire was RDF 1.1. The check counts the
+    classification *body*, not the name: `SparqlStore::rdf_version` has the
+    same signature for a different question (what a backend can hold).
+    check: [ "$(rg -o 'Term::Triple\(_\) => RdfVersion' src | wc -l)" = 1 ]
+
+The `version` media-type parameter is read in exactly one place.
+    → 2026-07-30-rdf12-design.md §4, §10. `Content-Type` on write and
+    `Accept` on read ask the same question of the same syntax; a second
+    reader is how `1.2` comes to mean one thing on the way in and another on
+    the way out. Mirrors the single q-value parse rule above, and it is why
+    `Repr::Rdf` carries the declared version through the write path instead
+    of the handler re-reading the header it already parsed.
+    check: [ "$(rg -o '"version=?"' src | wc -l)" = 1 ]
