@@ -1,4 +1,4 @@
-# Conformance findings — first run
+# Conformance findings
 
 | | |
 |---|---|
@@ -492,7 +492,7 @@ and passes them.
 the finding Plan 10 existed to produce, not a side effect of it: 434 of the 540 scenarios this
 run newly measures — 80% — pass outright. `read-access-{agent,bob,public}` each go from
 untestable to `80/90`; `write-access-{agent,bob}` to `68/84`; `write-access-public` to `40/53`.
-Every failure among those four features has a named cause above (`PATCH`, or one of the two
+Every failure among those six features has a named cause above (`PATCH`, or one of the two
 new `POST`/`DELETE` findings) — none is an ordinary Read/Write/Append/Control decision coming
 out wrong. The ~370 rows the second run's document called "genuinely unmeasured" and "the real
 reason to do #1 first" are measured now, and WAC held up.
