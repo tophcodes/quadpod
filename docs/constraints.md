@@ -100,8 +100,12 @@ Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     server-authored queries never use and nothing here should be able to
     reach for. The compiler does not require the opt-out:
     `.without_default_http_service_handler()` is a builder call a future
-    query site can simply omit and still compile.
-    check: [ "$(rg -o 'SparqlEvaluator::new\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
+    query site can simply omit and still compile. `SparqlEvaluator` also
+    implements `Default`, so `SparqlEvaluator::default()` constructs the same
+    live-`SERVICE` evaluator and must count as a construction site too — a
+    check pinned to `::new()` alone is a check a rewrite to `::default()`
+    walks straight past while staying green.
+    check: [ "$(rg -o 'SparqlEvaluator::(new|default)\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
 
 `SparqlStore` has exactly one implementor.
     → 2026-07-24-sparql-solid-pod-design.md §16 ADR-2;
