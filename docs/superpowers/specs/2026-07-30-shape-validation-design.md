@@ -88,44 +88,27 @@ type this pod already stores for it (`resource::stored_media_type`), never from 
 ShEx would slot in here as two more rows (`text/shex`, `application/shex+json`), which is why
 the dispatch is a table rather than an `if`. It is not in this design; see §8.
 
-### 3.4 Scope, and the vocabulary this adds
+### 3.4 The data graph is the written document, and nothing else
 
 SHACL cannot express which data graph it is validating. `sh:targetClass`, `sh:targetNode` and
 friends select *focus nodes within* a data graph; choosing the graph is the caller's job and
 lies outside SHACL's model. `sh:shapesGraph` points the other way — from data to shapes — and
 is declared inside the data, which makes it a per-write client choice rather than a container
-policy. So the scope needs a term of ours:
+policy. The choice is therefore the server's, and this design makes it once: **the data graph
+is the body being written, alone.**
 
-```turtle
-</notes/> ldp:constrainedBy </shapes/note> ;
-          qp:validationScope qp:Container .
-```
+That is the common denominator of the shape languages. A ShEx schema checks a node against a
+shape through a ShapeMap and has no notion of a container's aggregate state at all, so a
+document-scoped binding is the only one both languages can mean the same thing by. Widening
+the scope is a SHACL-only idea and would have to be a term ShEx ignores.
 
-| value | data graph |
-|---|---|
-| `qp:Resource` (default when the predicate is absent) | the written body alone |
-| `qp:Container` | the written body ∪ the container's graph, **projected** — see below |
+It also means this design mints **no vocabulary**. `ldp:constrainedBy` says which shape,
+`sh:severity` says how hard (§4), and there is nothing left to express. The provisional
+namespace of `docs/uri-space.md` — the one that owes a permanent identifier before 1.0 — keeps
+its single existing term instead of gaining three more ahead of the move.
 
-`qp:Container` exists because `ldp:contains` is already materialized in the container's graph.
-Cardinality and membership typing — "at most one profile here", "every member is a `Note`" —
-are constraints over containment triples, and answering them costs one store read rather than
-one read per member.
-
-**The projection is load-bearing.** Validation runs before the write (§5), so at that moment
-the container's graph does not yet contain the `ldp:contains` triple this write would add. A
-rule of "at most five members" evaluated against the stored graph counts the pre-write state
-and admits the sixth member — silently, with no error anywhere. The data graph for
-`qp:Container` is therefore the container's stored graph **plus the containment triple this
-write would create**, never the stored graph as-is.
-
-The terms are minted in the namespace `docs/uri-space.md` already establishes,
-`https://quadpod.toph.so/ns#`, which that document flags as provisional and owing a permanent
-identifier before 1.0. This design adds three terms to the one that exists, which raises the
-cost of the move it does not make.
-
-They are deliberately **not** under `urn:quadpod:`. That prefix is reserved
-(`dataset::RESERVED_PREFIX`) and `Dataset::uses_reserved_namespace` rejects any client body
-mentioning it with a `400` — a scope term there would be a term no client could ever write.
+Container-scoped validation is deferred, not rejected; §8 states what it would buy, what it
+would cost, and why adding it later invalidates no binding written under this rule.
 
 ## 4. Severity is the enforcement dial
 
@@ -178,9 +161,9 @@ wants refusal there should say `sh:Violation`.
 
 - **Auxiliary writes.** An ACL is server-understood data with its own rules; a user shape has
   no business refusing one, and a shape that could would be a way to lock an ACL.
-- **Blob bodies**, under `qp:Resource` — there are no triples to validate.
-- Blob writes under `qp:Container` **are** checked, over the projected container graph only.
-  Otherwise "at most five members" is bypassed by writing a PNG.
+- **Blob bodies.** There are no triples to validate. A blob write into a constrained container
+  therefore always succeeds, which is a hole only for constraints about the container — and
+  those are out of scope (§3.4, §8).
 
 ## 6. Read path — `GET /path?validate`
 
@@ -252,11 +235,26 @@ until it is fixed — see §10.
   ShEx/SHACL via `st:shape` and `st:usesLanguage` — and it would reuse the validation function
   written here with a different binding lookup. Keeping lookup and validation separate
   functions is what keeps that a second lookup rather than a rewrite.
-- **`qp:ContainerDeep`** — a data graph including every member's content. It buys constraints
-  across member bodies at a cost of one store read per member per write, and it brings two
-  defects worth stating: a write to X can be refused because unreadable Y is malformed, and a
-  container that already violates its shape refuses the very write that would repair it. The
-  scope term is an enumeration so this can be added without touching existing bindings.
+- **Container-scoped validation** — a data graph wider than the written document. Two variants
+  were weighed. The cheap one adds the container's own graph, where `ldp:contains` is already
+  materialized, and buys cardinality and membership typing for one store read. The expensive
+  one adds every member's content and buys constraints across member bodies for one read per
+  member per write.
+
+  Both are deferred for the same reason: the constraints they buy are exactly the ones whose
+  failure modes are worst. The cheap variant must validate against the container's graph
+  **projected** to include the containment triple the write would add — validation runs before
+  the write (§5.1), so against the stored graph a rule of "at most five members" counts the
+  pre-write state and admits the sixth, silently. The expensive variant additionally lets a
+  write to X be refused because an unreadable Y is malformed, and lets a container that already
+  violates its shape refuse the very write that would repair it.
+
+  Adding either later invalidates no binding written under §3.4: absence of a scope statement
+  means document scope, so a scope vocabulary is purely additive. Should one be minted, it
+  belongs in the `https://quadpod.toph.so/ns#` namespace and deliberately **not** under
+  `urn:quadpod:` — that prefix is reserved (`dataset::RESERVED_PREFIX`) and
+  `Dataset::uses_reserved_namespace` answers `400` for any client body mentioning it, so a
+  term there would be a term no client could write.
 - **Ad-hoc validation** (`?validate=<shapeIri>`). It would need the shape IRI restricted to
   pod-local resources resolved through the store — never dereferenced, or it is an SSRF vector
   the `auth::safe_fetch` policy exists to prevent — and `acl:Read` on the shape.
@@ -271,11 +269,10 @@ Properties, each of which must be shown to fail before the code that makes it ho
    This is the §5.1 ordering, and it fails loudly if validation moves after the walk.
 3. A shape whose constraints are all `sh:Warning` admits the write and the response carries
    the `describedby` link.
-4. `qp:Container` with a `sh:maxCount` over `ldp:contains` refuses the member that would
-   exceed it — the projection test from §3.4. Against the unprojected graph this admits one
-   member too many.
-5. A blob write is refused by a `qp:Container` cardinality rule and unaffected by a
-   `qp:Resource` shape.
+4. A shape whose focus nodes exist only in *other* members of the container finds nothing —
+   the data graph is the written document alone (§3.4), and a test that passes here only
+   because the container happened to be empty is not this test.
+5. A blob write into a constrained container succeeds and is not validated.
 6. An ACL write is never validated, even under a shape that would refuse it.
 7. `GET /x?validate` reflects a shape edited after `/x` was written, with no write to `/x`.
 8. `GET /x?validate` requires `acl:Read` on `/x` and is `404` where no binding exists.
@@ -287,7 +284,10 @@ Properties, each of which must be shown to fail before the code that makes it ho
 - **A broken constraint document bricks its container** until the binding is fixed or removed.
   Deliberate: failing open would disable a policy silently, which is the failure mode a
   validation feature exists to prevent.
-- **Validation cost is paid per write**, and under `qp:Container` includes one store read.
+- **Validation cost is paid per write.** It is bounded by the size of the written body; no
+  store read is added to the write path.
+- **Nothing constrains a container's shape as a whole** — not its member count, not its member
+  types. `ldp:contains` is never in a data graph here (§3.4, §8).
 - **`?validate` is reachable by any agent with `acl:Read`**, and repeated calls are repeated
   validation work. There is no rate limit in this pod.
 - **The report describes now, not then.** A report fetched after a later write describes the
@@ -299,10 +299,9 @@ Properties, each of which must be shown to fail before the code that makes it ho
 
 ## 11. Deltas against documents already in force
 
-- `docs/uri-space.md` — a new section for the `?validate` view (the first query parameter this
-  pod gives meaning to) and three additions to *The vocabulary this pod mints*:
-  `qp:validationScope`, `qp:Resource`, `qp:Container`. The provisional-IRI warning now covers
-  four terms instead of one.
+- `docs/uri-space.md` — one new section for the `?validate` view, the first query parameter
+  this pod gives meaning to. *The vocabulary this pod mints* is **unchanged**: this design adds
+  no term, so the provisional-IRI warning still covers exactly one.
 - `docs/superpowers/specs/2026-07-24-sparql-solid-pod-design.md` §11/§12 — SHACL moves from
   "deferred, seam only" to implemented-and-optional. §7's rented-crate table gains
   `rudof_lib`, replacing the `rudof (shacl_validation)` row with the crate that actually
