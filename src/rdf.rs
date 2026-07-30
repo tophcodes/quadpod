@@ -571,5 +571,4 @@ mod tests {
         assert_eq!(mt.header_value().to_str().unwrap(), "text/plain; charset=utf-8");
         assert_eq!(mt.header_value().to_str().unwrap(), mt.as_str());
     }
-
 }
