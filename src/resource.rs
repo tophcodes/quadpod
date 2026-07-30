@@ -261,6 +261,51 @@ pub async fn kind_of(
     Ok(Some(Kind::Binary(mt)))
 }
 
+/// What applying a patch did, or which of §6's conditions stopped it.
+///
+/// The three refusals are values rather than [`ResourceError`] variants because
+/// they are facts about the client's request meeting the stored state, not
+/// failures of this layer. The HTTP edge maps all three to `409`; keeping them
+/// distinct is what lets the message say which rule it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchResult {
+    Applied,
+    /// No variable mapping satisfies the conditions.
+    NoMapping,
+    /// More than one does, so "the" match does not exist.
+    SeveralMappings,
+    /// A mapping was found, but a triple the patch deletes was not there when
+    /// the write ran.
+    DeletionMissing,
+}
+
+/// Apply a patch to an **existing** RDF resource (`2026-07-30-n3-patch-design.md` §6).
+///
+/// Two store operations and no more. First the conditions as a `SELECT` with
+/// `LIMIT 2`, scoped to this resource's graph — enough to tell zero from one
+/// from several without materialising a large result. Then one
+/// `WITH … DELETE … INSERT … WHERE …` whose `WHERE` is the ground deletion set,
+/// so the presence check §6 requires *is* the write: an absent deletion triple
+/// makes the pattern fail to match and nothing happens, which is
+/// [`PatchResult::DeletionMissing`]. A separate check followed by
+/// `DELETE DATA`/`INSERT DATA` would leave a window in which a concurrent
+/// removal makes the delete skip silently while the insert still runs.
+///
+/// Only the resource's default graph is touched. N3 Patch cannot name a graph,
+/// so shelves are unreachable by any patch a client can write (§6.2).
+///
+/// Creating an absent resource is **not** here: that goes through the same
+/// ancestor materialization and containment linking `PUT` uses (§7), which lives
+/// at the HTTP edge because that is where authorization and materialization are
+/// already sequenced.
+pub async fn patch_dataset(
+    _store: &dyn SparqlStore,
+    _r: &ResourceUrl,
+    _patch: &crate::patch::Patch,
+) -> Result<PatchResult, ResourceError> {
+    todo!()
+}
+
 /// §6 step 2: the resource graph, the registry, and one `CONSTRUCT` per shelf.
 /// `query_triples` has no graph field, so a single query cannot recover which
 /// shelf a triple came from — 2+N in-process queries, and no fast path that

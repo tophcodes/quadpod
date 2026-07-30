@@ -120,6 +120,18 @@ There is one content-negotiation path, one parser and one ETag.
     both answer, one answers wrong.
     check: ! rg -q 'fn (format_for_accept|format_for_content_type)\b' src
 
+`patch` never reaches the store.
+    → 2026-07-30-n3-patch-design.md §3, §6. The argument that no client SPARQL
+    exists rests on the patch document being parsed to terms in one place and
+    turned into queries in another: `patch` decides whether a document is
+    acceptable, `resource::patch_dataset` decides what it does to a resource.
+    Give `patch` a store and the two questions merge, the shape validation stops
+    being testable without one, and the module that holds client-authored
+    structure gains the ability to execute it. The narrower grep is deliberate —
+    the word "store" appears in this module's prose, and a rule that trips over
+    its own doc comment is a rule someone deletes.
+    check: ! rg -q 'crate::store|SparqlStore' src/patch.rs
+
 No `#[allow]` attributes in `src/`.
     → Plan 6 Task 1 recorded this as a global constraint, and it was
     load-bearing once already: it forced a plan-mandated `Result<String, ()>`

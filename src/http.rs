@@ -37,8 +37,8 @@ pub fn router(state: AppState) -> Router {
     // outermost: `cors_layer` sees the `401` that `auth_layer` produces, which
     // is where the CORS fields are required.
     Router::new()
-        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).options(handle_options_root))
-        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).options(handle_options))
+        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).patch(handle_patch_root).options(handle_options_root))
+        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).patch(handle_patch).options(handle_options))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
         .layer(axum::middleware::from_fn(cors_layer))
@@ -450,6 +450,55 @@ async fn handle_put_root(
 ) -> Response {
     match classify(&st.space, "/") {
         Ok(target) => put_impl(st, agent, target, headers, body).await,
+        Err(status) => status.into_response(),
+    }
+}
+
+/// `PATCH` (`2026-07-30-n3-patch-design.md`). The sequence, which the plan fills
+/// in this order and no other:
+///
+/// 1. `authorize(…, Mode::Append)` — before anything is parsed, so an
+///    unauthorized caller learns nothing, and the returned `Decision` carries
+///    the full mode set §9 needs.
+/// 2. The `Content-Type` gate: `text/n3`, with `classify_body`'s split for a
+///    missing type — `400` on a non-empty body, `415` on an empty one.
+/// 3. `patch::Patch::parse` — `400` for unparseable N3 or a reserved IRI, `422`
+///    for a shape violation.
+/// 4. `RequiredModes::satisfied_by` against the decision already in hand. No
+///    second ACL resolution.
+/// 5. `kind_of` — a binary resource is `409`; the bytes are not triples.
+/// 6. On a container, refuse a patch touching `ldp:contains` with `409`, through
+///    the same `container::body_sets_containment` `put_impl` uses.
+/// 7. `check_conditionals` — `412`.
+/// 8. Absent target and empty conditions: create through the `PUT` path
+///    (`Patch::ground_insertions`, ancestor materialization, `created`) → `201`.
+///    Otherwise `resource::patch_dataset` → `204`, or `409` per its
+///    `PatchResult`.
+async fn patch_impl(
+    _st: AppState,
+    _agent: Agent,
+    _target: Target,
+    _headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    todo!()
+}
+
+async fn handle_patch(
+    State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
+    headers: HeaderMap, body: Bytes,
+) -> Response {
+    match classify(&st.space, &format!("/{path}")) {
+        Ok(target) => patch_impl(st, agent, target, headers, body).await,
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn handle_patch_root(
+    State(st): State<AppState>, Extension(agent): Extension<Agent>, headers: HeaderMap, body: Bytes,
+) -> Response {
+    match classify(&st.space, "/") {
+        Ok(target) => patch_impl(st, agent, target, headers, body).await,
         Err(status) => status.into_response(),
     }
 }
