@@ -7,6 +7,7 @@
 //! denying). A presence marker in `urn:quadpod:sys:<iri>` removes the ambiguity.
 
 use crate::{
+    container::RDF_TYPE,
     dataset::{Dataset, GroundGraphName, GroundQuad, Skolemized},
     rdf::{Format, RdfError},
     shelf::{ShelfKey, SYS_GRAPH_NAME, SYS_HAS_SUBGRAPH, SYS_MEDIA_TYPE},
@@ -50,8 +51,6 @@ pub const SYS_PRESENT: &str = "urn:quadpod:sys#present";
 /// empty RDF resource, and `application/rdf+xml` is already on the follow-up
 /// list (`2026-07-28-jsonld-datasets-design.md` §11).
 pub const SYS_BINARY_RESOURCE: &str = "urn:quadpod:sys#BinaryResource";
-
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// What a resource's representation is made of.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +99,12 @@ pub(crate) fn serialize_for_insert(quads: &Skolemized) -> String {
 /// update (design spec §5.1).
 ///
 /// One of the two teardown sites (§7): a blob this resource held is
-/// superseded by this write and is removed with it.
+/// superseded by this write. The object is deleted **after** the SPARQL
+/// update commits, matching [`aux::delete_subject`](crate::aux::delete_subject):
+/// an interrupted delete leaves an object no marker points at, which the next
+/// write to the same URL overwrites, whereas the reverse order would leave a
+/// resource marked `BinaryResource` with no object behind it — `GET` then
+/// answers `404` and blames a backend that did nothing wrong.
 pub async fn put_dataset(
     store: &dyn SparqlStore,
     blobs: &dyn crate::blob::BlobStore,
@@ -133,14 +137,6 @@ pub async fn put_dataset(
                 }
             }
         }
-    }
-
-    // §5.2: this write replaces the representation including its kind, so a
-    // blob that was here is superseded. Unconditional — deleting an absent
-    // object succeeds, and a check plus a delete is two round-trips with a
-    // window between them. Over-long keys have no object to remove.
-    if let Some(key) = crate::blob::BlobKey::of(r) {
-        blobs.delete(&key).await?;
     }
 
     // Both drops (§3.2 invariant 4): what the registry lists, and what we are
@@ -188,6 +184,15 @@ pub async fn put_dataset(
     update.push_str(&format!("INSERT DATA {{ GRAPH <{sys}> {{ {registry} }} }}"));
 
     store.update(&update).await?;
+
+    // §5.2: this write replaces the representation including its kind, so a
+    // blob that was here is superseded. Runs after the update commits — see
+    // the doc comment above. Unconditional — deleting an absent object
+    // succeeds, and a check plus a delete is two round-trips with a window
+    // between them. Over-long keys have no object to remove.
+    if let Some(key) = crate::blob::BlobKey::of(r) {
+        blobs.delete(&key).await?;
+    }
     Ok(())
 }
 
@@ -716,7 +721,10 @@ mod tests {
         assert_eq!(back.quads().len(), 2);
         assert!(back.quads().iter().any(|q| q.graph_name == g.clone().into()),
             "the graph name came back");
-        assert_eq!(stored_media_type(&store, &r).await.unwrap(), Some(crate::rdf::MediaType::from(jsonld)));
+        assert_eq!(
+            stored_media_type(&store, &r).await.unwrap(),
+            Some(crate::rdf::MediaType::parse(jsonld.media_type()).unwrap())
+        );
     }
 
     // §3.2 invariant 4: a shelf the registry no longer lists is not litter, it

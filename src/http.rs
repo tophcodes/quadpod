@@ -241,7 +241,7 @@ fn created(target: &Target) -> Response {
 
 fn put_status(e: &ResourceError) -> StatusCode {
     match e {
-        ResourceError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ResourceError::Store(_) | ResourceError::Blob(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -363,10 +363,9 @@ enum Repr {
 /// that only exists now that an unrecognised type is a blob rather than a
 /// refusal.
 ///
-/// The error is boxed because `Repr::Rdf` carries a whole `Dataset`: an
-/// unboxed `Result<Repr, Response>` would size every `Ok` return by the
-/// larger of the two variants, making the common case pay for the error
-/// path's size.
+/// The error is boxed for `clippy::result_large_err`, which measures the
+/// `Err` type: `Response` is large, and boxing it keeps `Result<Repr, _>`
+/// from being sized by it.
 fn classify_body(headers: &HeaderMap, body: &Bytes, target: &Target) -> Result<Repr, Box<Response>> {
     let ct = header_str(headers, header::CONTENT_TYPE).trim();
     if ct.is_empty() {
@@ -1135,6 +1134,12 @@ mod tests {
     }
 
     async fn fixture_with_body_limit(max_body_bytes: usize) -> Fixture {
+        fixture_with_blobs(Arc::new(crate::blob::ObjectStoreBlobs::in_memory()), max_body_bytes).await
+    }
+
+    /// Like [`fixture`], but with a caller-chosen `BlobStore` — for a fixture
+    /// whose blob backend is failing (see `a_blob_backend_outage_answers_500_not_400`).
+    async fn fixture_with_blobs(blobs: Arc<dyn crate::blob::BlobStore>, max_body_bytes: usize) -> Fixture {
         assert!(
             !FIXTURE_HELD.with(|f| f.replace(true)),
             "call fixture() once per test: it holds the process-wide DPoP replay lock \
@@ -1143,8 +1148,6 @@ mod tests {
         let _replay_guard = crate::auth::dpop::test_replay_lock().lock().await;
         let store: Arc<dyn crate::store::SparqlStore> =
             Arc::new(OxigraphStore::in_memory().unwrap());
-        let blobs: Arc<dyn crate::blob::BlobStore> =
-            Arc::new(crate::blob::ObjectStoreBlobs::in_memory());
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space.root()).await.unwrap();
         crate::wac::provision::provision_root_acl(store.as_ref(), &space, OWNER, false).await.unwrap();
@@ -4240,5 +4243,42 @@ mod tests {
         let res = f.app.clone().oneshot(f.owner_request("GET", "/secret.txt")
             .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// A `BlobStore` whose `put` always fails, standing in for a backend
+    /// outage — disk full, bucket unreachable. Reached only through the HTTP
+    /// handlers here, unlike `resource::`'s own `FailingBlobs`: that one
+    /// pins `put_dataset`'s write order, but nothing at that level ever
+    /// passes through `put_status`, which is the function this test exists
+    /// to cover.
+    struct FailingBlobs;
+
+    #[async_trait::async_trait]
+    impl crate::blob::BlobStore for FailingBlobs {
+        async fn put(&self, _: &crate::blob::BlobKey, _: bytes::Bytes)
+            -> Result<(), crate::blob::BlobError> {
+            Err(crate::blob::BlobError::Backend("disk on fire".into()))
+        }
+        async fn get(&self, _: &crate::blob::BlobKey)
+            -> Result<Option<bytes::Bytes>, crate::blob::BlobError> {
+            Err(crate::blob::BlobError::Backend("disk on fire".into()))
+        }
+        async fn delete(&self, _: &crate::blob::BlobKey)
+            -> Result<(), crate::blob::BlobError> { Ok(()) }
+    }
+
+    // Whole-branch review, Important 1: `put_status` mapped `ResourceError::Blob`
+    // through its `_` arm to `400`, telling a client a server-side outage was
+    // their malformed request. `resource::`'s own `FailingBlobs` never caught
+    // this because it never goes through a handler — this one does.
+    #[tokio::test]
+    async fn a_blob_backend_outage_answers_500_not_400() {
+        let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/photo.png")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(Body::from(&b"x"[..])).unwrap()).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

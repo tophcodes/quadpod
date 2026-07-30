@@ -116,13 +116,6 @@ impl MediaType {
     }
 }
 
-impl From<Format> for MediaType {
-    fn from(f: Format) -> Self {
-        MediaType::parse(f.media_type())
-            .expect("a Format's media type is a valid media type")
-    }
-}
-
 /// A media type this pod can read and write, and what it is capable of.
 ///
 /// The point of the newtype is that "Turtle cannot carry named graphs" is
@@ -212,10 +205,9 @@ impl Format {
 /// tie, as `(q, position, media range)`.
 ///
 /// **The only place this header is parsed.** [`negotiate`] asks it which
-/// format to render into; a resource with a single representation asks it
-/// whether that one type is admissible. Those are different questions, but a
-/// second copy of the q-value parse is how the two come to disagree about
-/// `q=0`.
+/// format to render into; [`accept_allows`] asks it whether a resource's one
+/// representation is admissible. Those are different questions, but a second
+/// copy of the q-value parse is how the two come to disagree about `q=0`.
 fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
     let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
     for (i, part) in accept.split(',').enumerate() {
@@ -592,7 +584,7 @@ mod tests {
     #[test]
     fn every_format_is_also_a_media_type() {
         let ttl = Format::from_content_type("text/turtle").unwrap();
-        assert_eq!(MediaType::from(ttl).as_str(), "text/turtle");
+        assert_eq!(MediaType::parse(ttl.media_type()).unwrap().as_str(), "text/turtle");
     }
 
     // A MediaType that parsed is a header value that exists. No call site

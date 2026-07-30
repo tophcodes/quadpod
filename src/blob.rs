@@ -37,7 +37,10 @@ pub struct BlobKey(Path);
 
 impl BlobKey {
     /// `None` when the mirrored key would exceed a segment or path length
-    /// limit: a legal URL this pod cannot store (§3.2, §11).
+    /// limit: a legal URL this pod cannot store (§3.2, §11). Also `None` for
+    /// a path ending in `/`: a container is never a blob, and `Path::from`
+    /// drops a trailing empty segment, which would otherwise mint the same
+    /// key for `/box` and `/box/`.
     ///
     /// `Path::from` percent-encodes segments the backends treat as
     /// problematic, so a relative segment never reaches the backend as a
@@ -46,6 +49,9 @@ impl BlobKey {
     /// encoded `Path`, not on the raw URL path.
     pub fn of(r: &ResourceUrl) -> Option<Self> {
         let rel = r.path().trim_start_matches('/');
+        if rel.ends_with('/') {
+            return None;
+        }
         let path = Path::from(rel);
         if path.as_ref().len() > MAX_PATH_BYTES {
             return None;
@@ -150,6 +156,16 @@ mod tests {
     fn the_key_mirrors_the_resource_path() {
         assert_eq!(BlobKey::of(&res("/photos/cat.png")).unwrap().as_str(), "photos/cat.png");
         assert_eq!(BlobKey::of(&res("/notes")).unwrap().as_str(), "notes");
+    }
+
+    // `Path::from` drops a trailing empty segment, so without this check
+    // `/box` and `/box/` would mint the same key — a container and its
+    // slash-pair counterpart colliding on one object. A container is never a
+    // blob, so there is no key to mint.
+    #[test]
+    fn a_path_ending_in_a_slash_has_no_key() {
+        assert_eq!(BlobKey::of(&res("/box/")), None);
+        assert_ne!(BlobKey::of(&res("/box")), None);
     }
 
     // Also asserted on the key: a `400` from somewhere upstream would make a
