@@ -1,5 +1,5 @@
 use oxigraph::model::Triple;
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::sparql::{QueryResults, QuerySolution, SparqlEvaluator};
 use oxigraph::store::Store;
 use thiserror::Error;
 
@@ -28,6 +28,18 @@ pub trait SparqlStore: Send + Sync {
     async fn update(&self, sparql: &str) -> Result<(), StoreError>;
     async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, StoreError>;
     async fn ask(&self, sparql: &str) -> Result<bool, StoreError>;
+    /// A `SELECT`'s solutions, in the order the backend produced them.
+    ///
+    /// The third read shape, beside a graph and a boolean. It exists because
+    /// N3 Patch must distinguish *no* variable mapping from *one* from *several*
+    /// (`2026-07-30-n3-patch-design.md` §6), and neither a `CONSTRUCT` nor an
+    /// `ASK` answers that question without encoding a `SELECT` into one of them
+    /// and decoding it again.
+    ///
+    /// Carries no atomicity obligation: this trait's guarantee is about
+    /// `;`-separated *updates*, and a read cannot come apart the way a write
+    /// sequence can.
+    async fn query_solutions(&self, sparql: &str) -> Result<Vec<QuerySolution>, StoreError>;
 }
 
 pub struct OxigraphStore {
@@ -76,6 +88,10 @@ impl SparqlStore for OxigraphStore {
             QueryResults::Boolean(b) => Ok(b),
             _ => Err(StoreError::Backend("expected ASK/boolean results".into())),
         }
+    }
+
+    async fn query_solutions(&self, _sparql: &str) -> Result<Vec<QuerySolution>, StoreError> {
+        todo!()
     }
 }
 
