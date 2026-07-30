@@ -98,8 +98,12 @@ pub(crate) fn serialize_for_insert(quads: &Skolemized) -> String {
 /// read-then-write race, accepted for the same reason: single-user v1, and
 /// `DROP GRAPH` takes no variable, so the read cannot be folded into the
 /// update (design spec §5.1).
+///
+/// One of the two teardown sites (§7): a blob this resource held is
+/// superseded by this write and is removed with it.
 pub async fn put_dataset(
     store: &dyn SparqlStore,
+    blobs: &dyn crate::blob::BlobStore,
     r: &ResourceUrl,
     dataset: &Skolemized,
     media_type: Format,
@@ -129,6 +133,14 @@ pub async fn put_dataset(
                 }
             }
         }
+    }
+
+    // §5.2: this write replaces the representation including its kind, so a
+    // blob that was here is superseded. Unconditional — deleting an absent
+    // object succeeds, and a check plus a delete is two round-trips with a
+    // window between them. Over-long keys have no object to remove.
+    if let Some(key) = crate::blob::BlobKey::of(r) {
+        blobs.delete(&key).await?;
     }
 
     // Both drops (§3.2 invariant 4): what the registry lists, and what we are
@@ -629,11 +641,12 @@ mod tests {
     #[tokio::test]
     async fn insert_marked_writes_a_presence_marker() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let foo = res("/foo");
         insert_marked(&store, &foo, &ground_triples("<#it> <http://schema.org/name> \"x\" .", foo.graph_iri())).await.unwrap();
         assert!(exists(&store, &foo).await.unwrap());
         // A resource is removed by the cascade, not by `delete_rdf`.
-        assert!(crate::aux::delete_subject(&store, &foo).await.unwrap());
+        assert!(crate::aux::delete_subject(&store, &blobs, &foo).await.unwrap());
         assert!(!exists(&store, &foo).await.unwrap());
     }
 
@@ -688,6 +701,7 @@ mod tests {
     #[tokio::test]
     async fn a_dataset_round_trips_through_the_store() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let jsonld = crate::rdf::Format::from_content_type("application/ld+json").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
@@ -696,7 +710,7 @@ mod tests {
             gq("http://example.org/alice", "Alice", g.clone().into()),
         ]);
 
-        put_dataset(&store, &r, &ds, jsonld).await.unwrap();
+        put_dataset(&store, &blobs, &r, &ds, jsonld).await.unwrap();
 
         let back = get_dataset(&store, &r).await.unwrap().expect("present");
         assert_eq!(back.quads().len(), 2);
@@ -711,21 +725,22 @@ mod tests {
     #[tokio::test]
     async fn a_replacing_write_leaves_no_shelf_behind() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
         let with_graph = Skolemized::new(vec![gq("http://example.org/alice", "Alice", g.clone().into())]);
 
-        put_dataset(&store, &r, &with_graph, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &with_graph, ttl).await.unwrap();
         assert_eq!(registered_shelves(&store, &r).await.unwrap().len(), 1);
 
         // Replace with a document that has no named graph at all.
-        put_dataset(&store, &r, &Skolemized::new(vec![]), ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &Skolemized::new(vec![]), ttl).await.unwrap();
         assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
 
         // And the shelf is gone, not merely emptied: write the same graph name
         // again and it must not inherit the old triples.
-        put_dataset(&store, &r, &with_graph, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &with_graph, ttl).await.unwrap();
         let back = get_dataset(&store, &r).await.unwrap().unwrap();
         assert_eq!(back.quads().len(), 1, "no resurrected content");
     }
@@ -746,6 +761,7 @@ mod tests {
     #[tokio::test]
     async fn a_replacing_write_with_a_different_graph_name_leaves_the_old_shelf_empty() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let a = oxigraph::model::NamedNode::new("urn:example:a").unwrap();
@@ -754,10 +770,10 @@ mod tests {
         let with_a = Skolemized::new(vec![gq("http://example.org/alice", "Alice", a.clone().into())]);
         let with_b = Skolemized::new(vec![gq("http://example.org/bob", "Bob", b.into())]);
 
-        put_dataset(&store, &r, &with_a, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &with_a, ttl).await.unwrap();
         let key_a = ShelfKey::of(&r, a.as_ref());
 
-        put_dataset(&store, &r, &with_b, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &with_b, ttl).await.unwrap();
 
         let leftover = store.query_triples(&format!(
             "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", key_a.graph_iri()
@@ -772,10 +788,11 @@ mod tests {
     #[tokio::test]
     async fn put_dataset_with_no_named_graphs_still_marks_presence() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
 
-        put_dataset(&store, &r, &Skolemized::new(vec![]), ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &Skolemized::new(vec![]), ttl).await.unwrap();
 
         assert!(exists(&store, &r).await.unwrap(), "a graphless dataset write must still mark presence");
         assert!(get_dataset(&store, &r).await.unwrap().is_some());
@@ -789,12 +806,13 @@ mod tests {
     #[tokio::test]
     async fn a_graph_name_that_survived_the_parser_still_round_trips() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:valid-name").unwrap();
         let ds = Skolemized::new(vec![gq("http://example.org/alice", "Alice", g.clone().into())]);
 
-        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &ds, ttl).await.unwrap();
 
         let back = get_dataset(&store, &r).await.unwrap().expect("present");
         assert_eq!(back.quads().len(), 1);
@@ -808,13 +826,14 @@ mod tests {
     #[tokio::test]
     async fn a_second_default_graph_write_replaces_not_accumulates() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let first = Skolemized::new(vec![gq("http://example.org/alice", "Alice", GroundGraphName::DefaultGraph)]);
         let second = Skolemized::new(vec![gq("http://example.org/bob", "Bob", GroundGraphName::DefaultGraph)]);
 
-        put_dataset(&store, &r, &first, ttl).await.unwrap();
-        put_dataset(&store, &r, &second, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &first, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &second, ttl).await.unwrap();
 
         let back = get_dataset(&store, &r).await.unwrap().unwrap();
         assert_eq!(back.quads().len(), 1, "second default-graph write should replace, not accumulate");
@@ -928,12 +947,13 @@ mod tests {
     #[tokio::test]
     async fn a_shelf_with_no_graph_name_makes_get_dataset_fail_closed() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
         let ds = Skolemized::new(vec![gq("http://example.org/alice", "Alice", g.clone().into())]);
 
-        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &ds, ttl).await.unwrap();
 
         // Derived the same way the module itself derives it — never by
         // writing the string `"urn:quadpod:sys:"` here.
@@ -949,5 +969,54 @@ mod tests {
             .unwrap();
 
         assert!(matches!(get_dataset(&store, &r).await, Err(ResourceError::InvalidIri)));
+    }
+
+    // §5.2: PUT replaces the representation including its kind. The assertion
+    // is against the BlobStore directly, not through the marker — reading back
+    // through the registry is how `b4d2346` found orphans invisible.
+    #[tokio::test]
+    async fn writing_rdf_over_a_blob_removes_the_object() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let r = res("/thing");
+        let key = crate::blob::BlobKey::of(&r).unwrap();
+        let ttl = Format::from_content_type("text/turtle").unwrap();
+
+        put_blob(&store, &blobs, &r, bytes::Bytes::from_static(b"x"),
+                 &crate::rdf::MediaType::parse("text/plain").unwrap()).await.unwrap();
+        assert!(crate::blob::BlobStore::get(&blobs, &key).await.unwrap().is_some());
+
+        put_dataset(&store, &blobs, &r, &Skolemized::new(vec![]), ttl).await.unwrap();
+
+        assert_eq!(kind_of(&store, &r).await.unwrap(), Some(Kind::Rdf));
+        assert!(
+            crate::blob::BlobStore::get(&blobs, &key).await.unwrap().is_none(),
+            "the superseded object must be gone, not merely unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_a_blob_over_rdf_removes_the_graph_and_its_shelves() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let r = res("/thing");
+        let ttl = Format::from_content_type("text/turtle").unwrap();
+        let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
+        let ds = Skolemized::new(vec![gq("http://example.org/alice", "Alice", g.clone().into())]);
+
+        put_dataset(&store, &blobs, &r, &ds, ttl).await.unwrap();
+        let shelf = ShelfKey::of(&r, g.as_ref());
+
+        put_blob(&store, &blobs, &r, bytes::Bytes::from_static(b"x"),
+                 &crate::rdf::MediaType::parse("text/plain").unwrap()).await.unwrap();
+
+        assert!(matches!(kind_of(&store, &r).await.unwrap(), Some(Kind::Binary(_))));
+        assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
+        // Probed directly: an emptied-but-present shelf is content the next
+        // write to the same graph name would inherit.
+        let leftover = store.query_triples(&format!(
+            "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", shelf.graph_iri()
+        )).await.unwrap();
+        assert!(leftover.is_empty());
     }
 }

@@ -50,6 +50,7 @@ async fn main() {
     }
     let state = AppState {
         store: Arc::new(OxigraphStore::in_memory().expect("store")),
+        blobs: Arc::new(sparql_pod::blob::ObjectStoreBlobs::in_memory()),
         space,
         resolver: Arc::new(HttpJwksResolver::new(fetch_policy.clone())),
         webid_verifier: Arc::new(HttpWebIdIssuers::new(fetch_policy)),

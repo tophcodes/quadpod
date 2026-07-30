@@ -120,11 +120,14 @@ pub async fn put(
 /// (design spec §7). A container's registry is simply empty, so the same
 /// cascade is correct for it without a branch.
 ///
-/// Graphs only. Callers remain responsible for containment: the subject's
-/// membership triple in its parent, and for a container subject its children,
-/// are `container`'s business, not this function's.
+/// This is the one delete cascade (§7): callers remain responsible for
+/// containment — the subject's membership triple in its parent, and for a
+/// container subject its children, are `container`'s business, not this
+/// function's — but everything else a subject can hold, including a blob it
+/// stored bytes as, goes with it here.
 pub async fn delete_subject(
     store: &dyn SparqlStore,
+    blobs: &dyn crate::blob::BlobStore,
     subject: &ResourceUrl,
 ) -> Result<bool, ResourceError> {
     let existed = exists(store, subject).await?;
@@ -140,6 +143,13 @@ pub async fn delete_subject(
         drops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(&aux)));
     }
     store.update(&drops.join("; ")).await?;
+    // §7: graphs and marker first, then the object. An interrupted second half
+    // leaves an object no marker points at, which the next write to the same
+    // URL overwrites; the reverse order would leave a resource that exists and
+    // cannot be served.
+    if let Some(key) = crate::blob::BlobKey::of(subject) {
+        blobs.delete(&key).await?;
+    }
     Ok(existed)
 }
 
@@ -311,6 +321,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_a_subject_deletes_every_auxiliary_kind() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let foo = res("/foo");
         put_rdf(&store, &foo, &[]).await.unwrap();
         for kind in AuxKind::ALL {
@@ -319,7 +330,7 @@ mod tests {
             assert_eq!(get_rdf(&store, &aux).await.unwrap(), Some(grant(&aux)));
         }
 
-        assert!(delete_subject(&store, &foo).await.unwrap());
+        assert!(delete_subject(&store, &blobs, &foo).await.unwrap());
 
         assert!(!exists(&store, &foo).await.unwrap());
         for kind in AuxKind::ALL {
@@ -341,7 +352,8 @@ mod tests {
     #[tokio::test]
     async fn deleting_an_absent_subject_reports_absence() {
         let store = OxigraphStore::in_memory().unwrap();
-        assert!(!delete_subject(&store, &res("/nope")).await.unwrap());
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        assert!(!delete_subject(&store, &blobs, &res("/nope")).await.unwrap());
     }
 
     // Finding 1b/3: the asymmetric state — auxiliaries present, subject not.
@@ -351,6 +363,7 @@ mod tests {
     #[tokio::test]
     async fn an_orphaned_auxiliary_is_removed_even_though_the_subject_is_gone() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let foo = res("/foo");
         let acl = foo.aux(AuxKind::Acl);
         put_rdf(&store, &foo, &[]).await.unwrap();
@@ -368,7 +381,7 @@ mod tests {
         assert!(exists(&store, &acl).await.unwrap(), "orphan not staged");
 
         assert!(
-            !delete_subject(&store, &foo).await.unwrap(),
+            !delete_subject(&store, &blobs, &foo).await.unwrap(),
             "the subject was already absent, so the answer is false"
         );
 
@@ -395,6 +408,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_a_subject_empties_its_shelves_too() {
         let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
         let r = res("/c/notes");
         let ttl = Format::from_content_type("text/turtle").unwrap();
         let g = oxigraph::model::NamedNode::new("urn:example:g1").unwrap();
@@ -404,10 +418,10 @@ mod tests {
             oxigraph::model::Literal::new_simple_literal("Alice"),
             g.clone(),
         )]);
-        put_dataset(&store, &r, &ds, ttl).await.unwrap();
+        put_dataset(&store, &blobs, &r, &ds, ttl).await.unwrap();
         let key = ShelfKey::of(&r, g.as_ref());
 
-        assert!(delete_subject(&store, &r).await.unwrap(), "existed");
+        assert!(delete_subject(&store, &blobs, &r).await.unwrap(), "existed");
 
         let leftover = graph_contents(&store, key.graph_iri()).await;
         assert!(
@@ -416,5 +430,35 @@ mod tests {
         );
         assert!(get_dataset(&store, &r).await.unwrap().is_none());
         assert!(registered_shelves(&store, &r).await.unwrap().is_empty());
+    }
+
+    // §7: there is one delete cascade, and the blob goes with it. Asserted
+    // against the BlobStore, not against a 404 from a read path.
+    #[tokio::test]
+    async fn the_delete_cascade_takes_the_blob_with_it() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let r = res("/photo");
+        let key = crate::blob::BlobKey::of(&r).unwrap();
+
+        crate::resource::put_blob(
+            &store, &blobs, &r, bytes::Bytes::from_static(b"x"),
+            &crate::rdf::MediaType::parse("image/png").unwrap(),
+        ).await.unwrap();
+
+        assert!(delete_subject(&store, &blobs, &r).await.unwrap());
+        assert!(!crate::resource::exists(&store, &r).await.unwrap());
+        assert!(crate::blob::BlobStore::get(&blobs, &key).await.unwrap().is_none());
+    }
+
+    // The cascade is correct for a resource that never had a blob, and it
+    // must not report failure for one — `delete` on an absent key succeeds.
+    #[tokio::test]
+    async fn the_cascade_still_works_for_an_rdf_resource() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let r = res("/notes");
+        crate::resource::put_rdf(&store, &r, &[]).await.unwrap();
+        assert!(delete_subject(&store, &blobs, &r).await.unwrap());
     }
 }

@@ -21,6 +21,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn SparqlStore>,
+    pub blobs: Arc<dyn crate::blob::BlobStore>,
     pub space: StorageSpace,
     pub resolver: Arc<dyn JwksResolver>,
     pub webid_verifier: Arc<dyn WebIdIssuerVerifier>,
@@ -474,7 +475,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             }
             created(&target)
         }
-        Target::Resource(r) => match put_dataset(store, r, &skolemized, fmt).await {
+        Target::Resource(r) => match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
             Ok(()) => created(&target),
             Err(e) => (put_status(&e), e.to_string()).into_response(),
         },
@@ -609,7 +610,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         return with_aux_links(res, &child);
     }
     match &child {
-        Target::Resource(r) => match put_dataset(store, r, &skolemized, fmt).await {
+        Target::Resource(r) => match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
             Ok(()) => created(&child),
             Err(e) => (put_status(&e), e.to_string()).into_response(),
         },
@@ -858,7 +859,7 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
     }
-    match aux::delete_subject(store, subject).await {
+    match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
         Ok(true) => {
             if let Some(parent) = subject.parent() {
                 if let Err(e) =
@@ -923,6 +924,7 @@ mod tests {
     struct Fixture {
         app: axum::Router,
         store: Arc<dyn crate::store::SparqlStore>,
+        blobs: Arc<dyn crate::blob::BlobStore>,
         space: StorageSpace,
         idp: TestIdp,
         client: TestClient,
@@ -946,6 +948,8 @@ mod tests {
         let _replay_guard = crate::auth::dpop::test_replay_lock().lock().await;
         let store: Arc<dyn crate::store::SparqlStore> =
             Arc::new(OxigraphStore::in_memory().unwrap());
+        let blobs: Arc<dyn crate::blob::BlobStore> =
+            Arc::new(crate::blob::ObjectStoreBlobs::in_memory());
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space.root()).await.unwrap();
         crate::wac::provision::provision_root_acl(store.as_ref(), &space, OWNER, false).await.unwrap();
@@ -957,13 +961,14 @@ mod tests {
 
         let state = AppState {
             store: store.clone(),
+            blobs: blobs.clone(),
             space: space.clone(),
             resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
             webid_verifier: Arc::new(issuers),
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
         };
         Fixture {
-            app: router(state), store, space, idp, client, _replay_guard,
+            app: router(state), store, blobs, space, idp, client, _replay_guard,
             _reentrancy: ReentrancyGuard,
         }
     }
@@ -1023,6 +1028,7 @@ mod tests {
             issuers.allow(webid, ISSUER);
             router(AppState {
                 store: self.store.clone(),
+                blobs: self.blobs.clone(),
                 space: self.space.clone(),
                 resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
                 webid_verifier: Arc::new(issuers),

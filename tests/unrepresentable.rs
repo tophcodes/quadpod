@@ -101,6 +101,7 @@ async fn a_slug_cannot_reach_the_auxiliary_space() {
 #[tokio::test]
 async fn an_auxiliary_never_outlives_its_subject() {
     let store = OxigraphStore::in_memory().unwrap();
+    let blobs = sparql_pod::blob::ObjectStoreBlobs::in_memory();
     let space = StorageSpace::new("https://pod.toph.so/").unwrap();
     let Target::Resource(doc) = space.resolve("/doc").unwrap() else { panic!() };
 
@@ -108,7 +109,7 @@ async fn an_auxiliary_never_outlives_its_subject() {
     aux::put(&store, &doc.aux(AuxKind::Acl), &[]).await.unwrap();
     assert!(resource::exists(&store, &doc.aux(AuxKind::Acl)).await.unwrap());
 
-    assert!(aux::delete_subject(&store, &doc).await.unwrap());
+    assert!(aux::delete_subject(&store, &blobs, &doc).await.unwrap());
     assert!(!resource::exists(&store, &doc.aux(AuxKind::Acl)).await.unwrap());
 
     // recreate the same path: it inherits, it does not resurrect
