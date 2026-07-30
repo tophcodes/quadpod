@@ -159,11 +159,21 @@ Expected: suite green, `14 checked, 0 violated, 0 broken`.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock src/lib.rs src/rdf.rs src/dataset.rs src/http.rs docs/constraints.md
+git add Cargo.toml Cargo.lock src/rdf.rs src/dataset.rs src/http.rs docs/constraints.md
 git commit -m "feat: refuse RDF 1.2 triple terms, so the RDF 1.1 contract is checked"
 ```
 
-The commit includes `Cargo.toml`, `Cargo.lock` and `src/lib.rs` because Task 1's dependency line is what makes this task necessary and what makes the tree compile again; `src/shapes.rs` stays uncommitted for Task 1.
+`Cargo.toml` and `Cargo.lock` belong in this commit: the dependency is what introduces `Term::Triple` and therefore what makes this task necessary. An unused dependency compiles fine on its own.
+
+**`src/lib.rs` must NOT be in this commit, and neither must `src/shapes.rs`.** They belong together — `pub mod shapes;` without the file it names is `error[E0583]: file not found for module`, so committing the declaration alone leaves a commit that does not build on a fresh checkout, breaking `git bisect` and per-commit CI even though the working directory still compiles. Task 1 adds both in one commit. Verify before moving on:
+
+```bash
+git worktree add --detach /tmp/verify-task0 HEAD && \
+  (cd /tmp/verify-task0 && nix develop -c cargo check) && \
+  git worktree remove /tmp/verify-task0
+```
+
+A `cargo check` in your own working directory cannot catch this — the untracked file is still sitting there.
 
 ---
 
