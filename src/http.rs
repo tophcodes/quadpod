@@ -4859,10 +4859,10 @@ mod tests {
         }
     }
 
-    /// Whole-branch review, Important 1: the `describedby` link falls out of
-    /// a tail shared by `Target::Resource`'s `Err` arm, so a warning-only
-    /// validation followed by a `put_dataset` failure must not still
-    /// advertise a report for a write that never persisted.
+    /// The `describedby` link falls out of a tail that `Target::Resource`'s
+    /// `Err` arm shares with its `Ok` arm, so a warning-only validation
+    /// followed by a `put_dataset` failure must not still advertise a report
+    /// for a write that never persisted.
     ///
     /// The resource is pre-created so the failing write adds no containment
     /// triple — `store.update` runs exactly once for it, inside `put_dataset`
