@@ -36,7 +36,13 @@ const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256 RS256\"";
 /// an anonymous caller learns that credentials would help (401), a verified
 /// one that theirs are insufficient (403). Neither learns whether the
 /// resource exists — `authorize` runs before any existence check.
-fn deny(agent: &Agent) -> Response {
+///
+/// Public to the crate for the one refusal this module cannot make itself:
+/// a patch's required modes are known only after the body is parsed, and
+/// re-running [`authorize`] to say no would resolve the ACL a second time.
+/// It stays the single place the `401`/`403` split and [`DPOP_CHALLENGE`] are
+/// decided, which is what a handler-side refusal would break.
+pub(crate) fn deny(agent: &Agent) -> Response {
     match agent {
         Agent::Public => (
             StatusCode::UNAUTHORIZED,

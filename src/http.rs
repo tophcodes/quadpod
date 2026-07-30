@@ -8,15 +8,15 @@
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
     http::{StatusCode, HeaderMap, HeaderValue, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
-use oxigraph::model::{Quad, Triple};
+use oxigraph::model::{NamedNode, Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{Dataset, Skolemized},
-    resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, ResourceError},
+    resource::{put_rdf, get_rdf, delete_rdf, exists, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
     rdf::{Format, MediaType, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
-    space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
+    space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize}, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::{authorize, authorize_and_materialize, deny}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -475,13 +475,163 @@ async fn handle_put_root(
 ///    Otherwise `resource::patch_dataset` → `204`, or `409` per its
 ///    `PatchResult`.
 async fn patch_impl(
-    _st: AppState,
-    _agent: Agent,
-    _target: Target,
-    _headers: HeaderMap,
-    _body: Bytes,
+    st: AppState,
+    agent: Agent,
+    target: Target,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    todo!()
+    let store = st.store.as_ref();
+    // Append is the weakest mode any patch §5.1 admits can need, and
+    // `AccessModes::allows` makes Write subsume it — so this refuses exactly
+    // those callers who could do nothing anyway, and it runs before the body
+    // is looked at so an unauthorized caller learns nothing.
+    let decision = match authorize(store, &agent, &target, Mode::Append).await {
+        Ok(d) => d,
+        Err(res) => return with_aux_links(res, &target),
+    };
+
+    let ct = header_str(&headers, header::CONTENT_TYPE).trim();
+    if ct.is_empty() {
+        return if body.is_empty() {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()
+        } else {
+            (StatusCode::BAD_REQUEST, "Content-Type is required").into_response()
+        };
+    }
+    if MediaType::parse(ct).map(|m| m.essence()).as_deref() != Some("text/n3") {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+
+    let patch = match crate::patch::Patch::parse(&body, target.graph_iri()) {
+        Ok(p) => p,
+        Err(e @ crate::patch::PatchError::Shape(_)) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
+        }
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    // §9: the modes this particular patch needs, against the set `authorize`
+    // already resolved. `deny` rather than a second `authorize` — the answer
+    // is in hand, and re-resolving would walk the ancestor chain again and
+    // could read an ACL written in between.
+    if !patch.required_modes().satisfied_by(decision.user) {
+        return with_aux_links(deny(&agent), &target);
+    }
+
+    // §8: `text/n3` is a perfectly good request body, so the conflict is with
+    // the state of the target — bytes, which have no triples to patch.
+    if let Target::Resource(r) = &target {
+        match kind_of(store, r).await {
+            Ok(Some(Kind::Binary(_))) => {
+                return (StatusCode::CONFLICT, BINARY_TARGET_MESSAGE).into_response()
+            }
+            Ok(_) => {}
+            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+        }
+    }
+    // Containment is server-managed, refused before anything is written for
+    // the same reason `put_impl` refuses it there.
+    if let Target::Container(c) = &target {
+        if patch_sets_containment(&patch, c) {
+            return (StatusCode::CONFLICT, CONTAINMENT_MESSAGE).into_response();
+        }
+    }
+    if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
+        return res;
+    }
+    // An auxiliary is written through `aux::put`, whose subject-existence
+    // guard is what keeps a policy document off a path that names nothing;
+    // `patch_dataset` addresses a resource graph and carries no such guard, so
+    // there is nothing here that could serve one correctly.
+    let r = match &target {
+        Target::Resource(r) => r,
+        Target::Container(c) => c.as_resource(),
+        Target::Aux(_) => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+    match exists(store, &target).await {
+        Ok(true) => {}
+        // §7's creation path is not served: a patch cannot yet bring a
+        // resource into existence.
+        Ok(false) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+        Err(e) => return (put_status(&e), e.to_string()).into_response(),
+    }
+    match patch_dataset(store, r, &patch).await {
+        Ok(PatchResult::Applied) => StatusCode::NO_CONTENT.into_response(),
+        Ok(PatchResult::NoMapping) => {
+            patch_conflict("nothing matches the conditions", patch.conditions())
+        }
+        Ok(PatchResult::SeveralMappings) => {
+            patch_conflict("more than one mapping satisfies the conditions", patch.conditions())
+        }
+        Ok(PatchResult::DeletionMissing) => {
+            patch_conflict("a triple this patch deletes is not there", patch.deletions())
+        }
+        Err(e) => (put_status(&e), e.to_string()).into_response(),
+    }
+}
+
+const BINARY_TARGET_MESSAGE: &str =
+    "this resource holds bytes rather than triples, so there is nothing to patch";
+
+const CONTAINMENT_MESSAGE: &str = "ldp:contains is server-managed";
+
+/// Whether a patch would write the containment triples the server manages.
+///
+/// Over the insertions and the deletions both — unlinking a member forges the
+/// container's contents exactly as inserting one does — and over the patterns
+/// rather than over what they would bind to, because the refusal has to land
+/// before the write.
+///
+/// [`container::body_sets_containment`] reads the predicate and nothing else,
+/// so each pattern is offered to it as a triple whose subject and object are
+/// the container itself: positions that check never looks at. A pattern whose
+/// predicate is not an IRI has no triple form at all and can still bind to
+/// `ldp:contains`, so it is refused without asking.
+fn patch_sets_containment(patch: &crate::patch::Patch, c: &ContainerUrl) -> bool {
+    let iri = NamedNode::new(c.graph_iri()).expect("a container's IRI is valid");
+    let mut written = Vec::new();
+    for p in patch.insertions().iter().chain(patch.deletions()) {
+        let crate::patch::PatternTerm::Named(predicate) = &p.predicate else {
+            return true;
+        };
+        written.push(Triple::new(iri.clone(), predicate.clone(), iri.clone()));
+    }
+    container::body_sets_containment(&written)
+}
+
+/// A `409` that names the patterns it is about (§6.4).
+///
+/// The patterns are the client's own words, and they are all a message ever
+/// carries: a *binding* may be a skolem IRI the client has never seen, while a
+/// pattern cannot be one — `Patch::parse` refuses any document that names the
+/// reserved namespace.
+fn patch_conflict(reason: &str, patterns: &[crate::patch::Pattern]) -> Response {
+    (StatusCode::CONFLICT, format!("{reason}: {}", show_patterns(patterns))).into_response()
+}
+
+/// Triple patterns as message text — never as SPARQL, which
+/// `resource::patch_dataset` builds for itself. A variable prints by its
+/// index: the name the client chose does not leave `patch` (§6.1).
+fn show_patterns(patterns: &[crate::patch::Pattern]) -> String {
+    patterns
+        .iter()
+        .map(|p| {
+            format!(
+                "{} {} {} .",
+                show_term(&p.subject), show_term(&p.predicate), show_term(&p.object)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn show_term(t: &crate::patch::PatternTerm) -> String {
+    match t {
+        crate::patch::PatternTerm::Named(n) => n.to_string(),
+        crate::patch::PatternTerm::Literal(l) => l.to_string(),
+        crate::patch::PatternTerm::Var(i) => format!("?v{i}"),
+    }
 }
 
 async fn handle_patch(
@@ -4674,5 +4824,214 @@ mod tests {
             .body(Body::from(&b"x"[..])).unwrap()).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn patch_body(inner: &str) -> String {
+        format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix ex: <http://example.org/> .\n{inner}"
+        )
+    }
+
+    async fn patch_n3(f: &Fixture, path: &str, inner: &str) -> axum::response::Response {
+        f.app.clone().oneshot(f.owner_request("PATCH", path)
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(inner))).unwrap()).await.unwrap()
+    }
+
+    async fn body_bytes(res: axum::response::Response) -> Vec<u8> {
+        http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_patch_changes_one_triple_and_answers_204() {
+        let f = fixture().await;
+        f.put_turtle("/profile",
+            "<#me> <http://example.org/email> \"old\" ; <http://example.org/name> \"Toph\" .").await;
+
+        let res = patch_n3(&f, "/profile",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:deletes { ?p ex:email \"old\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let ttl = f.get_turtle("/profile").await;
+        assert!(ttl.contains("\"new\""), "{ttl}");
+        assert!(!ttl.contains("\"old\""), "{ttl}");
+        assert!(ttl.contains("\"Toph\""), "an untouched triple must survive: {ttl}");
+    }
+
+    // §8: `text/n3` is a perfectly good body, so `415` would be a claim about
+    // the wrong thing — the conflict is with a target that has no triples.
+    // The byte assertion is the half a status check cannot see: a `409` that
+    // also destroyed the object passes a status-only test.
+    #[tokio::test]
+    async fn a_patch_at_a_blob_is_409_and_the_bytes_survive() {
+        let f = fixture().await;
+        f.put_blob("/notes.txt", "text/plain", b"hello \x00\xff bytes").await;
+
+        let res = patch_n3(&f, "/notes.txt",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x \"1\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let got = f.app.clone().oneshot(f.owner_request("GET", "/notes.txt")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(body_bytes(got).await, b"hello \x00\xff bytes");
+    }
+
+    #[tokio::test]
+    async fn a_patch_setting_containment_on_a_container_is_409() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let res = patch_n3(&f, "/c/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> <http://www.w3.org/ns/ldp#contains> \
+                               <https://pod.toph.so/c/forged> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let ttl = f.get_turtle("/c/").await;
+        assert!(!ttl.contains("forged"), "containment is server-managed: {ttl}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_if_match_refuses_the_patch_with_412() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .header(header::IF_MATCH, "\"deadbeef\"")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:inserts { <> ex:x \"1\" . } .\n"))).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+
+        let ttl = f.get_turtle("/profile").await;
+        assert!(!ttl.contains("\"1\""), "nothing may have been written: {ttl}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_patch_document_is_422_and_a_bad_body_is_400() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let two_inserts = patch_n3(&f, "/profile",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x \"1\" . } ;\n\
+               solid:inserts { <> ex:y \"2\" . } .\n").await;
+        assert_eq!(two_inserts.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let junk = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from("this is not N3 {{{")).unwrap()).await.unwrap();
+        assert_eq!(junk.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // The middle row is `content-type-reject:19`, which has never been
+    // reachable because there was no `PATCH` route to reach the gate with.
+    #[tokio::test]
+    async fn the_content_type_gate_matches_classify_body() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+        let body = patch_body(
+            "_:patch a solid:InsertDeletePatch ; solid:inserts { <> ex:x \"1\" . } .\n");
+
+        let wrong = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(body.clone())).unwrap()).await.unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let untyped = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(untyped.status(), StatusCode::BAD_REQUEST);
+
+        let empty = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(empty.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // `authentication/header:40` as a unit test. It fails today only because
+    // axum answers `405` before the auth layer ever runs.
+    #[tokio::test]
+    async fn an_anonymous_patch_is_401_not_405() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = f.app.clone().oneshot(Request::builder()
+            .method("PATCH").uri("/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ; solid:inserts { <> ex:x \"1\" . } .\n")))
+            .unwrap()).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    // §6.4. Both halves matter: the first alone is satisfied by a message that
+    // names nothing, the second alone by one that also prints the binding —
+    // which for a blank-node subject is a skolem IRI the client has never seen.
+    #[tokio::test]
+    async fn a_409_names_the_patch_and_never_a_skolem_iri() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "[] <http://example.org/email> \"old\" .").await;
+
+        let res = patch_n3(&f, "/profile",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:deletes { ?p ex:email \"old\" . ?p ex:phone \"123\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let body = String::from_utf8(body_bytes(res).await).unwrap();
+        assert!(!body.contains("urn:quadpod:"), "a minted IRI must not leak: {body}");
+        assert!(body.contains("phone"), "the message must say what failed: {body}");
+    }
+
+    // §9, and the `write-access-*` fixture's `A` row in both directions. A
+    // single `Mode::Write` gate refuses the first; a gate that only ever asks
+    // for `Append` admits the second.
+    #[tokio::test]
+    async fn an_append_only_agent_may_insert_but_not_delete() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let acl = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
+        );
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+
+        let insert = f.sign(Request::builder().method("PATCH").uri("/profile"), bob, "PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ; solid:inserts { <> ex:x \"1\" . } .\n")))
+            .unwrap();
+        assert_eq!(bob_app.clone().oneshot(insert).await.unwrap().status(), StatusCode::NO_CONTENT,
+            "an insert-only patch needs Append, not Write");
+
+        let delete = f.sign(Request::builder().method("PATCH").uri("/profile"), bob, "PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:where   { ?p ex:email \"old\" . } ;\n\
+                   solid:deletes { ?p ex:email \"old\" . } .\n")))
+            .unwrap();
+        assert_eq!(bob_app.oneshot(delete).await.unwrap().status(), StatusCode::FORBIDDEN,
+            "deleting needs Write");
     }
 }
