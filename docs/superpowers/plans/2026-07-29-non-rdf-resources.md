@@ -2159,12 +2159,9 @@ async fn blob_read(st: AppState, target: Target, headers: HeaderMap, mt: MediaTy
     if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
         return with_allow(with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target), &target);
     }
-    out.insert(
-        header::CONTENT_TYPE,
-        // Every byte came through `MediaType::parse`, which admits only RFC
-        // 9110 tchars plus `/`, `;`, `=` and space.
-        mt.as_str().parse().expect("a MediaType is header-safe"),
-    );
+    // `MediaType` carries the `HeaderValue` its constructor validated, so
+    // there is nothing here to assert.
+    out.insert(header::CONTENT_TYPE, mt.header_value());
     with_allow(with_aux_links((out, bytes).into_response(), &target), &target)
 }
 ```
