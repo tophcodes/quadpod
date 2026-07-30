@@ -333,11 +333,16 @@ A `409` may name the triples it is about — that is most of its diagnostic valu
 them **de-skolemized**, through the same conversion the read path uses. A skolem IRI never
 appears in a response body.
 
-This is possible rather than merely desirable because `Dataset::deskolemize` derives the blank
-node's label from the skolem IRI instead of generating one, precisely so that *"two reads of one
-stored state must produce identical bytes"*. The label a message would print is therefore the
-label the client already saw in its `GET` — `_:b9f3c…`, not `<urn:quadpod:bnode:9f3c…>`. The safe
-answer and the useful answer are the same answer, so there is no reason to withhold values.
+The cheapest way to get there is not to convert anything: **a message names the patch's own
+patterns, not the bindings computed from them.** The client wrote `?p ex:phone "123"`, and
+echoing that back says exactly which rule failed on exactly which triple, in the client's own
+words. No skolem IRI can appear, because a patch document containing one was already refused
+by §6.3 — so the property holds by construction rather than by remembering to convert.
+
+Where a bound term genuinely must be shown, `Dataset::deskolemize` is the conversion: it derives
+the blank node's label from the skolem IRI rather than generating one, precisely so that *"two
+reads of one stored state must produce identical bytes"*, and the label it prints is therefore
+the label the client already saw in its `GET` — `_:b9f3c…`, not `<urn:quadpod:bnode:9f3c…>`.
 
 What stays forbidden is the raw form. A message assembled from the *bound* triples without that
 conversion prints an IRI the server minted and the client has never seen, which is the leak
@@ -549,11 +554,11 @@ Each test names the mutant it kills.
     substitution rather than before, which refuses this patch with a message naming an IRI the
     client never saw. That mutant passes every other test here, because every other test's
     fixture has no blank nodes.
-13. **Error bodies are de-skolemized.** Provoke a `409` against a resource holding blank nodes.
-    Assert the body contains no `urn:quadpod:` **and** that it does contain the blank-node label
-    the client's own `GET` returned. Both halves are needed: the first alone is satisfied by a
-    message that names nothing at all, which §6.4 explicitly does not want, and the second alone
-    is satisfied by printing the raw IRI.
+13. **Error bodies name the client's own words.** Provoke a `409` against a resource holding
+    blank nodes, with a patch whose deletion set is not fully present. Assert the body contains
+    no `urn:quadpod:` **and** that it does name the predicate the client wrote. Both halves are
+    needed: the first alone is satisfied by a message that names nothing, which §6.4 does not
+    want, and the second alone is satisfied by a message that also prints the binding.
 
 ## 14. Conformance: what this moves
 
