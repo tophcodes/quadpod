@@ -258,6 +258,10 @@ impl Skolemized {
                 Term::NamedNode(n) => GroundTerm::NamedNode(n.clone()),
                 Term::BlankNode(b) => GroundTerm::NamedNode(iri_for(b)),
                 Term::Literal(l) => GroundTerm::Literal(l.clone()),
+                Term::Triple(_) => unreachable!(
+                    "Format::parse refuses RDF 1.2 triple terms, and every Dataset \
+                     skolemized here came from it"
+                ),
             },
             graph_name: match &q.graph_name {
                 GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
@@ -292,6 +296,7 @@ impl Skolemized {
                     Term::NamedNode(n) => GroundTerm::NamedNode(n),
                     Term::Literal(l) => GroundTerm::Literal(l),
                     Term::BlankNode(_) => return None,
+                    Term::Triple(_) => return None,
                 },
                 graph_name: match q.graph_name {
                     GraphName::DefaultGraph => GroundGraphName::DefaultGraph,

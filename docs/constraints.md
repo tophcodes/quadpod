@@ -136,3 +136,14 @@ The `Accept` header is parsed in exactly one place.
     reader cannot avoid rewriting, which is what makes this fail against a real
     violation rather than against a naming convention.
     check: [ "$(rg -o 'strip_prefix\("q="\)' src | wc -l)" = 1 ]
+
+## RDF version
+
+The wire contract is RDF 1.1, and it is checked rather than assumed.
+    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-shape-validation-design.md §2.1.
+    `rudof_lib` turns on oxigraph's `rdf-12` feature transitively, and Cargo
+    unifies features crate-wide, so the linked parser accepts RDF 1.2 whether
+    this pod wants it or not. Before that dependency the non-goal held because
+    nothing had enabled the feature — an accident, not a property. `oxttl` has
+    no version switch, so the refusal is ours and lives in the one parser.
+    check: rg -q 'Term::Triple\(_\)' src/rdf.rs

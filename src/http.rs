@@ -4626,4 +4626,15 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    #[tokio::test]
+    async fn a_put_carrying_a_triple_term_is_a_400() {
+        let f = fixture().await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> ."
+            )).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
 }
