@@ -114,6 +114,12 @@ rather than of a correct escape at every site. N3 Patch is the same shape of ans
 query it issues from those terms itself. There is no client SPARQL text anywhere in this
 design, so there is nothing to sandbox and no list to keep exhaustive.
 
+The cost is one scenario, and that is measured rather than hoped. Of the 66 `PATCH` failures,
+**63 send `text/n3`** — the `protected-operation` fixture quoted in §9 — and one sends no
+`Content-Type` at all. `containment:38` is the only row in the entire suite that uses
+`application/sparql-update`. The format this design implements is the format the tests
+overwhelmingly speak.
+
 Adding `sparql-update` later remains possible and would be its own design, with its own
 containment argument. It is not required by anything, which is what makes deferring it cheap.
 
@@ -353,9 +359,35 @@ decision at all: a second lookup repeats the ancestor walk on the hot path, and 
 between the two would let the answer describe access other than the access granted.
 
 An agent holding only Append can therefore run an insert-only patch and is refused one that
-deletes — which is the behaviour the `protected-operation` features test, and which a single
-`Mode::Write` gate would get wrong in the permissive direction for the first case and the
-restrictive direction for the second.
+deletes. This is not an inference about what the suite probably wants — the fixture is
+`specification-tests` v0.0.19 `web-access-control/protected-operation/write-access-bob.feature`,
+and its `Examples` table says so directly:
+
+| caller's access to the resource | awaited status |
+|---|---|
+| `W` | `[200, 201, 204, 205]` |
+| **`A`** | **`[200, 201, 204, 205]`** |
+| `C` | `[403]` |
+| Public | `[401]` |
+
+The patch those rows send is insert-only:
+
+```
+Content-Type: text/n3
+
+@prefix solid: <http://www.w3.org/ns/solid/terms#>.
+_:insert a solid:InsertDeletePatch; solid:inserts { <> a <http://example.org#Foo> . }.
+```
+
+So the `A` rows are exactly this section's tiering, and a single `Mode::Write` gate loses them.
+The `C` rows are the other half: `AccessModes::allows` already grants nothing from `Control`
+except ACL access, so they need no new logic — only that the patch path asks the same question
+every other handler asks.
+
+Two further things that table settles. The rows target `fictive` resources — names the suite
+reserved and never created — and await `2xx`, which is §7's creation path under test rather
+than under discussion. And `201`/`204` from §10.1 are both inside the awaited set, so the
+success-code choice needs no revisiting.
 
 ## 10. The HTTP edge
 
@@ -494,10 +526,21 @@ Against the fifth run's 66, this design accounts for every one:
 
 `63 + 1 + 1 + 1 = 66`.
 
-The honest form of the claim: **65 of the 66 become reachable, 2 are certainly green, and the
-63 are a measurement rather than a prediction.** They have never run against this pod, so
-asserting a number for them would be inventing one — the same mistake the third run's write-up
-avoided when it declined to call the unblocked WAC rows a free 540.
+The 63 split by what they await, which is worth separating because the two halves test
+different things:
+
+- **The 30 `read-access-*` rows await only refusal** (`403` for a named agent, `401` for
+  Public). They need the route to exist and `authorize` to run; the parse and apply machinery
+  is never reached. If `PATCH` denies as `PUT` and `DELETE` already do, they pass.
+- **The 33 `write-access-*` rows are mixed** — `write-access-bob` splits 6 awaiting `2xx`,
+  3 awaiting `403` (`Control`), 3 awaiting `401` (Public). Only the `2xx` half exercises
+  parsing, mapping and writing end to end.
+
+The honest form of the claim: **65 of the 66 become reachable, 2 are certainly green, the
+denial rows turn on `authorize` alone, and the success rows are a measurement rather than a
+prediction.** They have never run against this pod, so asserting a number for them would be
+inventing one — the same mistake the third run's write-up avoided when it declined to call the
+unblocked WAC rows a free 540.
 
 No test is disabled. The findings document attributes every failure to a named cause, and the
 reconciliation across runs only works while nothing is switched off.
