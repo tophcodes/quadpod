@@ -73,6 +73,14 @@ A SPARQL literal is never interpolated by hand.
     respectively, both quoted per their own RFC, never SPARQL.
     check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs' --glob '!src/dataset.rs'
 
+Only `blob::BlobKey` builds an object key.
+    → 2026-07-29-non-rdf-resources-design.md §3.2. The key is the resource's
+    own path, so two resources sharing one object is a cross-resource read and
+    write — the same failure `ShelfKey` guards against one layer up. It is also
+    what the derived-key argument rests on: an interrupted write heals only
+    because every writer computes the same key from the same URL.
+    check: ! rg -q 'Path::(from|parse)' src --glob '!src/blob.rs'
+
 ## Boundaries that have no compiler behind them
 
 `FetchPolicy::permissive` stays `#[cfg(test)]`.
@@ -118,3 +126,12 @@ No `#[allow]` attributes in `src/`.
     dataset skeleton suspended it deliberately, with `// skeleton:` comments;
     this rule is what removes them.
     check: ! rg -q '#\[allow' src
+
+The `Accept` header is parsed in exactly one place.
+    → 2026-07-29-non-rdf-resources-design.md §6.1. `negotiate` and
+    `accept_allows` ask different questions of the same header. The existing
+    negotiation rule pins that two *named* functions do not return; this pins
+    the property those names stood for. The q-value parse is what a second
+    reader cannot avoid rewriting, which is what makes this fail against a real
+    violation rather than against a naming convention.
+    check: [ "$(rg -o 'strip_prefix\("q="\)' src | wc -l)" = 1 ]

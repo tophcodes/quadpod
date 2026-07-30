@@ -155,10 +155,16 @@ Enterprise Solid Server hosts access-control resources on an entirely separate s
 
 ## Server-asserted facts are not auxiliary resources
 
-Creation and modification times, byte size, content hash and storage keys are **not**
-addressable and not writable. They live in an internal graph (`urn:quadpod:sys:<res>`) and are
-exposed through the HTTP headers that already exist for them — `Last-Modified`, `ETag`,
-`Content-Length`.
+Creation and modification times, existence, the kind of representation, and — for a binary
+representation — the media type it arrived as are **not** addressable and not writable. They
+live in an internal graph (`urn:quadpod:sys:<res>`) and are exposed through the HTTP headers
+that already exist for them — `Last-Modified`, `ETag`, `Content-Length`.
+
+Byte size and content hash live nowhere: with a swappable blob backend, the pod does not
+exclusively own the bytes behind a resource, so a stored size or hash would go silently false
+the moment anything else writes into the same bucket. `Content-Length` and `ETag` are computed
+from the bytes themselves instead. The storage key is derived from the resource's own URL
+rather than recorded.
 
 The split is by authority, not by subject matter. An auxiliary holds what *you* assert about
 a resource; these are what the *server* asserts about it. This pod also never writes
