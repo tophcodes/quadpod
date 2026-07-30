@@ -11,8 +11,8 @@ use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
 use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{Dataset, Skolemized},
-    resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, put_blob, get_dataset, stored_media_type, ResourceError},
-    rdf::{Format, MediaType, Shape, negotiate},
+    resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, ResourceError},
+    rdf::{Format, MediaType, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
@@ -274,13 +274,26 @@ fn triples_of(dataset: &Dataset) -> Vec<Triple> {
 /// Containers and auxiliaries never carry a named graph (§3.4 refuses that at
 /// write time), but a client can still fetch them as any of the [`SERVABLE`]
 /// formats, so they get the same treatment: one tag per format.
+///
+/// A binary resource has a single representation and therefore a single tag,
+/// computed by [`blob_etag`] rather than drawn from this list.
 const SERVABLE: [&str; 5] = [
     "text/turtle", "application/n-triples", "application/ld+json",
     "application/trig", "application/n-quads",
 ];
 
-async fn current_tags(store: &dyn SparqlStore, target: &Target) -> Result<Option<Vec<String>>, ResourceError> {
+async fn current_tags(
+    store: &dyn SparqlStore,
+    blobs: &dyn crate::blob::BlobStore,
+    target: &Target,
+) -> Result<Option<Vec<String>>, ResourceError> {
     if let Target::Resource(r) = target {
+        if let Some(Kind::Binary(_)) = kind_of(store, r).await? {
+            let Some(key) = crate::blob::BlobKey::of(r) else {
+                return Ok(None);
+            };
+            return Ok(blobs.get(&key).await?.map(|b| vec![blob_etag(&b)]));
+        }
         let Some(stored) = get_dataset(store, r).await? else {
             return Ok(None);
         };
@@ -386,13 +399,14 @@ fn classify_body(headers: &HeaderMap, body: &Bytes, target: &Target) -> Result<R
 /// RFC 9110 §13.1.1 preconditions, shared by both kinds of write.
 async fn check_conditionals(
     store: &dyn SparqlStore,
+    blobs: &dyn crate::blob::BlobStore,
     headers: &HeaderMap,
     target: &Target,
 ) -> Result<(), Response> {
     if !headers.contains_key(IF_MATCH) && !headers.contains_key(IF_NONE_MATCH) {
         return Ok(());
     }
-    let current_tags = match current_tags(store, target).await {
+    let current_tags = match current_tags(store, blobs, target).await {
         Ok(t) => t,
         Err(e) => return Err((put_status(&e), e.to_string()).into_response()),
     };
@@ -434,7 +448,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             if crate::blob::BlobKey::of(r).is_none() {
                 return StatusCode::URI_TOO_LONG.into_response();
             }
-            if let Err(res) = check_conditionals(store, &headers, &target).await {
+            if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
                 return res;
             }
             if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
@@ -504,7 +518,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         }
     }
     let skolemized = Skolemized::skolemize(&dataset);
-    if let Err(res) = check_conditionals(store, &headers, &target).await {
+    if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
         return res;
     }
     // Creating a resource materializes every missing ancestor container and
@@ -766,6 +780,57 @@ async fn handle_get_root(
     }
 }
 
+/// §3.4: the validator for a blob, computed from the bytes about to be served.
+///
+/// Not `ObjectMeta::e_tag`: it is optional, its meaning differs per backend,
+/// and it changes under a backend migration although the content did not. This
+/// is the same rule and the same shape as
+/// [`Skolemized::etag`](crate::dataset::Skolemized::etag).
+fn blob_etag(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("\"{}\"", hex::encode(h.finalize()))
+}
+
+/// §6: a blob's representation. `Accept` is an acceptability test rather than
+/// a negotiation, because there is only one representation to offer.
+async fn blob_read(st: AppState, target: Target, headers: HeaderMap, mt: MediaType) -> Response {
+    let Target::Resource(r) = &target else {
+        unreachable!("only a resource can be binary")
+    };
+    if !accept_allows(header_str(&headers, header::ACCEPT), &mt) {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    }
+    let Some(key) = crate::blob::BlobKey::of(r) else {
+        return StatusCode::URI_TOO_LONG.into_response();
+    };
+    let bytes = match st.blobs.get(&key).await {
+        Ok(Some(b)) => b,
+        // §6.2: the pod's namespace still says this exists; the backend has
+        // nothing to hand over. A `500` would read as "my fault, retry".
+        Ok(None) => {
+            let mut out = HeaderMap::new();
+            if let Some(w) = warning_header("the storage backend has no object for this resource") {
+                out.insert(header::WARNING, w);
+            }
+            return with_aux_links((StatusCode::NOT_FOUND, out).into_response(), &target);
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let tag = blob_etag(&bytes);
+    let mut out = HeaderMap::new();
+    out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
+    out.insert(header::VARY, "Accept".parse().expect("static"));
+    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
+        return with_allow(with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target), &target);
+    }
+    // `MediaType` carries the `HeaderValue` its constructor validated, so
+    // there is nothing here to assert.
+    out.insert(header::CONTENT_TYPE, mt.header_value());
+    with_allow(with_aux_links((out, bytes).into_response(), &target), &target)
+}
+
 async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap) -> Response {
     let store = st.store.as_ref();
     if let Err(res) = authorize(store, &agent, &target, Mode::Read).await {
@@ -774,6 +839,18 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     let Target::Resource(r) = &target else {
         return legacy_graph_read(st, agent, target, headers).await; // containers, auxiliaries
     };
+    // §6: which kind this is, then the matching read. Both kinds share
+    // authorization, the auxiliary advertisement and the `Allow` header above
+    // and below; only the representation differs.
+    match kind_of(store, r).await {
+        // `st.clone()` rather than a move: `store` above borrows `st.store`,
+        // and `AppState` is `Clone` over `Arc`s, so this costs two refcounts.
+        Ok(Some(Kind::Binary(mt))) => return blob_read(st.clone(), target.clone(), headers, mt).await,
+        Ok(Some(Kind::Rdf)) => {}
+        Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+        Err(ResourceError::InvalidIri) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
     // §6.1: read everything first — the ETag covers the resource, not the
     // body, so the shelves are read even when only the default graph will be
     // served.
@@ -1136,6 +1213,19 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK, "GET {path}");
             let b = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
             String::from_utf8(b.to_vec()).unwrap()
+        }
+
+        async fn put_blob(&self, path: &str, ct: &str, body: &'static [u8]) {
+            let res = self.app.clone().oneshot(self.owner_request("PUT", path)
+                .header(header::CONTENT_TYPE, ct)
+                .body(Body::from(body)).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED, "PUT {path}");
+        }
+
+        async fn etag_of(&self, path: &str) -> String {
+            let res = self.app.clone().oneshot(self.owner_request("GET", path)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            res.headers()[header::ETAG].to_str().unwrap().to_owned()
         }
 
         /// The typed URL a request path names, for tests that inspect the
@@ -4060,5 +4150,95 @@ mod tests {
             .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from(vec![b'x'; 4096])).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // §3.4: the validator is computed from the served bytes, so the same bytes
+    // give the same tag and one byte's difference gives a different one.
+    #[tokio::test]
+    async fn a_blob_carries_a_strong_validator_and_answers_conditionally() {
+        let f = fixture().await;
+        f.put_blob("/a.txt", "text/plain", b"hello").await;
+        f.put_blob("/b.txt", "text/plain", b"hello").await;
+        f.put_blob("/c.txt", "text/plain", b"hellp").await;
+
+        let ta = f.etag_of("/a.txt").await;
+        assert_eq!(ta, f.etag_of("/b.txt").await, "same bytes, same tag");
+        assert_ne!(ta, f.etag_of("/c.txt").await, "one byte apart, different tag");
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/a.txt")
+            .header(header::IF_NONE_MATCH, &ta)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+
+        // A stale If-Match must refuse the write rather than overwrite it.
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/a.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::IF_MATCH, "\"0000000000000000000000000000000000000000000000000000000000000000\"")
+            .body(Body::from("new")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    // §6.1. Both halves matter: without the admitting cases an accept_allows
+    // that always refuses would pass.
+    #[tokio::test]
+    async fn accept_decides_whether_a_blob_is_servable() {
+        let f = fixture().await;
+        f.put_blob("/pic.png", "image/png", b"png").await;
+
+        for accept in ["*/*", "image/*", "image/png", "text/turtle, image/png"] {
+            let res = f.app.clone().oneshot(f.owner_request("GET", "/pic.png")
+                .header(header::ACCEPT, accept).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "Accept: {accept}");
+        }
+        for accept in ["text/turtle", "text/*", "image/png;q=0", "*/*, image/png;q=0"] {
+            let res = f.app.clone().oneshot(f.owner_request("GET", "/pic.png")
+                .header(header::ACCEPT, accept).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE, "Accept: {accept}");
+        }
+    }
+
+    // §6.2: the pod's namespace still says the resource exists, but there is
+    // nothing to serve. 500 would read as "my fault, retry".
+    #[tokio::test]
+    async fn a_blob_whose_object_vanished_is_a_404_with_a_warning() {
+        let f = fixture().await;
+        f.put_blob("/gone.txt", "text/plain", b"x").await;
+
+        // Emptied from underneath, exactly as an operator or another writer
+        // on a shared bucket would.
+        let r = match f.space.resolve("/gone.txt").unwrap() {
+            crate::space::Target::Resource(r) => r,
+            _ => panic!("resource"),
+        };
+        let key = crate::blob::BlobKey::of(&r).unwrap();
+        f.blobs.delete(&key).await.unwrap();
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/gone.txt")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.headers().contains_key(header::WARNING));
+    }
+
+    // §10: the claim the whole plan exists to make testable.
+    #[tokio::test]
+    async fn wac_governs_a_blob_exactly_as_it_governs_a_graph() {
+        let f = fixture().await;
+        f.put_blob("/secret.txt", "text/plain", b"s3cret").await;
+        f.put_turtle("/.aux/secret.txt.acl", &format!(
+            "@prefix acl: <http://www.w3.org/ns/auth/acl#> . \
+             <#owner> a acl:Authorization ; \
+               acl:agent <{OWNER}> ; \
+               acl:accessTo <https://pod.toph.so/secret.txt> ; \
+               acl:mode acl:Read, acl:Write, acl:Control ."
+        )).await;
+
+        // Anonymous: the ACL names only the owner.
+        let res = f.app.clone().oneshot(Request::builder()
+            .method("GET").uri("/secret.txt").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/secret.txt")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }
