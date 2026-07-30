@@ -51,10 +51,29 @@ pub struct GroundQuad {
 }
 
 /// `Term` minus its blank node — the object position of a [`GroundQuad`].
+///
+/// Recursive since RDF 1.2: a triple term's own object is a term, and it is
+/// ground under exactly the same rule. `Box` because a type cannot contain
+/// itself by value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroundTerm {
     NamedNode(NamedNode),
     Literal(Literal),
+    Triple(Box<GroundTriple>),
+}
+
+/// An RDF 1.2 triple term, ground throughout.
+///
+/// Its subject is a `NamedNode` rather than a `NamedOrBlankNode` for the same
+/// reason a [`GroundQuad`]'s is: a blank node anywhere in a stored quad is
+/// what skolemization removes, and nesting does not exempt it. Without that,
+/// `skolemize`'s totality claim — *no input maps to something that still
+/// holds a blank node* — would be false one level down, and false silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroundTriple {
+    pub subject: NamedNode,
+    pub predicate: NamedNode,
+    pub object: GroundTerm,
 }
 
 /// `GraphName` minus its blank node. Every graph a stored quad names is
@@ -105,15 +124,29 @@ impl From<GroundGraphName> for oxigraph::model::GraphName {
     }
 }
 
+/// The one widening from the ground term type back to oxigraph's. Every
+/// caller that needs a `Term` goes through it, so the triple-term recursion
+/// is written once rather than at each site that happens to need it.
+impl From<&GroundTerm> for Term {
+    fn from(t: &GroundTerm) -> Self {
+        match t {
+            GroundTerm::NamedNode(n) => Term::NamedNode(n.clone()),
+            GroundTerm::Literal(l) => Term::Literal(l.clone()),
+            GroundTerm::Triple(t) => Term::Triple(Box::new(Triple::new(
+                t.subject.clone(),
+                t.predicate.clone(),
+                Term::from(&t.object),
+            ))),
+        }
+    }
+}
+
 impl From<&GroundQuad> for Quad {
     fn from(q: &GroundQuad) -> Self {
         Quad::new(
             q.subject.clone(),
             q.predicate.clone(),
-            match &q.object {
-                GroundTerm::NamedNode(n) => oxigraph::model::Term::NamedNode(n.clone()),
-                GroundTerm::Literal(l) => oxigraph::model::Term::Literal(l.clone()),
-            },
+            Term::from(&q.object),
             q.graph_name.clone(),
         )
     }
@@ -127,6 +160,10 @@ impl fmt::Display for GroundTerm {
         match self {
             GroundTerm::NamedNode(n) => n.fmt(f),
             GroundTerm::Literal(l) => l.fmt(f),
+            // `Triple`'s own `Display` writes RDF 1.2 triple-term syntax,
+            // which is what `resource::serialize_for_insert` must emit for
+            // the store to parse it back (SPARQL 1.2).
+            GroundTerm::Triple(_) => Term::from(self).fmt(f),
         }
     }
 }
@@ -273,9 +310,9 @@ impl Skolemized {
     /// directions of the word: every input maps, and no input can map to
     /// something that still holds a blank node.
     pub fn skolemize(dataset: &Dataset) -> Self {
-        use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
+        use oxigraph::model::{BlankNode, GraphName, NamedOrBlankNode};
         let mut minted: std::collections::HashMap<String, NamedNode> = std::collections::HashMap::new();
-        let mut iri_for = |b: &oxigraph::model::BlankNode| -> NamedNode {
+        let mut iri_for = |b: &BlankNode| -> NamedNode {
             minted.entry(b.as_str().to_owned())
                 .or_insert_with(|| {
                     NamedNode::new(format!("{SKOLEM_PREFIX}{}", uuid::Uuid::new_v4()))
@@ -283,21 +320,32 @@ impl Skolemized {
                 })
                 .clone()
         };
+        // Recursive, because a triple term's subject and object are terms in
+        // their own right and the totality claim above has to hold at every
+        // depth. A blank node left un-skolemized inside a triple term breaks
+        // the round trip and the ETag, and it does so without erroring.
+        fn ground(t: &Term, iri_for: &mut impl FnMut(&BlankNode) -> NamedNode) -> GroundTerm {
+            match t {
+                Term::NamedNode(n) => GroundTerm::NamedNode(n.clone()),
+                Term::BlankNode(b) => GroundTerm::NamedNode(iri_for(b)),
+                Term::Literal(l) => GroundTerm::Literal(l.clone()),
+                Term::Triple(inner) => GroundTerm::Triple(Box::new(GroundTriple {
+                    subject: match &inner.subject {
+                        NamedOrBlankNode::NamedNode(n) => n.clone(),
+                        NamedOrBlankNode::BlankNode(b) => iri_for(b),
+                    },
+                    predicate: inner.predicate.clone(),
+                    object: ground(&inner.object, iri_for),
+                })),
+            }
+        }
         let quads = dataset.quads().iter().map(|q| GroundQuad {
             subject: match &q.subject {
                 NamedOrBlankNode::NamedNode(n) => n.clone(),
                 NamedOrBlankNode::BlankNode(b) => iri_for(b),
             },
             predicate: q.predicate.clone(),
-            object: match &q.object {
-                Term::NamedNode(n) => GroundTerm::NamedNode(n.clone()),
-                Term::BlankNode(b) => GroundTerm::NamedNode(iri_for(b)),
-                Term::Literal(l) => GroundTerm::Literal(l.clone()),
-                Term::Triple(_) => unreachable!(
-                    "Format::parse refuses RDF 1.2 triple terms, and every Dataset \
-                     skolemized here came from it"
-                ),
-            },
+            object: ground(&q.object, &mut iri_for),
             graph_name: match &q.graph_name {
                 GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
                 GraphName::NamedNode(n) => GroundGraphName::NamedNode(n.clone()),
@@ -319,7 +367,28 @@ impl Skolemized {
     /// [`new`](Self::new) — because a check that runs on our own values is
     /// the check that quietly stops running.
     pub fn from_store(quads: Vec<Quad>) -> Option<Self> {
-        use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
+        use oxigraph::model::{GraphName, NamedOrBlankNode};
+        // A triple term is ground exactly when everything inside it is. It
+        // must be *accepted* here: refusing it would make the pod report
+        // data it stored correctly as corruption.
+        fn ground(t: Term) -> Option<GroundTerm> {
+            Some(match t {
+                Term::NamedNode(n) => GroundTerm::NamedNode(n),
+                Term::Literal(l) => GroundTerm::Literal(l),
+                Term::BlankNode(_) => return None,
+                Term::Triple(inner) => {
+                    let inner = *inner;
+                    GroundTerm::Triple(Box::new(GroundTriple {
+                        subject: match inner.subject {
+                            NamedOrBlankNode::NamedNode(n) => n,
+                            NamedOrBlankNode::BlankNode(_) => return None,
+                        },
+                        predicate: inner.predicate,
+                        object: ground(inner.object)?,
+                    }))
+                }
+            })
+        }
         quads.into_iter().map(|q| {
             Some(GroundQuad {
                 subject: match q.subject {
@@ -327,12 +396,7 @@ impl Skolemized {
                     NamedOrBlankNode::BlankNode(_) => return None,
                 },
                 predicate: q.predicate,
-                object: match q.object {
-                    Term::NamedNode(n) => GroundTerm::NamedNode(n),
-                    Term::Literal(l) => GroundTerm::Literal(l),
-                    Term::BlankNode(_) => return None,
-                    Term::Triple(_) => return None,
-                },
+                object: ground(q.object)?,
                 graph_name: match q.graph_name {
                     GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
                     GraphName::NamedNode(n) => GroundGraphName::NamedNode(n),
@@ -388,13 +452,27 @@ impl Skolemized {
                 Some(b) => NamedOrBlankNode::BlankNode(b),
                 None => NamedOrBlankNode::NamedNode(q.subject.clone()),
             };
-            let object = match &q.object {
-                GroundTerm::NamedNode(n) => match blank_for(n) {
-                    Some(b) => Term::BlankNode(b),
-                    None => Term::NamedNode(n.clone()),
-                },
-                GroundTerm::Literal(l) => Term::Literal(l.clone()),
-            };
+            // Recursive for the same reason `skolemize` is: a skolem IRI
+            // sitting inside a triple term is one this pod minted, so it must
+            // come back as the blank node it replaced.
+            fn term_for(t: &GroundTerm) -> Term {
+                match t {
+                    GroundTerm::NamedNode(n) => match blank_for(n) {
+                        Some(b) => Term::BlankNode(b),
+                        None => Term::NamedNode(n.clone()),
+                    },
+                    GroundTerm::Literal(l) => Term::Literal(l.clone()),
+                    GroundTerm::Triple(inner) => Term::Triple(Box::new(Triple::new(
+                        match blank_for(&inner.subject) {
+                            Some(b) => NamedOrBlankNode::BlankNode(b),
+                            None => NamedOrBlankNode::NamedNode(inner.subject.clone()),
+                        },
+                        inner.predicate.clone(),
+                        term_for(&inner.object),
+                    ))),
+                }
+            }
+            let object = term_for(&q.object);
             let graph_name = match &q.graph_name {
                 GroundGraphName::NamedNode(n) => match blank_for(n) {
                     Some(b) => GraphName::BlankNode(b),
@@ -433,6 +511,95 @@ impl Skolemized {
 mod tests {
     use super::*;
     use oxigraph::model::{BlankNode, Literal, NamedNode, Quad};
+
+    /// §7's silent-failure case. A blank node inside a triple term must
+    /// skolemize like any other, or the round trip and the ETag come apart
+    /// with nothing to signal it.
+    #[test]
+    fn a_blank_node_inside_a_triple_term_skolemizes() {
+        use oxigraph::model::{GraphName, Term, Triple};
+        let inner = Triple::new(
+            BlankNode::new("b0").unwrap(),
+            NamedNode::new("http://e/b").unwrap(),
+            NamedNode::new("http://e/c").unwrap(),
+        );
+        let ds = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://e/s").unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(inner)),
+            GraphName::DefaultGraph,
+        )]);
+
+        let stored = Skolemized::skolemize(&ds);
+        let GroundTerm::Triple(t) = &stored.quads()[0].object else {
+            panic!("the triple term must survive skolemization as a triple term");
+        };
+        assert!(
+            t.subject.as_str().starts_with(SKOLEM_PREFIX),
+            "the inner blank node must have become a skolem IRI, got {}",
+            t.subject.as_str()
+        );
+    }
+
+    /// The totality claim in `skolemize`'s own doc comment must survive the
+    /// recursion: no input maps to something that still holds a blank node.
+    #[test]
+    fn skolemizing_a_nested_blank_node_round_trips() {
+        use oxigraph::model::{GraphName, NamedOrBlankNode, Term, Triple};
+        let inner = Triple::new(
+            BlankNode::new("b0").unwrap(),
+            NamedNode::new("http://e/b").unwrap(),
+            NamedNode::new("http://e/c").unwrap(),
+        );
+        let ds = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://e/s").unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(inner)),
+            GraphName::DefaultGraph,
+        )]);
+
+        let stored = Skolemized::skolemize(&ds);
+        let back = stored.deskolemize();
+        let Term::Triple(t) = &back.quads()[0].object else {
+            panic!("expected a triple term back");
+        };
+        assert!(
+            matches!(t.subject, NamedOrBlankNode::BlankNode(_)),
+            "the inner term must be a blank node again after de-skolemization"
+        );
+        assert_eq!(stored.deskolemize(), back, "two reads must agree (§6.4)");
+    }
+
+    /// `from_store` is documented as a *parse* of what the store hands back.
+    /// A correctly stored triple term is ground; reading it as non-ground
+    /// would make the pod report its own data as corruption (§7).
+    #[test]
+    fn from_store_accepts_a_triple_term_as_ground() {
+        use oxigraph::model::GraphName;
+        assert!(Skolemized::from_store(vec![q_triple_term(
+            "http://e/s",
+            GraphName::DefaultGraph
+        )])
+        .is_some());
+    }
+
+    /// A blank node *inside* a triple term is still not ground.
+    #[test]
+    fn from_store_refuses_a_blank_node_inside_a_triple_term() {
+        use oxigraph::model::{GraphName, Term, Triple};
+        let inner = Triple::new(
+            BlankNode::new("b0").unwrap(),
+            NamedNode::new("http://e/b").unwrap(),
+            NamedNode::new("http://e/c").unwrap(),
+        );
+        let quads = vec![Quad::new(
+            NamedNode::new("http://e/s").unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(inner)),
+            GraphName::DefaultGraph,
+        )];
+        assert!(Skolemized::from_store(quads).is_none());
+    }
 
     /// A quad whose object is an RDF 1.2 triple term.
     fn q_triple_term(s: &str, g: oxigraph::model::GraphName) -> Quad {
