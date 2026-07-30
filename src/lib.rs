@@ -8,5 +8,6 @@ pub mod rdf;
 pub mod resource;
 pub mod shelf;
 pub mod space;
+pub mod sparql;
 pub mod store;
 pub mod wac;

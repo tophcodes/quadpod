@@ -36,8 +36,16 @@ fn media_type(ct: &str) -> &str {
 /// correct escape at every site. The cost is that `multipart/...;
 /// boundary="--x"` is rejected, which is acceptable because multipart is a
 /// request encoding rather than a stored representation.
+///
+/// Carries its `http::HeaderValue` alongside the raw string, both built by
+/// the one constructor. `#[derive(PartialEq, Eq)]` compares both fields
+/// rather than `raw` alone, which is fine: the two are always built together
+/// by `parse`, so they never disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaType(String);
+pub struct MediaType {
+    raw: String,
+    header: http::HeaderValue,
+}
 
 /// RFC 9110 §5.6.2 tchar.
 fn is_tchar(b: u8) -> bool {
@@ -85,24 +93,33 @@ impl MediaType {
                 return None;
             }
         }
-        Some(Self(s.to_owned()))
+        let header = http::HeaderValue::from_str(s).ok()?;
+        Some(Self { raw: s.to_owned(), header })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.raw
+    }
+
+    /// The `Content-Type` header for this media type. Infallible: the value
+    /// was built and checked by the only constructor, so no call site has to
+    /// assert it.
+    pub fn header_value(&self) -> http::HeaderValue {
+        self.header.clone()
     }
 
     /// `type/subtype`, lowercased, parameters dropped — what an `Accept`
     /// comparison is made against, since media-type tokens are
     /// case-insensitive (RFC 9110 §8.3.1) but parameter values need not be.
     pub fn essence(&self) -> String {
-        media_type(&self.0).to_ascii_lowercase()
+        media_type(&self.raw).to_ascii_lowercase()
     }
 }
 
 impl From<Format> for MediaType {
     fn from(f: Format) -> Self {
-        Self(f.media_type().to_owned())
+        MediaType::parse(f.media_type())
+            .expect("a Format's media type is a valid media type")
     }
 }
 
@@ -530,5 +547,14 @@ mod tests {
     fn every_format_is_also_a_media_type() {
         let ttl = Format::from_content_type("text/turtle").unwrap();
         assert_eq!(MediaType::from(ttl).as_str(), "text/turtle");
+    }
+
+    // A MediaType that parsed is a header value that exists. No call site
+    // should have to assert that with an `.expect`.
+    #[test]
+    fn a_media_type_carries_its_header_value() {
+        let mt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+        assert_eq!(mt.header_value().to_str().unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(mt.header_value().to_str().unwrap(), mt.as_str());
     }
 }

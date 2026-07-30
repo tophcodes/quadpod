@@ -2296,6 +2296,7 @@ dependencies = [
  "clap",
  "dpop-verifier",
  "hex",
+ "http",
  "http-body-util",
  "josekit",
  "oxigraph",

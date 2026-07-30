@@ -62,6 +62,17 @@ Only `dataset` mints or recognises a skolem IRI.
     `urn:quadpod:bnode:` is a second place that can get the round trip wrong.
     check: ! rg -q "urn:quadpod:bnode" src --glob '!src/dataset.rs'
 
+A SPARQL literal is never interpolated by hand.
+    → 2026-07-29-non-rdf-resources-design.md §8.2; `sparql::Literal`. Every
+    `<...>` interpolation in this crate is fed by a sealed or validated type, so
+    the IRI half needs no rule; the quote half had exactly one site and no rule
+    at all. A hand-written `"{}"` is a value that can close its own literal and
+    continue the update as syntax, and it fails by executing rather than by
+    erroring. `src/http.rs` and `src/dataset.rs` are excluded: their `\"{`
+    matches build an HTTP `Link`/`Warning` header and an HTTP `ETag`
+    respectively, both quoted per their own RFC, never SPARQL.
+    check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs' --glob '!src/dataset.rs'
+
 ## Boundaries that have no compiler behind them
 
 `FetchPolicy::permissive` stays `#[cfg(test)]`.

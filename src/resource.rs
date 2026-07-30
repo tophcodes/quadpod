@@ -11,6 +11,7 @@ use crate::{
     rdf::{Format, RdfError},
     shelf::{ShelfKey, SYS_GRAPH_NAME, SYS_HAS_SUBGRAPH, SYS_MEDIA_TYPE},
     space::{DirectlyDeletable, DirectlyWritable, GraphName, ResourceUrl, SpaceError},
+    sparql,
     store::{SparqlStore, StoreError},
 };
 use oxigraph::model::Triple;
@@ -130,9 +131,11 @@ pub async fn put_dataset(
     }
     update.push_str("}; ");
 
+    let mt = sparql::Literal::new(&oxigraph::model::Literal::new_simple_literal(
+        media_type.media_type(),
+    ));
     let mut registry = format!(
-        "<{iri}> <{SYS_PRESENT}> true . <{iri}> <{SYS_MEDIA_TYPE}> \"{}\" . ",
-        media_type.media_type()
+        "<{iri}> <{SYS_PRESENT}> true . <{iri}> <{SYS_MEDIA_TYPE}> {mt} . "
     );
     for (key, name, _) in &shelves {
         // §3.6: `space::GraphName` is sealed so only server-minted types may
