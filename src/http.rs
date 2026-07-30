@@ -470,10 +470,11 @@ async fn handle_put_root(
 /// 6. On a container, refuse a patch touching `ldp:contains` with `409`, through
 ///    the same `container::body_sets_containment` `put_impl` uses.
 /// 7. `check_conditionals` — `412`.
-/// 8. Absent target and empty conditions: create through the `PUT` path
-///    (`Patch::ground_insertions`, ancestor materialization, `created`) → `201`.
-///    Otherwise `resource::patch_dataset` → `204`, or `409` per its
-///    `PatchResult`.
+/// 8. An absent target is patched against an empty dataset (§7): with no
+///    conditions that is a creation through the `PUT` path — `create_by_patch`
+///    → `201`; with conditions nothing can match it, which is `409` and no
+///    write. An existing target goes to `resource::patch_dataset` → `204`, or
+///    the `409` its `PatchResult` names.
 async fn patch_impl(
     st: AppState,
     agent: Agent,
@@ -570,13 +571,63 @@ async fn patch_impl(
     };
     match exists(store, &target).await {
         Ok(true) => {}
-        // §7's creation path is not served: a patch cannot yet bring a
-        // resource into existence.
-        Ok(false) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+        Ok(false) => return create_by_patch(&st, &agent, &target, &patch).await,
         Err(e) => return (put_status(&e), e.to_string()).into_response(),
     }
     match patch_dataset(store, r, &patch).await {
         Ok(result) => patch_response(result, &patch),
+        Err(e) => (put_status(&e), e.to_string()).into_response(),
+    }
+}
+
+/// §7: a target that does not exist is patched against an empty RDF dataset,
+/// so a patch that asks nothing of the prior state creates it — through the
+/// same [`authorize_and_materialize`] walk, the same containment linking and
+/// the same [`created`] response `PUT` uses. There is no second creation path.
+///
+/// [`crate::patch::Patch::ground_insertions`] is the whole test for whether a
+/// patch can create: it answers `Some` exactly when the patch has no
+/// conditions. A patch that has them finds no mapping in an empty dataset,
+/// which is §6's `409` and touches nothing — so the two cases cannot overlap
+/// and need no further condition between them.
+///
+/// The media type recorded for a resource created this way is `text/turtle`:
+/// a patch declares no representation format, and Turtle is what negotiation
+/// falls back to.
+///
+/// Only a resource or a container reaches here. An auxiliary is answered by
+/// `aux::patch`, which refuses an absent one itself.
+async fn create_by_patch(
+    st: &AppState,
+    agent: &Agent,
+    target: &Target,
+    patch: &crate::patch::Patch,
+) -> Response {
+    let store = st.store.as_ref();
+    let Some(triples) = patch.ground_insertions() else {
+        return patch_response(PatchResult::NoMapping, patch);
+    };
+    if let Err(res) = authorize_and_materialize(store, agent, target).await {
+        return with_aux_links(res, target);
+    }
+    let written = match target {
+        Target::Resource(r) => {
+            let turtle =
+                Format::from_content_type("text/turtle").expect("text/turtle is an RDF format");
+            put_dataset(store, st.blobs.as_ref(), r, &ground_dataset(triples), turtle).await
+        }
+        // A container's graph carries the server's own type triples, so it is
+        // written the way `put_impl` writes one rather than through
+        // `put_dataset`, which §3.4 keeps containers off. There is no existing
+        // containment to preserve: nothing was there to contain anything.
+        Target::Container(c) => match put_rdf(store, c, &triples).await {
+            Ok(()) => container::ensure_container(store, c).await,
+            Err(e) => Err(e),
+        },
+        Target::Aux(_) => unreachable!("an auxiliary never reaches the creation branch"),
+    };
+    match written {
+        Ok(()) => created(target),
         Err(e) => (put_status(&e), e.to_string()).into_response(),
     }
 }
@@ -5284,5 +5335,81 @@ mod tests {
             "the same answer PUT already gives for the same reason");
 
         assert!(f.stored("/.aux/never-existed.acl").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_insert_only_patch_creates_the_resource() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/fresh",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:nickname \"Charlie\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(
+            res.headers()[header::LOCATION].to_str().unwrap(),
+            "https://pod.toph.so/fresh"
+        );
+
+        let ttl = f.get_turtle("/fresh").await;
+        assert!(ttl.contains("Charlie"), "{ttl}");
+    }
+
+    // §7: the same ancestor materialization and containment linking `PUT`
+    // uses, not a second creation path. Asserted on the parent's containment
+    // rather than on the child's existence — a creation that skipped the
+    // ancestor walk still produces a readable child.
+    #[tokio::test]
+    async fn creating_by_patch_materializes_ancestors_and_containment() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/deep/er/thing",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:nickname \"Charlie\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let root = f.get_turtle("/").await;
+        assert!(root.contains("https://pod.toph.so/deep/"),
+            "the root must contain deep/: {root}");
+        let deep = f.get_turtle("/deep/").await;
+        assert!(deep.contains("https://pod.toph.so/deep/er/"),
+            "deep/ must contain er/: {deep}");
+        let er = f.get_turtle("/deep/er/").await;
+        assert!(er.contains("https://pod.toph.so/deep/er/thing"),
+            "er/ must contain thing: {er}");
+    }
+
+    // A container's type triples are the server's, so a container a patch
+    // creates carries them exactly as one `PUT` creates does — otherwise the
+    // creation answers `201` for something no client can read as a container.
+    #[tokio::test]
+    async fn an_insert_only_patch_creates_a_container_with_its_type() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/box/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:label \"things\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let ttl = f.get_turtle("/box/").await;
+        assert!(ttl.contains("things"), "{ttl}");
+        assert!(ttl.contains("ldp#BasicContainer"), "{ttl}");
+    }
+
+    // The two cases cannot overlap: a condition against an empty dataset finds
+    // zero mappings, which is a 409 and not a creation.
+    #[tokio::test]
+    async fn a_patch_with_conditions_on_an_absent_resource_is_409() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/fresh",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let get = f.app.clone().oneshot(f.owner_request("GET", "/fresh")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND,
+            "a refused patch must not have created anything");
     }
 }
