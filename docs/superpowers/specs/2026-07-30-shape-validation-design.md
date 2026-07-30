@@ -66,6 +66,14 @@ This design therefore refuses triple terms in `Format::parse` with a `400`. Only
 position can hold one — subjects are `NamedOrBlankNode` — so it is one check in the pod's one
 parser, and every `Dataset` downstream is free of them by construction.
 
+The same feature unification reaches a second parser this design adds: `oxttl`'s N3 parser,
+which `patch::Patch::parse` uses for a `text/n3` `PATCH` body. A patch never goes through
+`Format::parse` — it builds no `Dataset` at all, only patterns over one it never materializes
+(§5.4) — so the refusal above does not cover it, and a triple term in a patch's insertions or deletions would otherwise reach the
+store by a route the RDF-1.1 non-goal never anticipated. The refusal is therefore needed a
+second time, on the N3 path, checked against `N3Term::Triple(_)` the same way `Format::parse`
+checks `Term::Triple(_)`, and for the same `400`.
+
 **Deliberately not decided here: whether this pod should speak RDF 1.2 at all.** Storing
 triple terms is a coherent thing to want, and RDF 1.2 is distinguishable from 1.1 in three
 independent places — the `version` media-type parameter, the in-band `VERSION` directive, and
@@ -225,6 +233,32 @@ wants refusal there should say `sh:Violation`.
   those are out of scope (§3.4, §8). For the same reason, `GET /path?validate` on a blob answers
   `404`: there is no report for a representation SHACL never saw (§6, §7).
 
+### 5.4 `PATCH`
+
+`PATCH` did not exist when this design's write path was written, and it is a third route into
+the store that neither `put_impl` nor `post_impl` covers. Left alone, a shape bound to a
+container constrains what a `PUT` or a `POST` may write there and nothing at all about what a
+`PATCH` may turn it into.
+
+Validating the *result* of a patch is not available at the cost §5.1 relies on. A patch is
+applied as one SPARQL update whose `WHERE` clause carries the deletion-presence check (the N3
+Patch design's §6) — the graph it produces never exists as a `Dataset` in this process, so there
+is nothing to hand `shapes::validate`. Validating only the insertions would be cheap, but wrong:
+a `sh:Violation` can be produced by a deletion as readily as by an insertion — removing the one
+triple that satisfied an `sh:minCount`, say — so a check that saw only what was added would pass
+patches it should refuse.
+
+So a shape-constrained container refuses every `PATCH` outright: `409`, with a message naming
+the container as shape-constrained and pointing at `PUT` as the way to write a validated
+representation. The check runs after the patch body has parsed — a malformed patch still earns
+its own `400`/`422` — and after `authorize` — an unauthorized caller learns nothing more than it
+already would have.
+
+An auxiliary is exempt for the same reason §5.3 exempts it from validation on `PUT`/`POST`: an
+ACL is never validated, and a shape must not be able to lock one. `patch_shape_conflict` mirrors
+`enforce_shape`'s target-to-container resolution and returns immediately for `Target::Aux`, so a
+`PATCH` to `/.aux/…` is unaffected by whatever shape its subject's container binds.
+
 ## 6. Read path — `GET /path?validate`
 
 The report is not stored. It is computed when asked for:
@@ -278,6 +312,7 @@ there is no constraint.
 | binding names a resource that does not exist, is a blob of an unsupported type, names more than one document, or does not parse as SHACL | `409`, naming the unusable constraint document |
 | binding names a constraint document that uses SHACL-SPARQL (§8) | `409`, naming the unusable constraint document |
 | the validation engine itself fails | `500` |
+| `PATCH` on a resource whose container binds a shape (§5.4) | `409`, naming the container as shape-constrained |
 | `?validate` on an unconstrained or absent resource | `404` |
 | `?validate` on an existing blob | `404` (§5.3) |
 
@@ -390,6 +425,9 @@ Properties, each of which must be shown to fail before the code that makes it ho
   SHACL-conformant servers always refuse violations will be surprised by a warn-only shape.
 - **Whoever can write a container can constrain it.** Under the single-user v1 topology this
   is the owner; it is an access-control property to revisit before multi-tenant.
+- **A shape-constrained container does not accept `PATCH`** (§5.4). There is no partial update
+  into a container bound to a shape — every write there is a full representation through `PUT`,
+  because a patch's effect never exists as a `Dataset` for the engine to check.
 
 ## 11. Deltas against documents already in force
 

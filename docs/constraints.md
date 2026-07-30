@@ -222,11 +222,16 @@ The query string is read in exactly one place.
 
 ## RDF version
 
-The wire contract is RDF 1.1, and it is checked rather than assumed.
+The wire contract is RDF 1.1, and it is checked rather than assumed — in both parsers that can
+build a `Dataset`, not just the first.
     → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-shape-validation-design.md §2.1.
     `rudof_lib` turns on oxigraph's `rdf-12` feature transitively, and Cargo
-    unifies features crate-wide, so the linked parser accepts RDF 1.2 whether
-    this pod wants it or not. Before that dependency the non-goal held because
-    nothing had enabled the feature — an accident, not a property. `oxttl` has
-    no version switch, so the refusal is ours and lives in the one parser.
-    check: rg -q 'Term::Triple\(_\)' src/rdf.rs
+    unifies features crate-wide, so every parser built on `oxttl` accepts RDF
+    1.2 whether this pod wants it or not. Before that dependency the non-goal
+    held because nothing had enabled the feature — an accident, not a
+    property. `oxttl` has no version switch, so the refusal is ours. It has to
+    be in two places because a patch is the only way into the store that does
+    not go through `Format::parse`: a `text/n3` body reaches
+    `patch::Patch::parse` instead, which builds no `Dataset` and so sits
+    outside a refusal that lived only in `rdf.rs`.
+    check: rg -q 'Term::Triple\(_\)' src/rdf.rs && rg -q 'N3Term::Triple\(_\)' src/patch.rs

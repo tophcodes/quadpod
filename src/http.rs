@@ -513,6 +513,15 @@ async fn patch_impl(
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
+    // A shape-constrained container refuses every PATCH outright — see
+    // `patch_shape_conflict` for why validating one is not an option. Checked
+    // after the patch parses, so a malformed document still gets its own
+    // answer, and after `authorize` above ran, so an unauthorized caller
+    // learns nothing more than it already has.
+    if let Err(res) = patch_shape_conflict(&st, &target).await {
+        return res;
+    }
+
     // §9: the modes this particular patch needs, against the set `authorize`
     // already resolved. `deny` rather than a second `authorize` — the answer
     // is in hand, and re-resolving would walk the ancestor chain again and
@@ -891,6 +900,49 @@ async fn enforce_shape(
         return Err(res);
     }
     Ok(if report.is_empty() { None } else { Some(report) })
+}
+
+/// Whether `target`'s parent container binds a shape — and if it does, the
+/// `409` that refuses a `PATCH` outright, without attempting to validate it.
+///
+/// A patch is applied as one SPARQL update whose `WHERE` clause carries the
+/// deletion-presence check, so the graph a patch produces never exists as a
+/// [`crate::dataset::Dataset`] in this process — there is nothing for
+/// [`crate::shapes::validate`] to run against. Checking only the insertions
+/// would be cheap, but wrong: a `sh:Violation` can be produced by a deletion
+/// as readily as by an insertion (removing the one triple that satisfied an
+/// `sh:minCount`, say), so a check that saw only what was added would pass
+/// patches it should refuse. Refusing the whole request is the answer that
+/// stays honest; `PUT` is how a shape-constrained container gets a validated
+/// write.
+///
+/// An auxiliary's own container is never asked, mirroring `enforce_shape` for
+/// the same reason: an ACL is never validated, and a shape must not be able
+/// to lock one.
+async fn patch_shape_conflict(st: &AppState, target: &Target) -> Result<(), Response> {
+    let container = match target {
+        Target::Aux(_) => return Ok(()),
+        Target::Resource(r) => r.parent(),
+        Target::Container(c) => c.as_resource().parent(),
+    };
+    let Some(container) = container else {
+        return Ok(()); // the root container has no parent to constrain it
+    };
+    match crate::shapes::load(st.store.as_ref(), &st.space, &container).await {
+        Ok(None) => Ok(()),
+        Ok(Some(shape)) => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{} is shape-constrained (by {}); a PATCH cannot be validated against a \
+                 shape, so it is refused rather than risk writing a state the shape does \
+                 not allow — PUT a full representation to write a validated one",
+                container.graph_iri(),
+                shape.iri,
+            ),
+        )
+            .into_response()),
+        Err(e) => Err(shape_status(e)),
+    }
 }
 
 /// The response a shape lookup or validation failure earns.
@@ -5218,6 +5270,21 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    // §2.1's refusal has to hold in both parsers that can build a `Dataset`:
+    // `Format::parse` above, and here `patch::Patch::parse` — the only other
+    // way a triple term could reach the store, since a patch body never goes
+    // through `Format::parse` at all.
+    #[tokio::test]
+    async fn a_patch_carrying_a_triple_term_is_a_400() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = patch_n3(&f, "/profile",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x <<( <http://e/a> <http://e/b> <http://e/c> )>> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// The shapes document, and a container bound to it. Returns nothing;
     /// both are ordinary resources afterwards.
     /// Binds `shape_ttl`, stored at `shape_path`, to `container_path` — the
@@ -6245,5 +6312,72 @@ mod tests {
             .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(get.status(), StatusCode::NOT_FOUND,
             "a refused patch must not have created anything");
+    }
+
+    // `patch_shape_conflict`: a patch's effect never exists as a `Dataset` in
+    // this process, so a shape-constrained container refuses the write
+    // outright rather than attempt to validate it. The inserted triple is
+    // one `NoteShape` would happily admit — proving the refusal fires on the
+    // binding alone, not on anything the patch's content would have failed.
+    #[tokio::test]
+    async fn a_patch_into_a_shape_constrained_container_is_409() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"first\" .").await;
+
+        let res = patch_n3(&f, "/notes/n1",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x \"1\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = body_string(res).await;
+        assert!(body.contains("shape-constrained"), "{body}");
+        assert!(body.contains("PUT"), "{body}");
+
+        let ttl = f.get_turtle("/notes/n1").await;
+        assert!(!ttl.contains("\"1\""), "a refused patch must not have written: {ttl}");
+    }
+
+    // The converse: an ordinary container with no binding is unaffected by
+    // the refusal above.
+    #[tokio::test]
+    async fn a_patch_into_an_unconstrained_container_still_succeeds() {
+        let f = fixture().await;
+        f.put_turtle("/notes/n1", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = patch_n3(&f, "/notes/n1",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x \"1\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    // An ACL is never validated (§5.3 of the shape-validation design), and
+    // `patch_shape_conflict` must not lock one either: the subject's
+    // container binds a shape here, and the patch still lands.
+    #[tokio::test]
+    async fn a_patch_to_an_acl_under_a_shape_constrained_container_still_succeeds() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"first\" .").await;
+        let acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/notes/n1> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_acl = f.owner_request("PUT", "/.aux/notes/n1.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl_body)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let res = patch_n3(&f, "/.aux/notes/n1.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Append> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let ttl = f.get_turtle("/.aux/notes/n1.acl").await;
+        assert!(ttl.contains("#Append"), "the patch's triple must be there: {ttl}");
     }
 }
