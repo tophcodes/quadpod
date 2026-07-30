@@ -521,6 +521,87 @@ async fn check_conditionals(
     Ok(())
 }
 
+/// Validate a body against the shape its container binds, if any.
+///
+/// `Err` is the response to send; `Ok(Some(report))` is a write that may
+/// proceed but has findings to advertise; `Ok(None)` is an unconstrained
+/// write. Auxiliaries are never validated — an ACL is server-understood data
+/// with its own rules.
+async fn enforce_shape(
+    st: &AppState,
+    target: &Target,
+    dataset: &crate::dataset::Dataset,
+) -> Result<Option<crate::shapes::Report>, Response> {
+    let container = match target {
+        Target::Aux(_) => return Ok(None),
+        Target::Resource(r) => r.parent(),
+        Target::Container(c) => c.as_resource().parent(),
+    };
+    let Some(container) = container else {
+        return Ok(None); // the root container has no parent to constrain it
+    };
+    let shapes = match crate::shapes::load(st.store.as_ref(), &st.space, &container).await {
+        Ok(None) => return Ok(None),
+        Ok(Some(s)) => s,
+        Err(e) => return Err(shape_status(e)),
+    };
+    let report = match crate::shapes::validate(&shapes, dataset) {
+        Ok(r) => r,
+        Err(e) => return Err(shape_status(e)),
+    };
+    if report.refuses() {
+        let body = turtle_bytes(&report.into_dataset());
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            [(header::CONTENT_TYPE, "text/turtle")],
+            body,
+        )
+            .into_response());
+    }
+    Ok(if report.is_empty() { None } else { Some(report) })
+}
+
+/// The response a shape lookup or validation failure earns.
+///
+/// The split is whose fault it is. Only parsing the constraint document reads
+/// something an author wrote, so only that is a `409` telling them to fix it;
+/// the engine failing, or this pod failing to serialize or re-read its own
+/// output, is a `500`. One function, so the two cannot drift apart.
+fn shape_status(e: crate::shapes::ShapeError) -> Response {
+    use crate::shapes::ShapeError;
+    let message = e.to_string();
+    let status = match &e {
+        ShapeError::Resource(r) => put_status(r),
+        ShapeError::Engine(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ShapeError::Unparsable(_) | ShapeError::Unsupported(_) | ShapeError::Missing => {
+            StatusCode::CONFLICT
+        }
+    };
+    (status, message).into_response()
+}
+
+/// A dataset as Turtle, for an error body. Not negotiated: `Accept` describes
+/// the target's representation, and this is not that.
+fn turtle_bytes(dataset: &crate::dataset::Dataset) -> Vec<u8> {
+    crate::rdf::Format::from_content_type("text/turtle")
+        .expect("text/turtle is one of the five formats")
+        .serialize(dataset)
+        .unwrap_or_default()
+}
+
+/// A `describedby` link to the resource's validation report.
+fn report_link(target: &Target, mut res: Response) -> Response {
+    let path = match target {
+        Target::Resource(r) => r.path().to_owned(),
+        Target::Container(c) => c.path().to_owned(),
+        Target::Aux(_) => return res,
+    };
+    if let Ok(v) = HeaderValue::from_str(&format!("<{path}?validate>; rel=\"describedby\"")) {
+        res.headers_mut().append(header::LINK, v);
+    }
+    res
+}
+
 async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let store = st.store.as_ref();
     if let Err(res) = authorize(store, &agent, &target, Mode::Write).await {
@@ -617,6 +698,10 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
         return res;
     }
+    let findings = match enforce_shape(&st, &target, &dataset).await {
+        Ok(f) => f,
+        Err(res) => return res,
+    };
     // Creating a resource materializes every missing ancestor container and
     // links it into the first one that already exists — real mutations of
     // resources the caller may hold nothing on. One traversal authorizes
@@ -634,7 +719,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
         return with_aux_links(res, &target);
     }
-    match &target {
+    let res = match &target {
         // An auxiliary exists only for an existing subject, and that rule is
         // inside `aux::put`'s update rather than a check here — a check and a
         // write are two round-trips, and an interleaved DELETE between them
@@ -675,7 +760,8 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             Ok(()) => created(&target),
             Err(e) => (put_status(&e), e.to_string()).into_response(),
         },
-    }
+    };
+    if findings.is_some() { report_link(&target, res) } else { res }
 }
 
 async fn handle_post(
@@ -4628,5 +4714,153 @@ mod tests {
                 "<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> ."
             )).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The shapes document, and a container bound to it. Returns nothing;
+    /// both are ordinary resources afterwards.
+    async fn bind_note_shape(f: &Fixture) {
+        f.put_turtle("/shapes/note", r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix schema: <http://schema.org/> .
+            <http://example.org/NoteShape> a sh:NodeShape ;
+              sh:targetClass schema:NoteDigitalDocument ;
+              sh:property [ sh:path schema:name ; sh:minCount 1 ; sh:severity sh:Violation ] .
+        "#).await;
+        f.put_turtle("/notes/", "<> <http://www.w3.org/ns/ldp#constrainedBy> \
+            <https://pod.toph.so/shapes/note> .").await;
+    }
+
+    #[tokio::test]
+    async fn a_violating_write_is_refused_and_stores_nothing() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"first\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/turtle");
+        let body = body_string(res).await;
+        assert!(body.contains("ValidationReport"), "the report is the body: {body}");
+
+        assert!(f.get_turtle("/notes/n1").await.contains("first"),
+            "the refused write must not have replaced the stored representation");
+    }
+
+    /// §5.1: validation runs before the traversal that adds the containment
+    /// triple, so a refusal leaves the container exactly as it was — no
+    /// `ldp:contains` pointing at a resource that was never created.
+    #[tokio::test]
+    async fn a_refused_write_adds_no_containment() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let listing = f.get_turtle("/notes/").await;
+        assert!(!listing.contains("/notes/n1"),
+            "the refused write left a containment triple behind: {listing}");
+    }
+
+    #[tokio::test]
+    async fn a_warning_admits_the_write_and_links_the_report() {
+        let f = fixture().await;
+        f.put_turtle("/shapes/note", r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix schema: <http://schema.org/> .
+            <http://example.org/NoteShape> a sh:NodeShape ;
+              sh:targetClass schema:NoteDigitalDocument ;
+              sh:property [ sh:path schema:name ; sh:minCount 1 ; sh:severity sh:Warning ] .
+        "#).await;
+        f.put_turtle("/notes/", "<> <http://www.w3.org/ns/ldp#constrainedBy> \
+            <https://pod.toph.so/shapes/note> .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let link = res.headers().get_all(header::LINK).iter()
+            .map(|v| v.to_str().unwrap().to_owned()).collect::<Vec<_>>().join(", ");
+        assert!(link.contains("/notes/n1?validate") && link.contains("describedby"),
+            "expected a describedby link to the report, got: {link}");
+    }
+
+    #[tokio::test]
+    async fn a_conforming_write_carries_no_report_link() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ; \
+                <http://schema.org/name> \"ok\" ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let link = res.headers().get_all(header::LINK).iter()
+            .map(|v| v.to_str().unwrap().to_owned()).collect::<Vec<_>>().join(", ");
+        assert!(!link.contains("validate"), "nothing to describe: {link}");
+    }
+
+    /// An ACL is server-understood data; a user shape may not refuse one (§5.3).
+    #[tokio::test]
+    async fn an_acl_write_is_never_validated() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"ok\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/.aux/notes/n1.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "@prefix acl: <http://www.w3.org/ns/auth/acl#> . \
+                 <#a> a acl:Authorization ; acl:agent <{OWNER}> ; \
+                 acl:accessTo <https://pod.toph.so/notes/n1> ; acl:mode acl:Read, acl:Write, acl:Control ."
+            ))).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    /// A blob has no triples, so nothing constrains it (§5.3).
+    #[tokio::test]
+    async fn a_blob_write_is_never_validated() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/pic.png")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(Body::from(&b"\x89PNG"[..])).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    /// Failing closed: an unusable constraint document refuses the write
+    /// rather than letting it through unvalidated (§7, §10).
+    #[tokio::test]
+    async fn a_broken_constraint_document_is_a_conflict() {
+        let f = fixture().await;
+        f.put_turtle("/notes/", "<> <http://www.w3.org/ns/ldp#constrainedBy> \
+            <https://pod.toph.so/shapes/gone> .").await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    /// §3.2: the binding does not inherit.
+    #[tokio::test]
+    async fn a_binding_does_not_reach_a_grandchild() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/2026/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED,
+            "/notes/2026/ carries no binding of its own");
     }
 }

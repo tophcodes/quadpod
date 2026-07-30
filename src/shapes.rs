@@ -28,6 +28,8 @@ pub enum ShapeError {
     Unsupported(String),
     #[error("the constraint document does not exist")]
     Missing,
+    #[error("the validation engine failed: {0}")]
+    Engine(String),
     #[error(transparent)]
     Resource(#[from] ResourceError),
 }
@@ -80,7 +82,7 @@ fn turtle() -> Format {
 pub fn validate(shapes_turtle: &str, body: &Dataset) -> Result<Report, ShapeError> {
     let data = turtle()
         .serialize(&body.default_graph_only())
-        .map_err(|e| ShapeError::Unparsable(e.to_string()))?;
+        .map_err(|e| ShapeError::Engine(e.to_string()))?;
     let data = String::from_utf8(data).expect("the serializer emits UTF-8");
 
     let mut rudof = Rudof::new(RudofConfig::default());
@@ -89,7 +91,7 @@ pub fn validate(shapes_turtle: &str, body: &Dataset) -> Result<Report, ShapeErro
         .with_data(&[InputSpec::Str(data)])
         .with_data_format(&DataFormat::Turtle)
         .execute()
-        .map_err(|e| ShapeError::Unparsable(e.to_string()))?;
+        .map_err(|e| ShapeError::Engine(e.to_string()))?;
     rudof
         .load_shacl_shapes()
         .with_shacl_schema(&InputSpec::Str(shapes_turtle.to_owned()))
@@ -100,18 +102,18 @@ pub fn validate(shapes_turtle: &str, body: &Dataset) -> Result<Report, ShapeErro
         .validate_shacl()
         .with_shacl_validation_mode(&ShaclValidationMode::Native)
         .execute()
-        .map_err(|e| ShapeError::Unparsable(e.to_string()))?;
+        .map_err(|e| ShapeError::Engine(e.to_string()))?;
 
     let mut out: Vec<u8> = Vec::new();
     rudof
         .serialize_shacl_validation_results(&mut out)
         .with_result_shacl_validation_format(&ResultShaclValidationFormat::Turtle)
         .execute()
-        .map_err(|e| ShapeError::Unparsable(e.to_string()))?;
+        .map_err(|e| ShapeError::Engine(e.to_string()))?;
 
     let report = turtle()
         .parse(&out, "urn:quadpod:report")
-        .map_err(|e| ShapeError::Unparsable(e.to_string()))?;
+        .map_err(|e| ShapeError::Engine(e.to_string()))?;
     Ok(Report(report))
 }
 
@@ -283,10 +285,10 @@ mod tests {
         assert!(report.is_empty(), "a named graph holds no focus node");
     }
 
-    /// A shapes document that is not SHACL at all is an error, not a panic
-    /// and not a silent pass.
+    /// A shapes document that is not SHACL is the author's problem; nothing
+    /// else in this function is.
     #[test]
-    fn an_unparsable_shapes_document_is_an_error() {
+    fn an_engine_failure_is_not_reported_as_an_unreadable_document() {
         let body = turtle("<> a <http://schema.org/NoteDigitalDocument> .");
         assert!(matches!(
             validate("this is not turtle {{{", &body),
