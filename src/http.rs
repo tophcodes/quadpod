@@ -513,15 +513,6 @@ async fn patch_impl(
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    // A shape-constrained container refuses every PATCH outright — see
-    // `patch_shape_conflict` for why validating one is not an option. Checked
-    // after the patch parses, so a malformed document still gets its own
-    // answer, and after `authorize` above ran, so an unauthorized caller
-    // learns nothing more than it already has.
-    if let Err(res) = patch_shape_conflict(&st, &target).await {
-        return res;
-    }
-
     // §9: the modes this particular patch needs, against the set `authorize`
     // already resolved. `deny` rather than a second `authorize` — the answer
     // is in hand, and re-resolving would walk the ancestor chain again and
@@ -545,6 +536,17 @@ async fn patch_impl(
             Ok(_) => {}
             Err(e) => return (put_status(&e), e.to_string()).into_response(),
         }
+    }
+    // A shape-constrained container refuses every PATCH outright — see
+    // `patch_shape_conflict` for why validating one is not an option. Checked
+    // after the two refusals above, which are about the caller and the
+    // target's own state and must win first: `authorize`'s own comment says
+    // it "runs before the body is looked at so an unauthorized caller learns
+    // nothing", and a caller the §9 mode check would deny must not learn a
+    // container is shape-constrained on the way to that denial, nor must a
+    // `PATCH` at a blob be told about a shape instead of about the blob.
+    if let Err(res) = patch_shape_conflict(&st, &target).await {
+        return res;
     }
     // Containment is server-managed, refused before anything is written for
     // the same reason `put_impl` refuses it there.
@@ -6379,5 +6381,64 @@ mod tests {
 
         let ttl = f.get_turtle("/.aux/notes/n1.acl").await;
         assert!(ttl.contains("#Append"), "the patch's triple must be there: {ttl}");
+    }
+
+    // `authorize`'s own comment says it "runs before the body is looked at so
+    // an unauthorized caller learns nothing" — `patch_shape_conflict` runs
+    // after the §9 mode check for the same property: a caller who was always
+    // going to be denied must be denied on that ground, not told first that
+    // the container happens to be shape-constrained.
+    #[tokio::test]
+    async fn a_denied_patch_is_403_not_the_shape_409() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"first\" .").await;
+
+        let acl = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/notes/n1> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/notes/n1> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
+        );
+        let put_acl = f.owner_request("PUT", "/.aux/notes/n1.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        // Bob holds only Append on /notes/n1, whose container binds a shape.
+        // A deletion needs Write, which he does not have — §9 must deny this
+        // before `patch_shape_conflict` ever runs.
+        let bob_app = f.app_also_trusting(bob);
+        let delete = f.sign(Request::builder().method("PATCH").uri("/notes/n1"), bob, "PATCH", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:where   { <> <http://schema.org/name> \"first\" . } ;\n\
+                   solid:deletes { <> <http://schema.org/name> \"first\" . } .\n")))
+            .unwrap();
+        assert_eq!(bob_app.oneshot(delete).await.unwrap().status(), StatusCode::FORBIDDEN,
+            "the mode denial must win over the shape refusal");
+    }
+
+    // The same ordering argument from the other side: a `PATCH` at a blob is
+    // refused for being a blob, not for its container's shape — even when
+    // the container has one.
+    #[tokio::test]
+    async fn a_patch_at_a_blob_in_a_shape_constrained_container_is_the_binary_refusal() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_blob("/notes/pic.png", "image/png", b"\x89PNG").await;
+
+        let res = patch_n3(&f, "/notes/pic.png",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x \"1\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(body_string(res).await, BINARY_TARGET_MESSAGE,
+            "the blob refusal must win over the shape one");
     }
 }
