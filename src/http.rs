@@ -533,8 +533,8 @@ async fn patch_impl(
     // Containment is server-managed, refused before anything is written for
     // the same reason `put_impl` refuses it there.
     if let Target::Container(c) = &target {
-        if patch_sets_containment(&patch, c) {
-            return (StatusCode::CONFLICT, CONTAINMENT_MESSAGE).into_response();
+        if let Some(conflict) = patch_sets_containment(&patch, c) {
+            return (StatusCode::CONFLICT, conflict.message()).into_response();
         }
     }
     if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
@@ -576,7 +576,29 @@ const BINARY_TARGET_MESSAGE: &str =
 
 const CONTAINMENT_MESSAGE: &str = "ldp:contains is server-managed";
 
-/// Whether a patch would write the containment triples the server manages.
+const CONTAINMENT_VARIABLE_PREDICATE_MESSAGE: &str =
+    "a variable predicate on a container may bind ldp:contains, which is server-managed";
+
+/// Why a patch on a container is refused for touching containment.
+enum ContainmentConflict {
+    /// The patch names `ldp:contains` as a ground predicate.
+    Ground,
+    /// A pattern's predicate is a variable, which could bind `ldp:contains`
+    /// even though nothing in the patch names it.
+    VariablePredicate,
+}
+
+impl ContainmentConflict {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Ground => CONTAINMENT_MESSAGE,
+            Self::VariablePredicate => CONTAINMENT_VARIABLE_PREDICATE_MESSAGE,
+        }
+    }
+}
+
+/// Whether a patch would write the containment triples the server manages,
+/// and why.
 ///
 /// Over the insertions and the deletions both — unlinking a member forges the
 /// container's contents exactly as inserting one does — and over the patterns
@@ -588,16 +610,16 @@ const CONTAINMENT_MESSAGE: &str = "ldp:contains is server-managed";
 /// the container itself: positions that check never looks at. A pattern whose
 /// predicate is not an IRI has no triple form at all and can still bind to
 /// `ldp:contains`, so it is refused without asking.
-fn patch_sets_containment(patch: &crate::patch::Patch, c: &ContainerUrl) -> bool {
+fn patch_sets_containment(patch: &crate::patch::Patch, c: &ContainerUrl) -> Option<ContainmentConflict> {
     let iri = NamedNode::new(c.graph_iri()).expect("a container's IRI is valid");
     let mut written = Vec::new();
     for p in patch.insertions().iter().chain(patch.deletions()) {
         let crate::patch::PatternTerm::Named(predicate) = &p.predicate else {
-            return true;
+            return Some(ContainmentConflict::VariablePredicate);
         };
         written.push(Triple::new(iri.clone(), predicate.clone(), iri.clone()));
     }
-    container::body_sets_containment(&written)
+    container::body_sets_containment(&written).then_some(ContainmentConflict::Ground)
 }
 
 /// A `409` that names the patterns it is about (§6.4).
@@ -4895,6 +4917,19 @@ mod tests {
 
         let ttl = f.get_turtle("/c/").await;
         assert!(!ttl.contains("forged"), "containment is server-managed: {ttl}");
+    }
+
+    #[tokio::test]
+    async fn a_patch_deleting_through_a_variable_predicate_on_a_container_is_409() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+        f.put_turtle("/c/", "<> <http://example.org/marker> <http://example.org/target> .").await;
+
+        let res = patch_n3(&f, "/c/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { <> ?p <http://example.org/target> . } ;\n\
+               solid:deletes { <> ?p <http://example.org/target> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
