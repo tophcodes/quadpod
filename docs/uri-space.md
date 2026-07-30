@@ -157,10 +157,15 @@ Enterprise Solid Server hosts access-control resources on an entirely separate s
 
 Existence, the kind of representation, and the media type it arrived as are **not**
 addressable and not writable. They live in an internal graph (`urn:quadpod:sys:<res>`), and a
-client reads them off the response rather than off a URL: existence as the status code —
-`200` or `404` — the media type as `Content-Type`, and the kind through no header of its own;
-a client infers it from `Content-Type`, since only the media types this pod recognises as RDF
-name an RDF resource, and anything else names a binary one.
+client reads them off the response rather than off a URL: existence as the status code (a
+`200` or a `304` rather than a `404`), the media type as `Content-Type`, and the kind through
+no header of its own; a client infers it from `Content-Type`, since only the media types this
+pod recognises as RDF name an RDF resource, and anything else names a binary one.
+
+For a binary resource `Content-Type` is the stored media type exactly, because there is one
+representation. For an RDF resource it is the negotiated one: a graph stored as Turtle and
+fetched with `Accept: application/ld+json` answers `application/ld+json`. The stored value is
+what `*/*` resolves to, not a promise about every response.
 
 Byte size and content hash live nowhere: with a swappable blob backend, the pod does not
 exclusively own the bytes behind a resource, so a stored size or hash would go silently false
@@ -171,10 +176,11 @@ rather than recorded.
 The split is by authority, not by subject matter. An auxiliary holds what *you* assert about
 a resource; these are what the *server* asserts about it. This pod also never writes
 association triples into your data — no `seeAlso` pointing at an ACL, nothing. The `Link`
-header is the interface; your graphs stay yours. The moment a server-asserted fact
-has a writable URL, a client can assert its own creation timestamp and the value is
-worthless for auditing or ordering. A read-only projection of these facts may be offered
-later; it will never be writable.
+header is the interface; your graphs stay yours. The moment a server-asserted fact has a
+writable URL it stops being server-asserted: a client could declare its own resource binary
+while storing triples, or claim a media type the bytes are not in, and every reader
+downstream would believe it. A read-only projection of these facts may be offered later; it
+will never be writable.
 
 ## The vocabulary this pod mints
 
