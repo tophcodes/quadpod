@@ -17,7 +17,7 @@
 //! and not a self-check.
 
 use crate::rdf::Format;
-use oxigraph::model::{Literal, NamedNode, Quad};
+use oxigraph::model::{Literal, NamedNode, Quad, Triple};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -215,6 +215,14 @@ impl Dataset {
                 .collect(),
         )
     }
+}
+
+/// A dataset's quads as triples, graph name dropped. Used only where the
+/// caller has already established there is no graph name worth keeping —
+/// either every quad is already in the default graph, or (the containment
+/// check) the graph name is exactly what must not hide anything from it.
+pub(crate) fn triples_of(dataset: &Dataset) -> Vec<Triple> {
+    dataset.quads().iter().cloned().map(Triple::from).collect()
 }
 
 /// The skolem namespace. Only this module writes or matches it — see

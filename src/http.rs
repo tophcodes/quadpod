@@ -10,7 +10,7 @@ use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
     http::{StatusCode, HeaderMap, HeaderValue, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
-    dataset::{Dataset, Skolemized},
+    dataset::{triples_of, Dataset, Skolemized},
     resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, ResourceError},
     rdf::{Format, MediaType, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
@@ -353,14 +353,6 @@ fn put_status(e: &ResourceError) -> StatusCode {
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> &str {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
-}
-
-/// A dataset's quads as triples, graph name dropped. Used only where the
-/// caller has already established there is no graph name worth keeping —
-/// either every quad is already in the default graph, or (the containment
-/// check) the graph name is exactly what must not hide anything from it.
-fn triples_of(dataset: &Dataset) -> Vec<Triple> {
-    dataset.quads().iter().cloned().map(Triple::from).collect()
 }
 
 /// Every `ETag` `target` currently answers with, one per representation —

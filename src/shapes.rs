@@ -8,7 +8,13 @@ use rudof_lib::{
 };
 use thiserror::Error;
 
-use crate::{dataset::Dataset, rdf::Format, resource::ResourceError};
+use crate::{
+    dataset::Dataset,
+    rdf::Format,
+    resource::{as_quads, get_rdf, kind_of, Kind, ResourceError},
+    space::{ContainerUrl, GraphName, StorageSpace, Target},
+    store::SparqlStore,
+};
 
 /// `sh:resultSeverity`, and the one severity that refuses a write.
 const SH_RESULT_SEVERITY: &str = "http://www.w3.org/ns/shacl#resultSeverity";
@@ -109,6 +115,60 @@ pub fn validate(shapes_turtle: &str, body: &Dataset) -> Result<Report, ShapeErro
     Ok(Report(report))
 }
 
+/// `ldp:constrainedBy`, the only binding this pod reads.
+const LDP_CONSTRAINED_BY: &str = "http://www.w3.org/ns/ldp#constrainedBy";
+
+/// The constraint document bound to `container`, serialized as Turtle.
+///
+/// The binding does not inherit: this reads `container`'s own graph and
+/// walks nowhere. A document outside this pod's space is refused rather than
+/// fetched — shapes are data here, not links.
+pub async fn load(
+    store: &dyn SparqlStore,
+    space: &StorageSpace,
+    container: &ContainerUrl,
+) -> Result<Option<String>, ShapeError> {
+    let Some(triples) = get_rdf(store, container).await? else {
+        return Ok(None);
+    };
+    let Some(iri) = triples.iter().find_map(|t| match &t.object {
+        oxigraph::model::Term::NamedNode(n) if t.predicate.as_str() == LDP_CONSTRAINED_BY => {
+            Some(n.as_str().to_owned())
+        }
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+
+    // `strip_prefix` alone confuses `https://pod.toph.so/x` with
+    // `https://pod.toph.so.evil.example/x` — the latter also starts with the
+    // trimmed base as a byte string. The remainder must begin with `/`, the
+    // boundary a same-origin path always has, or the IRI names a different
+    // origin entirely.
+    let base = space.root().graph_iri().trim_end_matches('/').to_owned();
+    let Some(rest) = iri.strip_prefix(&base).filter(|r| r.starts_with('/')) else {
+        return Err(ShapeError::Unsupported(iri));
+    };
+    let Ok(Target::Resource(r)) = space.resolve(rest) else {
+        return Err(ShapeError::Unsupported(iri));
+    };
+
+    match kind_of(store, &r).await? {
+        None => Err(ShapeError::Missing),
+        Some(Kind::Binary(mt)) => Err(ShapeError::Unsupported(mt.as_str().to_owned())),
+        Some(Kind::Rdf) => {
+            let triples = get_rdf(store, &r).await?.unwrap_or_default();
+            let dataset = Dataset::new(as_quads(&triples));
+            let bytes = turtle()
+                .serialize(&dataset)
+                .map_err(|e| ShapeError::Unparsable(e.to_string()))?;
+            Ok(Some(
+                String::from_utf8(bytes).expect("the serializer emits UTF-8"),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +252,117 @@ mod tests {
             validate("this is not turtle {{{", &body),
             Err(ShapeError::Unparsable(_))
         ));
+    }
+
+    use crate::{
+        resource::put_rdf,
+        space::{StorageSpace, Target},
+        store::OxigraphStore,
+    };
+
+    fn space() -> StorageSpace {
+        StorageSpace::new("https://pod.toph.so/").unwrap()
+    }
+
+    fn container(space: &StorageSpace, path: &str) -> ContainerUrl {
+        match space.resolve(path).expect("resolves") {
+            Target::Container(c) => c,
+            _ => panic!("{path} is not a container"),
+        }
+    }
+
+    fn resource(space: &StorageSpace, path: &str) -> crate::space::ResourceUrl {
+        match space.resolve(path).expect("resolves") {
+            Target::Resource(r) => r,
+            _ => panic!("{path} is not a resource"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_container_without_a_binding_has_no_shape() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let c = container(&sp, "/notes/");
+        put_rdf(&store, &c, &[]).await.unwrap();
+        assert!(load(&store, &sp, &c).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_binding_yields_the_constraint_document() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let shape = resource(&sp, "/shapes/note");
+        let shape_triples = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note")
+            .unwrap();
+        put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
+
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/note> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+
+        let doc = load(&store, &sp, &c).await.unwrap().expect("a shape");
+        assert!(doc.contains("NodeShape"));
+    }
+
+    #[tokio::test]
+    async fn a_binding_to_a_missing_document_is_missing() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/gone> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+        assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Missing)));
+    }
+
+    /// A shape is never fetched over the network (§8), so a foreign IRI is
+    /// refused rather than resolved.
+    #[tokio::test]
+    async fn a_foreign_constraint_document_is_unsupported() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://elsewhere.example/s> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+        assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
+    }
+
+    /// The classic prefix-confusion bug: `https://pod.toph.so.evil.example/x`
+    /// starts with `https://pod.toph.so` as a byte string, but is a different
+    /// origin entirely. A bare `strip_prefix` would treat it as in-pod; the
+    /// remainder must begin with `/` for the origins to actually match.
+    #[tokio::test]
+    async fn a_domain_confusable_constraint_document_is_unsupported() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so.evil.example/x> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+        assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
     }
 }
