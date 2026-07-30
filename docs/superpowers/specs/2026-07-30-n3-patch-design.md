@@ -4,24 +4,42 @@
 **Status:** Proposed (pre-implementation), revision 1
 **Author:** Christopher Mühl (with Claude)
 **Parent spec:** [2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md)
-**Origin:** `docs/conformance-findings.md` rank 6 — the last unclaimed rank on that list, and
-the only Solid MUST this pod answers with `405`.
+**Origin:** `docs/conformance-findings.md`, fifth run — **rank 1 of the residual failures, 66
+scenarios, 78% of everything still red**, and the only Solid MUST this pod answers with `405`.
 
 ## 1. What is wrong today
 
-`rg -n 'patch' src/` finds nothing. No route, no handler, no `Accept-Patch`. Axum answers
-`405` for every `PATCH`, which costs two measured scenarios and a MUST:
+`rg -n 'PATCH' src/` finds nothing but an RFC 9110 citation in a comment. No route, no handler,
+no `Accept-Patch`. Axum's method dispatch answers `405` before authentication, before
+`Content-Type`, before anything about the request is inspected.
 
-- `protocol/writing-resource/containment:38` — a patch expected to succeed.
-- `protocol/authentication/header:40` — an **anonymous** patch expected to be refused with
-  `401`. It gets `405`, because the method check fires before authentication. The other five
-  anonymous rows in that feature pass, `WWW-Authenticate` included; this one fails only
-  because the method does not exist.
+This was rank 6 while non-RDF resources blocked 540 scenarios. That work has landed and the
+fifth run measures 567 passed against 85 failed, which leaves `PATCH` as **the largest single
+gap in the suite**:
 
-The cost is larger than two rows. Within the 491 `protected-operation` scenarios that the
-non-RDF work unblocks, a share exercises `PATCH`; those rows have never been evaluated
-against this pod, and they will fail on `405` the moment the `415` clears. The same findings
-entry named `OPTIONS` alongside `PATCH`, and `OPTIONS` has since landed.
+| Feature | Failures |
+|---|---|
+| `wac/protected-operation/read-access-{agent,bob,public}` | 10 each |
+| `wac/protected-operation/write-access-{agent,bob}` | 12 each |
+| `wac/protected-operation/write-access-public` | 9 |
+| `protocol/writing-resource/containment:38` | 1 |
+| `protocol/authentication/header:40` | 1 |
+| `protocol/writing-resource/content-type-reject:19` | 1 |
+
+`10×3 + 12×2 + 9 + 1 + 1 + 1 = 66`.
+
+The 63 `protected-operation` rows are `retry until <expected-status>` steps that never
+converge: `405` is never one of the awaited statuses (`403`, `401`, or
+`[200, 201, 204, 205]` depending on the row), so karate gives up after three attempts. They
+read differently in `harness.log` than an ordinary assertion mismatch and have the identical
+root cause.
+
+The remaining three are individually informative. `containment:38` sends
+`application/sparql-update`. `authentication/header:40` is an **anonymous** patch that must be
+refused with `401` — the other five anonymous rows in that feature pass, `WWW-Authenticate`
+included, and this one fails only because the method does not exist. `content-type-reject:19`
+is a patch with no `Content-Type` at all, which cannot reach the `Content-Type` gate that
+already answers it correctly for `PUT` and `POST`.
 
 A pod that cannot change one triple of a document without rewriting the whole document is
 also, separately, a bad pod. `PUT` is the only editing primitive this server offers today.
@@ -215,6 +233,24 @@ IRIs are rendered through `NamedNode`, literals through `sparql::Literal` — th
 codebase already established for exactly this, and the constraint check that forbids a
 hand-written `"{}"` covers the new call sites without amendment.
 
+**A `sparql!` macro would not cover this query, and that is worth writing down before anyone
+builds one.** `2026-07-29-non-rdf-resources-design.md` §13 proposes a `sqlx::query!`-style
+proc-macro that parses each query at build time with `spargebra`, and states the condition that
+makes it safe: *"the SPARQL text must stay a source literal."*
+
+Every query this pod issues today satisfies that — a fixed skeleton with values interpolated
+into it. The patch `SELECT` is the first that does not. Its **graph pattern** comes from the
+client's `solid:where` formula, so the query's shape exists only at runtime and no build-time
+parse can reach it, by construction rather than by omission. A macro adopted later must leave
+this one call site outside itself, and the danger is precisely that it would then look
+covered.
+
+What stands in for it here is the same thing that stands in for it everywhere else in this
+codebase: every term is rendered through a type whose alphabet is established, every variable
+name is the server's own, and §13's tests name the mutants. The failure a build-time parse
+catches is a query that does not parse; the failure that matters on this path is a query that
+parses and means something else, which the macro would not have caught either.
+
 ### 6.2 The default graph only
 
 A resource in this pod may hold a dataset with named graphs (shelves). N3 Patch has no syntax
@@ -327,7 +363,8 @@ restrictive direction for the second.
 
 | Code | Cause |
 |---|---|
-| `415` | `Content-Type` is not `text/n3` |
+| `400` | No `Content-Type` at all, on a non-empty body |
+| `415` | A `Content-Type` that is not `text/n3`; or no `Content-Type` on an empty body |
 | `400` | The body is not parseable N3, or names the reserved `urn:quadpod:` namespace |
 | `422` | The patch document violates §5.1 |
 | `409` | Zero or multiple mappings; a deletion triple is absent; the target is a binary resource; the patch touches `ldp:contains` on a container |
@@ -345,6 +382,11 @@ introduce a third success shape this codebase has no other use for.
 for the same body content. The namespace rule is about what a client may write anywhere, not
 about the shape of a patch document.
 
+The missing-`Content-Type` split mirrors `classify_body` exactly — `400 "Content-Type is
+required"` for a body with no type, `415` for an empty one. That distinction is not decorative:
+`content-type-reject:19` is a patch with no `Content-Type`, and the gate that already answers
+its `PUT` and `POST` siblings correctly has simply never been reachable by a patch.
+
 ### 10.2 Advertisement
 
 - `allowed_methods` gains `PATCH` for every target it already lists, which feeds both the
@@ -355,9 +397,10 @@ about the shape of a patch document.
 
 ### 10.3 Conditional requests
 
-The `If-Match` / `If-None-Match` block from `put_impl` moves to a shared helper and is used
-unchanged. `PATCH` evaluates it after authorization and before any write, in the same position
-`PUT` does.
+`check_conditionals` — *"RFC 9110 §13.1.1 preconditions, shared by both kinds of write"* —
+already exists and is already shared. `PATCH` becomes its third caller and needs no extraction
+and no new interface. It is evaluated after authorization and before any write, in the same
+position `PUT` uses it.
 
 ## 11. Documented limits
 
@@ -440,12 +483,21 @@ Each test names the mutant it kills.
 
 ## 14. Conformance: what this moves
 
-- `protocol/authentication/header:40` — **green.** The method exists, so the auth middleware
-  answers before the method check.
-- `protocol/writing-resource/containment:38` — **stays red**, and moves into Bucket 1 with the
-  reason from §3: it sends `application/sparql-update`, which the Protocol does not define.
-- The `PATCH` share of the `protected-operation` scenarios becomes **measured** for the first
-  time.
+Against the fifth run's 66, this design accounts for every one:
+
+| Scenarios | Expectation |
+|---|---|
+| 63 `protected-operation` rows | **Become reachable.** They are `retry until <expected-status>` steps awaiting `403`, `401` or `[200, 201, 204, 205]`; each of those is now a status the pod can produce. Whether they go green is what §9's tiering decides, and finding that out is the point. |
+| `authentication/header:40` | **Green.** The method exists, so the auth middleware answers `401` before the method check. |
+| `content-type-reject:19` | **Green.** A patch with no `Content-Type` now reaches the gate that already answers `400` for `PUT` and `POST` (§10.1). |
+| `containment:38` | **Stays red**, and moves into Bucket 1 with the reason from §3: it sends `application/sparql-update`, which the Protocol does not define. |
+
+`63 + 1 + 1 + 1 = 66`.
+
+The honest form of the claim: **65 of the 66 become reachable, 2 are certainly green, and the
+63 are a measurement rather than a prediction.** They have never run against this pod, so
+asserting a number for them would be inventing one — the same mistake the third run's write-up
+avoided when it declined to call the unblocked WAC rows a free 540.
 
 No test is disabled. The findings document attributes every failure to a named cause, and the
 reconciliation across runs only works while nothing is switched off.
