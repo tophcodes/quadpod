@@ -40,6 +40,40 @@ the engine's native mode against triples we hand it, not against a remote endpoi
 Built here: the binding lookup, the choice of data graph, the placement in the write path, the
 severity-to-status mapping, and the read view.
 
+### 2.1 Taking rudof brings RDF 1.2 into the type system
+
+`rudof_rdf` and `sparql_service` enable oxigraph's `rdf-12` feature unconditionally, and Cargo
+unifies features crate-wide, so the dependency cannot be taken without it. Two consequences,
+both measured rather than assumed:
+
+- `oxrdf::Term` gains a `Triple(_)` variant, which breaks two exhaustive matches in
+  `dataset.rs`.
+- **The Turtle parser accepts RDF 1.2 syntax.** `<http://e/s> <http://e/p> <<( <http://e/a>
+  <http://e/b> <http://e/c> )>> .` parses to one quad instead of failing.
+
+The second collides with the root spec's §3 non-goal, *"No RDF-star / RDF 1.2 on the wire"* —
+and it exposes that the non-goal was never enforced. It held because nothing had switched the
+feature on. `oxttl` 0.2.3 offers no version switch, so a strict-1.1 parser is not available;
+the refusal has to be ours and has to come after parsing.
+
+This design therefore refuses triple terms in `Format::parse` with a `400`. Only the object
+position can hold one — subjects are `NamedOrBlankNode` — so it is one check in the pod's one
+parser, and every `Dataset` downstream is free of them by construction.
+
+**Deliberately not decided here: whether this pod should speak RDF 1.2 at all.** Storing
+triple terms is a coherent thing to want, and RDF 1.2 is distinguishable from 1.1 in three
+independent places — the `version` media-type parameter, the in-band `VERSION` directive, and
+the terms themselves. The obstacle is not Solid, which only constrains what leaves the pod; it
+is the root spec's §13 success criterion that any SPARQL 1.1 store be swappable in by config,
+which stops holding for a resource holding triple terms.
+
+The shape of the answer, when it is taken up: the criterion names a *capability* rather than a
+product, the store's capability becomes a config-visible fact, and a pod configured against a
+1.1-only backend degrades by refusing the content types and formats that would produce terms
+the backend cannot hold — the same graceful-degradation move §6.2 of the datasets design
+already makes for named graphs. Nothing in the refusal built here has to be undone for that;
+it becomes a case distinction. That is a separate spec, with its own §4 and §13 amendments.
+
 ## 3. The binding
 
 ### 3.1 `ldp:constrainedBy`, on the container, in its own graph

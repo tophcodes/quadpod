@@ -22,6 +22,151 @@
 
 ---
 
+### Task 0: Refuse RDF 1.2 triple terms at the parser
+
+**Why this task exists:** `rudof_lib` transitively enables oxigraph's `rdf-12` feature — unconditionally, through `rudof_rdf` and `sparql_service`, confirmed with `cargo tree -e features -i oxrdf`. Cargo unifies features project-wide, so adding the dependency (Task 1 Step 1) does two things beyond adding SHACL: `oxrdf::Term` gains a `Triple(_)` variant, and **the Turtle parser starts accepting RDF 1.2 syntax**. Measured, not assumed:
+
+```
+Input:  <http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .
+Output: ACCEPTED 1 quad(s)
+```
+
+The root spec's §3 non-goal — *"No RDF-star / RDF 1.2 on the wire — Solid is RDF-1.1-anchored"* — would otherwise stop holding silently. This task makes it hold because it is checked. `oxttl` 0.2.3 has no version switch, so the check is ours and it goes after parsing.
+
+**Files:**
+- Modify: `src/rdf.rs` (`RdfError`, `Format::parse`), `src/dataset.rs` (two exhaustive matches)
+- Test: `src/rdf.rs` and `src/http.rs`, each in its own `mod tests`
+
+**Interfaces:**
+- Consumes: nothing from earlier tasks — this is the first task
+- Produces: `RdfError::Rdf12TripleTerm`, and the invariant that **a `Dataset` built by `Format::parse` never holds a `Term::Triple`**. Tasks 1–5 rely on that invariant and never re-check it.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `src/rdf.rs`'s `mod tests`:
+
+```rust
+    /// RDF 1.2 triple terms are refused, so the wire contract stays RDF 1.1
+    /// even though the linked parser understands more (root spec §3).
+    #[test]
+    fn a_triple_term_is_refused() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = b"<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .";
+        assert!(matches!(
+            fmt.parse(ttl, "http://e/"),
+            Err(RdfError::Rdf12TripleTerm)
+        ));
+    }
+
+    /// The refusal is about triple terms, not about the syntax being new:
+    /// ordinary RDF 1.1 still parses.
+    #[test]
+    fn an_ordinary_triple_still_parses() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = b"<http://e/s> <http://e/p> <http://e/o> .";
+        assert_eq!(fmt.parse(ttl, "http://e/").unwrap().quads().len(), 1);
+    }
+```
+
+In `src/http.rs`'s `mod tests`:
+
+```rust
+    #[tokio::test]
+    async fn a_put_carrying_a_triple_term_is_a_400() {
+        let f = fixture().await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> ."
+            )).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `nix develop -c cargo test --lib rdf::tests::a_triple_term_is_refused`
+Expected: FAIL — at this point the crate does not compile at all, because Task 1's dependency is already in `Cargo.toml` and `src/dataset.rs` has two non-exhaustive matches (`E0004`). That compile error **is** the first failure; fix it in Step 3 and the test failure appears underneath it.
+
+- [ ] **Step 3: Close the two matches in `src/dataset.rs`**
+
+In `Skolemized::skolemize`, the object match gains:
+
+```rust
+                Term::Triple(_) => unreachable!(
+                    "Format::parse refuses RDF 1.2 triple terms, and every Dataset \
+                     skolemized here came from it"
+                ),
+```
+
+In `Skolemized::from_store`, the object match gains an arm consistent with its neighbours, which already decline what they cannot represent:
+
+```rust
+                    Term::Triple(_) => return None,
+```
+
+`unreachable!` with a justifying message is house style here (`src/rdf.rs:62`). The two arms differ on purpose: `skolemize` sees only client bodies, which Step 4 filters; `from_store` sees whatever the store holds, which this pod does not control on its own.
+
+- [ ] **Step 4: Refuse triple terms in `Format::parse`**
+
+Add the variant to `RdfError`:
+
+```rust
+    #[error("RDF 1.2 triple terms are not accepted; this pod stores RDF 1.1")]
+    Rdf12TripleTerm,
+```
+
+and the check in `Format::parse`, after the parse loop and before `Ok(Dataset::new(out))`:
+
+```rust
+        // The linked oxigraph has `rdf-12` on — a transitive dependency turns
+        // it on and Cargo unifies features crate-wide — so the parser accepts
+        // RDF 1.2. The wire contract is RDF 1.1 (root spec §3), and this is
+        // what keeps that true rather than incidental. Only the object can be
+        // a triple term; subjects are `NamedOrBlankNode`.
+        if out.iter().any(|q| matches!(q.object, Term::Triple(_))) {
+            return Err(RdfError::Rdf12TripleTerm);
+        }
+```
+
+Map `Rdf12TripleTerm` to the same status the existing parse failure produces (`400`) — find that mapping rather than adding a second one.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `nix develop -c cargo test --lib rdf::tests` then `nix develop -c cargo test --lib http::tests::a_put_carrying_a_triple_term_is_a_400`
+Expected: PASS.
+
+- [ ] **Step 6: Add the constraint**
+
+In `docs/constraints.md`, under a new `## RDF version` heading:
+
+```markdown
+The wire contract is RDF 1.1, and it is checked rather than assumed.
+    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-shape-validation-design.md §2.1.
+    `rudof_lib` turns on oxigraph's `rdf-12` feature transitively, and Cargo
+    unifies features crate-wide, so the linked parser accepts RDF 1.2 whether
+    this pod wants it or not. Before that dependency the non-goal held because
+    nothing had enabled the feature — an accident, not a property. `oxttl` has
+    no version switch, so the refusal is ours and lives in the one parser.
+    check: rg -q 'Term::Triple\(_\)' src/rdf.rs
+```
+
+- [ ] **Step 7: Run the whole suite and the checks**
+
+Run: `nix develop -c cargo test && arch-check`
+Expected: suite green, `14 checked, 0 violated, 0 broken`.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock src/lib.rs src/rdf.rs src/dataset.rs src/http.rs docs/constraints.md
+git commit -m "feat: refuse RDF 1.2 triple terms, so the RDF 1.1 contract is checked"
+```
+
+The commit includes `Cargo.toml`, `Cargo.lock` and `src/lib.rs` because Task 1's dependency line is what makes this task necessary and what makes the tree compile again; `src/shapes.rs` stays uncommitted for Task 1.
+
+---
+
 ### Task 1: The validation function
 
 **Files:**
