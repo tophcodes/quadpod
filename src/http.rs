@@ -8,15 +8,15 @@
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
     http::{StatusCode, HeaderMap, HeaderValue, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
-use oxigraph::model::{Quad, Triple};
+use oxigraph::model::{NamedNode, Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{Dataset, Skolemized},
-    resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, ResourceError},
+    resource::{put_rdf, get_rdf, delete_rdf, exists, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
     rdf::{Format, MediaType, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
-    space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
+    space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize}, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::{authorize, authorize_and_materialize, deny}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -37,8 +37,8 @@ pub fn router(state: AppState) -> Router {
     // outermost: `cors_layer` sees the `401` that `auth_layer` produces, which
     // is where the CORS fields are required.
     Router::new()
-        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).options(handle_options_root))
-        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).options(handle_options))
+        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).patch(handle_patch_root).options(handle_options_root))
+        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).patch(handle_patch).options(handle_options))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
         .layer(axum::middleware::from_fn(cors_layer))
@@ -52,7 +52,7 @@ pub fn router(state: AppState) -> Router {
 /// emits. Both properties are asserted: `protocol/cors/enumerate-headers`
 /// requires the header to be present and to differ from `*`.
 const EXPOSED_HEADERS: &str =
-    "Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
+    "Accept-Patch, Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
 
 /// Reflect a request's `Origin` onto its response.
 ///
@@ -171,19 +171,24 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
 /// answers from the request URL alone and needs no representation to describe.
 fn allowed_methods(target: &Target) -> &'static str {
     match target {
-        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT, OPTIONS",
-        Target::Container(_) => "GET, HEAD, POST, PUT, DELETE, OPTIONS",
-        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, DELETE, OPTIONS",
+        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT, PATCH, OPTIONS",
+        Target::Container(_) => "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, PATCH, DELETE, OPTIONS",
     }
 }
 
+/// The one patch format this pod accepts. Protocol §5.3 makes advertising it a
+/// MUST, and it travels with `Allow` because both answer "what may I do here?".
+const ACCEPT_PATCH: &str = "text/n3";
+
 /// Attach [`allowed_methods`] to a read that succeeded — Protocol §4.1 makes
-/// it a MUST on `GET`/`HEAD`.
+/// it a MUST on `GET`/`HEAD` — alongside `Accept-Patch`.
 fn with_allow(mut res: Response, target: &Target) -> Response {
     res.headers_mut().insert(
         header::ALLOW,
         allowed_methods(target).parse().expect("method list is header-safe"),
     );
+    res.headers_mut().insert("accept-patch", HeaderValue::from_static(ACCEPT_PATCH));
     res
 }
 
@@ -454,6 +459,325 @@ async fn handle_put_root(
     }
 }
 
+/// `PATCH` (`2026-07-30-n3-patch-design.md`). The sequence, which the plan fills
+/// in this order and no other:
+///
+/// 1. `authorize(…, Mode::Append)` — before anything is parsed, so an
+///    unauthorized caller learns nothing, and the returned `Decision` carries
+///    the full mode set §9 needs.
+/// 2. The `Content-Type` gate: `text/n3`, with `classify_body`'s split for a
+///    missing type — `400` on a non-empty body, `415` on an empty one.
+/// 3. `patch::Patch::parse` — `400` for unparseable N3 or a reserved IRI, `422`
+///    for a shape violation.
+/// 4. `RequiredModes::satisfied_by` against the decision already in hand. No
+///    second ACL resolution.
+/// 5. `kind_of` — a binary resource is `409`; the bytes are not triples.
+/// 6. On a container, refuse a patch touching `ldp:contains` with `409`, through
+///    the same `container::body_sets_containment` `put_impl` uses.
+/// 7. `check_conditionals` — `412`.
+/// 8. An absent target is patched against an empty dataset (§7): a patch that
+///    asks nothing of the prior state — no conditions and no deletions — is a
+///    creation through the `PUT` path, `create_by_patch` → `201`. A patch that
+///    asks anything of it gets from the empty dataset the same `409` a target
+///    without those triples gives, and no write. An existing target goes to
+///    `resource::patch_dataset` → `204`, or the `409` its `PatchResult` names.
+/// 9. On a container, `container::ensure_container` afterwards, exactly as
+///    `put_impl` does — the server's type triples are its own, and a patch
+///    that deleted them would otherwise leave the container untyped.
+async fn patch_impl(
+    st: AppState,
+    agent: Agent,
+    target: Target,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let store = st.store.as_ref();
+    // Append is the weakest mode any patch §5.1 admits can need, and
+    // `AccessModes::allows` makes Write subsume it — so this refuses exactly
+    // those callers who could do nothing anyway, and it runs before the body
+    // is looked at so an unauthorized caller learns nothing.
+    let decision = match authorize(store, &agent, &target, Mode::Append).await {
+        Ok(d) => d,
+        Err(res) => return with_aux_links(res, &target),
+    };
+
+    let ct = header_str(&headers, header::CONTENT_TYPE).trim();
+    if ct.is_empty() {
+        return if body.is_empty() {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()
+        } else {
+            (StatusCode::BAD_REQUEST, "Content-Type is required").into_response()
+        };
+    }
+    if MediaType::parse(ct).map(|m| m.essence()).as_deref() != Some("text/n3") {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+
+    let patch = match crate::patch::Patch::parse(&body, target.graph_iri()) {
+        Ok(p) => p,
+        Err(e @ crate::patch::PatchError::Shape(_)) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
+        }
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    // §9: the modes this particular patch needs, against the set `authorize`
+    // already resolved. `deny` rather than a second `authorize` — the answer
+    // is in hand, and re-resolving would walk the ancestor chain again and
+    // could read an ACL written in between.
+    //
+    // §8: not for an auxiliary. `authorize` substituted `Control` for it
+    // regardless of the mode asked for, so asking again with modes derived
+    // from the patch's parts would demand `Read` or `Write` on top of
+    // `Control` — refusing an ACL patch from an agent WAC says may make it.
+    if !matches!(target, Target::Aux(_)) && !patch.required_modes().satisfied_by(decision.user) {
+        return with_aux_links(deny(&agent), &target);
+    }
+
+    // §8: `text/n3` is a perfectly good request body, so the conflict is with
+    // the state of the target — bytes, which have no triples to patch.
+    if let Target::Resource(r) = &target {
+        match kind_of(store, r).await {
+            Ok(Some(Kind::Binary(_))) => {
+                return (StatusCode::CONFLICT, BINARY_TARGET_MESSAGE).into_response()
+            }
+            Ok(_) => {}
+            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+        }
+    }
+    // Containment is server-managed, refused before anything is written for
+    // the same reason `put_impl` refuses it there.
+    if let Target::Container(c) = &target {
+        if let Some(conflict) = patch_sets_containment(&patch, c) {
+            return (StatusCode::CONFLICT, conflict.message()).into_response();
+        }
+    }
+    if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
+        return res;
+    }
+    // An auxiliary is written through `aux`, whose subject-existence guard is
+    // what keeps a policy document off a path that names nothing, and it
+    // answers the same `404` `put_impl` does when the subject is gone. It
+    // takes its own branch here because the `exists` check below is not the
+    // one it needs: §7's creation path is closed for an auxiliary as well, and
+    // `aux::patch` refuses an absent one itself, with a body that says which
+    // of the two is missing.
+    let r = match &target {
+        Target::Resource(r) => r,
+        Target::Container(c) => c.as_resource(),
+        Target::Aux(a) => {
+            return match aux::patch(store, a, &patch).await {
+                Ok(result) => patch_response(result, &patch),
+                Err(AuxError::SubjectMissing) => {
+                    (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
+                }
+                Err(e @ AuxError::Missing) => {
+                    (StatusCode::NOT_FOUND, e.to_string()).into_response()
+                }
+                Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
+            }
+        }
+    };
+    match exists(store, &target).await {
+        Ok(true) => {}
+        Ok(false) => return create_by_patch(&st, &agent, &target, &patch).await,
+        Err(e) => return (put_status(&e), e.to_string()).into_response(),
+    }
+    match patch_dataset(store, r, &patch).await {
+        // A container's type triples are the server's, and a patch names its
+        // own triples — including them. Re-asserting them here is what
+        // `put_impl` does after writing a container body, and it is why a
+        // container patch is not refused outright: the client stays free to
+        // patch everything else the container's graph holds.
+        Ok(result) => match &target {
+            Target::Container(c) => match container::ensure_container(store, c).await {
+                Ok(()) => patch_response(result, &patch),
+                Err(e) => (put_status(&e), e.to_string()).into_response(),
+            },
+            _ => patch_response(result, &patch),
+        },
+        Err(e) => (put_status(&e), e.to_string()).into_response(),
+    }
+}
+
+/// §7: a target that does not exist is patched against an empty RDF dataset,
+/// so a patch that asks nothing of the prior state creates it — through the
+/// same [`authorize_and_materialize`] walk, the same containment linking and
+/// the same [`created`] response `PUT` uses. There is no second creation path.
+///
+/// A patch creates only when the empty dataset answers everything it asks:
+/// [`crate::patch::Patch::ground_insertions`] is `Some` exactly when it has no
+/// conditions, and it must delete nothing. Either part unmet is §6's `409` and
+/// touches nothing — a condition finds no mapping in an empty dataset, and a
+/// triple to delete is not in one either.
+///
+/// The media type recorded for a resource created this way is `text/turtle`:
+/// a patch declares no representation format, and Turtle is what negotiation
+/// falls back to.
+///
+/// Only a resource or a container reaches here. An auxiliary is answered by
+/// `aux::patch`, which refuses an absent one itself.
+async fn create_by_patch(
+    st: &AppState,
+    agent: &Agent,
+    target: &Target,
+    patch: &crate::patch::Patch,
+) -> Response {
+    let store = st.store.as_ref();
+    let Some(triples) = patch.ground_insertions() else {
+        return patch_response(PatchResult::NoMapping, patch);
+    };
+    if !patch.deletions().is_empty() {
+        return patch_response(PatchResult::DeletionMissing, patch);
+    }
+    if let Err(res) = authorize_and_materialize(store, agent, target).await {
+        return with_aux_links(res, target);
+    }
+    let written = match target {
+        Target::Resource(r) => {
+            let turtle =
+                Format::from_content_type("text/turtle").expect("text/turtle is an RDF format");
+            put_dataset(store, st.blobs.as_ref(), r, &ground_dataset(triples), turtle).await
+        }
+        // A container's graph carries the server's own type triples, so it is
+        // written the way `put_impl` writes one rather than through
+        // `put_dataset`, which §3.4 keeps containers off. There is no existing
+        // containment to preserve: nothing was there to contain anything.
+        Target::Container(c) => match put_rdf(store, c, &triples).await {
+            Ok(()) => container::ensure_container(store, c).await,
+            Err(e) => Err(e),
+        },
+        Target::Aux(_) => unreachable!("an auxiliary never reaches the creation branch"),
+    };
+    match written {
+        Ok(()) => created(target),
+        Err(e) => (put_status(&e), e.to_string()).into_response(),
+    }
+}
+
+/// §6's outcomes as HTTP: applied is `204`, and each refusal is the `409` that
+/// names the part of the patch it was about. One function, because a target
+/// whose patch is refused for a reason the other target reports differently is
+/// a difference no client could explain.
+fn patch_response(result: PatchResult, patch: &crate::patch::Patch) -> Response {
+    match result {
+        PatchResult::Applied => StatusCode::NO_CONTENT.into_response(),
+        PatchResult::NoMapping => {
+            patch_conflict("nothing matches the conditions", patch.conditions())
+        }
+        PatchResult::SeveralMappings => {
+            patch_conflict("more than one mapping satisfies the conditions", patch.conditions())
+        }
+        PatchResult::DeletionMissing => {
+            patch_conflict("a triple this patch deletes is not there", patch.deletions())
+        }
+    }
+}
+
+const BINARY_TARGET_MESSAGE: &str =
+    "this resource holds bytes rather than triples, so there is nothing to patch";
+
+const CONTAINMENT_MESSAGE: &str = "ldp:contains is server-managed";
+
+const CONTAINMENT_VARIABLE_PREDICATE_MESSAGE: &str =
+    "a variable predicate on a container may bind ldp:contains, which is server-managed";
+
+/// Why a patch on a container is refused for touching containment.
+enum ContainmentConflict {
+    /// The patch names `ldp:contains` as a ground predicate.
+    Ground,
+    /// A pattern's predicate is a variable, which could bind `ldp:contains`
+    /// even though nothing in the patch names it.
+    VariablePredicate,
+}
+
+impl ContainmentConflict {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Ground => CONTAINMENT_MESSAGE,
+            Self::VariablePredicate => CONTAINMENT_VARIABLE_PREDICATE_MESSAGE,
+        }
+    }
+}
+
+/// Whether a patch would write the containment triples the server manages,
+/// and why.
+///
+/// Over the insertions and the deletions both — unlinking a member forges the
+/// container's contents exactly as inserting one does — and over the patterns
+/// rather than over what they would bind to, because the refusal has to land
+/// before the write.
+///
+/// [`container::body_sets_containment`] reads the predicate and nothing else,
+/// so each pattern is offered to it as a triple whose subject and object are
+/// the container itself: positions that check never looks at. A pattern whose
+/// predicate is not an IRI has no triple form at all and can still bind to
+/// `ldp:contains`, so it is refused without asking.
+fn patch_sets_containment(patch: &crate::patch::Patch, c: &ContainerUrl) -> Option<ContainmentConflict> {
+    let iri = NamedNode::new(c.graph_iri()).expect("a container's IRI is valid");
+    let mut written = Vec::new();
+    for p in patch.insertions().iter().chain(patch.deletions()) {
+        let crate::patch::PatternTerm::Named(predicate) = &p.predicate else {
+            return Some(ContainmentConflict::VariablePredicate);
+        };
+        written.push(Triple::new(iri.clone(), predicate.clone(), iri.clone()));
+    }
+    container::body_sets_containment(&written).then_some(ContainmentConflict::Ground)
+}
+
+/// A `409` that names the patterns it is about (§6.4).
+///
+/// The patterns are the client's own words, and they are all a message ever
+/// carries: a *binding* may be a skolem IRI the client has never seen, while a
+/// pattern cannot be one — `Patch::parse` refuses any document that names the
+/// reserved namespace.
+fn patch_conflict(reason: &str, patterns: &[crate::patch::Pattern]) -> Response {
+    (StatusCode::CONFLICT, format!("{reason}: {}", show_patterns(patterns))).into_response()
+}
+
+/// Triple patterns as message text — never as SPARQL, which
+/// `resource::patch_dataset` builds for itself. A variable prints by its
+/// index: the name the client chose does not leave `patch` (§6.1).
+fn show_patterns(patterns: &[crate::patch::Pattern]) -> String {
+    patterns
+        .iter()
+        .map(|p| {
+            format!(
+                "{} {} {} .",
+                show_term(&p.subject), show_term(&p.predicate), show_term(&p.object)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn show_term(t: &crate::patch::PatternTerm) -> String {
+    match t {
+        crate::patch::PatternTerm::Named(n) => n.to_string(),
+        crate::patch::PatternTerm::Literal(l) => l.to_string(),
+        crate::patch::PatternTerm::Var(i) => format!("?v{i}"),
+    }
+}
+
+async fn handle_patch(
+    State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
+    headers: HeaderMap, body: Bytes,
+) -> Response {
+    match classify(&st.space, &format!("/{path}")) {
+        Ok(target) => patch_impl(st, agent, target, headers, body).await,
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn handle_patch_root(
+    State(st): State<AppState>, Extension(agent): Extension<Agent>, headers: HeaderMap, body: Bytes,
+) -> Response {
+    match classify(&st.space, "/") {
+        Ok(target) => patch_impl(st, agent, target, headers, body).await,
+        Err(status) => status.into_response(),
+    }
+}
+
 /// What a request body is, once its `Content-Type` has been read.
 enum Repr {
     Rdf(Dataset, Format),
@@ -653,6 +977,9 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
                 Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(&target)),
                 Err(AuxError::SubjectMissing) =>
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
+                // Unreachable: `put` writes the auxiliary, so it never asks
+                // for one that is already there.
+                Err(AuxError::Missing) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                 Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
             }
         }
@@ -885,6 +1212,7 @@ fn options_impl(target: &Target, headers: &HeaderMap) -> Response {
     let methods = allowed_methods(target);
     out.insert(header::ALLOW, HeaderValue::from_static(methods));
     out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static(methods));
+    out.insert("accept-patch", HeaderValue::from_static(ACCEPT_PATCH));
     if let Some(requested) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
         out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
     }
@@ -1479,6 +1807,48 @@ mod tests {
         assert_ne!(exposed, "*");
         assert!(exposed.contains("ETag"), "{exposed}");
         assert!(exposed.contains("WAC-Allow"), "{exposed}");
+    }
+
+    #[tokio::test]
+    async fn allow_and_accept_patch_advertise_the_method() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        // Every target shape, because `allowed_methods` has three arms and a
+        // fix to one of them is not a fix to the others.
+        for path in ["/c/thing", "/c/", "/"] {
+            let get = f.app.clone().oneshot(f.owner_request("GET", path)
+                .header(header::ACCEPT, "text/turtle")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(get.status(), StatusCode::OK, "GET {path}");
+            let allow = get.headers()[header::ALLOW].to_str().unwrap();
+            assert!(allow.contains("PATCH"), "GET {path} Allow: {allow}");
+            assert_eq!(
+                get.headers()["accept-patch"].to_str().unwrap(), "text/n3",
+                "GET {path}"
+            );
+
+            let opt = f.app.clone().oneshot(Request::builder()
+                .method("OPTIONS").uri(path).body(Body::empty()).unwrap()).await.unwrap();
+            let allow = opt.headers()[header::ALLOW].to_str().unwrap();
+            assert!(allow.contains("PATCH"), "OPTIONS {path} Allow: {allow}");
+            let acam = opt.headers()[header::ACCESS_CONTROL_ALLOW_METHODS].to_str().unwrap();
+            assert!(acam.contains("PATCH"), "OPTIONS {path} ACAM: {acam}");
+            assert_eq!(opt.headers()["accept-patch"].to_str().unwrap(), "text/n3");
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_patch_is_exposed_to_cross_origin_readers() {
+        let f = fixture().await;
+        f.put_turtle("/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/thing")
+            .header(header::ORIGIN, "https://app.example")
+            .header(header::ACCEPT, "text/turtle")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let exposed = res.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS].to_str().unwrap();
+        assert!(exposed.contains("Accept-Patch"), "{exposed}");
     }
 
     // The reason the middleware wraps `auth_layer` instead of sitting inside
@@ -2184,10 +2554,10 @@ mod tests {
         assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
 
         for (method, path, expected) in [
-            ("GET", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
-            ("HEAD", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
-            ("GET", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
-            ("HEAD", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
+            ("GET", "/box/", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+            ("HEAD", "/box/", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+            ("GET", "/box/doc", "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"),
+            ("HEAD", "/box/doc", "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"),
         ] {
             let req = f.owner_request(method, path).body(Body::empty()).unwrap();
             let res = f.app.clone().oneshot(req).await.unwrap();
@@ -2203,7 +2573,7 @@ mod tests {
         let f = fixture().await;
         let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
         let res = f.app.oneshot(get).await.unwrap();
-        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT, OPTIONS");
+        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT, PATCH, OPTIONS");
     }
 
     #[tokio::test]
@@ -4625,5 +4995,529 @@ mod tests {
             .body(Body::from(&b"x"[..])).unwrap()).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn patch_body(inner: &str) -> String {
+        format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix ex: <http://example.org/> .\n{inner}"
+        )
+    }
+
+    async fn patch_n3(f: &Fixture, path: &str, inner: &str) -> axum::response::Response {
+        f.app.clone().oneshot(f.owner_request("PATCH", path)
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(inner))).unwrap()).await.unwrap()
+    }
+
+    async fn body_bytes(res: axum::response::Response) -> Vec<u8> {
+        http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_patch_changes_one_triple_and_answers_204() {
+        let f = fixture().await;
+        f.put_turtle("/profile",
+            "<#me> <http://example.org/email> \"old\" ; <http://example.org/name> \"Toph\" .").await;
+
+        let res = patch_n3(&f, "/profile",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:deletes { ?p ex:email \"old\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let ttl = f.get_turtle("/profile").await;
+        assert!(ttl.contains("\"new\""), "{ttl}");
+        assert!(!ttl.contains("\"old\""), "{ttl}");
+        assert!(ttl.contains("\"Toph\""), "an untouched triple must survive: {ttl}");
+    }
+
+    // §8: `text/n3` is a perfectly good body, so `415` would be a claim about
+    // the wrong thing — the conflict is with a target that has no triples.
+    // The byte assertion is the half a status check cannot see: a `409` that
+    // also destroyed the object passes a status-only test.
+    #[tokio::test]
+    async fn a_patch_at_a_blob_is_409_and_the_bytes_survive() {
+        let f = fixture().await;
+        f.put_blob("/notes.txt", "text/plain", b"hello \x00\xff bytes").await;
+
+        let res = patch_n3(&f, "/notes.txt",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x \"1\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let got = f.app.clone().oneshot(f.owner_request("GET", "/notes.txt")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(body_bytes(got).await, b"hello \x00\xff bytes");
+    }
+
+    #[tokio::test]
+    async fn a_patch_setting_containment_on_a_container_is_409() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let res = patch_n3(&f, "/c/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> <http://www.w3.org/ns/ldp#contains> \
+                               <https://pod.toph.so/c/forged> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let ttl = f.get_turtle("/c/").await;
+        assert!(!ttl.contains("forged"), "containment is server-managed: {ttl}");
+    }
+
+    // A container's LDP type lives only in its body — the pod emits no
+    // `Link: rel="type"` — so a patch that deletes it would leave the container
+    // untyped to every client. `put_impl` re-asserts the server's type triples
+    // after writing a container body; a patch is answered the same way, which
+    // keeps the client free to patch the container's other triples.
+    #[tokio::test]
+    async fn a_patch_cannot_strip_a_containers_ldp_type() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let res = patch_n3(&f, "/c/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:deletes { <> a <http://www.w3.org/ns/ldp#BasicContainer> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let ttl = f.get_turtle("/c/").await;
+        assert!(ttl.contains("BasicContainer"), "a container must stay typed: {ttl}");
+        assert!(ttl.contains("thing"), "its members must survive the re-assertion: {ttl}");
+    }
+
+    #[tokio::test]
+    async fn a_patch_deleting_through_a_variable_predicate_on_a_container_is_409() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+        f.put_turtle("/c/", "<> <http://example.org/marker> <http://example.org/target> .").await;
+
+        let res = patch_n3(&f, "/c/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { <> ?p <http://example.org/target> . } ;\n\
+               solid:deletes { <> ?p <http://example.org/target> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_stale_if_match_refuses_the_patch_with_412() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .header(header::IF_MATCH, "\"deadbeef\"")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:inserts { <> ex:x \"1\" . } .\n"))).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+
+        let ttl = f.get_turtle("/profile").await;
+        assert!(!ttl.contains("\"1\""), "nothing may have been written: {ttl}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_patch_document_is_422_and_a_bad_body_is_400() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let two_inserts = patch_n3(&f, "/profile",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:x \"1\" . } ;\n\
+               solid:inserts { <> ex:y \"2\" . } .\n").await;
+        assert_eq!(two_inserts.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let junk = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from("this is not N3 {{{")).unwrap()).await.unwrap();
+        assert_eq!(junk.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // The middle row is `content-type-reject:19`, which has never been
+    // reachable because there was no `PATCH` route to reach the gate with.
+    #[tokio::test]
+    async fn the_content_type_gate_matches_classify_body() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+        let body = patch_body(
+            "_:patch a solid:InsertDeletePatch ; solid:inserts { <> ex:x \"1\" . } .\n");
+
+        let wrong = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(body.clone())).unwrap()).await.unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let untyped = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(untyped.status(), StatusCode::BAD_REQUEST);
+
+        let empty = f.app.clone().oneshot(f.owner_request("PATCH", "/profile")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(empty.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // `authentication/header:40` as a unit test. It fails today only because
+    // axum answers `405` before the auth layer ever runs.
+    #[tokio::test]
+    async fn an_anonymous_patch_is_401_not_405() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = f.app.clone().oneshot(Request::builder()
+            .method("PATCH").uri("/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ; solid:inserts { <> ex:x \"1\" . } .\n")))
+            .unwrap()).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    // §6.4. Both halves matter: the first alone is satisfied by a message that
+    // names nothing, the second alone by one that also prints the binding —
+    // which for a blank-node subject is a skolem IRI the client has never seen.
+    #[tokio::test]
+    async fn a_409_names_the_patch_and_never_a_skolem_iri() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "[] <http://example.org/email> \"old\" .").await;
+
+        let res = patch_n3(&f, "/profile",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:deletes { ?p ex:email \"old\" . ?p ex:phone \"123\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let body = String::from_utf8(body_bytes(res).await).unwrap();
+        assert!(!body.contains("urn:quadpod:"), "a minted IRI must not leak: {body}");
+        assert!(body.contains("phone"), "the message must say what failed: {body}");
+    }
+
+    // §9, and the `write-access-*` fixture's `A` row in both directions. A
+    // single `Mode::Write` gate refuses the first; a gate that only ever asks
+    // for `Append` admits the second.
+    #[tokio::test]
+    async fn an_append_only_agent_may_insert_but_not_delete() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let acl = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             <#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
+        );
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+
+        let insert = f.sign(Request::builder().method("PATCH").uri("/profile"), bob, "PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ; solid:inserts { <> ex:x \"1\" . } .\n")))
+            .unwrap();
+        assert_eq!(bob_app.clone().oneshot(insert).await.unwrap().status(), StatusCode::NO_CONTENT,
+            "an insert-only patch needs Append, not Write");
+
+        let delete = f.sign(Request::builder().method("PATCH").uri("/profile"), bob, "PATCH", "/profile")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:where   { ?p ex:email \"old\" . } ;\n\
+                   solid:deletes { ?p ex:email \"old\" . } .\n")))
+            .unwrap();
+        assert_eq!(bob_app.oneshot(delete).await.unwrap().status(), StatusCode::FORBIDDEN,
+            "deleting needs Write");
+    }
+
+    /// An ACL granting the owner every mode over `/profile`, plus whatever
+    /// `extra` the test needs. The owner's own grant is repeated because this
+    /// ACL replaces the root's for its subject.
+    fn profile_acl(extra: &str) -> String {
+        format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             {extra}"
+        )
+    }
+
+    #[tokio::test]
+    async fn an_acl_url_accepts_a_patch() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(profile_acl(""))).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let res = patch_n3(&f, "/.aux/profile.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Append> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let ttl = f.get_turtle("/.aux/profile.acl").await;
+        assert!(ttl.contains("#Append"), "the patch's triple must be there: {ttl}");
+        assert!(ttl.contains("#Control"), "the grants it did not name must survive: {ttl}");
+    }
+
+    // §8: `authorize` substitutes Control for an Aux target regardless of the
+    // mode the handler asks for, so §9's tiering does not apply here. An agent
+    // holding Write on the subject but not Control must be refused — otherwise
+    // anyone who may edit a resource may rewrite the policy over it.
+    #[tokio::test]
+    async fn patching_an_acl_needs_control_not_write() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let acl = profile_acl(&format!(
+            "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write> ."
+        ));
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let req = f.sign(
+            Request::builder().method("PATCH").uri("/.aux/profile.acl"),
+            bob, "PATCH", "/.aux/profile.acl",
+        )
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:inserts { <#bob> <http://www.w3.org/ns/auth/acl#mode> \
+                                   <http://www.w3.org/ns/auth/acl#Control> . } .\n")))
+            .unwrap();
+        assert_eq!(bob_app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let stored = f.stored("/.aux/profile.acl").await.expect("the ACL exists");
+        assert!(
+            !stored.iter().any(|t| t.to_string().contains("#bob") && t.to_string().ends_with("#Control>")),
+            "a refused patch must not have granted anything: {stored:?}"
+        );
+    }
+
+    // The converse of the test above, and the only one that pins §8's skip of
+    // the §9 mode check: `authorize` substituted Control for the auxiliary, so
+    // an agent holding Control and nothing else is exactly who may rewrite the
+    // policy. Asking §9's question again would demand Append on top of
+    // Control — which Control does not subsume — and refuse them. The owner's
+    // own ACL grants Read, Write and Control together, so no test using it can
+    // tell the skip from its absence.
+    #[tokio::test]
+    async fn control_alone_may_patch_an_acl() {
+        let f = fixture().await;
+        let carol = "https://carol.example/card#me";
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let acl = profile_acl(&format!(
+            "<#carol> <http://www.w3.org/ns/auth/acl#agent> <{carol}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        ));
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let carol_app = f.app_also_trusting(carol);
+        let req = f.sign(
+            Request::builder().method("PATCH").uri("/.aux/profile.acl"),
+            carol, "PATCH", "/.aux/profile.acl",
+        )
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:inserts { <#carol> <http://www.w3.org/ns/auth/acl#mode> \
+                                   <http://www.w3.org/ns/auth/acl#Append> . } .\n")))
+            .unwrap();
+        assert_eq!(carol_app.oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+        let stored = f.stored("/.aux/profile.acl").await.expect("the ACL exists");
+        assert!(
+            stored.iter().any(|t| t.to_string().ends_with("#Append>")),
+            "the patch an agent with Control may make must land: {stored:?}"
+        );
+    }
+
+    // A patch does not create an auxiliary. The subject is present here, so
+    // the subject-missing `404` would be a false statement about the store —
+    // and an insert-only patch, whose `WHERE` the subject guard satisfies,
+    // would otherwise leave its triples in a graph nothing marks present.
+    #[tokio::test]
+    async fn patching_an_absent_acl_whose_subject_exists_is_404_and_writes_nothing() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let res = patch_n3(&f, "/.aux/profile.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Control> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_string(res).await, AuxError::Missing.to_string(),
+            "the subject exists, so the subject-missing body would be untrue");
+
+        assert!(f.stored("/.aux/profile.acl").await.is_none());
+        // Not just unmarked: `stored` gates on the presence marker, so it
+        // reports `None` for a graph full of triples nobody ever made present.
+        let iri = f.url("/.aux/profile.acl").graph_iri().to_string();
+        let leftover = f.store
+            .query_triples(&format!(
+                "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"
+            ))
+            .await
+            .unwrap();
+        assert!(leftover.is_empty(), "the refused patch wrote into the ACL graph: {leftover:?}");
+    }
+
+    // The other face of the same defect: a patch whose conditions match
+    // nothing returns before touching the store, and an existence question
+    // asked afterwards would turn that `409` into a `404` about a resource
+    // that is right there.
+    #[tokio::test]
+    async fn a_patch_matching_nothing_at_an_acl_is_409_not_404() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(profile_acl(""))).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let res = patch_n3(&f, "/.aux/profile.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?a <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Append> . } ;\n\
+               solid:inserts { ?a <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Write> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn patching_an_acl_whose_subject_is_absent_is_404() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/.aux/never-existed.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Control> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_string(res).await, AUX_SUBJECT_MISSING_MESSAGE,
+            "the same answer PUT already gives for the same reason");
+
+        assert!(f.stored("/.aux/never-existed.acl").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_insert_only_patch_creates_the_resource() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/fresh",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:nickname \"Charlie\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(
+            res.headers()[header::LOCATION].to_str().unwrap(),
+            "https://pod.toph.so/fresh"
+        );
+
+        let ttl = f.get_turtle("/fresh").await;
+        assert!(ttl.contains("Charlie"), "{ttl}");
+    }
+
+    // §7: the same ancestor materialization and containment linking `PUT`
+    // uses, not a second creation path. Asserted on the parent's containment
+    // rather than on the child's existence — a creation that skipped the
+    // ancestor walk still produces a readable child.
+    #[tokio::test]
+    async fn creating_by_patch_materializes_ancestors_and_containment() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/deep/er/thing",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:nickname \"Charlie\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let root = f.get_turtle("/").await;
+        assert!(root.contains("https://pod.toph.so/deep/"),
+            "the root must contain deep/: {root}");
+        let deep = f.get_turtle("/deep/").await;
+        assert!(deep.contains("https://pod.toph.so/deep/er/"),
+            "deep/ must contain er/: {deep}");
+        let er = f.get_turtle("/deep/er/").await;
+        assert!(er.contains("https://pod.toph.so/deep/er/thing"),
+            "er/ must contain thing: {er}");
+    }
+
+    // A container's type triples are the server's, so a container a patch
+    // creates carries them exactly as one `PUT` creates does — otherwise the
+    // creation answers `201` for something no client can read as a container.
+    #[tokio::test]
+    async fn an_insert_only_patch_creates_a_container_with_its_type() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/box/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <> ex:label \"things\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let ttl = f.get_turtle("/box/").await;
+        assert!(ttl.contains("things"), "{ttl}");
+        assert!(ttl.contains("ldp#BasicContainer"), "{ttl}");
+    }
+
+    // The two cases cannot overlap: a condition against an empty dataset finds
+    // zero mappings, which is a 409 and not a creation.
+    #[tokio::test]
+    async fn a_patch_with_conditions_on_an_absent_resource_is_409() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/fresh",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let get = f.app.clone().oneshot(f.owner_request("GET", "/fresh")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND,
+            "a refused patch must not have created anything");
+    }
+
+    // §7: the empty dataset an absent target is patched against holds no triple
+    // for a deletion to find, so the answer is the same `409` the identical
+    // patch gets on an existing target. The `GET` is the assertion that bites:
+    // a creation branch taken on the strength of the conditions alone answers
+    // `201` for a patch that asks only to remove something.
+    #[tokio::test]
+    async fn a_deletions_only_patch_on_an_absent_resource_is_409() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/gone",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:deletes { <> ex:nickname \"Charlie\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert!(body_string(res).await.contains("a triple this patch deletes is not there"),
+            "the same body the existing-target path gives for the same patch");
+
+        let get = f.app.clone().oneshot(f.owner_request("GET", "/gone")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND,
+            "a refused patch must not have created anything");
     }
 }

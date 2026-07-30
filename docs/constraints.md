@@ -120,6 +120,18 @@ There is one content-negotiation path, one parser and one ETag.
     both answer, one answers wrong.
     check: ! rg -q 'fn (format_for_accept|format_for_content_type)\b' src
 
+`patch` never reaches the store.
+    → 2026-07-30-n3-patch-design.md §3, §6. The argument that no client SPARQL
+    exists rests on the patch document being parsed to terms in one place and
+    turned into queries in another: `patch` decides whether a document is
+    acceptable, `resource::patch_dataset` decides what it does to a resource.
+    Give `patch` a store and the two questions merge, the shape validation stops
+    being testable without one, and the module that holds client-authored
+    structure gains the ability to execute it. The narrower grep is deliberate —
+    the word "store" appears in this module's prose, and a rule that trips over
+    its own doc comment is a rule someone deletes.
+    check: ! rg -q 'crate::store|SparqlStore' src/patch.rs
+
 No `#[allow]` attributes in `src/`.
     → Plan 6 Task 1 recorded this as a global constraint, and it was
     load-bearing once already: it forced a plan-mandated `Result<String, ()>`
@@ -127,6 +139,25 @@ No `#[allow]` attributes in `src/`.
     dataset skeleton suspended it deliberately, with `// skeleton:` comments;
     this rule is what removes them.
     check: ! rg -q '#\[allow' src
+
+Only `aux` patches an auxiliary.
+    → 2026-07-30-n3-patch-design.md §8; `docs/constraints.md`'s `DirectlyWritable`
+    rule, whose defect this is the patch-shaped version of. `patch_guarded` takes
+    any `GraphName` so an auxiliary can reach it, and an auxiliary reaching it
+    without the subject-existence guard plants a policy document on a path that
+    no longer exists — permanent, because nearest-ACL-wins then hands it out.
+    The type system cannot express "guarded" here; this check can.
+    What the grep pins is narrower than the sentence above it: that no other
+    file names the symbol at all, doc comment included — it does not stop
+    `aux.rs` itself from passing an empty guard. What pins that is one test,
+    `aux::tests::a_patch_whose_subject_vanishes_under_the_write_writes_nothing`:
+    it stages the auxiliary present with its subject gone, the only state that
+    reaches the guarded write, and asserts the auxiliary's graph is unchanged.
+    No other test reaches the guard — the ones that look as though they do are
+    refused by `aux::patch`'s opening `exists` check, because `delete_subject`
+    cascades the auxiliary away with its subject. Replacing the guard argument
+    with `""` makes that one test fail and no other.
+    check: ! rg -q 'patch_guarded' src --glob '!src/aux.rs' --glob '!src/resource.rs'
 
 The `Accept` header is parsed in exactly one place.
     → 2026-07-29-non-rdf-resources-design.md §6.1. `negotiate` and
