@@ -194,7 +194,22 @@ impl Patch {
     /// against an absent resource any non-empty condition finds zero mappings
     /// and is a `409`, so the two cases do not overlap.
     pub fn ground_insertions(&self) -> Option<Vec<Triple>> {
-        todo!()
+        if !self.conditions.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.insertions.len());
+        for p in &self.insertions {
+            let (PatternTerm::Named(s), PatternTerm::Named(pr)) = (&p.subject, &p.predicate) else {
+                return None;
+            };
+            let object = match &p.object {
+                PatternTerm::Named(n) => oxigraph::model::Term::NamedNode(n.clone()),
+                PatternTerm::Literal(l) => oxigraph::model::Term::Literal(l.clone()),
+                PatternTerm::Var(_) => return None,
+            };
+            out.push(Triple::new(s.clone(), pr.clone(), object));
+        }
+        Some(out)
     }
 }
 
@@ -526,6 +541,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(patch.variables(), 1);
+    }
+
+    // §7: the only shape that can create a resource. `Some` exactly when the
+    // conditions are empty — §5.1 admits a variable in the insertions only if
+    // a condition binds it, so no conditions means no variables to leave in.
+    #[test]
+    fn ground_insertions_exist_exactly_when_nothing_is_matched() {
+        let creatable = p(&format!(
+            "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts {{ <> ex:nickname \"Charlie\" . }} .\n"
+        ))
+        .unwrap();
+        let triples = creatable.ground_insertions().expect("no conditions, so ground");
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].subject, NamedNode::new(BASE).unwrap().into());
+        assert_eq!(triples[0].object, Literal::new_simple_literal("Charlie").into());
+
+        // A condition means a match is required, and against an absent
+        // resource that is a 409 rather than a creation.
+        let matching = p(&format!(
+            "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   {{ ?p ex:email \"old\" . }} ;\n\
+               solid:inserts {{ ?p ex:email \"new\" . }} .\n"
+        ))
+        .unwrap();
+        assert!(matching.ground_insertions().is_none());
+
+        // Empty patch: ground, and empty.
+        let empty = p(&format!("{PREFIXES}_:patch a solid:InsertDeletePatch .\n")).unwrap();
+        assert_eq!(empty.ground_insertions().map(|t| t.len()), Some(0));
     }
 
     use crate::wac::AccessModes;
