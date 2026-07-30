@@ -354,9 +354,189 @@ genuine tie, both inherited from the blob-alone measurement and both worth 6 sce
 just two 6-scenario defects, neither larger than the other, both already filed in Bucket 3
 and unrelated to this fix.
 
+## Sixth run — after N3 Patch (`d485135`)
+
+| | |
+|---|---|
+| **Date** | 2026-07-30 |
+| **Pod commit** | `d485135976795d0f5a6029a8f69029462b1993dd` (the fifth run's tree plus the N3 Patch work, [design](../superpowers/specs/2026-07-30-n3-patch-design.md)), **re-measured at `83f270e`** |
+
+| | Features | Scenarios | Passed | Failed |
+|---|---|---|---|---|
+| karate (everything that ran) | 41 | 652 | 632 | 20 |
+| harness's MUST-linked subset | 38 | 649 | 621 | 20 |
+
+Four whole-branch review fixes landed after this run — a container's LDP type is re-asserted after a patch, a formula predicate whose object names no formula is refused, and two guards gained the tests that pin them. The suite was run again at `83f270e` and produced the identical **632 / 20**, with the same seven failing features at the same counts, so every number below holds for the branch as it merges rather than only for the commit it was first measured at.
+
+Same 41 features, same 652 scenarios as every prior run. **34 of the 41 now pass every
+scenario and 7 have at least one failure**, against 29 and 12 in the fifth run. 85 residual
+failures fall to 20.
+
+One deviation in method, stated up front: this run's `karate-reports/` directory holds only
+the summary pages (`karate-summary.html`, `karate-summary-json.txt`, `karate-tags.html`,
+`karate-timeline.html`) — no per-feature HTML, which earlier runs used for per-scenario
+detail. `conformance/reports/report.html` carries the same detail as EARL/RDFa — every
+scenario's title, every step, and each step's `earl#passed` / `earl#failed` — and is what the
+per-scenario claims below are checked against, alongside `harness.log` for the response lines.
+
+### Which rows moved, and which did not
+
+Eight features gained; four features that still fail did not move at all. A feature that
+gained has no `ERROR` line left under it in `harness.log` and its own `failed: 0` banner; a
+feature that did not move carries the same `ERROR` lines, at the same scenario line numbers,
+as the fifth run. Both were read out of the log, not inferred from the totals.
+
+| Feature | Fifth run | Sixth run | Δ |
+|---|---|---|---|
+| `wac/protected-operation/read-access-agent` | 80/90 | **90/90** | +10 |
+| `wac/protected-operation/read-access-bob` | 80/90 | **90/90** | +10 |
+| `wac/protected-operation/read-access-public` | 80/90 | **90/90** | +10 |
+| `wac/protected-operation/write-access-agent` | 68/84 | **80/84** | +12 |
+| `wac/protected-operation/write-access-bob` | 68/84 | **80/84** | +12 |
+| `wac/protected-operation/write-access-public` | 40/53 | **49/53** | +9 |
+| `protocol/authentication/header` | 5/6 | **6/6** | +1 |
+| `protocol/writing-resource/content-type-reject` | 2/3 | **3/3** | +1 |
+
+`10 + 10 + 10 + 12 + 12 + 9 + 1 + 1 = 65`, and `567 + 65 = 632`. Every one of the 65 is a
+`PATCH` row — accounted for individually in the next section.
+
+Did not move. Named individually rather than left as a remainder:
+
+| Feature | Fifth run | Sixth run | `ERROR` lines in `harness.log` |
+|---|---|---|---|
+| `protocol/writing-resource/post-target-not-found` | 0/4 | 0/4 | `:13`, `:27`, `:41`, `:55` |
+| `protocol/writing-resource/containment` | 3/5 | 3/5 | `:38`, `:122` |
+| `protocol/cors/preflight` | 1/2 | 1/2 | `:28` |
+| `protocol/cors/preflight-requests` | 3/4 | 3/4 | `:51` |
+
+The other 29 features were fully green in the fifth run and are fully green here — each one's
+`passedCount` equals its `scenarioCount` in this run's `karate-summary-json.txt`, checked row
+by row, and none of them appears in `harness.log`'s `>>> failed features:` block. `29 + 5
+newly green + 4 unmoved + 3 write-access-* still partially red = 41`.
+
+### The 66-scenario `PATCH` gap, accounted for
+
+**65 of the 66 are green. One is not, and it is not a defect.** Every row the fifth run filed
+under "No `PATCH` route" is named here:
+
+| Rows | Where | Outcome |
+|---|---|---|
+| 30 | `read-access-{agent,bob,public}`, 10 each | **Green** |
+| 33 | `write-access-{agent,bob}` 12 each, `write-access-public` 9 | **Green** |
+| 1 | `protocol/authentication/header:40` | **Green** |
+| 1 | `protocol/writing-resource/content-type-reject:19` | **Green** |
+| 1 | `protocol/writing-resource/containment:38` | **Still red** — moved to Bucket 1 |
+
+`30 + 33 + 1 + 1 + 1 = 66`.
+
+- **The 30 `read-access-*` rows** are the `Bob cannot PATCH …` / `Public cannot PATCH …`
+  outlines at `read-access-{agent,bob}` Examples rows `95`–`104` and `read-access-public`
+  `99`–`108`. Each sends `Content-Type: text/n3` with a `solid:InsertDeletePatch` body and
+  runs `retry until responseStatus == 403` (`401` for the Public subject). All 30 report
+  `earl#passed` on that step, and all three features are `90/90` with no `ERROR` line.
+  `authorize` runs before the body is parsed, which is all these rows ever needed.
+- **The 33 `write-access-*` rows** are the Examples rows at `write-access-{agent,bob}`
+  `109`–`120` and `write-access-public` `85`–`93`. They split three ways, and **all three
+  parts are green, including the 18 that were a measurement rather than a prediction**:
+  - **18 rows await `2xx`** — `… can PATCH to a rdf resource …` and `… can PATCH to a fictive
+    resource …`, 6 per feature (`109`–`114`, `109`–`114`, `85`–`90`), under `W` and `A` grants
+    both direct and inherited. These are the only rows in the suite that drive parse → mode
+    check → apply → write end to end, and the `fictive` ones exercise creation through a patch
+    against an absent target. The design (§14) declined to predict them; they pass.
+  - **9 rows await `403`** — the `Control`-only grants (`115`–`117`, `115`–`117`, `91`–`93`).
+  - **6 rows await `401`** — the Public subject against a non-public resource (`118`–`120`
+    in `write-access-agent` and `write-access-bob`; `write-access-public` has no such row,
+    which is why it contributes 9 and not 12).
+- **`authentication/header:40`** — `Unauthenticated user gets an appropriate response on
+  PATCH`, `Then status 401`, `earl#passed`. The route exists, so the auth layer answers
+  before axum's method dispatch can say `405`.
+- **`content-type-reject:19`** — `Server rejects PATCH requests without Content-Type`,
+  `earl#passed`. The patch handler's `Content-Type` gate is now reachable and answers `400`
+  for a non-empty body with no type, the same answer `PUT` and `POST` already gave.
+- **`containment:38`** — `PATCH creates a grandchild resource and intermediate containers`,
+  the only row in the suite that sends `application/sparql-update`. Still red; see Bucket 1.
+
+**Neighbouring `PATCH` rows that were never part of the 66 did not regress.** Six rows per
+`read-access-*` feature (Examples `122`–`124` and `131`–`133`; `126`–`128` and `135`–`137` for
+`read-access-public`) send `Content-Type: text/plain` and accept
+`[403, 405, 415]` — `[401, 405, 415]` for the Public subject. They passed on `405` when there
+was no route; they pass now that there is one. That is 18 scenarios which could have gone red
+on a careless gate and did not.
+
+### The 20 residual failures, reconciled feature by feature
+
+| Cause | Scenarios | Bucket | Status |
+|---|---|---|---|
+| `POST` into a container whose grant is `accessTo`-only | 6 | 3 | unchanged |
+| `DELETE` of a container/fictive resource via inherited-only access | 6 | 2 + 3 | unchanged (3 defect, 3 pending-decision) |
+| `post-target-not-found` (ancestor materialization) | 4 | 2 | unchanged since the first run |
+| CORS/`OPTIONS` scheme-rewrite redirect, unreachable over `http` | 2 | 1 | unchanged in kind |
+| `containment:122` (trailing-slash pair) | 1 | 2 | unchanged since the first run |
+| `containment:38` (`application/sparql-update`) | 1 | 1 | **reclassified** — was "No `PATCH` route" |
+| **Total** | **20** | | |
+
+`6 + 6 + 4 + 2 + 1 + 1 = 20`. The `PATCH`-route row that dominated every table since the
+second run is gone from this one; nothing was folded into another cause to make it disappear.
+
+Verified line by line, feature by feature:
+
+- **`writing-resource/post-target-not-found` (0/4)** — the same four responses as every run
+  since the first: `:13` → `status code was: 201, expected: 404`; `:27` and `:41` → `409` not
+  in `[404, 405]`; `:55` → `409` not in `[404, 405, 415]`. Bucket 2.
+- **`writing-resource/containment` (3/5)** — `:122` → `status code was: 409, expected: 404,
+  … response: another resource already exists whose URI differs from this one only in the
+  trailing slash`, unchanged (Bucket 2). `:38` is the `application/sparql-update` row, now
+  Bucket 1.
+- **`cors/preflight` (1/2)** and **`cors/preflight-requests` (3/4)** — `:28` and `:51`, both
+  `[301, 308] contains responseStatus` failing on `204`. The `@http-redirect` rows: this pod
+  is dialled over `http` in the harness, so the scheme rewrite is a no-op. Bucket 1,
+  unchanged.
+- **`wac/protected-operation/write-access-{agent,bob,public}` (80/84, 80/84, 49/53)** — four
+  failures each, and only two shapes remain now that the `PATCH` rows are green:
+  - **`POST`, 2 per feature.** `harness.log`: `When method POST` / `too many retry
+    attempts: 3` at `write-access-agent:62`, `write-access-bob:62`, `write-access-public:47`,
+    twice each. The Examples rows are `78` and `80` (`agent`, `bob`) and `62` and `64`
+    (`public`): `… can write a container resource (POST) and cannot read it, when … has no
+    access to the container and W / A access to the resource`. The `accessTo`-only defect,
+    Bucket 3.
+  - **`DELETE`, 2 per feature.** `When method DELETE` / `too many retry attempts: 3` at
+    `write-access-agent:128`, `write-access-bob:127`, `write-access-public:100`, twice each.
+    Examples rows `147`/`151` (`agent`), `146`/`150` (`bob`), `119`/`123` (`public`): one
+    `… cannot DELETE a fictive resource …` (Bucket 2) and one `… cannot DELETE a container
+    resource …` (Bucket 3), both `W access to the container` / `inherited access to the
+    resource`.
+  - `2 + 2 = 4` per feature, `4 × 3 = 12`.
+
+`12` of the 20 sit inside `wac/protected-operation`; the other 8 are `post-target-not-found`
+4, `containment` 2, `preflight` 1, `preflight-requests` 1. `12 + 8 = 20`.
+
+### The ranking, rederived
+
+`PATCH` was 78% of the fifth run's residual. It is now one scenario, and that scenario is a
+media type the Protocol never defined. The two 6-scenario findings that shared rank 2 are
+promoted to a shared rank 1 unchanged — neither has been touched since the blob-alone
+measurement first surfaced them:
+
+| Rank | Gap | Scenarios | Bucket | Note |
+|---|---|---|---|---|
+| 1 | **`POST` into an `accessTo`-only container** | **6** | 3 | tied with rank 1 below |
+| 1 | **`DELETE` via inherited-only access** | **6** | 2 + 3 | tied with rank 1 above (3 defect, 3 pending-decision) |
+| 3 | **`post-target-not-found`** | **4** | 2 | unchanged since the first run |
+| 4 | **CORS/`OPTIONS` scheme-rewrite redirect (needs `https`)** | **2** | 1 | unchanged in kind; needs an `https` deployment, not a code change |
+| 5 | **`containment:122`, trailing-slash pair** | **1** | 2 | unchanged since the first run |
+| 5 | **`containment:38`, `application/sparql-update`** | **1** | 1 | new to this list; refused by design |
+
+`6 + 6 + 4 + 2 + 1 + 1 = 20`.
+
+The shape of what is left has changed, not just its size. Of the 20, **9 are defects**
+(Bucket 3), **8 are decisions this pod made deliberately and has written down** (Bucket 2),
+and **3 are gaps it will not close** (Bucket 1: two need `https`, one needs a media type the
+specification does not contain). There is no longer a single dominant cause, and no
+unimplemented feature on the list at all.
+
 ---
 
-## Bucket 1 — Expected gap (68 scenarios, as of the merged run)
+## Bucket 1 — Expected gap (3 scenarios, as of the sixth run)
 
 Features this pod deliberately does not have, or environment limits the harness cannot
 clear.
@@ -429,11 +609,40 @@ a missing header; `9d47b1a` fixed it, and `simple-requests`/`acao-vary` are now 
 green (see Bucket 3 and the fifth run above). The only `cors/*` failures left are the two
 `@http-redirect` scenarios noted above, unrelated to response headers.
 
-### `PATCH` — 66 scenarios (unchanged)
+### `PATCH` — RESOLVED as a route (N3 Patch); 1 scenario remains, and it is a media type this pod refuses by design
 
-This pod has no `PATCH` route at all (`rg PATCH src/` finds nothing but the RFC 9110
-citation in a comment); axum's method dispatch answers `405` before authentication,
-`Content-Type`, or anything else about the request is ever inspected.
+The pod implements N3 Patch: `PATCH` with a `text/n3` body against an RDF document, per
+Solid Protocol §5.3.1 and
+[the design](../superpowers/specs/2026-07-30-n3-patch-design.md). `patch_impl`
+(`src/http.rs:484`) authorizes before it parses, gates on `Content-Type`, and applies the
+patch — including against an absent target, which creates the resource. `Accept-Patch:
+text/n3` travels with `Allow` on every `GET`/`HEAD`/`OPTIONS` (`src/http.rs:182`). 65 of the
+66 scenarios this section used to list are green as of the sixth run.
+
+What remains is `protocol/writing-resource/containment:38`, and it is a deliberate gap rather
+than a defect:
+
+| | |
+|---|---|
+| **Test sends** | `PATCH` with `Content-Type: application/sparql-update` and body `INSERT DATA { <#hello> <#linked> <#world> . }`, asserting `responseStatus >= 200 && responseStatus < 300` |
+| **Pod does** | `415` — the `Content-Type` gate accepts `text/n3` and nothing else (`src/http.rs:509-511`) |
+| **Why** | `application/sparql-update` does not appear in the Solid Protocol at all — not as a MUST, not as a MAY, not as a mention. It is pre-N3-Patch ecosystem behaviour that the bundled `specification-tests` v0.0.19 still encodes. Accepting it would mean executing a client-authored database command against a store holding every resource, every ACL, and the server's own system graphs, separated from a `DROP ALL` only by a rejection list that must stay exhaustive against a `spargebra` AST that may gain a variant in any minor release — [design](../superpowers/specs/2026-07-30-n3-patch-design.md) §3. This is the only row in the whole suite that uses this media type. Adding it later remains possible and would be its own design. |
+
+One honest note on the evidence: `harness.log` records this row as `did not evaluate to
+'true': responseStatus >= 200 && responseStatus < 300` — karate prints a status only for
+`status` and `match` steps, not for `assert` — so there is **no response line in the log for
+this scenario**. The `415` is attributed from the request the per-scenario EARL detail in
+`conformance/reports/report.html` shows being sent (`header Content-Type =
+'application/sparql-update'`, `method PATCH`, both `earl#passed`) together with the gate at
+`src/http.rs:509-511` and its unit test (`the_content_type_gate_matches_classify_body`,
+`text/turtle` → `415`). That is a source attribution, not a measured response line, and it is
+named as one.
+
+<details>
+<summary>What used to fail here (first through fifth run)</summary>
+
+Before the route existed, axum's method dispatch answered `405` before authentication,
+`Content-Type`, or anything else about the request was ever inspected:
 
 | Feature | `PATCH` failures |
 |---|---|
@@ -447,12 +656,13 @@ citation in a comment); axum's method dispatch answers `405` before authenticati
 | `protocol/authentication/header:40` | 1 |
 | `protocol/writing-resource/content-type-reject:19` | 1 |
 
-`10×3 + 12×2 + 9 + 1 + 1 + 1 = 66`. Each `wac/protected-operation` row is a
-`retry until <expected-status>` step that never converges, because `405` is never one of
-the awaited statuses (`403`, `401`, or `[200, 201, 204, 205]` depending on the row) —
-karate gives up after 3 attempts and reports `too many retry attempts: 3`, which reads
-differently in `harness.log` than an ordinary assertion mismatch but has the identical
-root cause. **This is the largest single gap in the suite.**
+`10×3 + 12×2 + 9 + 1 + 1 + 1 = 66`. Each `wac/protected-operation` row was a
+`retry until <expected-status>` step that never converged, because `405` was never one of the
+awaited statuses (`403`, `401`, or `[200, 201, 204, 205]` depending on the row) — karate gave
+up after 3 attempts and reported `too many retry attempts: 3`. It was the largest single gap
+in the suite for four consecutive runs.
+
+</details>
 
 ---
 
@@ -517,10 +727,10 @@ correction was made:
    "Server MUST reject `PUT`, `POST`, and `PATCH` requests that contain content but lack
    the `Content-Type` header field, with a status code of `400`."
 
-`PUT` and `POST` without `Content-Type` answer `400` — confirmed, `content-type-reject`
-is `2/3`. The third case is `PATCH`, and it still answers `405`: no `PATCH` route exists,
-so the method check fires before `Content-Type` is ever inspected — the same cause as
-every other `PATCH` failure, not a residual of this defect.
+`PUT`, `POST` and `PATCH` without `Content-Type` all answer `400` — `content-type-reject` is
+`3/3` as of the sixth run. The `PATCH` leg was the last to arrive: until the route existed,
+axum's method check fired before `Content-Type` was ever inspected and the answer was `405`,
+which was a residual of the `PATCH` gap and not of this defect.
 
 ### D1 — RESOLVED (`0336247`) — `POST` ignored `Link: rel="type"`, so containers could not be created by POST
 
@@ -613,6 +823,18 @@ the 14 features with a failure, not sampled. As of the fifth run, `9d47b1a` remo
 `harness.log` and `karate-summary-json.txt`, feature by feature, for all 12 features with
 a failure. Nothing left over.
 
+As of the sixth run, 20 remain — `6 + 6 + 4 + 2 + 1 + 1 = 20` — and every one is attributed
+to a named cause: each of the 7 features with a failure was read out of `harness.log`'s
+`ERROR` lines and cross-checked against the per-scenario EARL detail in
+`conformance/reports/report.html`, which also supplied the Examples-row line numbers for the
+`wac/protected-operation` outlines. The 65 scenarios that went green were checked the same
+way rather than deduced from the totals: each was located by scenario title in
+`report.html` with `earl#passed` on its asserting step, and each of the six features involved
+carries a `failed: 0` banner in `harness.log`. One attribution is deliberately weaker than
+the rest and says so — `containment:38`'s `415` comes from the source gate and its unit test,
+because karate prints no status for a failed `assert` step. Bucket 4 stays empty, but that
+row is the closest thing in this run to an inference.
+
 ---
 
 ## What passed, and is therefore not on anyone's list
@@ -640,7 +862,9 @@ a failure. Nothing left over.
 | `cors/enumerate-headers` | 1 / 1 |
 | `cors/simple-requests` | 10 / 10 (as of the fifth run — `9d47b1a`) |
 | `cors/acao-vary` | 12 / 12 (as of the fifth run — `9d47b1a`) |
-| anonymous `401` rows in `authentication/header` | 5 / 6, `WWW-Authenticate` present |
+| `authentication/header` | 6 / 6 (as of the sixth run — `d485135`; the anonymous `PATCH` row included, `WWW-Authenticate` present) |
+| `content-type-reject` | 3 / 3 (as of the sixth run — `d485135`) |
+| all three `read-access-*` features | 90 / 90 each (as of the sixth run — `d485135`) |
 
 **The new auxiliary URL shape works, including for blobs.** The harness's
 `PREPARE SERVER` step created a container and set an ACL on it through the
@@ -651,11 +875,13 @@ failure traces to `PATCH`, `POST`, or `DELETE`, all of which apply identically t
 resources. `Vary` was the fourth such gap; `9d47b1a` fixed it (see Bucket 3).
 
 **WAC access decisions are correct for the large majority of newly-measured cases.** 434
-of the 540 scenarios the non-RDF work unblocked — 80% — pass outright.
-`read-access-{agent,bob,public}` each reach `80/90`; `write-access-{agent,bob}` reach
-`68/84`; `write-access-public` reaches `40/53`. Every failure among those six features has
-a named cause above (`PATCH`, or one of the two `POST`/`DELETE` findings) — none is an
-ordinary Read/Write/Append/Control decision coming out wrong.
+of the 540 scenarios the non-RDF work unblocked — 80% — passed outright at the merged run,
+when `read-access-{agent,bob,public}` each reached `80/90`, `write-access-{agent,bob}`
+`68/84`, and `write-access-public` `40/53`. As of the sixth run the three `read-access-*`
+features are `90/90`, `write-access-{agent,bob}` are `80/84`, and `write-access-public` is
+`49/53` — 12 failures across the six, all of them the `POST`/`DELETE` findings above. No
+failure in these features has ever been an ordinary Read/Write/Append/Control decision coming
+out wrong.
 
 **The trailing-slash-pair rule still costs nothing.** Exactly one scenario mentions it
 (`containment:122`), and that scenario failed before the rule existed too — see Bucket 2.

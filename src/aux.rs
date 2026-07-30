@@ -10,7 +10,10 @@ use thiserror::Error;
 
 use crate::{
     dataset::{Dataset, Skolemized},
-    resource::{exists, registered_shelves, serialize_for_insert, sys_graph_iri, ResourceError, SYS_PRESENT},
+    resource::{
+        exists, registered_shelves, serialize_for_insert, sys_graph_iri, PatchResult,
+        ResourceError, SYS_PRESENT,
+    },
     space::{AuxKind, AuxUrl, GraphName, ResourceUrl},
     store::SparqlStore,
 };
@@ -19,6 +22,10 @@ use crate::{
 pub enum AuxError {
     #[error("the auxiliary's subject resource does not exist")]
     SubjectMissing,
+    /// The subject is there; the auxiliary itself is not. Only operations that
+    /// require an existing auxiliary report this — [`put`] writes one instead.
+    #[error("the auxiliary resource does not exist")]
+    Missing,
     #[error(transparent)]
     Resource(#[from] ResourceError),
 }
@@ -33,6 +40,20 @@ pub enum AuxError {
 /// message lives here once rather than drifting between two copies.
 pub const AUX_SUBJECT_MISSING_MESSAGE: &str =
     "an auxiliary resource cannot be created for a resource that does not exist";
+
+/// The condition every auxiliary write carries: the subject is present at the
+/// moment of the write.
+///
+/// A group-graph-pattern fragment, so it can be appended to the `WHERE` of
+/// whichever update is doing the writing — [`conditional_put_update`] builds
+/// one around it, [`patch`] folds it into the patch's own. One function
+/// because two copies of this string are two things that can drift apart, and
+/// the direction they drift in is a write that lands without a subject.
+fn subject_present_guard(aux: &AuxUrl) -> String {
+    let subject_iri = aux.subject().graph_iri();
+    let subject_sys = sys_graph_iri(aux.subject());
+    format!("FILTER EXISTS {{ GRAPH <{subject_sys}> {{ <{subject_iri}> <{SYS_PRESENT}> true }} }}")
+}
 
 /// The update [`put`] issues: it replaces the auxiliary's contents and marks
 /// it present, but only for a subject that is present *at the moment of the
@@ -54,11 +75,7 @@ fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
     use oxigraph::model::{GraphName, Quad};
     let iri = aux.graph_iri();
     let sys = sys_graph_iri(aux);
-    let subject_iri = aux.subject().graph_iri();
-    let subject_sys = sys_graph_iri(aux.subject());
-    let guard = format!(
-        "FILTER EXISTS {{ GRAPH <{subject_sys}> {{ <{subject_iri}> <{SYS_PRESENT}> true }} }}"
-    );
+    let guard = subject_present_guard(aux);
     let quads: Vec<Quad> = triples.iter()
         .map(|t| Quad::new(t.subject.clone(), t.predicate.clone(), t.object.clone(), GraphName::DefaultGraph))
         .collect();
@@ -100,6 +117,46 @@ pub async fn put(
         return Err(AuxError::SubjectMissing);
     }
     Ok(())
+}
+
+/// Apply a patch to an auxiliary that already exists. A patch does not create
+/// one: an absent auxiliary is [`AuxError::Missing`], or
+/// [`AuxError::SubjectMissing`] when the subject it would belong to is absent
+/// too — the case [`put`] refuses for the same reason.
+///
+/// That check runs *before* the patch, where [`put`]'s runs after. A check
+/// that can only refuse is safe against an interleaved `DELETE`; the
+/// two-round-trip objection in [`conditional_put_update`] is about a check
+/// that then writes. It has to run first, because afterwards the two ways a
+/// patch can leave the auxiliary absent — it was never there, or the subject
+/// was deleted under the write — are indistinguishable, and the first is not
+/// a missing subject.
+///
+/// The write itself carries the guard [`conditional_put_update`] uses, folded
+/// into the patch's own `WHERE` so the precondition and the write stay one
+/// operation. The `exists` call afterwards is what the guard's suppression
+/// looks like from here: an auxiliary that was present before the update and
+/// is gone after went with its subject's delete cascade, so nothing landed
+/// and the caller is told the subject is missing rather than that the patch
+/// applied.
+pub async fn patch(
+    store: &dyn SparqlStore,
+    aux: &AuxUrl,
+    patch: &crate::patch::Patch,
+) -> Result<PatchResult, AuxError> {
+    if !exists(store, aux).await? {
+        return Err(if exists(store, aux.subject()).await? {
+            AuxError::Missing
+        } else {
+            AuxError::SubjectMissing
+        });
+    }
+    let result =
+        crate::resource::patch_guarded(store, aux, patch, &subject_present_guard(aux)).await?;
+    if !exists(store, aux).await? {
+        return Err(AuxError::SubjectMissing);
+    }
+    Ok(result)
 }
 
 /// Delete a subject resource together with every auxiliary it may have and
@@ -313,6 +370,131 @@ mod tests {
 
         store.update(&conditional_put_update(&acl, &[])).await.unwrap();
         assert_eq!(graph_contents(&store, acl.graph_iri()).await, grant(&acl));
+    }
+
+    /// A patch document parsed against the auxiliary it addresses, so `<#…>`
+    /// in the body names the same subjects a body written through [`put`] does.
+    fn patch_of(body: &str, aux: &AuxUrl) -> crate::patch::Patch {
+        let full = format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix acl: <http://www.w3.org/ns/auth/acl#> .\n{body}"
+        );
+        crate::patch::Patch::parse(full.as_bytes(), aux.graph_iri()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_acl_can_be_patched_when_its_subject_exists() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        let read = triples(
+            "<#owner> <http://www.w3.org/ns/auth/acl#mode> \
+             <http://www.w3.org/ns/auth/acl#Read> .",
+            acl.graph_iri(),
+        );
+        put(&store, &acl, &read).await.unwrap();
+
+        let p = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> acl:mode acl:Write . } .\n",
+            &acl,
+        );
+        assert_eq!(patch(&store, &acl, &p).await.unwrap(), PatchResult::Applied);
+
+        let back = get_rdf(&store, &acl).await.unwrap().expect("exists");
+        let rendered: Vec<String> = back.iter().map(|t| t.to_string()).collect();
+        assert!(rendered.iter().any(|t| t.ends_with("#Write>")), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|t| t.ends_with("#Read>")),
+            "the mode that was already granted must survive: {rendered:?}"
+        );
+    }
+
+    // The reason this function exists at all: without the guard a patch could
+    // write a policy document onto a path that no longer exists, which is the
+    // defect `docs/constraints.md` records for `put_rdf`. Asserted on the
+    // store, because the error alone is returned either way — `exists` reports
+    // the auxiliary absent whether or not the update wrote into its graph.
+    #[tokio::test]
+    async fn patching_an_acl_whose_subject_is_gone_writes_nothing() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        put(&store, &acl, &grant(&acl)).await.unwrap();
+        assert!(delete_subject(&store, &blobs, &foo).await.unwrap());
+
+        let p = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> acl:mode acl:Control . } .\n",
+            &acl,
+        );
+        assert!(matches!(
+            patch(&store, &acl, &p).await,
+            Err(AuxError::SubjectMissing)
+        ));
+
+        assert!(
+            graph_contents(&store, acl.graph_iri()).await.is_empty(),
+            "a patch landed on an auxiliary whose subject does not exist"
+        );
+        assert!(
+            graph_contents(&store, &sys_graph_iri(&acl)).await.is_empty(),
+            "the presence marker was written for a subject that does not exist"
+        );
+        assert!(!exists(&store, &acl).await.unwrap());
+    }
+
+    // The guard folded into the patch's own `WHERE`, and the only test that
+    // reaches it. The test above never does: `delete_subject` cascades the
+    // auxiliary away too, so `patch`'s opening `exists` refuses and returns
+    // before `patch_guarded` ever runs.
+    //
+    // The window the guard is for is the subject disappearing *between* that
+    // check and the write, which no in-memory interleaving can stage — so the
+    // state is staged directly instead: the auxiliary keeps its graph and its
+    // presence marker, only the subject's are dropped. The opening check then
+    // passes and the write itself is what has to refuse.
+    //
+    // Asserted on the auxiliary's graph, not on the returned value. The
+    // trailing `exists` finds the auxiliary still present and so reports
+    // success either way — whether the guard held the write back or the write
+    // landed is invisible from the return.
+    #[tokio::test]
+    async fn a_patch_whose_subject_vanishes_under_the_write_writes_nothing() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        put(&store, &acl, &grant(&acl)).await.unwrap();
+
+        let iri = foo.graph_iri();
+        let sys = sys_graph_iri(&foo);
+        store
+            .update(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>"))
+            .await
+            .unwrap();
+        assert!(!exists(&store, &foo).await.unwrap(), "the subject must be gone");
+        assert!(
+            exists(&store, &acl).await.unwrap(),
+            "the auxiliary must still be present, or the opening check refuses \
+             and the guard is never reached"
+        );
+
+        let p = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#intruder> acl:mode acl:Control . } .\n",
+            &acl,
+        );
+        let _ = patch(&store, &acl, &p).await;
+
+        assert_eq!(
+            graph_contents(&store, acl.graph_iri()).await,
+            grant(&acl),
+            "a patch landed on an auxiliary whose subject does not exist"
+        );
     }
 
     // The cascade is definitional, not a step someone remembers: deleting a
