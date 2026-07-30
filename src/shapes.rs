@@ -9,7 +9,7 @@ use rudof_lib::{
 use thiserror::Error;
 
 use crate::{
-    dataset::Dataset,
+    dataset::{Dataset, Skolemized},
     rdf::Format,
     resource::{as_quads, get_rdf, kind_of, Kind, ResourceError},
     space::{ContainerUrl, GraphName, StorageSpace, Target},
@@ -19,6 +19,34 @@ use crate::{
 /// `sh:resultSeverity`, and the one severity that refuses a write.
 const SH_RESULT_SEVERITY: &str = "http://www.w3.org/ns/shacl#resultSeverity";
 const SH_VIOLATION: &str = "http://www.w3.org/ns/shacl#Violation";
+
+/// The predicates SHACL-SPARQL uses to embed a query in a shapes graph.
+///
+/// `rudof_lib` pulls in `oxhttp` and `ShaclValidationMode::Native` does not
+/// disable SHACL-SPARQL, so a shape carrying `sh:sparql [ sh:select "…
+/// SERVICE <http://169.254.169.254/…> …" ]` makes this pod issue that
+/// request and echoes the response back as `sh:value` in the report — a
+/// blind write of a shapes document turns into server-side request forgery
+/// with exfiltration, entirely outside `auth::safe_fetch` (issue #6).
+/// Checked against the parsed graph, not the query text: a blocklist over a
+/// query language this pod does not implement is not a defence, and every
+/// SHACL-SPARQL embedding — a constraint, a target, a rule — names its query
+/// through one of these three predicates.
+const SH_SPARQL: &str = "http://www.w3.org/ns/shacl#sparql";
+const SH_SELECT: &str = "http://www.w3.org/ns/shacl#select";
+const SH_ASK: &str = "http://www.w3.org/ns/shacl#ask";
+
+/// Whether `triples` mentions SHACL-SPARQL anywhere — as the predicate that
+/// carries a query, or as an object, so a shape naming one of these terms
+/// indirectly (for instance through a property path) is refused too.
+fn mentions_shacl_sparql(triples: &[oxigraph::model::Triple]) -> bool {
+    let sparql_terms = [SH_SPARQL, SH_SELECT, SH_ASK];
+    triples.iter().any(|t| {
+        sparql_terms.contains(&t.predicate.as_str())
+            || matches!(&t.object, oxigraph::model::Term::NamedNode(n)
+                if sparql_terms.contains(&n.as_str()))
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum ShapeError {
@@ -120,6 +148,15 @@ pub fn validate(shapes_turtle: &str, body: &Dataset) -> Result<Report, ShapeErro
 /// `ldp:constrainedBy`, the only binding this pod reads.
 const LDP_CONSTRAINED_BY: &str = "http://www.w3.org/ns/ldp#constrainedBy";
 
+/// A constraint document bound to a container: its Turtle serialization, for
+/// [`validate`], and the resource IRI it was read from, for the `Link:
+/// rel="…ldp#constrainedBy"` a refusal or a `?validate` response carries
+/// (§3.1).
+pub struct Shape {
+    pub turtle: String,
+    pub iri: String,
+}
+
 /// The constraint document bound to `container`, serialized as Turtle.
 ///
 /// The binding does not inherit: this reads `container`'s own graph and
@@ -129,20 +166,31 @@ pub async fn load(
     store: &dyn SparqlStore,
     space: &StorageSpace,
     container: &ContainerUrl,
-) -> Result<Option<String>, ShapeError> {
-    // `Ok(None)` covers two different states of `container` — one that
-    // exists but carries no binding, and one that does not exist at all —
-    // because both mean the same thing to a caller: nothing constrains
-    // writes here.
-    let Some(triples) = get_rdf(store, container).await? else {
-        return Ok(None);
-    };
+) -> Result<Option<Shape>, ShapeError> {
+    let container_iri = container.graph_iri();
+    // The one predicate, about `container` itself and nothing else. A bare
+    // `CONSTRUCT { ?s ?p ?o }` over the whole container graph is O(members),
+    // because `ldp:contains` lives in that same graph — paid on every write,
+    // including into a container that binds no shape at all. Fixing the
+    // subject also means a triple stated about some *other* subject that
+    // happens to sit in this graph — `<#other> ldp:constrainedBy <x>` — does
+    // not bind the container it never named.
+    let triples: Vec<oxigraph::model::Triple> = store
+        .query_triples(&format!(
+            "CONSTRUCT {{ <{container_iri}> <{LDP_CONSTRAINED_BY}> ?o }} \
+             WHERE {{ GRAPH <{container_iri}> {{ <{container_iri}> <{LDP_CONSTRAINED_BY}> ?o }} }}"
+        ))
+        .await
+        .map_err(ResourceError::from)?;
+    // `Ok(None)` below covers two different states of `container` — one
+    // that exists but carries no binding, and one that does not exist at
+    // all — because both mean the same thing to a caller: nothing
+    // constrains writes here. The query above answers empty for both, so
+    // there is nothing further to distinguish.
     let bindings: Vec<String> = triples
         .iter()
         .filter_map(|t| match &t.object {
-            oxigraph::model::Term::NamedNode(n) if t.predicate.as_str() == LDP_CONSTRAINED_BY => {
-                Some(n.as_str().to_owned())
-            }
+            oxigraph::model::Term::NamedNode(n) => Some(n.as_str().to_owned()),
             _ => None,
         })
         .collect();
@@ -158,7 +206,7 @@ pub async fn load(
         _ => {
             return Err(ShapeError::Unsupported(format!(
                 "{} carries {} ldp:constrainedBy bindings ({}), not one",
-                container.graph_iri(),
+                container_iri,
                 bindings.len(),
                 bindings.join(", "),
             )))
@@ -200,13 +248,27 @@ pub async fn load(
             // Report the same `Missing` a document that was never there
             // reports, rather than tolerate the race.
             let triples = get_rdf(store, &r).await?.ok_or(ShapeError::Missing)?;
-            let dataset = Dataset::new(as_quads(&triples));
+            if mentions_shacl_sparql(&triples) {
+                return Err(ShapeError::Unsupported(format!(
+                    "{iri} uses SHACL-SPARQL (sh:sparql/sh:select/sh:ask), which is not \
+                     supported: it would let a shapes document make this pod issue \
+                     arbitrary outbound HTTP requests"
+                )));
+            }
+            // A skolem IRI is this pod's own bookkeeping (§3.2.2), not the
+            // client's to see, and not stable across a re-PUT of this same
+            // document either. Back to blank nodes before this graph goes
+            // anywhere near rudof or a response body.
+            let ground = Skolemized::from_store(as_quads(&triples))
+                .expect("the store holds no blank node");
+            let dataset = ground.deskolemize();
             let bytes = turtle()
                 .serialize(&dataset)
                 .map_err(|e| ShapeError::Unparsable(e.to_string()))?;
-            Ok(Some(
-                String::from_utf8(bytes).expect("the serializer emits UTF-8"),
-            ))
+            Ok(Some(Shape {
+                turtle: String::from_utf8(bytes).expect("the serializer emits UTF-8"),
+                iri,
+            }))
         }
     }
 }
@@ -351,7 +413,7 @@ mod tests {
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
 
         let doc = load(&store, &sp, &c).await.unwrap().expect("a shape");
-        assert!(doc.contains("NodeShape"));
+        assert!(doc.turtle.contains("NodeShape"));
     }
 
     #[tokio::test]
@@ -428,5 +490,121 @@ mod tests {
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
         assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
+    }
+
+    /// SHACL-SPARQL turns a shapes document into an SSRF primitive with the
+    /// response echoed back in the report — `sh:sparql`/`sh:select` here
+    /// stands in for the reachable-metadata-endpoint case the review
+    /// demonstrated. Refused before rudof ever sees the query.
+    const EVIL_SHAPE_SPARQL: &str = r#"
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        <http://example.org/EvilShape> a sh:NodeShape ;
+          sh:sparql [
+            sh:message "leaked" ;
+            sh:select "SELECT $this WHERE { SERVICE <http://169.254.169.254/> { ?s ?p ?o } }" ;
+          ] .
+    "#;
+
+    #[tokio::test]
+    async fn a_shacl_sparql_shape_is_refused() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let shape = resource(&sp, "/shapes/evil");
+        let shape_triples = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(EVIL_SHAPE_SPARQL.as_bytes(), "https://pod.toph.so/shapes/evil")
+            .unwrap();
+        put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
+
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/evil> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+
+        assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
+    }
+
+    /// The refusal is specific to SHACL-SPARQL — an ordinary Core shape,
+    /// which is all this design supports, still loads.
+    #[tokio::test]
+    async fn an_ordinary_core_shape_still_loads() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let shape = resource(&sp, "/shapes/note");
+        let shape_triples = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note")
+            .unwrap();
+        put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
+
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/note> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+
+        assert!(load(&store, &sp, &c).await.unwrap().is_some());
+    }
+
+    /// The narrowed lookup fixes the predicate to `LDP_CONSTRAINED_BY` *and*
+    /// the subject to the container's own IRI — a binding some other subject
+    /// happens to carry in this graph must not constrain the container.
+    #[tokio::test]
+    async fn a_binding_on_another_subject_does_not_bind_the_container() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<https://pod.toph.so/notes/other> <http://www.w3.org/ns/ldp#constrainedBy> \
+                  <https://pod.toph.so/shapes/note> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+        assert!(load(&store, &sp, &c).await.unwrap().is_none());
+    }
+
+    /// A shape written with a blank node — `sh:property [ … ]` — must not
+    /// surface the skolem IRI this pod minted for it (§3.2.2): it is this
+    /// pod's bookkeeping, not the client's, and it is not stable across a
+    /// re-PUT of the same document.
+    #[tokio::test]
+    async fn a_loaded_shape_carries_no_skolem_iri() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let shape = resource(&sp, "/shapes/note");
+        let shape_triples = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note")
+            .unwrap();
+        put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
+
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/note> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+
+        let doc = load(&store, &sp, &c).await.unwrap().expect("a shape");
+        assert!(
+            !doc.turtle.contains("urn:quadpod:"),
+            "a skolem IRI leaked into the served shape: {}",
+            doc.turtle
+        );
     }
 }

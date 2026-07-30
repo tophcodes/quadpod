@@ -34,8 +34,14 @@ Two version traps, both avoided by depending on `rudof_lib` alone:
 - `rudof` 0.1.12 is an abandoned earlier line, and upstream warns that 0.2.19–0.3.0 shipped
   broken. 0.3.7 is the floor.
 
-The default feature is `sparql`, which pulls `sparql_service`. It is off: validation runs in
-the engine's native mode against triples we hand it, not against a remote endpoint.
+The default feature is `sparql`, which pulls `sparql_service`. It is off — but that alone does
+not keep validation off the network: `ShaclValidationMode::Native` still executes SHACL-SPARQL
+(`sh:sparql`/`sh:select`/`sh:ask`) through the oxigraph evaluator that `http-client` brings into
+the tree regardless of that feature, `SERVICE <http://…>` included, and returns whatever comes
+back as `sh:value` in the report. What actually keeps this off the network is that
+`shapes::load` refuses to hand rudof a shapes graph that mentions any of those three predicates
+(§8) — checked against the parsed graph, not the query text, because a blocklist over SPARQL is
+not a defence.
 
 Built here: the binding lookup, the choice of data graph, the placement in the write path, the
 severity-to-status mapping, and the read view.
@@ -321,6 +327,13 @@ until it is fixed — see §10.
 - **Ad-hoc validation** (`?validate=<shapeIri>`). It would need the shape IRI restricted to
   pod-local resources resolved through the store — never dereferenced, or it is an SSRF vector
   the `auth::safe_fetch` policy exists to prevent — and `acl:Read` on the shape.
+- **SHACL-SPARQL** (`sh:sparql`, `sh:select`, `sh:ask`). `ShaclValidationMode::Native` executes
+  these regardless of the `sparql` cargo feature (§2), which turns a shapes document into an
+  SSRF primitive with the response echoed back as `sh:value` — reachable even from a
+  pre-authentication write, and entirely outside `auth::safe_fetch`. `shapes::load` refuses any
+  shapes graph mentioning one of the three predicates, so this pod validates SHACL Core only.
+  Federating a query under this pod's own `FetchPolicy` is the shape a supported version of this
+  would take; tracked as issue #6.
 
 ## 9. Testing
 
@@ -352,6 +365,9 @@ Properties, each of which must be shown to fail before the code that makes it ho
   store read is added to the write path.
 - **Nothing constrains a container's shape as a whole** — not its member count, not its member
   types. `ldp:contains` is never in a data graph here (§3.4, §8).
+- **SHACL Core only.** No SPARQL-based constraints, targets or rules (`sh:sparql`, `sh:select`,
+  `sh:ask`) and no SPARQL-based constraint components — `shapes::load` refuses a shapes graph
+  that mentions any of them (§8).
 - **Named graphs in a body are never validated** (§3.4). A dataset-valued resource is checked
   on its default graph only, so a shape cannot reach what a client put in a named graph.
 - **`?validate` is reachable by any agent with `acl:Read`**, and repeated calls are repeated
