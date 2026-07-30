@@ -155,10 +155,12 @@ Enterprise Solid Server hosts access-control resources on an entirely separate s
 
 ## Server-asserted facts are not auxiliary resources
 
-Creation and modification times, existence, the kind of representation, and — for a binary
-representation — the media type it arrived as are **not** addressable and not writable. They
-live in an internal graph (`urn:quadpod:sys:<res>`) and are exposed through the HTTP headers
-that already exist for them — `Last-Modified`, `ETag`, `Content-Length`.
+Existence, the kind of representation, and the media type it arrived as are **not**
+addressable and not writable. They live in an internal graph (`urn:quadpod:sys:<res>`), and a
+client reads them off the response rather than off a URL: existence as the status code —
+`200` or `404` — the media type as `Content-Type`, and the kind through no header of its own;
+a client infers it from `Content-Type`, since only the media types this pod recognises as RDF
+name an RDF resource, and anything else names a binary one.
 
 Byte size and content hash live nowhere: with a swappable blob backend, the pod does not
 exclusively own the bytes behind a resource, so a stored size or hash would go silently false
