@@ -240,8 +240,8 @@ template); the matcher is still built so the seam exists.
   external Solid viewer (SolidOS / Data Kitchen) pointed at the resource; the viewer bundle is
   static (proxy/CDN), not in the binary. Off by default (Solid mandates only Turtle + JSON-LD).
 - **Per-container SHACL/ShEx** — attach a shape to specific containers via `ldp:constrainedBy`;
-  violating writes get 422. Off by default (mandatory validation would break generic Solid-app
-  interop). Backed by `rudof`. For now, authoring integrity stays in the write pipelines.
+  violating writes get 422. Off unless a container binds a shape (mandatory validation would
+  break generic Solid-app interop). Backed by `rudof`.
 
 ## 12. v1 Scope
 

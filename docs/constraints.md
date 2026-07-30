@@ -144,13 +144,20 @@ Only `shapes` reads the constraint binding.
     decides whether a write is checked at all; a second reader is a second
     answer to "is this container constrained", and the one that says no wins
     silently. The lookup is also the seam a shape-tree binding would replace
-    (§8), which only stays a second lookup while there is exactly one. Quoted
-    without angle brackets: that is the bare IRI a comparison against
-    `NamedNode::as_str()` needs, and it is what a second reader would have to
-    write. The angle-bracket form is excluded because it also matches the
-    Turtle bodies test fixtures `PUT` to set a binding up — data, not a
-    second reader.
-    check: ! rg -q '"http://www.w3.org/ns/ldp#constrainedBy"' src --glob '!src/shapes.rs'
+    (§8), which only stays a second lookup while there is exactly one. Three
+    conjuncts, because a second reader can take three different shapes: it can
+    spell the IRI itself (bare-quoted, as `container.rs` spells
+    `LDP_CONTAINS`'s value, or angle-bracketed inside a SPARQL string, as
+    every other metadata read in this crate does); or it can skip the spelling
+    entirely by importing `LDP_CONSTRAINED_BY` and comparing against that.
+    `src/http.rs` is excluded from the first conjunct rather than cleared
+    outright: its `#[cfg(test)]` fixtures `PUT` a Turtle body to set a binding
+    up, which is data, not a read, but it is still the IRI in text — so the
+    second conjunct pins today's count instead, and a new occurrence anywhere
+    in the file, reader or fixture, goes red. The third conjunct is what
+    stops the import: `LDP_CONSTRAINED_BY` stays private, so nothing outside
+    `shapes.rs` can name it to compare against.
+    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs | wc -l)" = 6 ] && ! rg -q 'pub const LDP_CONSTRAINED_BY' src/shapes.rs
 
 The query string is read in exactly one place.
     → §6. `?validate` is the only query parameter this pod gives meaning to,
