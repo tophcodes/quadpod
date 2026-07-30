@@ -16,7 +16,7 @@ use crate::{
     store::SparqlStore,
 };
 
-use super::{pdp, prp, Mode};
+use super::{pdp, prp, Decision, Mode};
 
 /// The challenge sent with a 401, telling a client which credential the pod
 /// accepts. `Bearer` is deliberately absent: Plan 4 verifies DPoP-bound
@@ -105,19 +105,26 @@ fn required_mode_for_aux(kind: AuxKind) -> Mode {
     }
 }
 
-/// May `agent` perform `mode` on `target`?
+/// May `agent` perform `mode` on `target` — and what else may they, and the
+/// public, do there?
 ///
 /// An auxiliary is decided against its subject and requires the mode its
 /// [`AuxKind`] demands ([`required_mode_for_aux`]), not necessarily `mode`
 /// itself. That rewrite lives here rather than in the handlers so no handler
 /// can forget it — and it is now the type that carries the subject, so there
 /// is nothing left to derive from a string.
+///
+/// The returned [`Decision`] is what `WAC-Allow` is rendered from. It is
+/// produced here, from the ACL this call already resolved, rather than by a
+/// second lookup in the caller: a second resolution would repeat the ancestor
+/// walk on the pod's hottest path, and an ACL written between the two would
+/// let the header describe access other than the access just granted.
 pub async fn authorize(
     store: &dyn SparqlStore,
     agent: &Agent,
     target: &Target,
     mode: Mode,
-) -> Result<(), Response> {
+) -> Result<Decision, Response> {
     let (subject, required) = match target {
         Target::Aux(a) => (a.subject().clone(), required_mode_for_aux(a.kind())),
         Target::Resource(r) => (r.clone(), mode),
@@ -130,8 +137,19 @@ pub async fn authorize(
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     };
 
-    if pdp::decide(&acl.triples, agent, &acl.governed_iri, acl.inherited).allows(required) {
-        Ok(())
+    let user = pdp::decide(&acl.triples, agent, &acl.governed_iri, acl.inherited);
+    // An anonymous request has already computed the public answer; asking the
+    // same question twice would double the cost of the one case that gains
+    // nothing from a second evaluation.
+    let public = match agent {
+        Agent::Public => user,
+        Agent::WebId(_) => {
+            pdp::decide(&acl.triples, &Agent::Public, &acl.governed_iri, acl.inherited)
+        }
+    };
+
+    if user.allows(required) {
+        Ok(Decision { user, public })
     } else {
         Err(deny(agent))
     }
@@ -322,7 +340,10 @@ mod tests {
         crate::aux::put(store, &aux, &t).await.unwrap();
     }
 
-    fn status(r: Result<(), Response>) -> Option<StatusCode> {
+    /// Generic in the success type because it never looks at one: both
+    /// [`authorize`] and [`authorize_and_materialize`] are asked the same
+    /// question here, and only their refusal is under test.
+    fn status<T>(r: Result<T, Response>) -> Option<StatusCode> {
         r.err().map(|res| res.status())
     }
 

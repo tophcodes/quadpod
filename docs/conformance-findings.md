@@ -50,6 +50,55 @@ The harness's own `ResultLogger` counts only scenarios attached to a MUST requir
 karate totals count every scenario in every feature that ran. Use the karate row — it is
 what `reports/report.html` shows.
 
+## Third run — after the header slice (`WAC-Allow`, `OPTIONS`, CORS)
+
+| | |
+|---|---|
+| **Date** | 2026-07-29 |
+| **Pod commit** | `143584d` |
+
+| | Features | Scenarios | Passed | Failed |
+|---|---|---|---|---|
+| karate (everything that ran) | 41 | 652 | 101 | 551 |
+
+Same 41 features, same 652 scenarios. Passed rose by **58** against a predicted 59, and
+every one of the 58 is accounted for:
+
+| Feature | Second run | Third run | Δ |
+|---|---|---|---|
+| `wac/wac-allow/header-exists` | 0 / 2 | 2 / 2 | +2 |
+| `wac/wac-allow/user-access-direct` | 2 / 14 | 14 / 14 | +12 |
+| `wac/wac-allow/user-access-indirect` | 2 / 14 | 14 / 14 | +12 |
+| `wac/wac-allow/public-access-direct` | 2 / 14 | 14 / 14 | +12 |
+| `wac/wac-allow/public-access-indirect` | 2 / 14 | 14 / 14 | +12 |
+| `protocol/read-write-resource/read-method-support` | 4 / 6 | 6 / 6 | +2 |
+| `protocol/cors/preflight` | 0 / 2 | 1 / 2 | +1 |
+| `protocol/cors/access-control-headers` | 0 / 6 | 5 / 6 | +5 |
+
+`609 − 58 = 551`, which is what this run measured. Every other row in Buckets 1 and 2 was
+compared individually and none moved.
+
+**All 50 `WAC-Allow` scenarios pass, not merely the `!= null` assertion that used to stop
+them.** The first run's write-up flagged this as unknown: karate halts a scenario at its
+first failed assertion, so the `contains only` checks against real mode sets had never been
+evaluated against this pod. They have now, and they hold — including the case the header's
+shape depends on, where the owner reads a resource whose ACL names only Bob and the `user`
+group still reports `control`.
+
+Two scenarios in the moved features remain, and neither is header work:
+
+- `protocol/cors/preflight:28` is the `@http-redirect` row. It rewrites the target's scheme
+  to `http` and expects `301`/`308` to the `https` original. This pod is dialled over `http`
+  in the harness, so the rewrite is a no-op and the request is answered `204` rather than
+  redirected. Not reachable without an https deployment.
+- `protocol/cors/access-control-headers:31` is a credentialed `POST` of `text/plain` — the
+  non-RDF gap, rank 1.
+
+The five CORS features that did **not** move — `simple-requests` (0/10), `acao-vary` (0/12),
+`preflight-requests` (0/4), `accept-acah` (0/3), `enumerate-headers` (0/1) — all build a
+`text/plain` fixture in their `Background` and still abort there. Their CORS assertions have
+never run. The headers they ask for are implemented; whether they pass is a rank-1 question.
+
 `PREPARE SERVER` succeeded. The harness logged *"The Pod is using [WAC] for access control"*
 and *"Confirmed we can create a container … and set ACLs on it"*, so **nothing failed inside
 the harness's own setup** and the run measured the pod, not the runner.
@@ -65,16 +114,22 @@ CORS features (30), all four `acl-object` features (12), and seven more scenario
 across `containment`, `delete-*`, `acl-propagation` and `slash-semantics-exclude` **never
 reach an assertion at all**. Nothing downstream of that `415` has been measured.
 
-Ranked by scenarios unblocked, the work is:
+Ranked by scenarios unblocked, the work was:
 
-| Rank | Gap | Scenarios | Note |
-|---|---|---|---|
-| 1 | **non-RDF / blob resources** | **540** | 88% of all failures; unblocks, does not automatically pass |
-| 2 | `WAC-Allow` header | 50 | pure header work; the access decisions underneath already pass |
-| 3 | `Allow` header on GET/HEAD | 4 | classified as a defect below — a MUST, and cheap |
-| 4 | `OPTIONS` | 4 | 2 of them are also CORS |
-| 5 | CORS headers | 5 | the other 30 CORS scenarios are blocked by #1, not by CORS |
-| 6 | `PATCH` | 2 | |
+| Rank | Gap | Scenarios | Status | Note |
+|---|---|---|---|---|
+| 1 | **non-RDF / blob resources** | **540** | open | 88% of all failures; unblocks, does not automatically pass |
+| 2 | `WAC-Allow` header | 50 | **done** (`143584d`) | all 50 pass as of the third run |
+| 3 | `Allow` header on GET/HEAD | 4 | **done** (`3cb0723`) | was D2 below |
+| 4 | `OPTIONS` | 4 | **done** (`cab84b4`) | 3 of the 4 pass; the fourth needs an https deployment |
+| 5 | CORS headers | 5 | **done** (`15e5dc6`) | 5 of 6 in `access-control-headers`; the sixth is rank 1 |
+| 6 | `PATCH` | 2 | open | |
+
+Ranks 2, 4 and 5 were built as one slice — see
+[`docs/superpowers/specs/2026-07-29-conformance-headers-design.md`](superpowers/specs/2026-07-29-conformance-headers-design.md).
+**Rank 1 is now the only gap standing between this pod and the bulk of the suite**, and it
+is also the only way to find out whether the 30 CORS scenarios and the ~370 WAC access-mode
+rows behind it are correct.
 
 Rank 1 is not a free 540. Those scenarios become *runnable*, not green: within the 491
 `protected-operation` rows, 124 target a `text/plain` resource and **81 exercise `OPTIONS` or
@@ -263,7 +318,7 @@ Worth stating, because several of these were flagged as suspects before the run:
 | anonymous `401` rows in `authentication/header` | 5 / 6, `WWW-Authenticate` present |
 
 **The new auxiliary URL shape works.** The harness's `PREPARE SERVER` step created a container
-and set an ACL on it through the `Link`-advertised `/.aux/acl/{path}` URL, and the four
+and set an ACL on it through the `Link`-advertised `/.aux/{path}.acl` URL, and the four
 `wac-allow` features exercise ACL writes and reads repeatedly with every access decision
 correct. **No failure in this run traces to the ACL URL shape.**
 

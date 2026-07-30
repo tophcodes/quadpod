@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
-    http::{StatusCode, HeaderMap, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
+    http::{StatusCode, HeaderMap, HeaderValue, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{Dataset, Skolemized},
@@ -16,7 +16,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize}, pdp, Mode}};
+    wac::{guard::{authorize, authorize_and_materialize}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,11 +29,60 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     // axum 0.8 wildcard capture syntax: "/{*path}" (NOT the old "/*path").
+    //
+    // `Router::layer` wraps everything built so far, so the LAST call is the
+    // outermost: `cors_layer` sees the `401` that `auth_layer` produces, which
+    // is where the CORS fields are required.
     Router::new()
-        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root))
-        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete))
+        .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).options(handle_options_root))
+        .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).options(handle_options))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
+        .layer(axum::middleware::from_fn(cors_layer))
         .with_state(state)
+}
+
+/// The response headers a browser may read off a cross-origin response.
+///
+/// Enumerated rather than `*` because a wildcard names nothing a client can act
+/// on, and because every field here is one some handler on this pod actually
+/// emits. Both properties are asserted: `protocol/cors/enumerate-headers`
+/// requires the header to be present and to differ from `*`.
+const EXPOSED_HEADERS: &str =
+    "Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
+
+/// Reflect a request's `Origin` onto its response.
+///
+/// Wraps `auth_layer` rather than sitting inside it: the CORS fields are
+/// required on the `401` that layer produces for an anonymous request
+/// (`protocol/cors/simple-requests`), and a layer inside it never sees that
+/// response.
+///
+/// No `Access-Control-Allow-Credentials`. This pod authenticates from an
+/// `Authorization` header, which CORS treats as a request header to allow, not
+/// as a credential to flag; the flag exists for cookies and TLS client
+/// certificates, neither of which this pod accepts. That is what makes
+/// reflecting an arbitrary origin safe here — the browser attaches no
+/// credential of its own, so a foreign page can only send a token it already
+/// holds, and a page holding the token never needed CORS to use it. Setting the
+/// flag is the change that would make ambient authority usable against this
+/// pod.
+pub async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let origin = req.headers().get(header::ORIGIN).cloned();
+    let mut res = next.run(req).await;
+    let Some(origin) = origin else { return res };
+    let h = res.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    // `append`, not `insert`: a negotiated read has already set `Vary: Accept`,
+    // and replacing it would make a cache serve the wrong representation in
+    // order to satisfy a CORS assertion. The spelling matters too — the suite
+    // compares this field value as a case-sensitive string, and
+    // `header::ORIGIN` is lowercase.
+    h.append(header::VARY, HeaderValue::from_static("Origin"));
+    h.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static(EXPOSED_HEADERS),
+    );
+    res
 }
 
 /// Classify a request path, or answer it outright.
@@ -94,15 +143,14 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
 /// The methods a target actually accepts, as an `Allow` field value.
 ///
 /// Derived from the router's own shape rather than a fixed list: a container
-/// is the only thing `POST` may address, the root is the only container
-/// `DELETE` refuses (`delete_impl`), and `OPTIONS` is absent because no route
-/// serves it — advertising a method the pod answers with `405` would be worse
-/// than saying nothing.
+/// is the only thing `POST` may address, and the root is the only container
+/// `DELETE` refuses (`delete_impl`). `OPTIONS` is accepted everywhere — it
+/// answers from the request URL alone and needs no representation to describe.
 fn allowed_methods(target: &Target) -> &'static str {
     match target {
-        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT",
-        Target::Container(_) => "GET, HEAD, POST, PUT, DELETE",
-        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, DELETE",
+        Target::Container(c) if c.as_resource().parent().is_none() => "GET, HEAD, POST, PUT, OPTIONS",
+        Target::Container(_) => "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+        Target::Resource(_) | Target::Aux(_) => "GET, HEAD, PUT, DELETE, OPTIONS",
     }
 }
 
@@ -112,6 +160,44 @@ fn with_allow(mut res: Response, target: &Target) -> Response {
     res.headers_mut().insert(
         header::ALLOW,
         allowed_methods(target).parse().expect("method list is header-safe"),
+    );
+    res
+}
+
+/// `WAC-Allow` as WAC defines it: what the requester may do on this resource,
+/// and what an anonymous caller may do.
+///
+/// Both groups always appear. An empty group is `public=""` and not an omitted
+/// group — the field parses into a list per group, and an absent group does not
+/// yield the empty list a client (or the conformance suite) reads it as.
+///
+/// Modes are read through [`AccessModes::allows`], so a grant of `acl:Write`
+/// reports `append` beside `write`. That is WAC's own subsumption rule, and the
+/// suite pins it: its `read/write/append` case is checked for set equality, so
+/// an answer missing `append` fails it.
+fn wac_allow_value(decision: &Decision) -> String {
+    fn group(m: AccessModes) -> String {
+        [(Mode::Read, "read"), (Mode::Write, "write"),
+         (Mode::Append, "append"), (Mode::Control, "control")]
+            .iter()
+            .filter(|(mode, _)| m.allows(*mode))
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    format!("user=\"{}\",public=\"{}\"", group(decision.user), group(decision.public))
+}
+
+/// The headers every successful read carries: the auxiliary advertisements,
+/// the `Allow` Protocol §4.1 makes a MUST on `GET`/`HEAD`, and `WAC-Allow`.
+///
+/// One helper rather than three nested calls at four sites, so a read path
+/// added later cannot pick up two of the three and still look right.
+fn with_read_headers(res: Response, target: &Target, decision: &Decision) -> Response {
+    let mut res = with_allow(with_aux_links(res, target), target);
+    res.headers_mut().insert(
+        "wac-allow",
+        wac_allow_value(decision).parse().expect("mode names are header-safe"),
     );
     res
 }
@@ -633,6 +719,48 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     }
 }
 
+/// Answer a CORS preflight — and a bare `OPTIONS`, which the suite also sends
+/// (`protocol/cors/acao-vary` omits `Access-Control-Request-Method`).
+///
+/// Deliberately unauthorized. A preflight arrives without credentials by
+/// construction, so demanding them makes a pod unusable from a browser; and
+/// the answer is derived entirely from the request URL's shape —
+/// [`allowed_methods`] takes a [`Target`] and never reaches the store — so it
+/// discloses nothing about what exists. That is the line `post_impl` already
+/// draws when it answers `409` from the path shape rather than let `POST`
+/// become an existence oracle.
+///
+/// `Access-Control-Allow-Headers` mirrors what was asked for rather than
+/// naming a fixed set: `protocol/cors/accept-acah` sends two otherwise
+/// identical preflights and requires `Accept` to be absent from the answer to
+/// the one that did not request it.
+fn options_impl(target: &Target, headers: &HeaderMap) -> Response {
+    let mut out = HeaderMap::new();
+    let methods = allowed_methods(target);
+    out.insert(header::ALLOW, HeaderValue::from_static(methods));
+    out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static(methods));
+    if let Some(requested) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
+        out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
+    }
+    (StatusCode::NO_CONTENT, out).into_response()
+}
+
+async fn handle_options(
+    State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap,
+) -> Response {
+    match classify(&st.space, &format!("/{path}")) {
+        Ok(target) => options_impl(&target, &headers),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn handle_options_root(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match classify(&st.space, "/") {
+        Ok(target) => options_impl(&target, &headers),
+        Err(status) => status.into_response(),
+    }
+}
+
 async fn handle_get(
     State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
     headers: HeaderMap,
@@ -654,11 +782,12 @@ async fn handle_get_root(
 
 async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Read).await {
-        return with_aux_links(res, &target);
-    }
+    let decision = match authorize(store, &agent, &target, Mode::Read).await {
+        Ok(d) => d,
+        Err(res) => return with_aux_links(res, &target),
+    };
     let Target::Resource(r) = &target else {
-        return legacy_graph_read(st, agent, target, headers).await; // containers, auxiliaries
+        return legacy_graph_read(st, &decision, target, headers).await; // containers, auxiliaries
     };
     // §6.1: read everything first — the ETag covers the resource, not the
     // body, so the shelves are read even when only the default graph will be
@@ -689,8 +818,8 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         let mut out = HeaderMap::new();
         out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
         out.insert(header::VARY, "Accept".parse().expect("static"));
-        return with_allow(with_aux_links(
-            (StatusCode::NOT_MODIFIED, out).into_response(), &target), &target);
+        return with_read_headers(
+            (StatusCode::NOT_MODIFIED, out).into_response(), &target, &decision);
     }
     // §6.2: a graph format gets the default graph, and is told what it missed.
     let served = if fmt.carries_dataset() { visible.clone() } else { visible.default_graph_only() };
@@ -724,7 +853,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             ).parse().expect("static"));
         }
     }
-    with_allow(with_aux_links((out, bytes).into_response(), &target), &target)
+    with_read_headers((out, bytes).into_response(), &target, &decision)
 }
 
 /// The pre-dataset read path: containers and auxiliaries, whose graph never
@@ -735,7 +864,9 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
 /// and `aux::put` — an ACL may legitimately contain `[]` — so the matching
 /// step out belongs here, the one place this shared path serializes, rather
 /// than inside a resource-shaped branch (design spec §4).
-async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers: HeaderMap) -> Response {
+async fn legacy_graph_read(
+    st: AppState, decision: &Decision, target: Target, headers: HeaderMap,
+) -> Response {
     let store = st.store.as_ref();
     let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), Shape::Graph, None) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
@@ -750,9 +881,8 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
                 let mut out = HeaderMap::new();
                 out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
                 out.insert(header::VARY, "Accept".parse().expect("static"));
-                return with_allow(
-                    with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target),
-                    &target,
+                return with_read_headers(
+                    (StatusCode::NOT_MODIFIED, out).into_response(), &target, decision,
                 );
             }
             let visible = ground.deskolemize();
@@ -762,7 +892,7 @@ async fn legacy_graph_read(st: AppState, _agent: Agent, target: Target, headers:
                     headers.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
                     headers.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
                     headers.insert(header::VARY, "Accept".parse().expect("static"));
-                    with_allow(with_aux_links((headers, bytes).into_response(), &target), &target)
+                    with_read_headers((headers, bytes).into_response(), &target, decision)
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
@@ -1041,6 +1171,196 @@ mod tests {
     async fn calling_fixture_twice_panics_instead_of_hanging() {
         let _first = fixture().await;
         let _second = fixture().await;
+    }
+
+    #[tokio::test]
+    async fn no_origin_means_no_cors_headers() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(res.headers().get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_origin_is_reflected_and_vary_keeps_accept() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://app.example"
+        );
+        // Both, and `Origin` with a capital O: the suite compares the field
+        // value as a case-sensitive string.
+        let vary: Vec<&str> = res.headers().get_all(header::VARY)
+            .iter().map(|v| v.to_str().unwrap()).collect();
+        assert!(vary.contains(&"Accept"), "{vary:?}");
+        assert!(vary.contains(&"Origin"), "{vary:?}");
+    }
+
+    #[tokio::test]
+    async fn expose_headers_is_enumerated_and_not_a_wildcard() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        let exposed = res.headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS).unwrap().to_str().unwrap();
+        assert_ne!(exposed, "*");
+        assert!(exposed.contains("ETag"), "{exposed}");
+        assert!(exposed.contains("WAC-Allow"), "{exposed}");
+    }
+
+    // The reason the middleware wraps `auth_layer` instead of sitting inside
+    // it: `protocol/cors/simple-requests` asserts the CORS fields on an
+    // anonymous request, which this pod answers 401.
+    #[tokio::test]
+    async fn cors_headers_survive_a_401() {
+        let f = fixture().await;
+        let get = Request::builder().method("GET").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://app.example"
+        );
+        assert!(res.headers().get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_some());
+    }
+
+    // A preflight carries no credentials by construction — the browser sends
+    // it before, and without, the credentialed request.
+    #[tokio::test]
+    async fn options_answers_without_credentials() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .header("access-control-request-method", "POST")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(body_string(res).await, "");
+    }
+
+    #[tokio::test]
+    async fn options_mirrors_exactly_the_requested_headers() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "X-CUSTOM, Content-Type")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        let allowed = res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap().to_str().unwrap();
+        assert!(allowed.contains("X-CUSTOM"), "{allowed}");
+        assert!(allowed.contains("Content-Type"), "{allowed}");
+        // The negative half: `accept-acah` asserts Accept is ABSENT when it was
+        // not requested, in an otherwise identical request. A fixed list fails
+        // one of the two.
+        assert!(!allowed.contains("Accept"), "{allowed}");
+    }
+
+    #[tokio::test]
+    async fn options_omits_allow_headers_when_none_were_requested() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(res.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS).is_none());
+    }
+
+    #[tokio::test]
+    async fn options_advertises_the_methods_the_target_accepts() {
+        let f = fixture().await;
+
+        let on_container = Request::builder().method("OPTIONS").uri("/box/")
+            .body(Body::empty()).unwrap();
+        let res = f.app.clone().oneshot(on_container).await.unwrap();
+        let allow = res.headers().get(header::ALLOW).unwrap().to_str().unwrap().to_string();
+        let acam = res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS).unwrap().to_str().unwrap();
+        assert!(allow.contains("POST"), "{allow}");
+        assert!(allow.contains("OPTIONS"), "{allow}");
+        assert_eq!(allow, acam, "Allow and Access-Control-Allow-Methods must agree");
+
+        let on_resource = Request::builder().method("OPTIONS").uri("/foo")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(on_resource).await.unwrap();
+        let allow = res.headers().get(header::ALLOW).unwrap().to_str().unwrap();
+        assert!(!allow.contains("POST"), "{allow}");
+        assert!(allow.contains("OPTIONS"), "{allow}");
+    }
+
+    // `classify` still decides what a path means: the reserved namespace is not
+    // storage, and OPTIONS does not get to pretend otherwise.
+    #[tokio::test]
+    async fn options_on_the_unallocated_reserved_namespace_is_404() {
+        let f = fixture().await;
+        let req = Request::builder().method("OPTIONS").uri("/.aux/bogus/x")
+            .body(Body::empty()).unwrap();
+        let res = f.app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    // The root ACL grants the owner Read/Write/Control and nobody else
+    // anything, so this pins three things at once: both groups are always
+    // present, an empty group is `""` rather than omitted, and `write` reports
+    // `append` alongside it.
+    #[tokio::test]
+    async fn wac_allow_reports_both_groups_and_appends_with_write() {
+        let f = fixture().await;
+        let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("wac-allow").unwrap().to_str().unwrap(),
+            "user=\"read write append control\",public=\"\""
+        );
+    }
+
+    // A resource's own ACL replaces inheritance entirely, which is why the
+    // owner's group here is the narrower set this document grants and not the
+    // root ACL's.
+    #[tokio::test]
+    async fn wac_allow_reports_public_read_when_the_acl_grants_it() {
+        let f = fixture().await;
+        let put = f.owner_request("PUT", "/foo")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
+        assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+        let acl = format!(
+            "<#public> <http://www.w3.org/ns/auth/acl#agentClass> <http://xmlns.com/foaf/0.1/Agent> ; \
+                       <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> ; \
+                       <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read> . \
+             <#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                      <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/foo> ; \
+                      <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                                                           <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        let put_acl = f.owner_request("PUT", "/.aux/foo.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        let status = f.app.clone().oneshot(put_acl).await.unwrap().status();
+        assert!(status.is_success(), "writing the ACL returned {status}");
+
+        let get = f.owner_request("GET", "/foo").body(Body::empty()).unwrap();
+        let res = f.app.oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("wac-allow").unwrap().to_str().unwrap(),
+            "user=\"read control\",public=\"read\""
+        );
     }
 
     #[tokio::test]
@@ -1494,10 +1814,10 @@ mod tests {
         assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
 
         for (method, path, expected) in [
-            ("GET", "/box/", "GET, HEAD, POST, PUT, DELETE"),
-            ("HEAD", "/box/", "GET, HEAD, POST, PUT, DELETE"),
-            ("GET", "/box/doc", "GET, HEAD, PUT, DELETE"),
-            ("HEAD", "/box/doc", "GET, HEAD, PUT, DELETE"),
+            ("GET", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
+            ("HEAD", "/box/", "GET, HEAD, POST, PUT, DELETE, OPTIONS"),
+            ("GET", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
+            ("HEAD", "/box/doc", "GET, HEAD, PUT, DELETE, OPTIONS"),
         ] {
             let req = f.owner_request(method, path).body(Body::empty()).unwrap();
             let res = f.app.clone().oneshot(req).await.unwrap();
@@ -1513,7 +1833,7 @@ mod tests {
         let f = fixture().await;
         let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
         let res = f.app.oneshot(get).await.unwrap();
-        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT");
+        assert_eq!(res.headers().get(header::ALLOW).unwrap(), "GET, HEAD, POST, PUT, OPTIONS");
     }
 
     #[tokio::test]
