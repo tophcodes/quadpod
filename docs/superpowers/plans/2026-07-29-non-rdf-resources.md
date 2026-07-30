@@ -27,7 +27,7 @@
 | File | Responsibility | Change |
 |---|---|---|
 | `src/blob.rs` | `BlobKey` (the only place an object key is built), the `BlobStore` trait and its `object_store` implementation | **new** |
-| `src/rdf.rs` | `MediaType`, `ranked_accept` (the only `Accept` parser), `accept_allows` alongside `negotiate` | modify |
+| `src/rdf.rs` | `MediaType`, `sparql::Literal`'s one caller, `ranked_accept` (the only `Accept` parser), later `accept_allows` alongside `negotiate` | modify |
 | `src/resource.rs` | `put_blob`, `kind_of`, `stored_media_type` returning `MediaType`, blob teardown inside `put_dataset` | modify |
 | `src/aux.rs` | blob teardown inside the one delete cascade | modify |
 | `src/config.rs` | `--blob-store`, `--max-body-bytes` | modify |
@@ -493,51 +493,25 @@ site has to assert header-safety with an .expect on another type's invariant."
 
 **Interfaces:**
 - Consumes: `MediaType` from Task 1.
-- Produces: `pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool`.
+- Produces: `fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)>` — private to `rdf.rs`,
+  consumed by `negotiate` here and by `accept_allows` in Task 8.
+
+`accept_allows` itself lands in Task 8, with the read path that calls it. A `pub(crate)`
+function with no production caller is a `dead_code` warning, and this build is warning-free
+by rule — so the acceptability test cannot ship six tasks ahead of its consumer.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-    // §6.1: a blob has one representation, so this is an acceptability test
-    // and not a resolver. The cases are the ones `negotiate` already handles,
-    // which is precisely why they must not be answered by a second parse.
-    #[test]
-    fn accept_allows_admits_or_refuses_a_single_representation() {
-        let png = MediaType::parse("image/png").unwrap();
-        let txt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+There is no new test to write here. The extraction is behaviour-preserving, and
+`negotiate`'s existing suite — `q=0` as a refusal, wildcard scoping, case-insensitivity, the
+two-pass dataset fallback — is exactly what says so. Adding a test for `ranked_accept` itself
+would assert the shape of a private helper rather than any behaviour a caller can observe.
 
-        assert!(accept_allows("", &png), "no Accept header means no constraint");
-        assert!(accept_allows("*/*", &png));
-        assert!(accept_allows("image/*", &png));
-        assert!(accept_allows("image/png", &png));
-        assert!(accept_allows("Image/PNG", &png), "ranges are case-insensitive");
-        assert!(accept_allows("text/turtle, image/png;q=0.1", &png));
-        // Parameters do not take part in the match; the essence does.
-        assert!(accept_allows("text/plain", &txt));
+- [ ] **Step 2: Confirm the existing suite is green before you touch anything**
 
-        assert!(!accept_allows("text/turtle", &png));
-        assert!(!accept_allows("text/*", &png));
-    }
-
-    // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
-    // overrides a less specific one — so the answer cannot be derived from
-    // order or from the highest q alone.
-    #[test]
-    fn accept_allows_honours_q_zero_and_specificity() {
-        let png = MediaType::parse("image/png").unwrap();
-
-        assert!(!accept_allows("image/png;q=0", &png));
-        assert!(!accept_allows("*/*, image/png;q=0", &png), "specific overrides */*");
-        assert!(!accept_allows("image/png;q=0, */*", &png), "and order does not matter");
-        assert!(accept_allows("*/*;q=0, image/png", &png), "and it works the other way");
-        assert!(!accept_allows("image/*;q=0, */*", &png), "type/* overrides */*");
-    }
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `nix develop -c cargo test --lib rdf::tests::accept_allows 2>&1 | tail -20`
-Expected: FAIL — `cannot find function accept_allows in this scope`.
+Run: `nix develop -c cargo test --lib rdf 2>&1 | tail -5`
+Expected: PASS. This is the baseline the extraction must not move.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -547,10 +521,11 @@ In `src/rdf.rs`, add before `negotiate`:
 /// The `Accept` list, highest quality first with earlier entries breaking a
 /// tie, as `(q, position, media range)`.
 ///
-/// **The only place this header is parsed.** [`negotiate`] and
-/// [`accept_allows`] ask different questions of it — which format to render
-/// into, and whether one fixed type is admissible — but a second copy of the
-/// q-value parse is how the two come to disagree about `q=0`.
+/// **The only place this header is parsed.** [`negotiate`] asks it which
+/// format to render into; a resource with a single representation asks it
+/// whether that one type is admissible. Those are different questions, but a
+/// second copy of the q-value parse is how the two come to disagree about
+/// `q=0`.
 fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
     let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
     for (i, part) in accept.split(',').enumerate() {
@@ -568,37 +543,6 @@ fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
     ranked
 }
 
-/// §6.1: whether `accept` admits a resource whose only representation is `mt`.
-///
-/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
-/// makes a more specific media range override a less specific one, so the
-/// decision is by specificity rather than by order or by the highest q.
-pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
-    let accept = accept.trim();
-    if accept.is_empty() {
-        return true;
-    }
-    let essence = mt.essence();
-    let ty = essence.split('/').next().unwrap_or("");
-    let type_wildcard = format!("{ty}/*");
-    let mut best: Option<(u8, f32)> = None;
-    for (q, _, range) in ranked_accept(accept) {
-        let range = range.to_ascii_lowercase();
-        let specificity = if range == essence {
-            3
-        } else if range == type_wildcard {
-            2
-        } else if range == "*/*" {
-            1
-        } else {
-            continue;
-        };
-        if best.is_none_or(|(s, _)| specificity > s) {
-            best = Some((specificity, q));
-        }
-    }
-    matches!(best, Some((_, q)) if q > 0.0)
-}
 ```
 
 Then replace the inline ranking inside `negotiate` — the block from
@@ -617,24 +561,17 @@ Run: `nix develop -c cargo test --lib rdf 2>&1 | tail -5`
 Expected: PASS. Every pre-existing negotiation test must still pass — the extraction is
 behaviour-preserving, and those tests are what says so.
 
-- [ ] **Step 5: Verify the specificity test bites**
-
-Temporarily replace `accept_allows`'s body with a version that returns
-`ranked_accept(accept).iter().any(|(q, _, r)| *q > 0.0 && (*r == "*/*" || *r == essence))`.
-Run `nix develop -c cargo test --lib rdf::tests::accept_allows_honours`. Expected: FAIL on
-`"*/*, image/png;q=0"`. Revert.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/rdf.rs
-git commit -m "refactor: one Accept parser, two consumers
+git commit -m "refactor: one Accept parser, one consumer so far
 
 A blob has a single representation, so 'does the client accept it?' is a
 different question from 'which format do I render into?'. Both parse the
 same header, and two q-value parses is how they come to disagree about q=0
 — which docs/constraints.md already names as the failure mode. ranked_accept
-is the one parser; negotiate and accept_allows consume it."
+is the one parser; the second consumer arrives with the blob read path."
 ```
 
 ---
@@ -1783,7 +1720,7 @@ fn classify_body(headers: &HeaderMap, body: &Bytes, target: &Target) -> Result<R
 }
 ```
 
-Add `use crate::rdf::{Format, MediaType, Shape, accept_allows, negotiate};` to the imports and
+Add `use crate::rdf::{Format, MediaType, Shape, negotiate};` to the imports and
 `use crate::resource::{… , put_blob, kind_of, Kind};`.
 
 - [ ] **Step 4: Rewire `put_impl`**
@@ -1926,10 +1863,57 @@ conflated with 'unsupported'."
 - Test: `src/http.rs` `mod tests`
 
 **Interfaces:**
-- Consumes: `kind_of`, `Kind`, `accept_allows`, `BlobStore::get`.
-- Produces: `fn blob_etag(&[u8]) -> String` in `src/http.rs`.
+- Consumes: `kind_of`, `Kind`, `BlobStore::get`, `ranked_accept` (Task 2), `MediaType`.
+- Produces: `pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool` in
+  `src/rdf.rs`; `fn blob_etag(&[u8]) -> String` in `src/http.rs`.
+
+`accept_allows` lands here rather than in Task 2 because this is the task that gives it a
+production caller. Shipping it earlier would be a `dead_code` warning in a build that is
+warning-free by rule.
 
 - [ ] **Step 1: Write the failing tests**
+
+In `src/rdf.rs`'s `mod tests`:
+
+```rust
+    // §6.1: a blob has one representation, so this is an acceptability test
+    // and not a resolver. The cases are the ones `negotiate` already handles,
+    // which is precisely why they must not be answered by a second parse.
+    #[test]
+    fn accept_allows_admits_or_refuses_a_single_representation() {
+        let png = MediaType::parse("image/png").unwrap();
+        let txt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+
+        assert!(accept_allows("", &png), "no Accept header means no constraint");
+        assert!(accept_allows("*/*", &png));
+        assert!(accept_allows("image/*", &png));
+        assert!(accept_allows("image/png", &png));
+        assert!(accept_allows("Image/PNG", &png), "ranges are case-insensitive");
+        assert!(accept_allows("text/turtle, image/png;q=0.1", &png));
+        // Parameters do not take part in the match; the essence does.
+        assert!(accept_allows("text/plain", &txt));
+
+        assert!(!accept_allows("text/turtle", &png));
+        assert!(!accept_allows("text/*", &png));
+    }
+
+    // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
+    // overrides a less specific one — so the answer cannot be derived from
+    // order or from the highest q alone.
+    #[test]
+    fn accept_allows_honours_q_zero_and_specificity() {
+        let png = MediaType::parse("image/png").unwrap();
+
+        assert!(!accept_allows("image/png;q=0", &png));
+        assert!(!accept_allows("*/*, image/png;q=0", &png), "specific overrides */*");
+        assert!(!accept_allows("image/png;q=0, */*", &png), "and order does not matter");
+        assert!(accept_allows("*/*;q=0, image/png", &png), "and it works the other way");
+        assert!(!accept_allows("image/*;q=0, */*", &png), "type/* overrides */*");
+    }
+```
+```
+
+In `src/http.rs`'s `mod tests`:
 
 ```rust
     // §3.4: the validator is computed from the served bytes, so the same bytes
@@ -2045,7 +2029,45 @@ Add these `Fixture` helpers next to the existing ones:
 Run: `nix develop -c cargo test --lib http 2>&1 | tail -30`
 Expected: FAIL — `get_impl` runs the dataset path and answers `404` or `500` for a blob.
 
-- [ ] **Step 3: Write the read path**
+- [ ] **Step 3: Write `accept_allows`**
+
+In `src/rdf.rs`, directly after `ranked_accept`:
+
+```rust
+/// §6.1: whether `accept` admits a resource whose only representation is `mt`.
+///
+/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
+/// makes a more specific media range override a less specific one, so the
+/// decision is by specificity rather than by order or by the highest q.
+pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
+    let accept = accept.trim();
+    if accept.is_empty() {
+        return true;
+    }
+    let essence = mt.essence();
+    let ty = essence.split('/').next().unwrap_or("");
+    let type_wildcard = format!("{ty}/*");
+    let mut best: Option<(u8, f32)> = None;
+    for (q, _, range) in ranked_accept(accept) {
+        let range = range.to_ascii_lowercase();
+        let specificity = if range == essence {
+            3
+        } else if range == type_wildcard {
+            2
+        } else if range == "*/*" {
+            1
+        } else {
+            continue;
+        };
+        if best.is_none_or(|(s, _)| specificity > s) {
+            best = Some((specificity, q));
+        }
+    }
+    matches!(best, Some((_, q)) if q > 0.0)
+}
+```
+
+- [ ] **Step 3b: Write the read path**
 
 Add above `get_impl`:
 
@@ -2152,9 +2174,16 @@ format; add that a binary resource has a single representation and therefore a s
 Run: `nix develop -c cargo test 2>&1 | tail -10`
 Expected: PASS, including Task 7's byte-fidelity test.
 
-- [ ] **Step 6: Verify the Accept test bites**
+- [ ] **Step 6: Verify the Accept tests bite, both of them**
 
-Temporarily make `blob_read` skip the `accept_allows` check. Run
+Specificity first — this is the one most likely to be wrong. Temporarily replace
+`accept_allows`'s body with
+`ranked_accept(accept).iter().any(|(q, _, r)| *q > 0.0 && (*r == "*/*" || *r == essence))`.
+Run `nix develop -c cargo test --lib rdf::tests::accept_allows_honours`. Expected: FAIL on
+`"*/*, image/png;q=0"` — RFC 9110 §12.5.1 makes a more specific range override a less
+specific one, so neither order nor highest-q gives the right answer. Revert.
+
+Then the wiring. Temporarily make `blob_read` skip the `accept_allows` check. Run
 `nix develop -c cargo test --lib http::tests::accept_decides`. Expected: FAIL on the
 refusing half. Then make it `return NOT_ACCEPTABLE` unconditionally: expected FAIL on the
 admitting half. Revert.

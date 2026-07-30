@@ -211,10 +211,11 @@ impl Format {
 /// The `Accept` list, highest quality first with earlier entries breaking a
 /// tie, as `(q, position, media range)`.
 ///
-/// **The only place this header is parsed.** [`negotiate`] and
-/// [`accept_allows`] ask different questions of it — which format to render
-/// into, and whether one fixed type is admissible — but a second copy of the
-/// q-value parse is how the two come to disagree about `q=0`.
+/// **The only place this header is parsed.** [`negotiate`] asks it which
+/// format to render into; a resource with a single representation asks it
+/// whether that one type is admissible. Those are different questions, but a
+/// second copy of the q-value parse is how the two come to disagree about
+/// `q=0`.
 fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
     let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
     for (i, part) in accept.split(',').enumerate() {
