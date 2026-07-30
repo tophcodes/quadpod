@@ -11,9 +11,11 @@ starts, it stops.
 
 ## Current status
 
-The full suite runs and a report lands on disk. As of `1fe4953`: **41 features,
-652 scenarios, 43 passed, 609 failed**. One gap — no non-RDF resources —
-accounts for 540 of those 609. The triage lives in
+The full suite runs and a report lands on disk. As of `7debec9`: **41 features,
+652 scenarios, 479 passed, 173 failed**. Non-RDF resources (Plan 10) unblocked
+540 previously-untestable scenarios, of which 434 turned out to pass outright.
+The largest remaining gap is `PATCH`, which this pod does not implement at
+all — 66 scenarios. The triage lives in
 [`docs/conformance-findings.md`](../docs/conformance-findings.md).
 
 ## What it starts
@@ -126,13 +128,16 @@ Three things to know before drawing conclusions from it:
 - **A failed scenario and an aborted feature are different.** Several features
   build their fixtures in a `callonce` `Background`; if that setup request
   fails, the whole feature errors out at once rather than failing row by row.
-  A `text/plain` fixture does this — the pod answers `415` to any non-RDF
-  media type, which takes out all six WAC `protected-operation` features
-  before their assertions run.
-- **Some failures are decisions, not defects.** `content-type-reject` expects
-  `400` where this pod answers `415`; `post-target-not-found` expects `404`
-  where this pod deliberately materialises missing ancestors and answers
-  `201`. Triage lives in `docs/conformance-findings.md`, not here.
+  A `text/plain` fixture used to do this — before Plan 10, the pod answered
+  `415` to any non-RDF media type, which took out all six WAC
+  `protected-operation` features before their assertions ran. It no longer
+  does; `text/plain` and any other non-RDF type now store as a blob.
+- **Some failures are decisions, not defects.** `post-target-not-found`
+  expects `404` where this pod deliberately materialises missing ancestors
+  and answers `201`; `DELETE` of a resource the suite reserved a name for but
+  never created expects `403` where this pod, having authorized the request,
+  finds nothing there and answers `404`. Triage lives in
+  `docs/conformance-findings.md`, not here.
 
 ## Knobs
 
