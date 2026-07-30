@@ -11,8 +11,8 @@ use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
 use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{Dataset, Skolemized},
-    resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, get_dataset, stored_media_type, ResourceError},
-    rdf::{Format, Shape, negotiate},
+    resource::{put_rdf, get_rdf, delete_rdf, exists, put_dataset, put_blob, get_dataset, stored_media_type, ResourceError},
+    rdf::{Format, MediaType, Shape, negotiate},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
@@ -336,17 +336,116 @@ async fn handle_put_root(
     }
 }
 
+/// What a request body is, once its `Content-Type` has been read.
+enum Repr {
+    Rdf(Dataset, Format),
+    Blob(Bytes, MediaType),
+}
+
+/// §8.1: the three-way gate. `Err` is the response to send.
+///
+/// The order matters. A missing `Content-Type` on a request with content is
+/// Solid Protocol §2.2's `400` and is answered before anything else, because
+/// it is a different failure from a type this pod cannot use — a distinction
+/// that only exists now that an unrecognised type is a blob rather than a
+/// refusal.
+///
+/// The error is boxed because `Repr::Rdf` carries a whole `Dataset`: an
+/// unboxed `Result<Repr, Response>` would size every `Ok` return by the
+/// larger of the two variants, making the common case pay for the error
+/// path's size.
+fn classify_body(headers: &HeaderMap, body: &Bytes, target: &Target) -> Result<Repr, Box<Response>> {
+    let ct = header_str(headers, header::CONTENT_TYPE).trim();
+    if ct.is_empty() {
+        if !body.is_empty() {
+            return Err(Box::new((StatusCode::BAD_REQUEST, "Content-Type is required").into_response()));
+        }
+        return Err(Box::new(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()));
+    }
+    if let Some(fmt) = Format::from_content_type(ct) {
+        return match fmt.parse(body, target.graph_iri()) {
+            Ok(d) => Ok(Repr::Rdf(d, fmt)),
+            Err(e) => Err(Box::new((StatusCode::BAD_REQUEST, e.to_string()).into_response())),
+        };
+    }
+    let Some(mt) = MediaType::parse(ct) else {
+        return Err(Box::new(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()));
+    };
+    match target {
+        // §8.5: an auxiliary is a policy document the PDP has to read, and a
+        // container's representation carries server-managed containment.
+        Target::Aux(_) => Err(Box::new(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response())),
+        Target::Container(_) => Err(Box::new((
+            StatusCode::BAD_REQUEST,
+            "a container's representation must be RDF",
+        ).into_response())),
+        Target::Resource(_) => Ok(Repr::Blob(body.clone(), mt)),
+    }
+}
+
+/// RFC 9110 §13.1.1 preconditions, shared by both kinds of write.
+async fn check_conditionals(
+    store: &dyn SparqlStore,
+    headers: &HeaderMap,
+    target: &Target,
+) -> Result<(), Response> {
+    if !headers.contains_key(IF_MATCH) && !headers.contains_key(IF_NONE_MATCH) {
+        return Ok(());
+    }
+    let current_tags = match current_tags(store, target).await {
+        Ok(t) => t,
+        Err(e) => return Err((put_status(&e), e.to_string()).into_response()),
+    };
+    if let Some(im) = headers.get(IF_MATCH).and_then(|v| v.to_str().ok()) {
+        // RFC 9110 §13.1.1: `If-Match` matches *any* current representation,
+        // not the one the server would have picked.
+        if !current_tags.as_ref().is_some_and(|ts| ts.iter().any(|t| t == im)) {
+            return Err(StatusCode::PRECONDITION_FAILED.into_response());
+        }
+    }
+    if headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("*")
+        && current_tags.is_some()
+    {
+        return Err(StatusCode::PRECONDITION_FAILED.into_response());
+    }
+    Ok(())
+}
+
 async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let store = st.store.as_ref();
     if let Err(res) = authorize(store, &agent, &target, Mode::Write).await {
         return with_aux_links(res, &target);
     }
-    let Some(fmt) = Format::from_content_type(header_str(&headers, header::CONTENT_TYPE)) else {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    let repr = match classify_body(&headers, &body, &target) {
+        Ok(r) => r,
+        Err(res) => return *res,
     };
-    let dataset = match fmt.parse(&body, target.graph_iri()) {
-        Ok(d) => d,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    let (dataset, fmt) = match repr {
+        Repr::Rdf(d, f) => (d, f),
+        Repr::Blob(bytes, mt) => {
+            // A blob has none of the dataset checks below to run: no named
+            // graphs, no reserved namespace, no containment triples. It does
+            // share the conditional-request block and the ancestor walk, so
+            // it runs them itself rather than falling through to where the
+            // RDF path runs them.
+            let Target::Resource(r) = &target else {
+                unreachable!("classify_body refuses a blob for any other target")
+            };
+            if crate::blob::BlobKey::of(r).is_none() {
+                return StatusCode::URI_TOO_LONG.into_response();
+            }
+            if let Err(res) = check_conditionals(store, &headers, &target).await {
+                return res;
+            }
+            if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
+                return with_aux_links(res, &target);
+            }
+            return match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
+                Ok(()) => created(&target),
+                Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
+                Err(e) => (put_status(&e), e.to_string()).into_response(),
+            };
+        }
     };
     // §3.2.2 — the skolem namespace is the server's.
     if dataset.uses_reserved_namespace() {
@@ -405,24 +504,8 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         }
     }
     let skolemized = Skolemized::skolemize(&dataset);
-    if headers.contains_key(IF_MATCH) || headers.contains_key(IF_NONE_MATCH) {
-        let current_tags = match current_tags(store, &target).await {
-            Ok(t) => t,
-            Err(e) => return (put_status(&e), e.to_string()).into_response(),
-        };
-        if let Some(im) = headers.get(IF_MATCH).and_then(|v| v.to_str().ok()) {
-            // RFC 9110 §13.1.1: `If-Match` matches *any* current
-            // representation, not the one the server would have picked.
-            let matched = current_tags.as_ref().is_some_and(|ts| ts.iter().any(|t| t == im));
-            if !matched {
-                return StatusCode::PRECONDITION_FAILED.into_response();
-            }
-        }
-        if headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("*")
-            && current_tags.is_some()
-        {
-            return StatusCode::PRECONDITION_FAILED.into_response();
-        }
+    if let Err(res) = check_conditionals(store, &headers, &target).await {
+        return res;
     }
     // Creating a resource materializes every missing ancestor container and
     // links it into the first one that already exists — real mutations of
@@ -544,9 +627,6 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     let Target::Container(parent) = &target else {
         return StatusCode::CONFLICT.into_response(); // POST target must be a container
     };
-    let Some(fmt) = Format::from_content_type(header_str(&headers, header::CONTENT_TYPE)) else {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
-    };
     let slug = headers.get("slug").and_then(|v| v.to_str().ok());
     // A settled child name contains no `/`, so the child of a container is
     // always an ordinary resource — unless the server would have to allocate
@@ -586,26 +666,43 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     if let Err(res) = authorize(store, &agent, &child, Mode::Append).await {
         return with_aux_links(res, &child);
     }
-    let dataset = match fmt.parse(&body, child.graph_iri()) {
-        Ok(d) => d,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    let repr = match classify_body(&headers, &body, &child) {
+        Ok(r) => r,
+        Err(res) => return *res,
     };
-    // §3.2.2 — the skolem namespace is the server's.
-    if dataset.uses_reserved_namespace() {
-        return (StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response();
-    }
-    // §3.4 — the allocated child is always a resource or a container (never an
-    // auxiliary, see above), so this is exactly `put_impl`'s check.
-    if dataset.has_named_graphs() && !matches!(child, Target::Resource(_)) {
-        return (StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response();
-    }
-    // Containment is server-managed, for a container POST asks for exactly as
-    // much as for one a PUT names — and refused before anything is written,
-    // for the same reason.
-    if matches!(child, Target::Container(_)) && container::body_sets_containment(&triples_of(&dataset)) {
-        return StatusCode::CONFLICT.into_response();
-    }
-    let skolemized = Skolemized::skolemize(&dataset);
+    // The dataset checks below have no meaning for a blob: no named graphs,
+    // no reserved namespace, no containment triples. It gets its own
+    // over-long-key check instead, run here for the same reason the dataset
+    // checks are — before the ancestor walk below writes anything.
+    let skolemized = match &repr {
+        Repr::Rdf(dataset, _) => {
+            // §3.2.2 — the skolem namespace is the server's.
+            if dataset.uses_reserved_namespace() {
+                return (StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response();
+            }
+            // §3.4 — the allocated child is always a resource or a container
+            // (never an auxiliary, see above), so this is exactly `put_impl`'s check.
+            if dataset.has_named_graphs() && !matches!(child, Target::Resource(_)) {
+                return (StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response();
+            }
+            // Containment is server-managed, for a container POST asks for
+            // exactly as much as for one a PUT names — and refused before
+            // anything is written, for the same reason.
+            if matches!(child, Target::Container(_)) && container::body_sets_containment(&triples_of(dataset)) {
+                return StatusCode::CONFLICT.into_response();
+            }
+            Some(Skolemized::skolemize(dataset))
+        }
+        Repr::Blob(..) => {
+            let Target::Resource(r) = &child else {
+                unreachable!("classify_body refuses a blob for a non-resource target")
+            };
+            if crate::blob::BlobKey::of(r).is_none() {
+                return StatusCode::URI_TOO_LONG.into_response();
+            }
+            None
+        }
+    };
     // POSTing into a container that does not exist yet materializes it and
     // its missing ancestors, so those need authorizing too — the same single
     // traversal `put_impl` uses.
@@ -613,14 +710,27 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         return with_aux_links(res, &child);
     }
     match &child {
-        Target::Resource(r) => match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
-            Ok(()) => created(&child),
-            Err(e) => (put_status(&e), e.to_string()).into_response(),
+        Target::Resource(r) => match repr {
+            Repr::Blob(bytes, mt) => match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
+                Ok(()) => created(&child),
+                Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
+                Err(e) => (put_status(&e), e.to_string()).into_response(),
+            },
+            Repr::Rdf(_, fmt) => {
+                let skolemized = skolemized.expect("Repr::Rdf produced a skolemized dataset above");
+                match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
+                    Ok(()) => created(&child),
+                    Err(e) => (put_status(&e), e.to_string()).into_response(),
+                }
+            }
         },
         // A freshly allocated name, so there are no members to preserve — the
         // read-then-merge `put_impl` does for an existing container has
         // nothing to read here.
         Target::Container(c) => {
+            let Repr::Rdf(dataset, _) = &repr else {
+                unreachable!("classify_body refuses a blob for Target::Container")
+            };
             let triples = triples_of(&dataset.default_graph_only());
             if let Err(e) = put_rdf(store, c, &triples).await {
                 return (put_status(&e), e.to_string()).into_response();
@@ -1012,6 +1122,22 @@ mod tests {
             self.sign(b, OWNER, method, path)
         }
 
+        async fn put_turtle(&self, path: &str, ttl: &str) {
+            let res = self.app.clone().oneshot(self.owner_request("PUT", path)
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(ttl.to_owned())).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED, "PUT {path}");
+        }
+
+        async fn get_turtle(&self, path: &str) -> String {
+            let res = self.app.clone().oneshot(self.owner_request("GET", path)
+                .header(header::ACCEPT, "text/turtle")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "GET {path}");
+            let b = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+            String::from_utf8(b.to_vec()).unwrap()
+        }
+
         /// The typed URL a request path names, for tests that inspect the
         /// store directly rather than through HTTP.
         fn url(&self, path: &str) -> Target {
@@ -1081,6 +1207,109 @@ mod tests {
         assert!(body_string(res).await.contains("schema.org/name"));
     }
 
+    #[tokio::test]
+    async fn a_text_file_can_be_put_and_read_back_byte_for_byte() {
+        let f = fixture().await;
+        let body: &[u8] = &[0x00, 0xff, 0xfe, b'\r', b'\n', b'A'];
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(body.to_vec())).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/notes.txt")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/plain");
+        let got = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+        assert_eq!(&got[..], body, "bytes survive exactly");
+    }
+
+    // Solid Protocol §2.2 names the status code in its normative text:
+    // "Server MUST reject PUT, POST, and PATCH requests that contain content
+    // but lack the Content-Type header field, with a status code of 400."
+    #[tokio::test]
+    async fn a_write_with_content_and_no_content_type_is_a_400() {
+        let f = fixture().await;
+        for (method, path) in [("PUT", "/x"), ("POST", "/")] {
+            let res = f.app.clone().oneshot(f.owner_request(method, path)
+                .body(Body::from("hello")).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {path}");
+        }
+    }
+
+    // The live injection vector: a legal HTTP header value that is not a legal
+    // media type, whose quote would close the SPARQL literal it is
+    // interpolated into. A CRLF payload would NOT do here — hyper rejects it
+    // before any handler runs, so that test would pin hyper and pass no matter
+    // what MediaType::parse does.
+    #[tokio::test]
+    async fn a_content_type_that_is_not_a_media_type_is_a_415_and_stores_nothing() {
+        let f = fixture().await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/evil")
+            .header(header::CONTENT_TYPE, r#"text/plain;x=""#)
+            .body(Body::from("x")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/evil")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "nothing may have been stored");
+    }
+
+    // §3.2, §11: a legal URL this pod cannot store.
+    #[tokio::test]
+    async fn an_over_long_path_segment_is_a_414() {
+        let f = fixture().await;
+        let long = "a".repeat(300);
+        let res = f.app.clone().oneshot(f.owner_request("PUT", &format!("/{long}"))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("x")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    // §8.5: an ACL the PDP cannot parse is not an ACL.
+    #[tokio::test]
+    async fn a_non_rdf_body_on_an_auxiliary_is_a_415() {
+        let f = fixture().await;
+        f.put_turtle("/subject", "").await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/.aux/subject.acl")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("x")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // §8.5: a container's representation is RDF, so the two asks contradict.
+    #[tokio::test]
+    async fn posting_a_non_rdf_body_as_a_container_is_a_400() {
+        let f = fixture().await;
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::LINK, "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"")
+            .body(Body::from("x")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // A blob is a container member exactly as an RDF resource is.
+    #[tokio::test]
+    async fn a_posted_blob_joins_and_leaves_its_container() {
+        let f = fixture().await;
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/box/")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("x")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let loc = res.headers()[header::LOCATION].to_str().unwrap().to_owned();
+        let child_path = loc.strip_prefix("https://pod.toph.so").unwrap().to_owned();
+
+        let listing = f.get_turtle("/box/").await;
+        assert!(listing.contains(&loc), "the blob is a member");
+
+        let res = f.app.clone().oneshot(f.owner_request("DELETE", &child_path)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let listing = f.get_turtle("/box/").await;
+        assert!(!listing.contains(&loc), "and it leaves again");
+    }
+
     // Whole-branch review: `uses_reserved_namespace` sliced an IRI at a fixed
     // byte offset with no char-boundary check, so this body — legal Turtle,
     // and `<urn:quadpodé:x>` is a legal IRI oxrdf accepts — panicked the
@@ -1122,13 +1351,16 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
     }
 
+    // `application/json` is a syntactically valid media type that `Format`
+    // does not parse as RDF, so `classify_body` routes it to the blob path
+    // rather than refusing it.
     #[tokio::test]
-    async fn put_unsupported_content_type_is_415() {
+    async fn put_of_a_valid_but_unrecognised_media_type_stores_it_as_a_blob() {
         let f = fixture().await;
         let put = f.owner_request("PUT", "/foo")
             .header(header::CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap();
         let res = f.app.oneshot(put).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(res.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
