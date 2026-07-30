@@ -190,9 +190,14 @@ impl Patch {
     ///
     /// `Some` exactly when the conditions are empty: §5.1 admits a variable in
     /// the insertions only if a condition binds it, so no conditions means no
-    /// variables. This is the only shape that can create a resource (§7) —
-    /// against an absent resource any non-empty condition finds zero mappings
-    /// and is a `409`, so the two cases do not overlap.
+    /// variables, and the other positions are ground already — a literal
+    /// subject or predicate is refused by [`Patch::parse`]. The remaining
+    /// `None` arms are therefore unreachable, and stay so that this is a total
+    /// function rather than one with a panic in it.
+    ///
+    /// Ground insertions are what §7 needs to create a resource, but they are
+    /// not the whole test: a patch that also deletes asks something of the
+    /// prior state, which an absent resource does not have.
     pub fn ground_insertions(&self) -> Option<Vec<Triple>> {
         if !self.conditions.is_empty() {
             return None;
@@ -276,12 +281,26 @@ fn patterns(
             continue;
         }
         out.push(Pattern {
-            subject: term(&q.subject, names, binding)?,
-            predicate: term(&q.predicate, names, binding)?,
+            subject: non_literal(term(&q.subject, names, binding)?, LITERAL_SUBJECT)?,
+            predicate: non_literal(term(&q.predicate, names, binding)?, LITERAL_PREDICATE)?,
             object: term(&q.object, names, binding)?,
         });
     }
     Ok(out)
+}
+
+const LITERAL_SUBJECT: &str = "a literal in subject position";
+const LITERAL_PREDICATE: &str = "a literal in predicate position";
+
+/// §5.1: only the object position admits a literal. N3 is wider than RDF here —
+/// `oxttl` parses a literal subject or predicate inside a formula — so the two
+/// positions that RDF forbids are refused as a shape violation, and every later
+/// stage may take a subject and a predicate to be a name or a variable.
+fn non_literal(t: PatternTerm, violation: &'static str) -> Result<PatternTerm, PatchError> {
+    match t {
+        PatternTerm::Literal(_) => Err(PatchError::Shape(violation)),
+        other => Ok(other),
+    }
 }
 
 fn term(t: &N3Term, names: &mut Renumber, binding: Binding) -> Result<PatternTerm, PatchError> {
@@ -467,6 +486,47 @@ mod tests {
             )),
             Err(PatchError::Shape(_))
         ));
+    }
+
+    // §5.1: only the object position admits a literal. oxttl's N3 parser
+    // accepts one in subject and in predicate position inside a formula, so
+    // this is a document that reaches here and must be refused rather than
+    // left for a later stage to notice it cannot build a triple from it.
+    #[test]
+    fn a_literal_in_subject_or_predicate_position_is_refused() {
+        assert!(
+            matches!(
+                p(&format!(
+                    "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                       solid:inserts {{ \"s\" ex:p \"o\" . }} .\n"
+                )),
+                Err(PatchError::Shape(_))
+            ),
+            "a literal subject"
+        );
+        assert!(
+            matches!(
+                p(&format!(
+                    "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                       solid:inserts {{ <> \"p\" \"o\" . }} .\n"
+                )),
+                Err(PatchError::Shape(_))
+            ),
+            "a literal predicate"
+        );
+        // The conditions are held to the same rule: a pattern whose subject is
+        // a literal matches nothing an RDF graph can hold.
+        assert!(
+            matches!(
+                p(&format!(
+                    "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                       solid:where   {{ \"s\" ex:p ?o . }} ;\n\
+                       solid:inserts {{ <> ex:seen ?o . }} .\n"
+                )),
+                Err(PatchError::Shape(_))
+            ),
+            "a literal subject in the conditions"
+        );
     }
 
     // The two LENIENT cases. A fail-closed implementation gets both wrong,

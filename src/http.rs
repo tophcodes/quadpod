@@ -470,11 +470,12 @@ async fn handle_put_root(
 /// 6. On a container, refuse a patch touching `ldp:contains` with `409`, through
 ///    the same `container::body_sets_containment` `put_impl` uses.
 /// 7. `check_conditionals` — `412`.
-/// 8. An absent target is patched against an empty dataset (§7): with no
-///    conditions that is a creation through the `PUT` path — `create_by_patch`
-///    → `201`; with conditions nothing can match it, which is `409` and no
-///    write. An existing target goes to `resource::patch_dataset` → `204`, or
-///    the `409` its `PatchResult` names.
+/// 8. An absent target is patched against an empty dataset (§7): a patch that
+///    asks nothing of the prior state — no conditions and no deletions — is a
+///    creation through the `PUT` path, `create_by_patch` → `201`. A patch that
+///    asks anything of it gets from the empty dataset the same `409` a target
+///    without those triples gives, and no write. An existing target goes to
+///    `resource::patch_dataset` → `204`, or the `409` its `PatchResult` names.
 async fn patch_impl(
     st: AppState,
     agent: Agent,
@@ -585,11 +586,11 @@ async fn patch_impl(
 /// same [`authorize_and_materialize`] walk, the same containment linking and
 /// the same [`created`] response `PUT` uses. There is no second creation path.
 ///
-/// [`crate::patch::Patch::ground_insertions`] is the whole test for whether a
-/// patch can create: it answers `Some` exactly when the patch has no
-/// conditions. A patch that has them finds no mapping in an empty dataset,
-/// which is §6's `409` and touches nothing — so the two cases cannot overlap
-/// and need no further condition between them.
+/// A patch creates only when the empty dataset answers everything it asks:
+/// [`crate::patch::Patch::ground_insertions`] is `Some` exactly when it has no
+/// conditions, and it must delete nothing. Either part unmet is §6's `409` and
+/// touches nothing — a condition finds no mapping in an empty dataset, and a
+/// triple to delete is not in one either.
 ///
 /// The media type recorded for a resource created this way is `text/turtle`:
 /// a patch declares no representation format, and Turtle is what negotiation
@@ -607,6 +608,9 @@ async fn create_by_patch(
     let Some(triples) = patch.ground_insertions() else {
         return patch_response(PatchResult::NoMapping, patch);
     };
+    if !patch.deletions().is_empty() {
+        return patch_response(PatchResult::DeletionMissing, patch);
+    }
     if let Err(res) = authorize_and_materialize(store, agent, target).await {
         return with_aux_links(res, target);
     }
@@ -5408,6 +5412,28 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CONFLICT);
 
         let get = f.app.clone().oneshot(f.owner_request("GET", "/fresh")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND,
+            "a refused patch must not have created anything");
+    }
+
+    // §7: the empty dataset an absent target is patched against holds no triple
+    // for a deletion to find, so the answer is the same `409` the identical
+    // patch gets on an existing target. The `GET` is the assertion that bites:
+    // a creation branch taken on the strength of the conditions alone answers
+    // `201` for a patch that asks only to remove something.
+    #[tokio::test]
+    async fn a_deletions_only_patch_on_an_absent_resource_is_409() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/gone",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:deletes { <> ex:nickname \"Charlie\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert!(body_string(res).await.contains("a triple this patch deletes is not there"),
+            "the same body the existing-target path gives for the same patch");
+
+        let get = f.app.clone().oneshot(f.owner_request("GET", "/gone")
             .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(get.status(), StatusCode::NOT_FOUND,
             "a refused patch must not have created anything");
