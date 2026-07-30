@@ -659,6 +659,15 @@ mod tests {
         // legal URLs, which is the mirror-image bug.
         let at_limit = "a".repeat(255);
         assert!(BlobKey::of(&res(&format!("/{at_limit}"))).is_some());
+
+        // `~` is legal and unescaped in a URL, and `object_store` encodes it
+        // anyway, so the raw length and the stored length differ by 3x. The
+        // limits are measured on what is stored, so both halves matter: 255
+        // raw `~` is 765 encoded bytes and must be refused, and 85 of them is
+        // 255 encoded bytes and must not be — a check that simply rejected
+        // every `~` would pass the first half alone.
+        assert!(BlobKey::of(&res(&format!("/{}", "~".repeat(255)))).is_none());
+        assert!(BlobKey::of(&res(&format!("/{}", "~".repeat(85)))).is_some());
     }
 
     #[tokio::test]
@@ -753,16 +762,19 @@ impl BlobKey {
     ///
     /// `Path::from` percent-encodes segments the backends treat as
     /// problematic, so a relative segment never reaches the backend as a
-    /// directory ascent.
+    /// directory ascent. That same encoding can expand a segment to up to
+    /// three times its raw length, so the limits are measured on the
+    /// encoded `Path`, not on the raw URL path.
     pub fn of(r: &ResourceUrl) -> Option<Self> {
         let rel = r.path().trim_start_matches('/');
-        if rel.len() > MAX_PATH_BYTES {
+        let path = Path::from(rel);
+        if path.as_ref().len() > MAX_PATH_BYTES {
             return None;
         }
-        if rel.split('/').any(|s| s.len() > MAX_SEGMENT_BYTES) {
+        if path.parts().any(|p| p.as_ref().len() > MAX_SEGMENT_BYTES) {
             return None;
         }
-        Some(Self(Path::from(rel)))
+        Some(Self(path))
     }
 
     pub fn as_str(&self) -> &str {
