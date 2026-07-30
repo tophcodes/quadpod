@@ -149,8 +149,14 @@ Only `aux` patches an auxiliary.
     The type system cannot express "guarded" here; this check can.
     What the grep pins is narrower than the sentence above it: that no other
     file names the symbol at all, doc comment included — it does not stop
-    `aux.rs` itself from passing an empty guard, and `aux::patch`'s tests are
-    what pin that the guard is there.
+    `aux.rs` itself from passing an empty guard. What pins that is one test,
+    `aux::tests::a_patch_whose_subject_vanishes_under_the_write_writes_nothing`:
+    it stages the auxiliary present with its subject gone, the only state that
+    reaches the guarded write, and asserts the auxiliary's graph is unchanged.
+    No other test reaches the guard — the ones that look as though they do are
+    refused by `aux::patch`'s opening `exists` check, because `delete_subject`
+    cascades the auxiliary away with its subject. Replacing the guard argument
+    with `""` makes that one test fail and no other.
     check: ! rg -q 'patch_guarded' src --glob '!src/aux.rs' --glob '!src/resource.rs'
 
 The `Accept` header is parsed in exactly one place.

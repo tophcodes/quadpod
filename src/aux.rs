@@ -447,6 +447,56 @@ mod tests {
         assert!(!exists(&store, &acl).await.unwrap());
     }
 
+    // The guard folded into the patch's own `WHERE`, and the only test that
+    // reaches it. The test above never does: `delete_subject` cascades the
+    // auxiliary away too, so `patch`'s opening `exists` refuses and returns
+    // before `patch_guarded` ever runs.
+    //
+    // The window the guard is for is the subject disappearing *between* that
+    // check and the write, which no in-memory interleaving can stage — so the
+    // state is staged directly instead: the auxiliary keeps its graph and its
+    // presence marker, only the subject's are dropped. The opening check then
+    // passes and the write itself is what has to refuse.
+    //
+    // Asserted on the auxiliary's graph, not on the returned value. The
+    // trailing `exists` finds the auxiliary still present and so reports
+    // success either way — whether the guard held the write back or the write
+    // landed is invisible from the return.
+    #[tokio::test]
+    async fn a_patch_whose_subject_vanishes_under_the_write_writes_nothing() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        put(&store, &acl, &grant(&acl)).await.unwrap();
+
+        let iri = foo.graph_iri();
+        let sys = sys_graph_iri(&foo);
+        store
+            .update(&format!("DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>"))
+            .await
+            .unwrap();
+        assert!(!exists(&store, &foo).await.unwrap(), "the subject must be gone");
+        assert!(
+            exists(&store, &acl).await.unwrap(),
+            "the auxiliary must still be present, or the opening check refuses \
+             and the guard is never reached"
+        );
+
+        let p = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#intruder> acl:mode acl:Control . } .\n",
+            &acl,
+        );
+        let _ = patch(&store, &acl, &p).await;
+
+        assert_eq!(
+            graph_contents(&store, acl.graph_iri()).await,
+            grant(&acl),
+            "a patch landed on an auxiliary whose subject does not exist"
+        );
+    }
+
     // The cascade is definitional, not a step someone remembers: deleting a
     // subject removes every auxiliary kind with it, so no orphan can outlive
     // it and be resurrected with stale grants when the path is recreated.
