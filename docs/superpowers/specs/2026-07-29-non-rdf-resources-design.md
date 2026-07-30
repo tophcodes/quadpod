@@ -546,6 +546,19 @@ since ~370 WAC rows are unmeasured today.
     policy, or accepting drift and saying so).
 - **`OPTIONS`, `WAC-Allow`, CORS, `PATCH`.** Ranks 2–6 of the findings. Several become
   measurable only once this lands.
+- **A compile-time-validated `sparql!` macro.** Every update this pod issues is built by
+  string concatenation, so a malformed one surfaces as a runtime `StoreError::Backend` and no
+  type catches it. A proc-macro on the `sqlx::query!` pattern — parsing the query at build
+  time with `spargebra` — would. That is a new guarantee rather than ergonomics, which is what
+  separates it from the cosmetic version (relief from `format!`'s `{{`/`}}` doubling), and the
+  cosmetic version is not worth having.
+
+  The condition that makes any such macro safe here: **the SPARQL text must stay a source
+  literal.** Half the rules in `docs/constraints.md` are `rg` over `src/` of the form "only
+  this file may build that string". A macro that assembles a query from fragments moves those
+  sites into the expansion, where the check cannot see them — putting the guard and the
+  guarded on opposite sides of macro expansion. A `sqlx`-style macro keeps the whole query
+  visible and does not have this problem; a builder-style one does.
 - **Orphan collection.** §3.2's derived key makes it unnecessary for correctness; a backend
   accumulating dead objects across many interrupted writes is an operational concern, not a
   correctness one.
