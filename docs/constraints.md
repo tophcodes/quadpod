@@ -140,6 +140,15 @@ No `#[allow]` attributes in `src/`.
     this rule is what removes them.
     check: ! rg -q '#\[allow' src
 
+Only `aux` patches an auxiliary.
+    → 2026-07-30-n3-patch-design.md §8; `docs/constraints.md`'s `DirectlyWritable`
+    rule, whose defect this is the patch-shaped version of. `patch_guarded` takes
+    any `GraphName` so an auxiliary can reach it, and an auxiliary reaching it
+    without the subject-existence guard plants a policy document on a path that
+    no longer exists — permanent, because nearest-ACL-wins then hands it out.
+    The type system cannot express "guarded" here; this check can.
+    check: ! rg -q 'patch_guarded' src --glob '!src/aux.rs' --glob '!src/resource.rs'
+
 The `Accept` header is parsed in exactly one place.
     → 2026-07-29-non-rdf-resources-design.md §6.1. `negotiate` and
     `accept_allows` ask different questions of the same header. The existing

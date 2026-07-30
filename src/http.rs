@@ -515,7 +515,12 @@ async fn patch_impl(
     // already resolved. `deny` rather than a second `authorize` — the answer
     // is in hand, and re-resolving would walk the ancestor chain again and
     // could read an ACL written in between.
-    if !patch.required_modes().satisfied_by(decision.user) {
+    //
+    // §8: not for an auxiliary. `authorize` substituted `Control` for it
+    // regardless of the mode asked for, so asking again with modes derived
+    // from the patch's parts would demand `Read` or `Write` on top of
+    // `Control` — refusing an ACL patch from an agent WAC says may make it.
+    if !matches!(target, Target::Aux(_)) && !patch.required_modes().satisfied_by(decision.user) {
         return with_aux_links(deny(&agent), &target);
     }
 
@@ -540,14 +545,23 @@ async fn patch_impl(
     if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
         return res;
     }
-    // An auxiliary is written through `aux::put`, whose subject-existence
-    // guard is what keeps a policy document off a path that names nothing;
-    // `patch_dataset` addresses a resource graph and carries no such guard, so
-    // there is nothing here that could serve one correctly.
+    // An auxiliary is written through `aux`, whose subject-existence guard is
+    // what keeps a policy document off a path that names nothing, and it
+    // answers the same `404` `put_impl` does when the subject is gone. It
+    // takes its own branch here because it has no existence check of its own
+    // to run below: the guard is inside its update.
     let r = match &target {
         Target::Resource(r) => r,
         Target::Container(c) => c.as_resource(),
-        Target::Aux(_) => return StatusCode::NOT_IMPLEMENTED.into_response(),
+        Target::Aux(a) => {
+            return match aux::patch(store, a, &patch).await {
+                Ok(result) => patch_response(result, &patch),
+                Err(AuxError::SubjectMissing) => {
+                    (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
+                }
+                Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
+            }
+        }
     };
     match exists(store, &target).await {
         Ok(true) => {}
@@ -557,17 +571,27 @@ async fn patch_impl(
         Err(e) => return (put_status(&e), e.to_string()).into_response(),
     }
     match patch_dataset(store, r, &patch).await {
-        Ok(PatchResult::Applied) => StatusCode::NO_CONTENT.into_response(),
-        Ok(PatchResult::NoMapping) => {
+        Ok(result) => patch_response(result, &patch),
+        Err(e) => (put_status(&e), e.to_string()).into_response(),
+    }
+}
+
+/// §6's outcomes as HTTP: applied is `204`, and each refusal is the `409` that
+/// names the part of the patch it was about. One function, because a target
+/// whose patch is refused for a reason the other target reports differently is
+/// a difference no client could explain.
+fn patch_response(result: PatchResult, patch: &crate::patch::Patch) -> Response {
+    match result {
+        PatchResult::Applied => StatusCode::NO_CONTENT.into_response(),
+        PatchResult::NoMapping => {
             patch_conflict("nothing matches the conditions", patch.conditions())
         }
-        Ok(PatchResult::SeveralMappings) => {
+        PatchResult::SeveralMappings => {
             patch_conflict("more than one mapping satisfies the conditions", patch.conditions())
         }
-        Ok(PatchResult::DeletionMissing) => {
+        PatchResult::DeletionMissing => {
             patch_conflict("a triple this patch deletes is not there", patch.deletions())
         }
-        Err(e) => (put_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -5068,5 +5092,94 @@ mod tests {
             .unwrap();
         assert_eq!(bob_app.oneshot(delete).await.unwrap().status(), StatusCode::FORBIDDEN,
             "deleting needs Write");
+    }
+
+    /// An ACL granting the owner every mode over `/profile`, plus whatever
+    /// `extra` the test needs. The owner's own grant is repeated because this
+    /// ACL replaces the root's for its subject.
+    fn profile_acl(extra: &str) -> String {
+        format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write>, <http://www.w3.org/ns/auth/acl#Control> . \
+             {extra}"
+        )
+    }
+
+    #[tokio::test]
+    async fn an_acl_url_accepts_a_patch() {
+        let f = fixture().await;
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(profile_acl(""))).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let res = patch_n3(&f, "/.aux/profile.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Append> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let ttl = f.get_turtle("/.aux/profile.acl").await;
+        assert!(ttl.contains("#Append"), "the patch's triple must be there: {ttl}");
+        assert!(ttl.contains("#Control"), "the grants it did not name must survive: {ttl}");
+    }
+
+    // §8: `authorize` substitutes Control for an Aux target regardless of the
+    // mode the handler asks for, so §9's tiering does not apply here. An agent
+    // holding Write on the subject but not Control must be refused — otherwise
+    // anyone who may edit a resource may rewrite the policy over it.
+    #[tokio::test]
+    async fn patching_an_acl_needs_control_not_write() {
+        let f = fixture().await;
+        let bob = "https://bob.example/card#me";
+        f.put_turtle("/profile", "<#me> <http://example.org/email> \"old\" .").await;
+
+        let acl = profile_acl(&format!(
+            "<#bob> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+               <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/profile> ; \
+               <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Read>, \
+                 <http://www.w3.org/ns/auth/acl#Write> ."
+        ));
+        let put_acl = f.owner_request("PUT", "/.aux/profile.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(acl)).unwrap();
+        assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+        let bob_app = f.app_also_trusting(bob);
+        let req = f.sign(
+            Request::builder().method("PATCH").uri("/.aux/profile.acl"),
+            bob, "PATCH", "/.aux/profile.acl",
+        )
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(patch_body(
+                "_:patch a solid:InsertDeletePatch ;\n\
+                   solid:inserts { <#bob> <http://www.w3.org/ns/auth/acl#mode> \
+                                   <http://www.w3.org/ns/auth/acl#Control> . } .\n")))
+            .unwrap();
+        assert_eq!(bob_app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let stored = f.stored("/.aux/profile.acl").await.expect("the ACL exists");
+        assert!(
+            !stored.iter().any(|t| t.to_string().contains("#bob") && t.to_string().ends_with("#Control>")),
+            "a refused patch must not have granted anything: {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patching_an_acl_whose_subject_is_absent_is_404() {
+        let f = fixture().await;
+
+        let res = patch_n3(&f, "/.aux/never-existed.acl",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts { <#owner> <http://www.w3.org/ns/auth/acl#mode> \
+                               <http://www.w3.org/ns/auth/acl#Control> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_string(res).await, AUX_SUBJECT_MISSING_MESSAGE,
+            "the same answer PUT already gives for the same reason");
+
+        assert!(f.stored("/.aux/never-existed.acl").await.is_none());
     }
 }

@@ -381,7 +381,27 @@ pub async fn patch_dataset(
     r: &ResourceUrl,
     patch: &crate::patch::Patch,
 ) -> Result<PatchResult, ResourceError> {
-    let iri = r.graph_iri();
+    patch_guarded(store, r, patch, "").await
+}
+
+/// [`patch_dataset`] with a precondition folded into the write.
+///
+/// `guard` is a SPARQL group-graph-pattern fragment appended to the update's
+/// `WHERE`. Empty means no precondition. It is a fragment rather than a
+/// structured type because its one non-empty caller builds it from a subject
+/// IRI it already holds, and a second shape would be a type for one use.
+///
+/// Takes any [`GraphName`] rather than a [`ResourceUrl`], which is what lets an
+/// auxiliary reach it — and is exactly why it is not `pub`: an auxiliary write
+/// that reaches this without a guard is the defect `docs/constraints.md`
+/// records against `put_rdf`. `aux::patch` is its only non-resource caller.
+pub(crate) async fn patch_guarded(
+    store: &dyn SparqlStore,
+    g: &impl GraphName,
+    patch: &crate::patch::Patch,
+    guard: &str,
+) -> Result<PatchResult, ResourceError> {
+    let iri = g.graph_iri();
 
     // Step 2–3: how many mappings satisfy the conditions? LIMIT 2 separates
     // zero from one from several and stops a broad pattern materialising a
@@ -424,7 +444,8 @@ pub async fn patch_dataset(
     };
     store
         .update(&format!(
-            "WITH <{iri}> DELETE {{ {deletions} }} INSERT {{ {insertions} }} WHERE {{ {deletions} }}"
+            "WITH <{iri}> DELETE {{ {deletions} }} INSERT {{ {insertions} }} \
+             WHERE {{ {deletions} {guard} }}"
         ))
         .await?;
     if !deletions.is_empty() && !before {
