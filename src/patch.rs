@@ -402,6 +402,28 @@ mod tests {
         assert_eq!(patch.insertions()[0].object, PatternTerm::Var(0));
     }
 
+    // `?x` and `_:x` are two names, which is what the `_:` key prefix in
+    // `Renumber` buys. Without it both bind index 0, and the conditions
+    // silently become `?x ex:knows ?x` — a pattern that matches a different
+    // set of triples than the one the client wrote, with no error anywhere.
+    #[test]
+    fn a_variable_and_a_blank_node_spelled_alike_are_different_names() {
+        let patch = p(&format!(
+            "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   {{ ?x ex:knows _:x . }} ;\n\
+               solid:inserts {{ ?x ex:seen \"yes\" . }} .\n"
+        ))
+        .unwrap();
+
+        assert_eq!(patch.variables(), 2, "?x and _:x must get an index each");
+        assert_eq!(patch.conditions()[0].subject, PatternTerm::Var(0));
+        assert_eq!(
+            patch.conditions()[0].object,
+            PatternTerm::Var(1),
+            "the blank node must not collapse onto the variable of the same spelling"
+        );
+    }
+
     // `<>` is the resource itself. The conformance fixture uses exactly this
     // shape, so a parser that does not resolve against the base IRI fails 63
     // scenarios while passing every test above.
