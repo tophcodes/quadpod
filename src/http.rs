@@ -6,7 +6,7 @@
 //! handler has to remember to evaluate.
 
 use std::sync::Arc;
-use axum::{Router, routing::get, extract::{State, Path}, body::Bytes, Extension,
+use axum::{Router, routing::get, extract::{State, Path, RawQuery}, body::Bytes, Extension,
     http::{StatusCode, HeaderMap, HeaderValue, header, header::{IF_MATCH, IF_NONE_MATCH}}, response::{IntoResponse, Response}};
 use oxigraph::model::{Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
@@ -1005,20 +1005,87 @@ async fn handle_options_root(State(st): State<AppState>, headers: HeaderMap) -> 
 
 async fn handle_get(
     State(st): State<AppState>, Path(path): Path<String>, Extension(agent): Extension<Agent>,
-    headers: HeaderMap,
+    RawQuery(query): RawQuery, headers: HeaderMap,
 ) -> Response {
     match classify(&st.space, &format!("/{path}")) {
+        Ok(target) if wants_validation(query.as_deref()) =>
+            validate_view(st, agent, target, headers).await,
         Ok(target) => get_impl(st, agent, target, headers).await,
         Err(status) => status.into_response(),
     }
 }
 
 async fn handle_get_root(
-    State(st): State<AppState>, Extension(agent): Extension<Agent>, headers: HeaderMap,
+    State(st): State<AppState>, Extension(agent): Extension<Agent>,
+    RawQuery(query): RawQuery, headers: HeaderMap,
 ) -> Response {
     match classify(&st.space, "/") {
+        Ok(target) if wants_validation(query.as_deref()) =>
+            validate_view(st, agent, target, headers).await,
         Ok(target) => get_impl(st, agent, target, headers).await,
         Err(status) => status.into_response(),
+    }
+}
+
+/// Whether this request asks for the validation report rather than the
+/// resource. The only query parameter this pod gives meaning to; every other
+/// parameter — including a near-miss like `?validat` — is ignored and the
+/// resource itself is served, exactly as before this parameter existed.
+fn wants_validation(query: Option<&str>) -> bool {
+    query.is_some_and(|q| q.split('&').any(|p| p == "validate"))
+}
+
+/// The current validation report for `target`, computed now and never
+/// stored: nothing here can go stale, because the report always describes
+/// the representation and the shape exactly as they are at the moment of the
+/// request.
+async fn validate_view(
+    st: AppState, agent: Agent, target: Target, headers: HeaderMap,
+) -> Response {
+    let store = st.store.as_ref();
+    if let Err(res) = authorize(store, &agent, &target, Mode::Read).await {
+        return with_aux_links(res, &target);
+    }
+    // The container whose `ldp:constrainedBy` binds a shape to `target` —
+    // its parent, the same lookup a write validates against (§3.2).
+    let container = match &target {
+        Target::Aux(_) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+        Target::Resource(r) => r.parent(),
+        Target::Container(c) => c.as_resource().parent(),
+    };
+    let Some(container) = container else {
+        return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target);
+    };
+    let shapes = match crate::shapes::load(store, &st.space, &container).await {
+        Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+        Ok(Some(s)) => s,
+        Err(e) => return shape_status(e),
+    };
+    // `target`'s own content — what the shape is validated against.
+    let dataset = match &target {
+        Target::Resource(r) => match get_dataset(store, r).await {
+            Ok(Some(d)) => d.deskolemize(),
+            Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+        },
+        Target::Container(c) => match get_rdf(store, c).await {
+            Ok(Some(t)) => ground_dataset(t).deskolemize(),
+            Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+        },
+        Target::Aux(_) => unreachable!("an auxiliary already returned above"),
+    };
+    let report = match crate::shapes::validate(&shapes, &dataset) {
+        Ok(r) => r,
+        Err(e) => return shape_status(e),
+    };
+    let accept = header_str(&headers, header::ACCEPT);
+    let Some(fmt) = negotiate(accept, Shape::Graph, None) else {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    };
+    match fmt.serialize(&report.into_dataset()) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, fmt.media_type())], bytes).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -1455,6 +1522,15 @@ mod tests {
         /// A request authenticated as the pod owner.
         fn owner_request(&self, method: &str, path: &str) -> axum::http::request::Builder {
             let b = Request::builder().method(method).uri(path);
+            self.sign(b, OWNER, method, path)
+        }
+
+        /// A request whose URI carries a query string. The DPoP proof is
+        /// signed for the bare path, because `htu` excludes the query.
+        fn owner_request_query(&self, method: &str, path: &str, query: &str)
+            -> axum::http::request::Builder
+        {
+            let b = Request::builder().method(method).uri(format!("{path}?{query}"));
             self.sign(b, OWNER, method, path)
         }
 
@@ -5003,5 +5079,84 @@ mod tests {
                 <http://schema.org/name> \"ok\" ."))
             .unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn validate_view_reports_the_current_state() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"ok\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/n1", "validate")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        assert!(body.contains("ValidationReport"));
+        assert!(!body.contains("resultSeverity"), "conforming, so no results: {body}");
+    }
+
+    /// The report is computed, not stored: editing the shape changes it with
+    /// no write to the resource.
+    #[tokio::test]
+    async fn validate_view_follows_a_later_shape_edit() {
+        let f = fixture().await;
+        f.put_turtle("/shapes/note", "@prefix sh: <http://www.w3.org/ns/shacl#> . \
+            <http://example.org/S> a sh:NodeShape .").await;
+        f.put_turtle("/notes/", "<> <http://www.w3.org/ns/ldp#constrainedBy> \
+            <https://pod.toph.so/shapes/note> .").await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> .").await;
+
+        f.put_turtle("/shapes/note", r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix schema: <http://schema.org/> .
+            <http://example.org/NoteShape> a sh:NodeShape ;
+              sh:targetClass schema:NoteDigitalDocument ;
+              sh:property [ sh:path schema:name ; sh:minCount 1 ; sh:severity sh:Warning ] .
+        "#).await;
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/n1", "validate")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_string(res).await.contains("Warning"),
+            "the report must reflect the shape as it is now");
+    }
+
+    #[tokio::test]
+    async fn validate_view_is_404_without_a_binding() {
+        let f = fixture().await;
+        f.put_turtle("/plain", "<> <http://schema.org/name> \"x\" .").await;
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/plain", "validate")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn validate_view_needs_read_on_the_subject() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"ok\" .").await;
+
+        let bob = "https://bob.example/card#me";
+        let bob_app = f.app_also_trusting(bob);
+        let req = f.sign(
+            Request::builder().method("GET").uri("/notes/n1?validate"),
+            bob, "GET", "/notes/n1",
+        ).body(Body::empty()).unwrap();
+        assert_eq!(bob_app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    /// An unknown query parameter is ignored, as everywhere else.
+    #[tokio::test]
+    async fn a_misspelled_parameter_returns_the_resource() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"ok\" .").await;
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/n1", "validat")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_string(res).await.contains("schema.org/name"));
     }
 }
