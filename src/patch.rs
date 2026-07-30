@@ -14,7 +14,7 @@
 //! client and leave as indices (§6.1), so the string a client wrote can never
 //! reach a query.
 
-use crate::wac::AccessModes;
+use crate::wac::{AccessModes, Mode};
 use oxigraph::model::{BlankNode, GraphName, Literal, NamedNode, Triple};
 use oxttl::n3::{N3Parser, N3Quad, N3Term};
 use std::collections::HashMap;
@@ -72,8 +72,10 @@ impl RequiredModes {
     /// Takes the held set rather than the store: §9's whole point is that the
     /// one `authorize` call already answered this, and a second ACL resolution
     /// would repeat the ancestor walk and could read a different ACL.
-    pub fn satisfied_by(self, _held: AccessModes) -> bool {
-        todo!()
+    pub fn satisfied_by(self, held: AccessModes) -> bool {
+        (!self.read || held.allows(Mode::Read))
+            && (!self.append || held.allows(Mode::Append))
+            && (!self.write || held.allows(Mode::Write))
     }
 }
 
@@ -177,7 +179,11 @@ impl Patch {
     }
 
     pub fn required_modes(&self) -> RequiredModes {
-        todo!()
+        RequiredModes {
+            read: !self.conditions.is_empty() || !self.deletions.is_empty(),
+            append: !self.insertions.is_empty(),
+            write: !self.deletions.is_empty(),
+        }
     }
 
     /// The insertions as ground triples, when there is nothing to match.
@@ -520,5 +526,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(patch.variables(), 1);
+    }
+
+    use crate::wac::AccessModes;
+
+    fn modes(read: bool, write: bool, append: bool) -> AccessModes {
+        AccessModes { read, write, append, control: false }
+    }
+
+    // §5.3.1's operation mapping. The insert-only row is the one the whole
+    // `protected-operation` fixture sends, and it must NOT require Write.
+    #[test]
+    fn required_modes_follow_the_operation_mapping() {
+        let insert_only = p(&format!(
+            "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+               solid:inserts {{ <> ex:x \"1\" . }} .\n"
+        ))
+        .unwrap()
+        .required_modes();
+        assert_eq!(insert_only, RequiredModes { read: false, append: true, write: false });
+
+        let with_conditions = p(&format!(
+            "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   {{ ?p ex:email \"old\" . }} ;\n\
+               solid:inserts {{ ?p ex:x \"1\" . }} .\n"
+        ))
+        .unwrap()
+        .required_modes();
+        assert_eq!(with_conditions, RequiredModes { read: true, append: true, write: false });
+
+        let with_deletions = p(&format!(
+            "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   {{ ?p ex:email \"old\" . }} ;\n\
+               solid:deletes {{ ?p ex:email \"old\" . }} .\n"
+        ))
+        .unwrap()
+        .required_modes();
+        assert_eq!(with_deletions, RequiredModes { read: true, append: false, write: true });
+    }
+
+    // The conformance table in §9: a caller holding Append alone may run an
+    // insert-only patch, and a caller holding Control alone may not run
+    // anything. Both directions, because a gate that always says yes and a
+    // gate that always says no each pass one half.
+    #[test]
+    fn satisfied_by_reads_the_held_modes_exactly() {
+        let insert_only = RequiredModes { read: false, append: true, write: false };
+        assert!(insert_only.satisfied_by(modes(false, false, true)), "Append alone suffices");
+        assert!(insert_only.satisfied_by(modes(false, true, false)), "Write subsumes Append");
+        assert!(!insert_only.satisfied_by(modes(true, false, false)), "Read alone does not");
+        assert!(
+            !insert_only.satisfied_by(AccessModes { read: false, write: false, append: false, control: true }),
+            "Control grants ACL access and nothing else"
+        );
+
+        let deleting = RequiredModes { read: true, append: false, write: true };
+        assert!(deleting.satisfied_by(modes(true, true, false)));
+        assert!(!deleting.satisfied_by(modes(false, true, false)), "Write without Read is not enough");
+        assert!(!deleting.satisfied_by(modes(true, false, true)), "Append is not Write");
     }
 }
