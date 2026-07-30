@@ -265,7 +265,12 @@ fn patterns(
 
 fn term(t: &N3Term, names: &mut Renumber, binding: Binding) -> Result<PatternTerm, PatchError> {
     match t {
-        N3Term::NamedNode(n) => Ok(PatternTerm::Named(n.clone())),
+        N3Term::NamedNode(n) => {
+            if crate::dataset::is_reserved_iri(n.as_str()) {
+                return Err(PatchError::Reserved);
+            }
+            Ok(PatternTerm::Named(n.clone()))
+        }
         N3Term::Literal(l) => Ok(PatternTerm::Literal(l.clone())),
         N3Term::Variable(v) => match binding {
             Binding::Bind => Ok(PatternTerm::Var(names.bind(v.as_str()))),
@@ -476,5 +481,44 @@ mod tests {
         .unwrap();
         assert_eq!(bnode_condition.conditions().len(), 1);
         assert_eq!(bnode_condition.conditions()[0].subject, PatternTerm::Var(0));
+    }
+
+    // §3.2.2: the skolem namespace is the server's, and a document naming it
+    // literally is a 400 exactly as it is for PUT.
+    #[test]
+    fn a_literal_reserved_iri_is_refused() {
+        for body in [
+            format!("{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                       solid:inserts {{ <urn:quadpod:res:1> ex:x \"1\" . }} .\n"),
+            format!("{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                       solid:inserts {{ <> ex:x <urn:quadpod:sys:evil> . }} .\n"),
+            format!("{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                       solid:where {{ <URN:QUADPOD:res:1> ex:x \"1\" . }} ;\n\
+                       solid:inserts {{ <> ex:y \"2\" . }} .\n"),
+        ] {
+            assert!(
+                matches!(Patch::parse(body.as_bytes(), BASE), Err(PatchError::Reserved)),
+                "must refuse: {body}"
+            );
+        }
+    }
+
+    // The other half, and the one a fail-closed implementation gets wrong: an
+    // ordinary patch must not be refused just because it CAN bind to a skolem
+    // IRI later. Nothing here names the namespace, so nothing here is refused.
+    #[test]
+    fn a_patch_that_may_bind_to_a_skolem_iri_parses_fine() {
+        let patch = Patch::parse(
+            format!(
+                "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                   solid:where   {{ ?p ex:email \"old\" . }} ;\n\
+                   solid:deletes {{ ?p ex:email \"old\" . }} ;\n\
+                   solid:inserts {{ ?p ex:email \"new\" . }} .\n"
+            )
+            .as_bytes(),
+            BASE,
+        )
+        .unwrap();
+        assert_eq!(patch.variables(), 1);
     }
 }
