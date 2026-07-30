@@ -481,6 +481,9 @@ async fn handle_put_root(
 ///    asks anything of it gets from the empty dataset the same `409` a target
 ///    without those triples gives, and no write. An existing target goes to
 ///    `resource::patch_dataset` → `204`, or the `409` its `PatchResult` names.
+/// 9. On a container, `container::ensure_container` afterwards, exactly as
+///    `put_impl` does — the server's type triples are its own, and a patch
+///    that deleted them would otherwise leave the container untyped.
 async fn patch_impl(
     st: AppState,
     agent: Agent,
@@ -581,7 +584,18 @@ async fn patch_impl(
         Err(e) => return (put_status(&e), e.to_string()).into_response(),
     }
     match patch_dataset(store, r, &patch).await {
-        Ok(result) => patch_response(result, &patch),
+        // A container's type triples are the server's, and a patch names its
+        // own triples — including them. Re-asserting them here is what
+        // `put_impl` does after writing a container body, and it is why a
+        // container patch is not refused outright: the client stays free to
+        // patch everything else the container's graph holds.
+        Ok(result) => match &target {
+            Target::Container(c) => match container::ensure_container(store, c).await {
+                Ok(()) => patch_response(result, &patch),
+                Err(e) => (put_status(&e), e.to_string()).into_response(),
+            },
+            _ => patch_response(result, &patch),
+        },
         Err(e) => (put_status(&e), e.to_string()).into_response(),
     }
 }
@@ -5052,6 +5066,26 @@ mod tests {
 
         let ttl = f.get_turtle("/c/").await;
         assert!(!ttl.contains("forged"), "containment is server-managed: {ttl}");
+    }
+
+    // A container's LDP type lives only in its body — the pod emits no
+    // `Link: rel="type"` — so a patch that deletes it would leave the container
+    // untyped to every client. `put_impl` re-asserts the server's type triples
+    // after writing a container body; a patch is answered the same way, which
+    // keeps the client free to patch the container's other triples.
+    #[tokio::test]
+    async fn a_patch_cannot_strip_a_containers_ldp_type() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let res = patch_n3(&f, "/c/",
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:deletes { <> a <http://www.w3.org/ns/ldp#BasicContainer> . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let ttl = f.get_turtle("/c/").await;
+        assert!(ttl.contains("BasicContainer"), "a container must stay typed: {ttl}");
+        assert!(ttl.contains("thing"), "its members must survive the re-assertion: {ttl}");
     }
 
     #[tokio::test]

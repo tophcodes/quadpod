@@ -366,10 +366,21 @@ prefers.
 `PATCH` is accepted wherever the target is an RDF document: `Target::Resource`,
 `Target::Container` and `Target::Aux`.
 
-- **Container.** Containment is server-managed. A patch whose insertions or deletions touch
-  `ldp:contains` is `409`, reusing `container::body_sets_containment` — the same refusal
-  `put_impl` already makes, at the same point in the sequence, so a rejected patch cannot
-  leave a containment triple behind.
+- **Container.** Two things in a container's graph are the server's, and each is held a
+  different way.
+
+  Containment is refused. A patch whose insertions or deletions touch `ldp:contains` is
+  `409`, reusing `container::body_sets_containment` — the same refusal `put_impl` already
+  makes, at the same point in the sequence, so a rejected patch cannot leave a containment
+  triple behind.
+
+  The LDP **type** triples are re-asserted. After a patch on a container applies,
+  `container::ensure_container` runs, exactly as it does after `put_impl` writes a container
+  body, so a patch that deleted `<> a ldp:BasicContainer` leaves the container typed anyway.
+  Re-assertion rather than refusal, because the type lives only in the container's body —
+  the pod emits no `Link: rel="type"` — while `ldp:contains` is a claim about other
+  resources: an untyped container is a defect for every client, whereas a client patching a
+  container's own triples is doing something legitimate that a refusal would block.
 - **Aux.** `authorize` already ignores the caller's mode for an `Aux` target and substitutes
   `required_mode_for_aux`, so patching an ACL requires `Control` without this design saying
   anything. §9's tiering applies to resources and containers only.
