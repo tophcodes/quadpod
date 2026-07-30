@@ -761,7 +761,12 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             Err(e) => (put_status(&e), e.to_string()).into_response(),
         },
     };
-    if findings.is_some() { report_link(&target, res) } else { res }
+    // The link describes the stored representation. `Target::Resource`'s
+    // `Err` arm above is a tail expression flowing into `res` exactly like
+    // its `Ok` arm, so findings alone cannot gate the link: a body that only
+    // warned, followed by a `put_dataset` failure, would otherwise still
+    // advertise a report for a write that stored nothing.
+    if findings.is_some() && res.status().is_success() { report_link(&target, res) } else { res }
 }
 
 async fn handle_post(
@@ -1367,14 +1372,25 @@ mod tests {
     /// Like [`fixture`], but with a caller-chosen `BlobStore` — for a fixture
     /// whose blob backend is failing (see `a_blob_backend_outage_answers_500_not_400`).
     async fn fixture_with_blobs(blobs: Arc<dyn crate::blob::BlobStore>, max_body_bytes: usize) -> Fixture {
+        fixture_with_store_and_blobs(
+            Arc::new(OxigraphStore::in_memory().unwrap()), blobs, max_body_bytes,
+        ).await
+    }
+
+    /// Like [`fixture_with_blobs`], but with a caller-chosen `SparqlStore` too
+    /// — for a fixture whose store backend starts failing partway through a
+    /// test (see `a_failed_write_after_a_warning_carries_no_report_link`).
+    async fn fixture_with_store_and_blobs(
+        store: Arc<dyn crate::store::SparqlStore>,
+        blobs: Arc<dyn crate::blob::BlobStore>,
+        max_body_bytes: usize,
+    ) -> Fixture {
         assert!(
             !FIXTURE_HELD.with(|f| f.replace(true)),
             "call fixture() once per test: it holds the process-wide DPoP replay lock \
              for the fixture's lifetime, so a second call would deadlock"
         );
         let _replay_guard = crate::auth::dpop::test_replay_lock().lock().await;
-        let store: Arc<dyn crate::store::SparqlStore> =
-            Arc::new(OxigraphStore::in_memory().unwrap());
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space.root()).await.unwrap();
         crate::wac::provision::provision_root_acl(store.as_ref(), &space, OWNER, false).await.unwrap();
@@ -4808,6 +4824,80 @@ mod tests {
         assert!(!link.contains("validate"), "nothing to describe: {link}");
     }
 
+    /// A `SparqlStore` that delegates to a real in-memory store until
+    /// [`FailingStore::arm`] is called, after which every `update` fails —
+    /// standing in for a backend outage that starts partway through a test.
+    /// Reads (`query_triples`, `ask`) always delegate, so shape lookup and
+    /// validation, which never write, are unaffected.
+    struct FailingStore {
+        inner: OxigraphStore,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingStore {
+        fn new(inner: OxigraphStore) -> Self {
+            Self { inner, armed: std::sync::atomic::AtomicBool::new(false) }
+        }
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::store::SparqlStore for FailingStore {
+        async fn update(&self, sparql: &str) -> Result<(), crate::store::StoreError> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::store::StoreError::Backend("store backend outage".into()));
+            }
+            self.inner.update(sparql).await
+        }
+        async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, crate::store::StoreError> {
+            self.inner.query_triples(sparql).await
+        }
+        async fn ask(&self, sparql: &str) -> Result<bool, crate::store::StoreError> {
+            self.inner.ask(sparql).await
+        }
+    }
+
+    /// Whole-branch review, Important 1: the `describedby` link falls out of
+    /// a tail shared by `Target::Resource`'s `Err` arm, so a warning-only
+    /// validation followed by a `put_dataset` failure must not still
+    /// advertise a report for a write that never persisted.
+    ///
+    /// The resource is pre-created so the failing write adds no containment
+    /// triple — `store.update` runs exactly once for it, inside `put_dataset`
+    /// itself, which is the call `FailingStore` is armed to fail.
+    #[tokio::test]
+    async fn a_failed_write_after_a_warning_carries_no_report_link() {
+        let store = Arc::new(FailingStore::new(OxigraphStore::in_memory().unwrap()));
+        let f = fixture_with_store_and_blobs(
+            store.clone(),
+            Arc::new(crate::blob::ObjectStoreBlobs::in_memory()),
+            64 * 1024 * 1024,
+        ).await;
+        f.put_turtle("/shapes/note", r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix schema: <http://schema.org/> .
+            <http://example.org/NoteShape> a sh:NodeShape ;
+              sh:targetClass schema:NoteDigitalDocument ;
+              sh:property [ sh:path schema:name ; sh:minCount 1 ; sh:severity sh:Warning ] .
+        "#).await;
+        f.put_turtle("/notes/", "<> <http://www.w3.org/ns/ldp#constrainedBy> \
+            <https://pod.toph.so/shapes/note> .").await;
+        f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
+            <http://schema.org/name> \"first\" .").await;
+
+        store.arm();
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(res.headers().get(header::LINK).is_none(),
+            "a write that did not persist has nothing for describedby to describe");
+    }
+
     /// An ACL is server-understood data; a user shape may not refuse one (§5.3).
     #[tokio::test]
     async fn an_acl_write_is_never_validated() {
@@ -4816,12 +4906,19 @@ mod tests {
         f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
             <http://schema.org/name> \"ok\" .").await;
 
+        // Alongside the authorization the ACL actually needs, a subject typed
+        // `schema:NoteDigitalDocument` with no `schema:name` — a triple
+        // `NoteShape` would refuse if this write were validated like any
+        // other resource. Without it, this test would still pass `201` even
+        // if the `Target::Aux(_)` exemption in `enforce_shape` were deleted.
         let res = f.app.clone().oneshot(f.owner_request("PUT", "/.aux/notes/n1.acl")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from(format!(
                 "@prefix acl: <http://www.w3.org/ns/auth/acl#> . \
+                 @prefix schema: <http://schema.org/> . \
                  <#a> a acl:Authorization ; acl:agent <{OWNER}> ; \
-                 acl:accessTo <https://pod.toph.so/notes/n1> ; acl:mode acl:Read, acl:Write, acl:Control ."
+                 acl:accessTo <https://pod.toph.so/notes/n1> ; acl:mode acl:Read, acl:Write, acl:Control . \
+                 <#note> a schema:NoteDigitalDocument ."
             ))).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
     }
