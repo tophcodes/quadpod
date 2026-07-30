@@ -211,6 +211,278 @@ property of the alphabet rather than of an escape at every call site."
 
 ---
 
+### Task 1b: make an unescaped SPARQL literal and an unsafe header value unrepresentable
+
+Inserted after Task 1, before Task 2. Two small newtypes closing two classes of "a raw string
+reaches a place where its alphabet matters", so later tasks cannot reopen them.
+
+**Files:**
+- Create: `src/sparql.rs`
+- Modify: `src/rdf.rs` (`MediaType`), `src/resource.rs:126-136` (`put_dataset`'s registry
+  string), `src/lib.rs`, `docs/constraints.md`
+- Test: `src/sparql.rs` `mod tests`, `src/rdf.rs` `mod tests`
+
+**Interfaces:**
+- Produces: `pub struct sparql::Literal` with `sparql::Literal::new(&oxigraph::model::Literal)
+  -> Literal` and `impl std::fmt::Display`; `MediaType::header_value(&self) ->
+  http::HeaderValue` (infallible).
+
+## Why, before what
+
+Scoping check run before writing this task: `rg -n '\\"\{' src` finds **exactly one**
+quote-delimited SPARQL literal interpolation in the whole codebase — `src/resource.rs:134`,
+the media type. Every other SPARQL interpolation is `<{iri}>`, where the IRI comes from the
+sealed `space::GraphName` trait (a constraint already guards that), from `shelf::ShelfKey`, or
+is validated through `NamedNode::new` at `src/resource.rs:144`. Literals inside user data go
+through oxrdf's `Display` in `serialize_for_insert`, which is the escaper this project already
+trusts.
+
+So this task builds a newtype for one call site today and one more that Task 4 adds — and
+**deliberately builds nothing else**. A general "SPARQL fragment" layer would be machinery for
+two callers, which this project's own rules forbid. What makes the rule stick is not the type
+but the constraint check in step 6: a type does not stop anyone writing
+`format!("\"{}\"", s)`, and the check does.
+
+The second half is smaller and has a named victim: the plan's Task 8 contains
+`mt.as_str().parse().expect("a MediaType is header-safe")` — a `.expect` asserting an
+invariant that a *different* type is supposed to guarantee. If `MediaType` carries the
+`HeaderValue` it validated, that `.expect` has nothing to assert and disappears.
+
+## Step 1: Write the failing tests
+
+Create `src/sparql.rs` with only this test module (implementation comes in step 3):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxigraph::model::Literal as OxLiteral;
+
+    // The escaping is oxrdf's, not ours — this pins that we render through it
+    // rather than beside it. A second escaper is how two write paths come to
+    // disagree about one backslash.
+    #[test]
+    fn a_literal_renders_quoted_and_escaped() {
+        assert_eq!(Literal::new(&OxLiteral::new_simple_literal("plain")).to_string(), "\"plain\"");
+
+        for raw in ["has \" quote", "has \\ backslash", "has \n newline", "has \r return"] {
+            let rendered = Literal::new(&OxLiteral::new_simple_literal(raw)).to_string();
+            let inner = &rendered[1..rendered.len() - 1];
+            assert!(
+                !inner.contains('"') || inner.contains("\\\""),
+                "{raw:?} rendered as {rendered:?}: a bare quote would close the literal"
+            );
+            assert!(!inner.contains('\n') && !inner.contains('\r'),
+                "{raw:?} rendered as {rendered:?}: a raw newline is not legal in STRING_LITERAL2");
+        }
+    }
+
+    // The whole point: what comes out can be concatenated into an update and
+    // still parse. Asserted by round-tripping through the store, not by
+    // eyeballing the string — a rendering that merely *looks* escaped but is
+    // not would pass a string comparison against a hand-written expectation.
+    #[tokio::test]
+    async fn a_rendered_literal_survives_an_actual_insert() {
+        use crate::store::{OxigraphStore, SparqlStore};
+        let store = OxigraphStore::in_memory().unwrap();
+        let nasty = "x\" . } DROP ALL ; INSERT DATA { GRAPH <urn:evil> { <urn:a> <urn:b> \"pwned";
+        let lit = Literal::new(&OxLiteral::new_simple_literal(nasty));
+
+        store.update(&format!(
+            "INSERT DATA {{ GRAPH <urn:test:g> {{ <urn:test:s> <urn:test:p> {lit} }} }}"
+        )).await.unwrap();
+
+        let back = store.query_triples(
+            "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <urn:test:g> { ?s ?p ?o } }"
+        ).await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert!(
+            matches!(&back[0].object, oxigraph::model::Term::Literal(l) if l.value() == nasty),
+            "the value must come back exactly, not truncated at the quote"
+        );
+        // The injected DROP ALL must not have run.
+        assert!(store.ask("ASK { GRAPH <urn:evil> { ?s ?p ?o } }").await.unwrap() == false,
+            "the payload was executed as syntax rather than stored as data");
+    }
+}
+```
+
+Add to `src/rdf.rs`'s `mod tests`:
+
+```rust
+    // A MediaType that parsed is a header value that exists. No call site
+    // should have to assert that with an `.expect`.
+    #[test]
+    fn a_media_type_carries_its_header_value() {
+        let mt = MediaType::parse("text/plain; charset=utf-8").unwrap();
+        assert_eq!(mt.header_value().to_str().unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(mt.header_value().to_str().unwrap(), mt.as_str());
+    }
+```
+
+## Step 2: Run tests to verify they fail
+
+Run: `nix develop -c cargo test --lib sparql 2>&1 | tail -20` and
+`nix develop -c cargo test --lib rdf::tests::a_media_type_carries 2>&1 | tail -20`
+
+Expected: FAIL — `sparql` is not a module; `header_value` does not exist.
+
+## Step 3: Write `src/sparql.rs`
+
+Add `pub mod sparql;` to `src/lib.rs` (alphabetical).
+
+```rust
+//! Values that may be interpolated into a SPARQL update or query.
+//!
+//! The store is written by string concatenation, so a value whose alphabet is
+//! not established is a value that can leave its delimiter and continue the
+//! update as syntax. This module holds the types that make that
+//! unrepresentable for the one shape where the delimiter is a quote.
+//!
+//! IRIs need no type here: every `<...>` interpolation in this crate is fed by
+//! `space::GraphName` (sealed), by `shelf::ShelfKey`, or by a name already
+//! validated through `NamedNode::new`.
+
+use std::fmt;
+
+/// A literal, rendered with its quotes and escapes.
+///
+/// The escaping is oxrdf's: `oxigraph::model::Literal`'s `Display` produces the
+/// N-Triples form, which is what `resource::serialize_for_insert` already
+/// relies on for every triple this pod writes. Rendering through it rather than
+/// beside it is the point — a second escaper is a second thing to get right,
+/// and the two would drift silently because both would still produce output.
+pub struct Literal(String);
+
+impl Literal {
+    pub fn new(value: &oxigraph::model::Literal) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+```
+
+Check what `oxigraph::model::Literal`'s `Display` actually emits for a simple literal — if it
+already includes the surrounding quotes, `Literal::new` stores it as-is and `Display` writes
+it through, as above. If it does **not**, add the quotes in `new` and say so in the doc
+comment. Let the tests tell you; do not assume.
+
+## Step 4: Give `MediaType` its header value
+
+In `src/rdf.rs`, change `MediaType` to carry both forms, built by the one constructor:
+
+```rust
+pub struct MediaType {
+    raw: String,
+    header: http::HeaderValue,
+}
+```
+
+`parse` builds the `HeaderValue` after the alphabet check and returns `None` if it fails.
+Given the alphabet (tchars plus `/`, `;`, `=`, space — all visible ASCII) it cannot fail, but
+handling it is what removes the `.expect`, and a `None` here is the correct answer anyway.
+
+```rust
+    /// The `Content-Type` header for this media type. Infallible: the value was
+    /// built and checked by the only constructor, so no call site has to assert
+    /// it.
+    pub fn header_value(&self) -> http::HeaderValue {
+        self.header.clone()
+    }
+```
+
+`as_str` returns `&self.raw`. `essence` is unchanged. `From<Format>` must go through `parse`
+rather than constructing the struct directly, so there is still exactly one path in — if
+`parse` on a `Format`'s own media type could ever fail, that is a bug worth panicking on, so
+`.expect("a Format's media type is a valid media type")` is correct there and is not the kind
+of `.expect` this task removes.
+
+Derive `PartialEq`/`Eq` on the field that carries identity (`raw`) — if `#[derive]` on the
+struct compares both fields that is fine too, since they are built together; state which you
+chose and why in one line.
+
+`http` is already in the dependency tree via axum. If it is not a direct dependency, add
+`http = "1"` to `Cargo.toml` — check `Cargo.lock` for the version axum resolved and match it.
+
+## Step 5: Use the type at the one call site
+
+`src/resource.rs:126-136`, `put_dataset`'s registry string, currently:
+
+```rust
+    let mut registry = format!(
+        "<{iri}> <{SYS_PRESENT}> true . <{iri}> <{SYS_MEDIA_TYPE}> \"{}\" . ",
+        media_type.media_type()
+    );
+```
+
+becomes a `crate::sparql::Literal` built from an `oxigraph::model::Literal` over
+`media_type.media_type()`, interpolated **without** hand-written quotes.
+
+## Step 6: Add the constraint that makes the rule stick
+
+A type does not stop anyone writing `format!("\"{}\"", s)`. The check does. Append to
+`docs/constraints.md` under "Storage addressing":
+
+```markdown
+A SPARQL literal is never interpolated by hand.
+    → 2026-07-29-non-rdf-resources-design.md §8.2; `sparql::Literal`. Every
+    `<...>` interpolation in this crate is fed by a sealed or validated type, so
+    the IRI half needs no rule; the quote half had exactly one site and no rule
+    at all. A hand-written `"{}"` is a value that can close its own literal and
+    continue the update as syntax, and it fails by executing rather than by
+    erroring.
+    check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs'
+```
+
+`src/http.rs` is excluded because its `\"{` matches are HTTP `Link` and `Warning` header
+construction, not SPARQL — verify that is still true when you add the rule
+(`rg -n '\\"\{' src/http.rs`) and, if any SPARQL has appeared there, narrow the check instead
+of widening the exclusion.
+
+**Demonstrate it goes red:** add `let _ = format!("\"{}\"", "x");` to `src/resource.rs`, run
+`arch-check --only 'SPARQL literal'`, confirm a non-zero exit, then remove it. `docs/constraints.md`
+requires this of every rule it carries.
+
+## Step 7: Full verification and commit
+
+```bash
+nix develop -c cargo test          # all green, output pristine
+nix develop -c cargo clippy --all-targets   # clean
+nix develop -c cargo build 2>&1 | grep -i warning   # nothing
+arch-check                         # 0 rot, now including the new rule
+rg -n '#\[allow' src               # no hits
+```
+
+```bash
+git add src/sparql.rs src/rdf.rs src/resource.rs src/lib.rs docs/constraints.md Cargo.toml Cargo.lock
+git commit -m "feat: make an unescaped SPARQL literal unrepresentable
+
+The store is written by string concatenation, so a literal whose alphabet is
+not established can close its own quote and continue the update as syntax —
+failing by executing rather than by erroring. sparql::Literal renders through
+oxrdf's escaper, the one this pod already trusts for every triple it writes,
+rather than beside it.
+
+MediaType now carries the HeaderValue its constructor validated, so no call
+site has to assert header-safety with an .expect on another type's invariant."
+```
+
+## Out of scope
+
+- Any general "SPARQL fragment" or IRI newtype. The IRI half is already covered by the sealed
+  `GraphName` trait and its existing constraint; building a type for it would be a second
+  guard over the same property.
+- Touching `serialize_for_insert`. It already renders through oxrdf's `Display`; wrapping that
+  in a newtype would add a layer without adding a guarantee.
+
+
+---
+
 ### Task 2: one `Accept` parser, two consumers
 
 `negotiate` parses the `Accept` list inline. A blob needs the same parse to answer a different question, and writing it twice is the drift `docs/constraints.md` names. The ranking moves out; both become consumers (§6.1).
