@@ -17,7 +17,7 @@
 - The data graph is the written body's **default graph**, alone (§3.4). No store read enters the write path.
 - This feature mints no vocabulary. `ldp:constrainedBy` and `sh:severity` are the whole interface.
 - A constraint document outside this pod's storage space is unsupported — shapes are never fetched over the network (§8).
-- After every task: `cargo test` passes and `arch-check` reports 0 violated, 0 broken.
+- After every task: `nix develop -c cargo test` passes and `arch-check` reports 0 violated, 0 broken.
 - Commit at the end of every task. Conventional commits.
 
 ---
@@ -148,7 +148,7 @@ mod tests {
 
 - [ ] **Step 4: Run the tests to verify they fail**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: FAIL — `cannot find function validate in this scope`, `cannot find type ShapeError`.
 
 - [ ] **Step 5: Write the implementation**
@@ -270,12 +270,12 @@ If `Dataset` exposes its quads under a different accessor than `quads()`, use th
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 7: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green, `13 checked, 0 violated, 0 broken`.
 
 - [ ] **Step 8: Commit**
@@ -399,7 +399,7 @@ If `triples_of` is private to `http.rs`, move it to `dataset.rs` as `pub(crate) 
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: FAIL — `cannot find function load in this scope`.
 
 - [ ] **Step 3: Write the implementation**
@@ -467,12 +467,12 @@ pub async fn load(
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib shapes::`
+Run: `nix develop -c cargo test --lib shapes::`
 Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 6: Commit**
@@ -533,23 +533,23 @@ Add to `mod tests` in `src/http.rs`:
             "the refused write must not have replaced the stored representation");
     }
 
-    /// §5.1: validation runs before the ancestor walk, so a refusal leaves no
-    /// container behind for a resource that was never created.
+    /// §5.1: validation runs before the traversal that adds the containment
+    /// triple, so a refusal leaves the container exactly as it was — no
+    /// `ldp:contains` pointing at a resource that was never created.
     #[tokio::test]
-    async fn a_refused_deep_write_creates_no_ancestor() {
+    async fn a_refused_write_adds_no_containment() {
         let f = fixture().await;
         bind_note_shape(&f).await;
 
-        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/2026/n1")
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/n1")
             .header(header::CONTENT_TYPE, "text/turtle")
             .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
             .unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-        let res = f.app.clone().oneshot(f.owner_request("GET", "/notes/2026/")
-            .body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND,
-            "the refused write materialized an ancestor container");
+        let listing = f.get_turtle("/notes/").await;
+        assert!(!listing.contains("/notes/n1"),
+            "the refused write left a containment triple behind: {listing}");
     }
 
     #[tokio::test]
@@ -648,11 +648,11 @@ Add to `mod tests` in `src/http.rs`:
     }
 ```
 
-`a_binding_does_not_reach_a_grandchild` contradicts `a_refused_deep_write_creates_no_ancestor` unless the container the binding is read from is the resource's **direct** parent. Both tests are wanted: the first pins §3.2, the second pins §5.1. Make them pass by reading the binding from `r.parent()`, and by having the second test bind the shape on `/notes/2026/` as well — adjust that test to `f.put_turtle("/notes/2026/", …)` before the refused write if the ancestor must exist for the binding to be found. Prefer the version that keeps §5.1's property observable.
+A note on what §5.1 is observable *through*, because it is easy to test the wrong thing. Because the binding does not inherit (§3.2), the container that refuses a write is always the target's direct parent — which must exist to hold the binding. A refused write therefore never had missing ancestors to materialize, and a test that asserts "no ancestor container was created" would pass no matter where validation sits. What `authorize_and_materialize` *does* add for a target that does not exist yet is the containment triple at the level above (`wac::guard`, the `is_member` branch). That triple is the observable: place validation after the walk and a `422` leaves `<container> ldp:contains <target>` pointing at a resource that was never created. `a_refused_write_adds_no_containment` is the test that fails when the ordering is wrong.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: FAIL — the violating write returns `201`, not `422`.
 
 - [ ] **Step 3: Write the enforcement helper**
@@ -743,12 +743,12 @@ fn report_link(target: &Target, mut res: Response) -> Response {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: PASS.
 
 - [ ] **Step 6: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 7: Commit**
@@ -805,7 +805,7 @@ git commit -m "feat: refuse a PUT that violates its container's shape"
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib http::tests::a_violating_post_is_refused_and_creates_nothing`
+Run: `nix develop -c cargo test --lib http::tests::a_violating_post_is_refused_and_creates_nothing`
 Expected: FAIL — status is `201`.
 
 - [ ] **Step 3: Call `enforce_shape` from `post_impl`**
@@ -823,12 +823,12 @@ Blob branches skip it exactly as in `put_impl`: the `Repr::Blob` arm never reach
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: PASS.
 
 - [ ] **Step 5: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 6: Commit**
@@ -949,7 +949,7 @@ Replace `BOB` with whatever the existing tests call the non-owner WebID — grep
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib http::tests::validate_view`
+Run: `nix develop -c cargo test --lib http::tests::validate_view`
 Expected: FAIL — the resource's own representation comes back instead of a report.
 
 - [ ] **Step 3: Route the query parameter**
@@ -1038,12 +1038,12 @@ async fn validate_view(
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test --lib http::tests`
+Run: `nix develop -c cargo test --lib http::tests`
 Expected: PASS.
 
 - [ ] **Step 6: Run the whole suite and the checks**
 
-Run: `cargo test && arch-check`
+Run: `nix develop -c cargo test && arch-check`
 Expected: all green.
 
 - [ ] **Step 7: Commit**

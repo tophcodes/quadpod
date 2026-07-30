@@ -151,9 +151,14 @@ principle for the checks above it:
 > Deliberately after the body checks: a 415 or an unparseable body must not leave containers
 > behind for a resource that was never created.
 
-A `422` is a body check in exactly that sense. Placed after the walk, every refused write
-would leave freshly materialized ancestor containers behind, and "just try the write and read
-the report" — the reason this design has no dry-run endpoint — would quietly mutate the pod.
+A `422` is a body check in exactly that sense. What a refused write would leave behind is not
+a container, though — because the binding does not inherit (§3.2), the container that refuses
+is the target's direct parent, which had to exist in order to hold the binding, so there were
+no missing ancestors to materialize. It is the **containment triple**: the same traversal adds
+`<container> ldp:contains <target>` for a target that does not exist yet. Placed after the
+walk, every refused write would leave that triple pointing at a resource that was never
+created — and "just try the write and read the report", the reason this design has no dry-run
+endpoint, would quietly mutate the pod.
 
 ### 5.2 There is no dry-run
 
@@ -271,8 +276,9 @@ Properties, each of which must be shown to fail before the code that makes it ho
 
 1. A body violating a bound shape is refused `422`, and a subsequent `GET` shows the *old*
    representation — the refusal stored nothing.
-2. A refused deep `PUT` (`/a/b/c` where `/a/` does not exist) leaves no container behind.
-   This is the §5.1 ordering, and it fails loudly if validation moves after the walk.
+2. A refused `PUT` leaves the container's `ldp:contains` unchanged. This is the §5.1 ordering,
+   and it fails loudly if validation moves after the walk. Asserting "no ancestor container
+   was created" instead would hold no matter where validation sits — see §5.1 for why.
 3. A shape whose constraints are all `sh:Warning` admits the write and the response carries
    the `describedby` link.
 4. A shape whose focus nodes exist only in *other* members of the container finds nothing —
