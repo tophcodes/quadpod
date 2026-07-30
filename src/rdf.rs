@@ -232,38 +232,6 @@ fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
     ranked
 }
 
-/// §6.1: whether `accept` admits a resource whose only representation is `mt`.
-///
-/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
-/// makes a more specific media range override a less specific one, so the
-/// decision is by specificity rather than by order or by the highest q.
-pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
-    let accept = accept.trim();
-    if accept.is_empty() {
-        return true;
-    }
-    let essence = mt.essence();
-    let ty = essence.split('/').next().unwrap_or("");
-    let type_wildcard = format!("{ty}/*");
-    let mut best: Option<(u8, f32)> = None;
-    for (q, _, range) in ranked_accept(accept) {
-        let range = range.to_ascii_lowercase();
-        let specificity = if range == essence {
-            3
-        } else if range == type_wildcard {
-            2
-        } else if range == "*/*" {
-            1
-        } else {
-            continue;
-        };
-        if best.is_none_or(|(s, _)| specificity > s) {
-            best = Some((specificity, q));
-        }
-    }
-    matches!(best, Some((_, q)) if q > 0.0)
-}
-
 /// §6.3: select the highest-ranked acceptable media range the server can
 /// serve, over the whole `Accept` list with q-values, rather than the first
 /// recognised entry — which would answer `text/turtle, application/ld+json`
@@ -603,38 +571,4 @@ mod tests {
         assert_eq!(mt.header_value().to_str().unwrap(), mt.as_str());
     }
 
-    // §6.1: a blob has one representation, so this is an acceptability test
-    // and not a resolver. The cases are the ones `negotiate` already handles,
-    // which is precisely why they must not be answered by a second parse.
-    #[test]
-    fn accept_allows_admits_or_refuses_a_single_representation() {
-        let png = MediaType::parse("image/png").unwrap();
-        let txt = MediaType::parse("text/plain; charset=utf-8").unwrap();
-
-        assert!(accept_allows("", &png), "no Accept header means no constraint");
-        assert!(accept_allows("*/*", &png));
-        assert!(accept_allows("image/*", &png));
-        assert!(accept_allows("image/png", &png));
-        assert!(accept_allows("Image/PNG", &png), "ranges are case-insensitive");
-        assert!(accept_allows("text/turtle, image/png;q=0.1", &png));
-        // Parameters do not take part in the match; the essence does.
-        assert!(accept_allows("text/plain", &txt));
-
-        assert!(!accept_allows("text/turtle", &png));
-        assert!(!accept_allows("text/*", &png));
-    }
-
-    // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
-    // overrides a less specific one — so the answer cannot be derived from
-    // order or from the highest q alone.
-    #[test]
-    fn accept_allows_honours_q_zero_and_specificity() {
-        let png = MediaType::parse("image/png").unwrap();
-
-        assert!(!accept_allows("image/png;q=0", &png));
-        assert!(!accept_allows("*/*, image/png;q=0", &png), "specific overrides */*");
-        assert!(!accept_allows("image/png;q=0, */*", &png), "and order does not matter");
-        assert!(accept_allows("*/*;q=0, image/png", &png), "and it works the other way");
-        assert!(!accept_allows("image/*;q=0, */*", &png), "type/* overrides */*");
-    }
 }
