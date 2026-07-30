@@ -30,17 +30,22 @@ const SH_VIOLATION: &str = "http://www.w3.org/ns/shacl#Violation";
 /// with exfiltration, entirely outside `auth::safe_fetch` (issue #6).
 /// Checked against the parsed graph, not the query text: a blocklist over a
 /// query language this pod does not implement is not a defence, and every
-/// SHACL-SPARQL embedding — a constraint, a target, a rule — names its query
-/// through one of these three predicates.
+/// SHACL-SPARQL embedding — a constraint, a target, a rule (`sh:SPARQLRule`),
+/// or an update executable (`sh:SPARQLUpdateExecutable`) — names its query
+/// through one of these five predicates.
 const SH_SPARQL: &str = "http://www.w3.org/ns/shacl#sparql";
 const SH_SELECT: &str = "http://www.w3.org/ns/shacl#select";
 const SH_ASK: &str = "http://www.w3.org/ns/shacl#ask";
+/// `sh:SPARQLRule`'s query predicate (SHACL-AF).
+const SH_CONSTRUCT: &str = "http://www.w3.org/ns/shacl#construct";
+/// `sh:SPARQLUpdateExecutable`'s query predicate (SHACL-AF).
+const SH_UPDATE: &str = "http://www.w3.org/ns/shacl#update";
 
 /// Whether `triples` mentions SHACL-SPARQL anywhere — as the predicate that
 /// carries a query, or as an object, so a shape naming one of these terms
 /// indirectly (for instance through a property path) is refused too.
 fn mentions_shacl_sparql(triples: &[oxigraph::model::Triple]) -> bool {
-    let sparql_terms = [SH_SPARQL, SH_SELECT, SH_ASK];
+    let sparql_terms = [SH_SPARQL, SH_SELECT, SH_ASK, SH_CONSTRUCT, SH_UPDATE];
     triples.iter().any(|t| {
         sparql_terms.contains(&t.predicate.as_str())
             || matches!(&t.object, oxigraph::model::Term::NamedNode(n)
@@ -187,13 +192,24 @@ pub async fn load(
     // all — because both mean the same thing to a caller: nothing
     // constrains writes here. The query above answers empty for both, so
     // there is nothing further to distinguish.
-    let bindings: Vec<String> = triples
-        .iter()
-        .filter_map(|t| match &t.object {
-            oxigraph::model::Term::NamedNode(n) => Some(n.as_str().to_owned()),
-            _ => None,
-        })
-        .collect();
+    //
+    // A binding whose object is not an IRI — `<> ldp:constrainedBy
+    // "not-an-iri"` — is refused rather than silently dropped: the author
+    // stated a binding this pod cannot use, which is the same not-knowing
+    // that makes a broken constraint document fail closed (§3.1). Dropping
+    // it would let a container that carries only such a binding read as
+    // unconstrained, and every write into it would proceed unvalidated.
+    let mut bindings: Vec<String> = Vec::with_capacity(triples.len());
+    for t in &triples {
+        match &t.object {
+            oxigraph::model::Term::NamedNode(n) => bindings.push(n.as_str().to_owned()),
+            other => {
+                return Err(ShapeError::Unsupported(format!(
+                    "{container_iri} binds ldp:constrainedBy to {other}, which is not an IRI"
+                )))
+            }
+        }
+    }
     // Exactly one binding, or none — never a pick among several. The
     // triples come back from a `CONSTRUCT` with no `ORDER BY`, so "the
     // first one" would be an artefact of the store's term ordering rather
@@ -250,8 +266,8 @@ pub async fn load(
             let triples = get_rdf(store, &r).await?.ok_or(ShapeError::Missing)?;
             if mentions_shacl_sparql(&triples) {
                 return Err(ShapeError::Unsupported(format!(
-                    "{iri} uses SHACL-SPARQL (sh:sparql/sh:select/sh:ask), which is not \
-                     supported: it would let a shapes document make this pod issue \
+                    "{iri} uses SHACL-SPARQL (sh:sparql/sh:select/sh:ask/sh:construct/sh:update), \
+                     which is not supported: it would let a shapes document make this pod issue \
                      arbitrary outbound HTTP requests"
                 )));
             }
@@ -451,6 +467,27 @@ mod tests {
         assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
     }
 
+    /// A binding whose object is a literal, not an IRI, must not be dropped
+    /// as if the container carried no binding at all — §3.1's fail-closed
+    /// argument for a broken constraint document applies equally here: the
+    /// author stated a binding this pod cannot use, so a write that should
+    /// have been checked must not silently proceed unvalidated.
+    #[tokio::test]
+    async fn a_binding_to_a_literal_is_unsupported() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> \"not-an-iri\" .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+        assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
+    }
+
     /// A shape is never fetched over the network (§8), so a foreign IRI is
     /// refused rather than resolved.
     #[tokio::test]
@@ -521,6 +558,45 @@ mod tests {
             .unwrap()
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/evil> .",
+                "https://pod.toph.so/notes/",
+            )
+            .unwrap();
+        put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
+
+        assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
+    }
+
+    /// SHACL-AF's `sh:SPARQLRule` names its query through `sh:construct`, not
+    /// through `sh:sparql`/`sh:select`/`sh:ask` — a shape carrying one is just
+    /// as capable of a `SERVICE`-based SSRF as `EVIL_SHAPE_SPARQL` above, and
+    /// stays safe today only because rudof 0.3.7 does not execute rules. That
+    /// is an upstream property, not one this code enforces, so the refusal
+    /// has to cover this predicate too rather than lean on it.
+    const EVIL_SHAPE_SPARQL_RULE: &str = r#"
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        <http://example.org/EvilRuleShape> a sh:NodeShape ;
+          sh:rule [
+            a sh:SPARQLRule ;
+            sh:construct "CONSTRUCT { $this ?p ?o } WHERE { SERVICE <http://169.254.169.254/> { ?s ?p ?o } }" ;
+          ] .
+    "#;
+
+    #[tokio::test]
+    async fn a_shacl_sparql_rule_shape_is_refused() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = space();
+        let shape = resource(&sp, "/shapes/evil-rule");
+        let shape_triples = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(EVIL_SHAPE_SPARQL_RULE.as_bytes(), "https://pod.toph.so/shapes/evil-rule")
+            .unwrap();
+        put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
+
+        let c = container(&sp, "/notes/");
+        let binding = Format::from_content_type("text/turtle")
+            .unwrap()
+            .parse(
+                b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/evil-rule> .",
                 "https://pod.toph.so/notes/",
             )
             .unwrap();

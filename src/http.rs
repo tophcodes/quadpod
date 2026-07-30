@@ -1090,7 +1090,8 @@ async fn validate_view(
             // write into `c` keeps succeeding, which is a contradiction no
             // client can act on (§10: `ldp:contains` is never in a data
             // graph here).
-            Ok(Some(t)) => ground_dataset(container::without_server_managed(t)).deskolemize(),
+            Ok(Some(t)) =>
+                ground_dataset(container::without_server_managed(t, c.graph_iri())).deskolemize(),
             Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
             Err(e) => return (put_status(&e), e.to_string()).into_response(),
         },
@@ -5270,6 +5271,47 @@ mod tests {
         let body = body_string(res).await;
         assert!(!body.contains("resultSeverity"),
             "the write into /notes/ was accepted, so ?validate must agree: {body}");
+    }
+
+    /// `without_server_managed` used to strip `rdf:type ldp:Container`/
+    /// `ldp:BasicContainer` on *any* subject, but `ensure_container` only ever
+    /// asserts that pair on the container's own IRI. A client-authored type
+    /// triple about a subject the server never touches — `<#x>` here — must
+    /// therefore survive into the `?validate` view exactly as the write path
+    /// validated it.
+    ///
+    /// The container's own subject is a different story: `ensure_container`
+    /// re-asserts the same pair there on every write, so a client-authored
+    /// `<> a ldp:Container` and the server's own assertion collapse into one
+    /// stored triple with no way to tell which wrote it — that focus node
+    /// keeps reporting `sh:Violation` for `sh:hasValue ldp:Container` even
+    /// though the write that produced it was accepted. Narrowing the strip to
+    /// the container's own subject cannot recover that; it only stops the
+    /// filter from reaching past it onto `<#x>`.
+    #[tokio::test]
+    async fn without_server_managed_only_strips_the_containers_own_type_pair() {
+        let f = fixture().await;
+        bind_shape(&f, "/", "/shapes/requires-container-type", r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ldp: <http://www.w3.org/ns/ldp#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            <http://example.org/S> a sh:NodeShape ;
+              sh:targetNode <https://pod.toph.so/notes/>, <https://pod.toph.so/notes/#x> ;
+              sh:property [ sh:path rdf:type ; sh:hasValue ldp:Container ; sh:severity sh:Violation ] .
+        "#).await;
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/notes/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<> a <http://www.w3.org/ns/ldp#Container> . \
+                <#x> a <http://www.w3.org/ns/ldp#Container> .")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = f.app.clone().oneshot(f.owner_request_query("GET", "/notes/", "validate")
+            .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        assert!(!body.contains("notes/#x>"),
+            "the write into /notes/ accepted <#x> a ldp:Container, so ?validate must not \
+             report a violation for it: {body}");
     }
 
     /// §5.3: a blob is never validated — `?validate` on one answers `404`,
