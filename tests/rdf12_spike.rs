@@ -31,19 +31,8 @@ async fn store_round_trips_a_triple_term() {
     );
 }
 
-/// The Turtle parser must produce a directional language-tagged string.
-/// This is the term kind today's refusal does not see (design §2): it is a
-/// `Term::Literal`, so the `Term::Triple` check never looks at it.
-#[test]
-fn turtle_parses_a_directional_literal() {
-    use sparql_pod::rdf::Format;
-    let fmt = Format::from_content_type("text/turtle").expect("turtle is supported");
-    let ttl = br#"<http://e/s> <http://e/p> "hello"@en--ltr ."#;
-    let ds = fmt
-        .parse(ttl, "http://e/")
-        .expect("a directional literal must parse — it is not a triple term");
-    let oxigraph::model::Term::Literal(l) = &ds.quads()[0].object else {
-        panic!("expected a literal, got {:?}", ds.quads()[0].object);
-    };
-    assert!(l.direction().is_some(), "the base direction must survive parsing");
-}
+// The second measurement — that `oxttl` produces a directional
+// language-tagged string — now lives in `rdf::tests`, as
+// `a_directional_literal_is_refused_too`. It measures the same fact from the
+// other side: the refusal reports `Rdf12Basic`, which is only reachable if
+// the parser built such a literal in the first place.

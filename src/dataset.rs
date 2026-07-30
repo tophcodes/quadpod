@@ -16,8 +16,8 @@
 //! the quads come from outside this type system and refusing them is a parse
 //! and not a self-check.
 
-use crate::rdf::Format;
-use oxigraph::model::{Literal, NamedNode, Quad, Triple};
+use crate::rdf::{Format, RdfVersion};
+use oxigraph::model::{Literal, NamedNode, Quad, Term, Triple};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -134,6 +134,33 @@ impl fmt::Display for GroundTerm {
 impl Dataset {
     pub fn new(quads: Vec<Quad>) -> Self {
         Self(quads)
+    }
+
+    /// The least [`RdfVersion`] under which every term here is expressible.
+    ///
+    /// **The only place a dataset's version is classified** — see
+    /// `docs/constraints.md`. Two classifiers is how the write-side check and
+    /// the read-side projection drift apart, and the drift is silent: both
+    /// answer, one answers wrong. The check that this replaced saw only
+    /// triple terms, and every directional literal walked past it.
+    ///
+    /// Only the object position can hold a triple term — subjects are
+    /// `NamedOrBlankNode` — and only a literal can carry a base direction, so
+    /// one pass over the objects decides it.
+    pub fn rdf_version(&self) -> RdfVersion {
+        let mut found = RdfVersion::Rdf11;
+        for q in &self.0 {
+            let here = match &q.object {
+                Term::Triple(_) => RdfVersion::Rdf12,
+                Term::Literal(l) if l.direction().is_some() => RdfVersion::Rdf12Basic,
+                _ => continue,
+            };
+            found = found.max(here);
+            if found == RdfVersion::Rdf12 {
+                break;
+            }
+        }
+        found
     }
 
     pub fn quads(&self) -> &[Quad] {
@@ -406,6 +433,73 @@ impl Skolemized {
 mod tests {
     use super::*;
     use oxigraph::model::{BlankNode, Literal, NamedNode, Quad};
+
+    /// A quad whose object is an RDF 1.2 triple term.
+    fn q_triple_term(s: &str, g: oxigraph::model::GraphName) -> Quad {
+        use oxigraph::model::{Term, Triple};
+        Quad::new(
+            NamedNode::new(s).unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(Triple::new(
+                NamedNode::new("http://e/a").unwrap(),
+                NamedNode::new("http://e/b").unwrap(),
+                NamedNode::new("http://e/c").unwrap(),
+            ))),
+            g,
+        )
+    }
+
+    /// A quad whose object is a directional language-tagged string — the
+    /// RDF 1.2 addition that is *not* a triple term (§2).
+    fn q_directional(s: &str, g: oxigraph::model::GraphName) -> Quad {
+        use oxigraph::model::BaseDirection;
+        Quad::new(
+            NamedNode::new(s).unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Literal::new_directional_language_tagged_literal("hi", "en", BaseDirection::Ltr)
+                .unwrap(),
+            g,
+        )
+    }
+
+    /// §3.1: the least label under which every term is expressible.
+    #[test]
+    fn a_plain_dataset_classifies_as_1_1() {
+        let ds = Dataset::new(vec![q("http://e/s", "v", oxigraph::model::GraphName::DefaultGraph)]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf11);
+    }
+
+    /// The term kind today's refusal cannot see. §2.
+    #[test]
+    fn a_directional_literal_classifies_as_1_2_basic() {
+        let ds = Dataset::new(vec![q_directional(
+            "http://e/s",
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf12Basic);
+    }
+
+    #[test]
+    fn a_triple_term_classifies_as_1_2() {
+        let ds = Dataset::new(vec![q_triple_term(
+            "http://e/s",
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf12);
+    }
+
+    /// The classification is over the whole dataset, so one 1.2 term among
+    /// many 1.1 quads still classifies 1.2.
+    #[test]
+    fn the_classification_is_the_maximum_over_all_terms() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![
+            q("http://e/s", "v", GraphName::DefaultGraph),
+            q_directional("http://e/s2", GraphName::DefaultGraph),
+            q_triple_term("http://e/s3", GraphName::DefaultGraph),
+        ]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf12);
+    }
 
     fn q(s: &str, o: &str, g: oxigraph::model::GraphName) -> Quad {
         Quad::new(

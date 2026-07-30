@@ -168,11 +168,14 @@ The query string is read in exactly one place.
 
 ## RDF version
 
-The wire contract is RDF 1.1, and it is checked rather than assumed.
-    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-shape-validation-design.md §2.1.
-    `rudof_lib` turns on oxigraph's `rdf-12` feature transitively, and Cargo
-    unifies features crate-wide, so the linked parser accepts RDF 1.2 whether
-    this pod wants it or not. Before that dependency the non-goal held because
-    nothing had enabled the feature — an accident, not a property. `oxttl` has
-    no version switch, so the refusal is ours and lives in the one parser.
-    check: rg -q 'Term::Triple\(_\)' src/rdf.rs
+The wire contract is RDF 1.1, and it is checked over both of RDF 1.2's additions.
+    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-rdf12-design.md §2, §3.1.
+    `rudof_lib` turned oxigraph's `rdf-12` feature on transitively; `Cargo.toml`
+    now declares it outright, so the capability is this crate's own fact rather
+    than a dependency's private choice. RDF 1.2 adds triple terms **and**
+    directional language-tagged strings, and the original check saw only the
+    first — a directional literal is a `Term::Literal` and walked past a match
+    on `Term::Triple` into storage. The rule was therefore half true from the
+    day it was written. `Dataset::rdf_version` is the one classifier both
+    halves now go through, which is what makes the refusal total.
+    check: rg -q 'fn rdf_version\(&self\) -> RdfVersion' src/dataset.rs

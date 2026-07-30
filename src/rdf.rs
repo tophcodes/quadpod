@@ -10,8 +10,8 @@ pub enum RdfError {
     Serialize(String),
     #[error("unsupported media type")]
     UnsupportedType,
-    #[error("RDF 1.2 triple terms are not accepted; this pod stores RDF 1.1")]
-    Rdf12TripleTerm,
+    #[error("this representation is RDF {}, and {} was declared", found.label(), allowed.label())]
+    UnsupportedRdfVersion { found: RdfVersion, allowed: RdfVersion },
 }
 
 fn media_type(ct: &str) -> &str {
@@ -241,7 +241,6 @@ impl Format {
     }
 
     pub fn parse(&self, bytes: &[u8], base_iri: &str) -> Result<Dataset, RdfError> {
-        use oxigraph::model::Term;
         let parser = RdfParser::from_format(self.0)
             .with_base_iri(base_iri)
             .map_err(|e| RdfError::Parse(e.to_string()))?;
@@ -249,15 +248,20 @@ impl Format {
         for quad in parser.for_slice(bytes) {
             out.push(quad.map_err(|e| RdfError::Parse(e.to_string()))?);
         }
-        // The linked oxigraph has `rdf-12` on — a transitive dependency turns
-        // it on and Cargo unifies features crate-wide — so the parser accepts
-        // RDF 1.2. The wire contract is RDF 1.1 (root spec §3), and this is
-        // what keeps that true rather than incidental. Only the object can be
-        // a triple term; subjects are `NamedOrBlankNode`.
-        if out.iter().any(|q| matches!(q.object, Term::Triple(_))) {
-            return Err(RdfError::Rdf12TripleTerm);
+        let parsed = Dataset::new(out);
+        // `Cargo.toml` declares oxigraph's `rdf-12`, so the parser accepts
+        // both of RDF 1.2's additions — triple terms *and* directional
+        // language-tagged strings. The refusal asks
+        // [`Dataset::rdf_version`], the one classifier, rather than matching
+        // on a term kind here: matching caught triple terms and let every
+        // directional literal through, which made the wire contract half
+        // true. Until the declared version is threaded through this
+        // signature, the contract is RDF 1.1 for everyone.
+        let found = parsed.rdf_version();
+        if found > RdfVersion::Rdf11 {
+            return Err(RdfError::UnsupportedRdfVersion { found, allowed: RdfVersion::Rdf11 });
         }
-        Ok(Dataset::new(out))
+        Ok(parsed)
     }
 
     /// §6.4: a deterministic function of its input. Quads are sorted before
@@ -475,15 +479,30 @@ mod tests {
         );
     }
 
-    /// RDF 1.2 triple terms are refused, so the wire contract stays RDF 1.1
-    /// even though the linked parser understands more (root spec §3).
+    /// The wire contract is RDF 1.1 until the declared version is threaded
+    /// through, and it is now checked over *both* of RDF 1.2's additions
+    /// rather than one.
     #[test]
     fn a_triple_term_is_refused() {
         let fmt = Format::from_content_type("text/turtle").unwrap();
         let ttl = b"<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .";
         assert!(matches!(
             fmt.parse(ttl, "http://e/"),
-            Err(RdfError::Rdf12TripleTerm)
+            Err(RdfError::UnsupportedRdfVersion { found: RdfVersion::Rdf12, .. })
+        ));
+    }
+
+    /// The gap this closes: a directional language-tagged string is a
+    /// `Term::Literal`, so the old `Term::Triple` match never saw it and it
+    /// walked into storage. Refusing it *as a version* also measures that the
+    /// parser produces one — `Rdf12Basic` is only reachable if it did.
+    #[test]
+    fn a_directional_literal_is_refused_too() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = br#"<http://e/s> <http://e/p> "hello"@en--ltr ."#;
+        assert!(matches!(
+            fmt.parse(ttl, "http://e/"),
+            Err(RdfError::UnsupportedRdfVersion { found: RdfVersion::Rdf12Basic, .. })
         ));
     }
 
