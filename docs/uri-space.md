@@ -188,6 +188,21 @@ while storing triples, or claim a media type the bytes are not in, and every rea
 downstream would believe it. A read-only projection of these facts may be offered later; it
 will never be writable.
 
+## One query parameter, and what it means
+
+`GET <resource>?validate` returns the resource's current SHACL validation
+report — a `sh:ValidationReport`, in the negotiated RDF format — instead of the
+resource's own representation. It is a computed view: nothing is stored, so it
+always describes the representation and the shape as they are now.
+
+It is a query parameter rather than an auxiliary because a report is a
+server-asserted fact about your data, not your data, and this document reserves
+`/.aux/` for the latter. The parameter changes no path, so the URL's WAC target
+is the resource itself and `acl:Read` on the resource is what it takes.
+
+`?validate` on a resource whose container binds no shape is a `404`. Every other
+query parameter is ignored, as it always has been.
+
 ## The vocabulary this pod mints
 
 One link relation is minted here, because none is registered for what it says:

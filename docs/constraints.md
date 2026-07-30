@@ -137,6 +137,28 @@ The `Accept` header is parsed in exactly one place.
     violation rather than against a naming convention.
     check: [ "$(rg -o 'strip_prefix\("q="\)' src | wc -l)" = 1 ]
 
+## Shape validation
+
+Only `shapes` reads the constraint binding.
+    → 2026-07-30-shape-validation-design.md §3.1, §3.2. The binding is what
+    decides whether a write is checked at all; a second reader is a second
+    answer to "is this container constrained", and the one that says no wins
+    silently. The lookup is also the seam a shape-tree binding would replace
+    (§8), which only stays a second lookup while there is exactly one. Quoted
+    without angle brackets: that is the bare IRI a comparison against
+    `NamedNode::as_str()` needs, and it is what a second reader would have to
+    write. The angle-bracket form is excluded because it also matches the
+    Turtle bodies test fixtures `PUT` to set a binding up — data, not a
+    second reader.
+    check: ! rg -q '"http://www.w3.org/ns/ldp#constrainedBy"' src --glob '!src/shapes.rs'
+
+The query string is read in exactly one place.
+    → §6. `?validate` is the only query parameter this pod gives meaning to,
+    and the reason it is safe is that it changes no path and therefore no WAC
+    target. A second reader elsewhere is behaviour hidden behind a parameter
+    that no URL shows and no ACL names.
+    check: [ "$(rg -o 'RawQuery' src | wc -l)" = 5 ]
+
 ## RDF version
 
 The wire contract is RDF 1.1, and it is checked rather than assumed.
