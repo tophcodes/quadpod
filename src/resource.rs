@@ -15,7 +15,7 @@ use crate::{
     sparql,
     store::{SparqlStore, StoreError},
 };
-use oxigraph::model::Triple;
+use oxigraph::{model::Triple, sparql::QuerySolution};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -279,6 +279,82 @@ pub enum PatchResult {
     DeletionMissing,
 }
 
+/// One pattern term as SPARQL text.
+///
+/// Named nodes render through `NamedNode`'s own `Display`, literals through
+/// [`crate::sparql::Literal`] — the escaper this pod already trusts — and a
+/// variable renders from its index, never from anything the client wrote.
+fn render_term(t: &crate::patch::PatternTerm) -> String {
+    match t {
+        crate::patch::PatternTerm::Named(n) => n.to_string(),
+        crate::patch::PatternTerm::Literal(l) => sparql::Literal::new(l).to_string(),
+        crate::patch::PatternTerm::Var(i) => format!("?v{i}"),
+    }
+}
+
+fn render_patterns(patterns: &[crate::patch::Pattern]) -> String {
+    patterns
+        .iter()
+        .map(|p| {
+            format!(
+                "{} {} {} . ",
+                render_term(&p.subject),
+                render_term(&p.predicate),
+                render_term(&p.object)
+            )
+        })
+        .collect()
+}
+
+/// A term a solution bound, as SPARQL text.
+///
+/// A binding may be a skolem IRI, and it is substituted verbatim: that is what
+/// §6.3 requires, and the reserved-namespace refusal already ran on the parsed
+/// document, where it can still tell a name the client wrote from one the store
+/// minted. Anything but an IRI or a literal is a term the store cannot hold.
+fn render_bound(t: &oxigraph::model::Term) -> Result<String, ResourceError> {
+    match t {
+        oxigraph::model::Term::NamedNode(n) => Ok(n.to_string()),
+        oxigraph::model::Term::Literal(l) => Ok(sparql::Literal::new(l).to_string()),
+        _ => Err(StoreError::Backend("a solution bound a term the store cannot hold".into()).into()),
+    }
+}
+
+/// The patterns as ground SPARQL text, with every variable replaced by what the
+/// single mapping bound it to.
+///
+/// `bindings` holds the one solution the conditions produced, or nothing when
+/// there were no conditions — in which case §5.1 leaves no variable for these
+/// patterns to carry.
+fn substitute(
+    patterns: &[crate::patch::Pattern],
+    bindings: &[QuerySolution],
+) -> Result<String, ResourceError> {
+    let mut out = String::new();
+    for p in patterns {
+        for t in [&p.subject, &p.predicate, &p.object] {
+            out.push_str(&ground_term(t, bindings)?);
+            out.push(' ');
+        }
+        out.push_str(". ");
+    }
+    Ok(out)
+}
+
+fn ground_term(
+    t: &crate::patch::PatternTerm,
+    bindings: &[QuerySolution],
+) -> Result<String, ResourceError> {
+    let crate::patch::PatternTerm::Var(i) = t else {
+        return Ok(render_term(t));
+    };
+    let bound = bindings
+        .first()
+        .and_then(|s| s.get(format!("v{i}").as_str()))
+        .ok_or_else(|| StoreError::Backend("a projected variable came back unbound".into()))?;
+    render_bound(bound)
+}
+
 /// Apply a patch to an **existing** RDF resource (`2026-07-30-n3-patch-design.md` §6).
 ///
 /// Two store operations and no more. First the conditions as a `SELECT` with
@@ -299,11 +375,55 @@ pub enum PatchResult {
 /// at the HTTP edge because that is where authorization and materialization are
 /// already sequenced.
 pub async fn patch_dataset(
-    _store: &dyn SparqlStore,
-    _r: &ResourceUrl,
-    _patch: &crate::patch::Patch,
+    store: &dyn SparqlStore,
+    r: &ResourceUrl,
+    patch: &crate::patch::Patch,
 ) -> Result<PatchResult, ResourceError> {
-    todo!()
+    let iri = r.graph_iri();
+
+    // Step 2–3: how many mappings satisfy the conditions? LIMIT 2 separates
+    // zero from one from several and stops a broad pattern materialising a
+    // large result purely to be counted.
+    let bindings = if patch.conditions().is_empty() {
+        Vec::new()
+    } else {
+        let vars: String = (0..patch.variables()).map(|i| format!("?v{i} ")).collect();
+        let solutions = store
+            .query_solutions(&format!(
+                "SELECT {vars} WHERE {{ GRAPH <{iri}> {{ {} }} }} LIMIT 2",
+                render_patterns(patch.conditions())
+            ))
+            .await?;
+        match solutions.len() {
+            0 => return Ok(PatchResult::NoMapping),
+            1 => solutions,
+            _ => return Ok(PatchResult::SeveralMappings),
+        }
+    };
+
+    let deletions = substitute(patch.deletions(), &bindings)?;
+    let insertions = substitute(patch.insertions(), &bindings)?;
+    if deletions.is_empty() && insertions.is_empty() {
+        return Ok(PatchResult::Applied);
+    }
+
+    // Step 5: the presence check IS the WHERE clause. Every term is ground, so
+    // the pattern matches at most once; an absent deletion triple makes it
+    // fail to match and nothing happens. The `ASK` only reports which of the
+    // two outcomes happened — under concurrency the two can disagree, and then
+    // the `WHERE` wins and the status is merely stale, never the store.
+    let before = store
+        .ask(&format!("ASK {{ GRAPH <{iri}> {{ {deletions} }} }}"))
+        .await?;
+    store
+        .update(&format!(
+            "WITH <{iri}> DELETE {{ {deletions} }} INSERT {{ {insertions} }} WHERE {{ {deletions} }}"
+        ))
+        .await?;
+    if !deletions.is_empty() && !before {
+        return Ok(PatchResult::DeletionMissing);
+    }
+    Ok(PatchResult::Applied)
 }
 
 /// §6 step 2: the resource graph, the registry, and one `CONSTRUCT` per shelf.
@@ -1071,5 +1191,135 @@ mod tests {
             "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", shelf.graph_iri()
         )).await.unwrap();
         assert!(leftover.is_empty());
+    }
+
+    fn patch_of(body: &str, r: &ResourceUrl) -> crate::patch::Patch {
+        let full = format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix ex: <http://example.org/> .\n{body}"
+        );
+        crate::patch::Patch::parse(full.as_bytes(), r.graph_iri()).unwrap()
+    }
+
+    async fn seed(store: &OxigraphStore, r: &ResourceUrl, turtle: &str) {
+        put_rdf(store, r, &triples(turtle, r.graph_iri())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_patch_replaces_exactly_what_it_names() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/profile");
+        seed(&store, &r, "<#me> <http://example.org/email> \"old\" ; \
+                          <http://example.org/name> \"Toph\" .").await;
+
+        let patch = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:deletes { ?p ex:email \"old\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n",
+            &r,
+        );
+
+        assert_eq!(patch_dataset(&store, &r, &patch).await.unwrap(), PatchResult::Applied);
+
+        let back = get_rdf(&store, &r).await.unwrap().expect("exists");
+        let rendered: Vec<String> = back.iter().map(|t| t.to_string()).collect();
+        assert!(rendered.iter().any(|t| t.contains("\"new\"")), "{rendered:?}");
+        assert!(!rendered.iter().any(|t| t.contains("\"old\"")), "{rendered:?}");
+        assert!(rendered.iter().any(|t| t.contains("\"Toph\"")),
+            "an untouched triple must survive: {rendered:?}");
+    }
+
+    // §6 step 3. The mutant is the obvious implementation as one
+    // `DELETE … INSERT … WHERE`, which applies to EVERY match — it would pass
+    // a one-match test perfectly and silently rewrite both rows here.
+    #[tokio::test]
+    async fn a_mapping_must_be_unique() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/profile");
+        seed(&store, &r, "<#me> <http://example.org/email> \"old\" . \
+                          <#alter> <http://example.org/email> \"old\" .").await;
+
+        let patch = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:deletes { ?p ex:email \"old\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n",
+            &r,
+        );
+
+        assert_eq!(
+            patch_dataset(&store, &r, &patch).await.unwrap(),
+            PatchResult::SeveralMappings
+        );
+        let back = get_rdf(&store, &r).await.unwrap().expect("exists");
+        assert_eq!(back.len(), 2, "nothing may have been written: {back:?}");
+        assert!(!back.iter().any(|t| t.to_string().contains("\"new\"")));
+    }
+
+    #[tokio::test]
+    async fn no_match_is_no_mapping() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/profile");
+        seed(&store, &r, "<#me> <http://example.org/email> \"other\" .").await;
+
+        let patch = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n",
+            &r,
+        );
+
+        assert_eq!(patch_dataset(&store, &r, &patch).await.unwrap(), PatchResult::NoMapping);
+    }
+
+    // §6 step 5: the deletion-presence check IS the write's WHERE clause. The
+    // assertion that matters is the second one — a version that checks
+    // presence in a separate query and then writes with DELETE DATA/INSERT
+    // DATA reports the same status here and still performs the insertion.
+    #[tokio::test]
+    async fn a_deletion_that_is_not_there_writes_nothing() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/profile");
+        seed(&store, &r, "<#me> <http://example.org/email> \"old\" .").await;
+
+        let patch = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?p ex:email \"old\" . } ;\n\
+               solid:deletes { ?p ex:email \"old\" . ?p ex:phone \"123\" . } ;\n\
+               solid:inserts { ?p ex:email \"new\" . } .\n",
+            &r,
+        );
+
+        assert_eq!(
+            patch_dataset(&store, &r, &patch).await.unwrap(),
+            PatchResult::DeletionMissing
+        );
+        let back = get_rdf(&store, &r).await.unwrap().expect("exists");
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(back[0].to_string().contains("\"old\""),
+            "the email must still be the old one: {back:?}");
+    }
+
+    // §6.1, and the reason variables are indices: a name chosen to close the
+    // query and open another must be structurally incapable of doing so.
+    #[tokio::test]
+    async fn a_hostile_variable_name_cannot_leave_its_query() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/profile");
+        seed(&store, &r, "<#me> <http://example.org/email> \"old\" .").await;
+
+        let patch = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { ?x_INSERT_DATA_GRAPH_urn_evil ex:email \"old\" . } ;\n\
+               solid:inserts { ?x_INSERT_DATA_GRAPH_urn_evil ex:email \"new\" . } .\n",
+            &r,
+        );
+
+        assert_eq!(patch_dataset(&store, &r, &patch).await.unwrap(), PatchResult::Applied);
+        assert!(
+            !store.ask("ASK { GRAPH <urn:evil> { ?s ?p ?o } }").await.unwrap(),
+            "no graph the patch named may exist"
+        );
     }
 }
