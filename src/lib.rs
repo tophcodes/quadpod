@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod aux;
+pub mod blob;
 pub mod config;
 pub mod container;
 pub mod dataset;
