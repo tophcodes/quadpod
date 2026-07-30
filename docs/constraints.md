@@ -234,6 +234,23 @@ The RDF version of a dataset is classified in exactly one place.
     same signature for a different question (what a backend can hold).
     check: [ "$(rg -o 'Term::Triple\(_\) => RdfVersion' src | wc -l)" = 1 ]
 
+The N3 Patch path refuses both RDF 1.2 additions, not just triple terms.
+    → 2026-07-30-rdf12-design.md §2; 2026-07-30-n3-patch-design.md. A patch is
+    the only way into the store that does not go through `Format::parse`: a
+    `text/n3` body builds no `Dataset`, so it cannot ask
+    `Dataset::rdf_version`, and the refusal has to be repeated in `patch.rs`.
+    It is repeated over **both** additions, because a directional
+    language-tagged string is an ordinary `Literal` and a match on
+    `N3Term::Triple` alone lets it through — the exact half-check
+    `Format::parse` shipped with.
+    **Honest about its own strength:** measured, `oxttl`'s N3 parser already
+    refuses both at the syntax level (`<<(` is "not a valid RDF value",
+    `@en--ltr` is "rdf:dirLangString is not supported in N3"), so today these
+    two arms are depth behind the parser rather than the live refusal. The
+    rule pins them so they are still there if `oxttl` gains RDF 1.2 syntax for
+    N3 — which is the only way they become load-bearing.
+    check: rg -q 'N3Term::Triple\(_\) => Err' src/patch.rs && rg -q 'l.direction\(\).is_some\(\) => Err' src/patch.rs
+
 The `version` media-type parameter is read in exactly one place.
     → 2026-07-30-rdf12-design.md §4, §10. `Content-Type` on write and
     `Accept` on read ask the same question of the same syntax; a second

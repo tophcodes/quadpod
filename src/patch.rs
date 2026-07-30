@@ -33,11 +33,21 @@ pub enum PatchError {
     /// IRI (§6.3).
     #[error("the urn:quadpod: namespace is reserved")]
     Reserved,
-    /// Carries an RDF 1.2 triple term — `400`, the same answer
-    /// [`crate::rdf::Format::parse`] gives the same construct in any other
-    /// body. This pod's wire contract is RDF 1.1.
-    #[error("RDF 1.2 triple terms are not accepted; this pod stores RDF 1.1")]
-    Rdf12TripleTerm,
+    /// Carries an RDF 1.2 term — `400`, the same answer
+    /// [`crate::rdf::Format::parse`] gives a body richer than it declared.
+    ///
+    /// **Both** of RDF 1.2's additions, not only triple terms: a directional
+    /// language-tagged string is an ordinary `Literal`, so a refusal that
+    /// matches on `N3Term::Triple` alone lets it through into the store —
+    /// which is exactly the half-check `Format::parse` used to have
+    /// (`2026-07-30-rdf12-design.md` §2).
+    ///
+    /// A patch is always read at RDF 1.1. `text/n3` is not one of the five
+    /// negotiated formats and carries no `version` parameter here, and §4
+    /// reads silence as 1.1. Writing RDF 1.2 through a patch is therefore not
+    /// possible today; it needs a version parameter on `text/n3` first.
+    #[error("RDF 1.2 terms are not accepted in a patch; a patch is read as RDF 1.1")]
+    Rdf12Term,
 }
 
 /// One position of a triple pattern: ground, or the `n`th variable.
@@ -335,6 +345,9 @@ fn term(t: &N3Term, names: &mut Renumber, binding: Binding) -> Result<PatternTer
             }
             Ok(PatternTerm::Named(n.clone()))
         }
+        // A directional language-tagged string is RDF 1.2, and it is a
+        // `Literal` — so it reaches this arm and not the one below.
+        N3Term::Literal(l) if l.direction().is_some() => Err(PatchError::Rdf12Term),
         N3Term::Literal(l) => Ok(PatternTerm::Literal(l.clone())),
         N3Term::Variable(v) => match binding {
             Binding::Bind => Ok(PatternTerm::Var(names.bind(v.as_str()))),
@@ -349,13 +362,13 @@ fn term(t: &N3Term, names: &mut Renumber, binding: Binding) -> Result<PatternTer
             Binding::Bind => Ok(PatternTerm::Var(names.bind(&format!("_:{}", b.as_str())))),
             Binding::Lookup => Err(PatchError::Shape("a blank node in insertions or deletions")),
         },
-        // The N3 parser understands RDF 1.2 because a dependency turns
-        // oxigraph's `rdf-12` on and Cargo unifies features crate-wide. The
-        // wire contract is RDF 1.1 (root spec §3), so the refusal is here —
-        // this is `text/n3`'s half of the rule `Format::parse` applies to
-        // every other body, and a patch is the only way into the store that
-        // does not go through that parser.
-        N3Term::Triple(_) => Err(PatchError::Rdf12TripleTerm),
+        // A patch is the only way into the store that does not go through
+        // `Format::parse`, so the version refusal has to be repeated here.
+        // It builds no `Dataset`, which is why it cannot ask
+        // `Dataset::rdf_version` — the one classifier — and why this arm and
+        // the literal arm above are pinned by their own rule in
+        // `docs/constraints.md`.
+        N3Term::Triple(_) => Err(PatchError::Rdf12Term),
     }
 }
 
@@ -379,6 +392,47 @@ mod tests {
 
     const PREFIXES: &str = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
                             @prefix ex: <http://example.org/> .\n";
+
+    /// A patch is read as RDF 1.1, and neither of RDF 1.2's additions gets
+    /// in. **Measured: `oxttl`'s N3 parser refuses both before this module
+    /// sees a term at all** — `<<( … )>>` is "not a valid RDF value" and
+    /// `@en--ltr` is "rdf:dirLangString is not supported in N3". So these
+    /// assert the refusal, not its route: the `N3Term::Triple` and
+    /// directional-`Literal` arms in `term` are depth behind the parser, and
+    /// would become the live refusal only if `oxttl` gained RDF 1.2 syntax
+    /// for N3.
+    ///
+    /// That is also why `docs/constraints.md` pins those arms with prose
+    /// saying they are currently unreachable: a check whose property holds
+    /// trivially is worse than no check when nobody records which one it is.
+    #[test]
+    fn a_triple_term_in_a_patch_does_not_get_in() {
+        let body = format!(
+            "{PREFIXES}<> a solid:InsertDeletePatch ; solid:inserts {{ \
+             ex:s ex:p <<( ex:a ex:b ex:c )>> . }} ."
+        );
+        assert!(p(&body).is_err(), "{:?}", p(&body));
+    }
+
+    #[test]
+    fn a_directional_literal_in_a_patch_does_not_get_in() {
+        let body = format!(
+            "{PREFIXES}<> a solid:InsertDeletePatch ; solid:inserts {{ \
+             ex:s ex:p \"hi\"@en--ltr . }} ."
+        );
+        assert!(p(&body).is_err(), "{:?}", p(&body));
+    }
+
+    /// The refusal is about the version, not about literals: an ordinary
+    /// language-tagged string still goes through.
+    #[test]
+    fn a_plain_language_tagged_literal_still_parses() {
+        let body = format!(
+            "{PREFIXES}<> a solid:InsertDeletePatch ; solid:inserts {{ \
+             ex:s ex:p \"hi\"@en . }} ."
+        );
+        assert!(p(&body).is_ok(), "{:?}", p(&body));
+    }
 
     // §4: a formula's contents arrive as quads whose graph_name is a blank
     // node that is ALSO the object of the solid:where / solid:deletes /
