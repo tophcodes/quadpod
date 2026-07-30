@@ -189,19 +189,29 @@ Checked against the parsed quads, before anything touches the store:
 - At most one `solid:where`, at most one `solid:deletes`, at most one `solid:inserts` on it.
 - The object of each is a blank node that occurs as a `graph_name` in the same document.
 - Neither `?insertions` nor `?deletions` contains a blank node.
-- Every variable in `?insertions` or `?deletions` also occurs in `?conditions`.
-- No quad in the document belongs to anything but the patch resource and its three formulae.
+- Every variable in `?insertions` or `?deletions` also occurs in `?conditions`. Note the
+  narrowness: only *variables* are constrained this way. `solid:deletes { ?p ex:phone "123" }`
+  is legal with `?p` bound by the conditions and the phone triple mentioned nowhere else — a
+  deletion whose triple is absent is answered by §6's `409`, not by a shape violation.
+- **Exactly one** subject carries the type. Two patch resources in one document make "the
+  patch" ambiguous, and picking the first would be arbitrary. `422` — *unprocessable* is
+  literally what it is.
 
-The last one is this design's addition rather than the specification's. A document carrying
-a second patch resource, or triples on an unrelated subject, is a document whose author
-believed something the server is not going to do. Refusing beats silently applying the part
-the server recognised — the same fail-closed reading `kind_of` already takes for a binary
-resource with no stored media type.
+**Triples outside the patch resource and its formulae are ignored, not refused.** The
+specification constrains the patch resource; it does not forbid a document from carrying
+anything else, and reading a lenient silence as a `422` would refuse documents no rule condemns.
+The ambiguity worth failing on is two patches, not one patch beside some noise.
 
-**A patch with neither `solid:inserts` nor `solid:deletes` is `422`.** The specification
-permits both to be absent, which describes a request that changes nothing. No client means it,
-and admitting it would put a request that needs no access mode at all into a path whose first
-gate is an access-mode check (§9).
+**A patch with neither `solid:inserts` nor `solid:deletes` succeeds as a no-op**, answering
+`204`. The specification says both are "at most one", so absent is legal, and its processing
+steps then yield no change — a literal reading requires success, and this design follows it
+rather than inventing a refusal.
+
+One consequence, recorded because it is a real if harmless deviation: such a patch still passes
+§9's `Append` pre-gate, so a caller holding only `Read` receives `403` for a request that would
+have changed nothing. The mode mapping says a patch with no insertions and no deletions needs
+no write mode at all. Keeping the gate is the trade for authorizing before parsing, and no
+client sends this request.
 
 ## 6. Applying the patch
 
@@ -218,11 +228,28 @@ client wrote is concatenated into a query as text.
    materialising a large result set purely to be counted.
 4. **Bind.** Substitute the mapping into the deletion and insertion formulae. Both are now
    **concrete triples** — no variables, and no blank nodes by §5.1.
-5. **Check deletions.** If the deletion set is non-empty and the stored graph does not contain
-   all of it → `409`, nothing written.
-6. **Write.** One update: `DELETE DATA { GRAPH <iri> { … } } ; INSERT DATA { GRAPH <iri> { … } }`.
-   Delete before insert, per the specification's step order — a patch that deletes and
-   re-inserts the same triple must end with it present.
+5. **Check and write, as one operation.** The deletion-presence check is the `WHERE` clause of
+   the write, not a query before it:
+
+   ```sparql
+   WITH <resource-iri>
+   DELETE { <ground deletions> }
+   INSERT { <ground insertions> }
+   WHERE  { <ground deletions> }
+   ```
+
+   Every term is ground, so the pattern matches at most once. If any deletion triple is absent
+   the pattern does not match and **nothing happens** — which is the `409`, decided by the store
+   rather than by a prior read. An empty deletion set leaves `WHERE { }`, which matches once, so
+   the insert-only shape needs no separate branch. Delete before insert, per the specification's
+   step order: a patch that deletes and re-inserts the same triple must end with it present.
+
+   Measured against `OxigraphStore`: a `WHERE` naming two triples of which one is absent leaves
+   the graph byte-identical; the satisfiable version applies; `WHERE { }` inserts. Folding the
+   check in this way is what closes the window a separate check leaves open — between reading
+   "all present" and writing, a concurrent writer can remove one, and `DELETE DATA` would then
+   silently skip it while `INSERT DATA` still ran, reporting success for a patch whose `409`
+   condition held at the moment of writing.
 
 ### 6.1 Variables are renumbered, not passed through
 
@@ -300,14 +327,21 @@ read-modify-write window §6 exists to avoid, now spanning the whole resource. I
 in exchange: a variable binds to a skolem IRI exactly as readily as to a derived blank-node
 label, so which triples match is identical either way.
 
-### 6.4 Error bodies name conditions, not values
+### 6.4 Error bodies speak the client's vocabulary
 
-A `409` says which rule failed. It does **not** echo the bound triples, because a binding may
-be a skolem IRI and that IRI is the server's, not the client's to see.
+A `409` may name the triples it is about — that is most of its diagnostic value — but it names
+them **de-skolemized**, through the same conversion the read path uses. A skolem IRI never
+appears in a response body.
 
-`put_impl` already draws this line: its named-graph `409` lists the IRI-named graphs and merely
-*counts* the blank-named ones, so the refusal accounts for everything it refuses without naming
-what the client never wrote. The patch path inherits the rule rather than rediscovering it.
+This is possible rather than merely desirable because `Dataset::deskolemize` derives the blank
+node's label from the skolem IRI instead of generating one, precisely so that *"two reads of one
+stored state must produce identical bytes"*. The label a message would print is therefore the
+label the client already saw in its `GET` — `_:b9f3c…`, not `<urn:quadpod:bnode:9f3c…>`. The safe
+answer and the useful answer are the same answer, so there is no reason to withhold values.
+
+What stays forbidden is the raw form. A message assembled from the *bound* triples without that
+conversion prints an IRI the server minted and the client has never seen, which is the leak
+`put_impl` avoids when it counts blank-named graphs rather than naming them.
 
 ## 7. Creation
 
@@ -455,7 +489,7 @@ auxiliary-URL advertisement, blob teardown and `name_is_taken` all apply unalter
 `DirectlyWritable` implementor appears; a patch is a way of writing a resource, not a new kind
 of thing in the URL space.
 
-**The targeted update of §6 step 6 is not a third teardown site.** `2026-07-29-non-rdf-resources-design.md`
+**The targeted update of §6 step 5 is not a third teardown site.** `2026-07-29-non-rdf-resources-design.md`
 §7 fixes the rule that wherever a resource's RDF state is torn down, its blob is torn down in
 the same operation, and names the two sites that do it: `put_dataset`'s replace and
 `delete_subject`'s cascade. `e31c88b` removed a second, weaker delete cascade once already, so
@@ -487,7 +521,11 @@ Each test names the mutant it kills.
    obvious implementation as a single `DELETE … INSERT … WHERE`, which applies to *all*
    matches and would pass a one-match test perfectly.
 4. **Missing deletion.** A deletion set the graph does not fully contain → `409`, **and the
-   insertions did not happen**. Asserted on the stored graph, not on the status code alone.
+   insertions did not happen**. Asserted on the stored graph, not on the status code alone —
+   this is the half a status-code assertion cannot see, and it is the half §6 step 5's folded
+   `WHERE` exists to guarantee. Kills a version that checks presence in a query and then writes
+   with `DELETE DATA`/`INSERT DATA`, which inserts even when a deletion has gone missing in
+   between.
 5. **Creation.** An insert-only patch on an absent resource creates it, materializes ancestors
    and links containment, answering `201`. A patch with a `where` on an absent resource →
    `409`.
@@ -499,8 +537,10 @@ Each test names the mutant it kills.
    was materialized by the attempt.
 9. **Conditional.** A stale `If-Match` → `412`, and the graph is unchanged.
 10. **Shape.** Blank node in insertions; a variable in deletions absent from conditions; two
-    `solid:inserts`; a stray triple on an unrelated subject; neither inserts nor deletes. Each
-    `422`.
+    `solid:inserts`; **two patch resources** — each `422`. And the two lenient cases, which are
+    the ones a fail-closed implementation gets wrong: a stray triple on an unrelated subject is
+    **ignored** and the patch applies; a patch with neither insertions nor deletions succeeds
+    with `204`.
 11. **Anonymous.** `PATCH` without credentials → `401` with `WWW-Authenticate`, not `405`.
     This is `authentication/header:40` as a unit test.
 12. **Skolem binding.** `PUT` a document containing a blank node, then patch that blank node's
@@ -509,9 +549,11 @@ Each test names the mutant it kills.
     substitution rather than before, which refuses this patch with a message naming an IRI the
     client never saw. That mutant passes every other test here, because every other test's
     fixture has no blank nodes.
-13. **No skolem IRI in an error body.** Provoke each `409` against a resource holding blank
-    nodes and assert the response body contains no `urn:quadpod:`. Kills the natural
-    implementation of §6 step 5's message, which would echo the bound triples to be helpful.
+13. **Error bodies are de-skolemized.** Provoke a `409` against a resource holding blank nodes.
+    Assert the body contains no `urn:quadpod:` **and** that it does contain the blank-node label
+    the client's own `GET` returned. Both halves are needed: the first alone is satisfied by a
+    message that names nothing at all, which §6.4 explicitly does not want, and the second alone
+    is satisfied by printing the raw IRI.
 
 ## 14. Conformance: what this moves
 
@@ -547,11 +589,20 @@ reconciliation across runs only works while nothing is switched off.
 
 ## 15. Follow-ups this design deliberately does not do
 
+- **Patching a named graph inside a resource.** §6.2, and the sharpest consequence of this
+  design: a resource `PUT` as JSON-LD with named graphs has parts no patch can reach, and the
+  only repair is a whole-resource `PUT`. This is a property of N3 Patch rather than of this pod
+  — no Solid server patches inside a named graph over `text/n3`, CSS included, because the
+  format has no syntax for naming one.
+
+  Two recorded routes out, neither taken here. `2026-07-28-jsonld-datasets-design.md` §11's
+  per-subgraph URLs are the mechanism, and that design fixes them as *"a **view**, not a
+  resource — read-only"*, so making them writable is a reopening rather than an extension. And
+  `application/sparql-update` **can** name a graph, which is the one capability it offers beyond
+  `containment:38` — the strongest argument on its side, and it belongs in that decision rather
+  than in this one.
 - **`application/sparql-update`.** §3. Its own design, with its own containment argument, if
-  a caller ever needs it.
-- **Patching a named graph inside a resource.** §6.2. Needs a format that can name one; the
-  per-subgraph-URL follow-up in `2026-07-28-jsonld-datasets-design.md` §11 is where that
-  conversation already lives.
+  a caller ever needs it. See the graph-targeting point immediately above for what it would buy.
 - **`Accept-Put`.** Adjacent to §10.2 and named in the JSON-LD design's follow-ups; it belongs
   with the discoverability work, not here.
 - **Server-side conflict merging.** Rejected by omission: the specification's answer to a
