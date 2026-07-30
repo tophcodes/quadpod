@@ -357,9 +357,11 @@ fn ground_term(
 
 /// Apply a patch to an **existing** RDF resource (`2026-07-30-n3-patch-design.md` §6).
 ///
-/// Two store operations and no more. First the conditions as a `SELECT` with
-/// `LIMIT 2`, scoped to this resource's graph — enough to tell zero from one
-/// from several without materialising a large result. Then one
+/// At most a `SELECT`, an `ASK`, and one `UPDATE` — never more. The `SELECT`
+/// runs only when the patch has conditions, with `LIMIT 2` and scoped to this
+/// resource's graph, enough to tell zero from one from several without
+/// materialising a large result. The `ASK` runs only when there is a
+/// deletion set to ask about. Then one
 /// `WITH … DELETE … INSERT … WHERE …` whose `WHERE` is the ground deletion set,
 /// so the presence check §6 requires *is* the write: an absent deletion triple
 /// makes the pattern fail to match and nothing happens, which is
@@ -387,10 +389,9 @@ pub async fn patch_dataset(
     let bindings = if patch.conditions().is_empty() {
         Vec::new()
     } else {
-        let vars: String = (0..patch.variables()).map(|i| format!("?v{i} ")).collect();
         let solutions = store
             .query_solutions(&format!(
-                "SELECT {vars} WHERE {{ GRAPH <{iri}> {{ {} }} }} LIMIT 2",
+                "SELECT * WHERE {{ GRAPH <{iri}> {{ {} }} }} LIMIT 2",
                 render_patterns(patch.conditions())
             ))
             .await?;
@@ -411,10 +412,16 @@ pub async fn patch_dataset(
     // the pattern matches at most once; an absent deletion triple makes it
     // fail to match and nothing happens. The `ASK` only reports which of the
     // two outcomes happened — under concurrency the two can disagree, and then
-    // the `WHERE` wins and the status is merely stale, never the store.
-    let before = store
-        .ask(&format!("ASK {{ GRAPH <{iri}> {{ {deletions} }} }}"))
-        .await?;
+    // the `WHERE` wins and the status is merely stale, never the store. Run it
+    // only when there is a deletion set to ask about; an empty one is never
+    // consulted below.
+    let before = if deletions.is_empty() {
+        false
+    } else {
+        store
+            .ask(&format!("ASK {{ GRAPH <{iri}> {{ {deletions} }} }}"))
+            .await?
+    };
     store
         .update(&format!(
             "WITH <{iri}> DELETE {{ {deletions} }} INSERT {{ {insertions} }} WHERE {{ {deletions} }}"
@@ -1320,6 +1327,35 @@ mod tests {
         assert!(
             !store.ask("ASK { GRAPH <urn:evil> { ?s ?p ?o } }").await.unwrap(),
             "no graph the patch named may exist"
+        );
+        let back = get_rdf(&store, &r).await.unwrap().expect("exists");
+        assert!(
+            back.iter().any(|t| t.to_string().contains("\"new\"")),
+            "the insertion must have landed: {back:?}"
+        );
+    }
+
+    // §5.1: a condition need not bind any variable — "does this exact triple
+    // exist" is the ordinary conditional-insert idiom. The counting query must
+    // still be valid SPARQL when there is nothing to project.
+    #[tokio::test]
+    async fn a_condition_with_no_variables_still_applies() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/profile");
+        seed(&store, &r, "<> <http://example.org/email> \"old\" .").await;
+
+        let patch = patch_of(
+            "_:patch a solid:InsertDeletePatch ;\n\
+               solid:where   { <> ex:email \"old\" . } ;\n\
+               solid:inserts { <> ex:nickname \"Charlie\" . } .\n",
+            &r,
+        );
+
+        assert_eq!(patch_dataset(&store, &r, &patch).await.unwrap(), PatchResult::Applied);
+        let back = get_rdf(&store, &r).await.unwrap().expect("exists");
+        assert!(
+            back.iter().any(|t| t.to_string().contains("\"Charlie\"")),
+            "the insertion must have landed: {back:?}"
         );
     }
 }
