@@ -187,4 +187,9 @@ The `version` media-type parameter is read in exactly one place.
     the way out. Mirrors the single q-value parse rule above, and it is why
     `Repr::Rdf` carries the declared version through the write path instead
     of the handler re-reading the header it already parsed.
-    check: [ "$(rg -o '"version=?"' src | wc -l)" = 1 ]
+    The check counts the idioms that *extract* the value, not every mention
+    of the word: calling `RdfVersion::from_media_type` twice is the one
+    reader being used twice and is fine, while a hand-rolled second parse is
+    what this forbids. A looser pattern counted a test assertion as a
+    violation.
+    check: [ "$(rg -o 'eq_ignore_ascii_case\("version"\)|strip_prefix\("version="\)|starts_with\("version="\)' src | wc -l)" = 1 ]

@@ -294,14 +294,19 @@ impl Format {
 }
 
 /// The `Accept` list, highest quality first with earlier entries breaking a
-/// tie, as `(q, position, media range)`.
+/// tie, as `(q, position, media range, the whole entry)`.
 ///
 /// **The only place this header is parsed.** [`negotiate`] asks it which
 /// format to render into; [`accept_allows`] asks it whether a resource's one
 /// representation is admissible. Those are different questions, but a second
 /// copy of the q-value parse is how the two come to disagree about `q=0`.
-fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
-    let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
+///
+/// The fourth element is the entry with its parameters still attached. The
+/// third has them stripped, because matching is by media range — but the
+/// `version` parameter belongs to the range that *wins*, so negotiation needs
+/// the unstripped text to hand to [`RdfVersion::from_media_type`].
+fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str, &str)> {
+    let mut ranked: Vec<(f32, usize, &str, &str)> = Vec::new();
     for (i, part) in accept.split(',').enumerate() {
         let mut bits = part.split(';');
         let mt = bits.next().unwrap_or("").trim();
@@ -309,7 +314,7 @@ fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
             .filter_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
             .next()
             .unwrap_or(1.0);
-        ranked.push((q, i, mt));
+        ranked.push((q, i, mt, part.trim()));
     }
     ranked.sort_by(|a, b| {
         b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
@@ -331,7 +336,7 @@ pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
     let ty = essence.split('/').next().unwrap_or("");
     let type_wildcard = format!("{ty}/*");
     let mut best: Option<(u8, f32)> = None;
-    for (q, _, range) in ranked_accept(accept) {
+    for (q, _, range, _) in ranked_accept(accept) {
         let range = range.to_ascii_lowercase();
         let specificity = if range == essence {
             3
@@ -357,7 +362,9 @@ pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
 /// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
 /// it. `None` means nothing acceptable is supported at all, which is the only
 /// remaining `406`.
-pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
+pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>)
+    -> Option<(Format, RdfVersion)>
+{
     let usable = |f: Format| shape == Shape::Graph || f.carries_dataset();
     let fallback = || {
         [ "text/turtle", "application/ld+json" ].iter()
@@ -366,7 +373,9 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
     };
     let accept = accept.trim();
     if accept.is_empty() {
-        return stored.filter(|f| usable(*f)).or_else(fallback);
+        // No `Accept` at all names no version either, and §4 reads silence
+        // as RDF 1.1.
+        return stored.filter(|f| usable(*f)).or_else(fallback).map(|f| (f, RdfVersion::Rdf11));
     }
 
     let ranked = ranked_accept(accept);
@@ -376,8 +385,8 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
     // excluded from what a wildcard elsewhere in the list resolves to —
     // `*/*, text/turtle;q=0` means "anything but Turtle".
     let rejected: Vec<String> = ranked.iter()
-        .filter(|(q, _, mt)| *q == 0.0 && !mt.ends_with("/*"))
-        .map(|(_, _, mt)| mt.to_ascii_lowercase())
+        .filter(|(q, _, mt, _)| *q == 0.0 && !mt.ends_with("/*"))
+        .map(|(_, _, mt, _)| mt.to_ascii_lowercase())
         .collect();
     let not_rejected = |f: Format| !rejected.iter().any(|r| r == f.media_type());
     let fallback_avoiding_rejected = || {
@@ -386,10 +395,18 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
             .find(|f| usable(*f) && not_rejected(*f))
     };
 
-    for &(q, _, mt) in &ranked {
+    for &(q, _, mt, whole) in &ranked {
         if q == 0.0 {
             continue;
         }
+        // An unrecognised version label on the read side skips this range
+        // rather than failing the request: another range may still be
+        // acceptable, and §6.3 keeps `406` for the case where nothing is.
+        // The write side answers `415` instead, because there is no second
+        // candidate to fall back to.
+        let Some(version) = RdfVersion::from_media_type(whole) else {
+            continue;
+        };
         // Media-type tokens are case-insensitive per RFC 9110 §8.3.1, so
         // `Text/*` must match the wildcard arms too.
         let candidate = match mt.to_ascii_lowercase().as_str() {
@@ -398,8 +415,8 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
             "application/*" => fallback_avoiding_rejected(),
             other => Format::from_content_type(other).filter(|f| usable(*f)),
         };
-        if candidate.is_some() {
-            return candidate;
+        if let Some(f) = candidate {
+            return Some((f, version));
         }
     }
     // Nothing offered can serve the resource fully — the first pass only
@@ -417,18 +434,21 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
             .filter_map(|ct| Format::from_content_type(ct))
             .find(|f| not_rejected(*f))
     };
-    for &(q, _, mt) in &ranked {
+    for &(q, _, mt, whole) in &ranked {
         if q == 0.0 {
             continue;
         }
+        let Some(version) = RdfVersion::from_media_type(whole) else {
+            continue;
+        };
         let candidate = match mt.to_ascii_lowercase().as_str() {
             "*/*" => stored.filter(|f| not_rejected(*f)).or_else(lax_fallback),
             "text/*" => Format::from_content_type("text/turtle").filter(|f| not_rejected(*f)),
             "application/*" => lax_fallback(),
             other => Format::from_content_type(other).filter(|f| not_rejected(*f)),
         };
-        if candidate.is_some() {
-            return candidate;
+        if let Some(f) = candidate {
+            return Some((f, version));
         }
     }
     None
@@ -438,6 +458,12 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
 mod tests {
     use super::*;
     use oxigraph::model::{GraphName, Literal, NamedNode, Quad};
+
+    /// The negotiated format alone. The version half is asserted by its own
+    /// tests below, so the format tests stay about formats.
+    fn neg(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
+        negotiate(accept, shape, stored).map(|(f, _)| f)
+    }
 
     /// §2.1: the labels are ordered by containment — data valid at a lower
     /// label is valid at a higher one. The whole capability check is a `<=`
@@ -634,31 +660,31 @@ mod tests {
         // The case the old first-match resolver gets wrong: Turtle is listed
         // first, but the client also offered a format that carries everything.
         assert_eq!(
-            negotiate("text/turtle, application/ld+json", Shape::Dataset, None),
+            neg("text/turtle, application/ld+json", Shape::Dataset, None),
             Some(jsonld));
         // On a graph-shaped resource the same header takes the first match.
         assert_eq!(
-            negotiate("text/turtle, application/ld+json", Shape::Graph, None),
+            neg("text/turtle, application/ld+json", Shape::Graph, None),
             Some(turtle));
         // q-values outrank order.
         assert_eq!(
-            negotiate("application/ld+json;q=0.2, text/turtle;q=0.9", Shape::Graph, None),
+            neg("application/ld+json;q=0.2, text/turtle;q=0.9", Shape::Graph, None),
             Some(turtle));
         // `*/*` resolves to what the resource arrived as (§6.4).
-        assert_eq!(negotiate("*/*", Shape::Graph, Some(turtle)), Some(turtle));
-        assert_eq!(negotiate("*/*", Shape::Dataset, Some(turtle)), Some(jsonld),
+        assert_eq!(neg("*/*", Shape::Graph, Some(turtle)), Some(turtle));
+        assert_eq!(neg("*/*", Shape::Dataset, Some(turtle)), Some(jsonld),
             "stored format cannot serve it, so fall to one that can");
         // text/* is scoped by its type.
-        assert_eq!(negotiate("text/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("text/*", Shape::Graph, None), Some(turtle));
         // Nothing supported at all is the only remaining 406.
-        assert_eq!(negotiate("image/png", Shape::Graph, None), None);
+        assert_eq!(neg("image/png", Shape::Graph, None), None);
         // `*/*` with nothing stored falls back to Turtle first (§6.4) — only
         // when Turtle cannot carry the resource does JSON-LD win.
-        assert_eq!(negotiate("*/*", Shape::Graph, None), Some(turtle));
-        assert_eq!(negotiate("*/*", Shape::Dataset, None), Some(jsonld));
+        assert_eq!(neg("*/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("*/*", Shape::Dataset, None), Some(jsonld));
         // application/* must resolve to something that can serve the resource.
-        assert_eq!(negotiate("application/*", Shape::Graph, None), Some(turtle));
-        assert_eq!(negotiate("application/*", Shape::Dataset, None), Some(jsonld));
+        assert_eq!(neg("application/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("application/*", Shape::Dataset, None), Some(jsonld));
     }
 
     // RFC 9110 §12.5.1: q=0 is a refusal, not a low rank.
@@ -666,19 +692,19 @@ mod tests {
     fn q_zero_is_a_refusal_not_a_low_rank() {
         let jsonld = Format::from_content_type("application/ld+json").unwrap();
 
-        assert_eq!(negotiate("text/turtle;q=0", Shape::Graph, None), None);
+        assert_eq!(neg("text/turtle;q=0", Shape::Graph, None), None);
         // The only nominally-acceptable entry is refused, and the other is
         // unsupported outright — nothing left to serve.
-        assert_eq!(negotiate("image/png, text/turtle;q=0", Shape::Graph, None), None);
+        assert_eq!(neg("image/png, text/turtle;q=0", Shape::Graph, None), None);
         // `*/*` must not resolve to a type excluded elsewhere in the list.
-        assert_ne!(negotiate("*/*, text/turtle;q=0", Shape::Graph, None), Some(Format::from_content_type("text/turtle").unwrap()));
-        assert_eq!(negotiate("*/*, text/turtle;q=0", Shape::Graph, None), Some(jsonld));
+        assert_ne!(neg("*/*, text/turtle;q=0", Shape::Graph, None), Some(Format::from_content_type("text/turtle").unwrap()));
+        assert_eq!(neg("*/*, text/turtle;q=0", Shape::Graph, None), Some(jsonld));
     }
 
     #[test]
     fn wildcard_matching_is_case_insensitive() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
-        assert_eq!(negotiate("Text/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("Text/*", Shape::Graph, None), Some(turtle));
     }
 
     // §6.2: a client that names only a graph format still gets an answer —
@@ -688,11 +714,11 @@ mod tests {
     #[test]
     fn a_lone_graph_format_still_serves_a_dataset_shaped_resource() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
-        assert_eq!(negotiate("text/turtle", Shape::Dataset, None), Some(turtle));
+        assert_eq!(neg("text/turtle", Shape::Dataset, None), Some(turtle));
         // q=0 still refuses it outright — this is a fallback, not an override.
-        assert_eq!(negotiate("text/turtle;q=0", Shape::Dataset, None), None);
+        assert_eq!(neg("text/turtle;q=0", Shape::Dataset, None), None);
         // A genuinely unsupported type gets no such fallback.
-        assert_eq!(negotiate("image/png", Shape::Dataset, None), None);
+        assert_eq!(neg("image/png", Shape::Dataset, None), None);
     }
 
     // §6.3: `text/*` admits `text/turtle`, and `406` is for when *nothing*
@@ -705,12 +731,12 @@ mod tests {
     #[test]
     fn a_wildcard_range_still_serves_a_dataset_shaped_resource() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
-        assert_eq!(negotiate("text/*", Shape::Dataset, None), Some(turtle));
-        assert_eq!(negotiate("Text/*", Shape::Dataset, None), Some(turtle),
+        assert_eq!(neg("text/*", Shape::Dataset, None), Some(turtle));
+        assert_eq!(neg("Text/*", Shape::Dataset, None), Some(turtle),
             "media ranges are case-insensitive here too (RFC 9110 §8.3.1)");
         // Still scoped by its type, and still refusable.
-        assert_eq!(negotiate("text/*, text/turtle;q=0", Shape::Dataset, None), None);
-        assert_eq!(negotiate("image/*", Shape::Dataset, None), None);
+        assert_eq!(neg("text/*, text/turtle;q=0", Shape::Dataset, None), None);
+        assert_eq!(neg("image/*", Shape::Dataset, None), None);
     }
 
     #[test]

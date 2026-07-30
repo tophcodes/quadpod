@@ -200,6 +200,44 @@ impl Dataset {
         found
     }
 
+    /// This dataset as it can be expressed at `target`.
+    ///
+    /// The two RDF 1.2 additions degrade unequally, and that asymmetry is the
+    /// point. A base direction is presentation metadata *on* a literal —
+    /// strip it and the statement survives. A triple term *is* the object:
+    /// there is nothing to strip, so the whole triple goes.
+    ///
+    /// The result is a **subset** of what was written, never a rewriting of
+    /// it. Approximating a triple term with something a 1.1 client could read
+    /// would manufacture assertions the document never made — the same
+    /// argument §6.2 of the datasets design makes against merging named
+    /// graphs into the default one.
+    pub fn project_to(&self, target: RdfVersion) -> Dataset {
+        if self.rdf_version() <= target {
+            return self.clone();
+        }
+        let quads = self.0.iter().filter_map(|q| {
+            if target < RdfVersion::Rdf12 && matches!(q.object, Term::Triple(_)) {
+                return None;
+            }
+            let object = match &q.object {
+                Term::Literal(l)
+                    if target < RdfVersion::Rdf12Basic && l.direction().is_some() =>
+                {
+                    let language =
+                        l.language().expect("a directional literal is language-tagged");
+                    Term::Literal(
+                        Literal::new_language_tagged_literal(l.value(), language)
+                            .expect("the tag came off a literal that already validated it"),
+                    )
+                }
+                other => other.clone(),
+            };
+            Some(Quad { object, ..q.clone() })
+        }).collect();
+        Dataset::new(quads)
+    }
+
     pub fn quads(&self) -> &[Quad] {
         &self.0
     }
@@ -518,6 +556,56 @@ impl Skolemized {
 mod tests {
     use super::*;
     use oxigraph::model::{BlankNode, Literal, NamedNode, Quad};
+
+    /// §5: a triple term cannot be stripped, so the triple goes.
+    #[test]
+    fn projecting_to_1_1_drops_triples_with_triple_terms() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![
+            q("http://e/s", "v", GraphName::DefaultGraph),
+            q_triple_term("http://e/s2", GraphName::DefaultGraph),
+        ]);
+        let projected = ds.project_to(RdfVersion::Rdf11);
+        assert_eq!(projected.quads().len(), 1);
+        assert_eq!(projected.rdf_version(), RdfVersion::Rdf11);
+    }
+
+    /// §5: a base direction *is* strippable — the triple survives, and only
+    /// the presentation metadata is lost.
+    #[test]
+    fn projecting_to_1_1_strips_the_base_direction() {
+        use oxigraph::model::{GraphName, Term};
+        let ds = Dataset::new(vec![q_directional("http://e/s", GraphName::DefaultGraph)]);
+        let projected = ds.project_to(RdfVersion::Rdf11);
+        assert_eq!(projected.quads().len(), 1, "the triple must survive");
+        let Term::Literal(l) = &projected.quads()[0].object else { panic!() };
+        assert!(l.direction().is_none(), "the direction must be gone");
+        assert_eq!(l.language(), Some("en"), "the language tag must remain");
+    }
+
+    /// `1.2-basic` keeps directions and drops only triple terms — the middle
+    /// label earning its place.
+    #[test]
+    fn projecting_to_1_2_basic_keeps_the_direction() {
+        use oxigraph::model::{GraphName, Term};
+        let ds = Dataset::new(vec![
+            q_directional("http://e/s", GraphName::DefaultGraph),
+            q_triple_term("http://e/s2", GraphName::DefaultGraph),
+        ]);
+        let projected = ds.project_to(RdfVersion::Rdf12Basic);
+        assert_eq!(projected.quads().len(), 1, "the triple term goes");
+        let Term::Literal(l) = &projected.quads()[0].object else { panic!() };
+        assert!(l.direction().is_some(), "the direction stays");
+    }
+
+    /// Projecting to a target at or above the dataset's own version is
+    /// identity.
+    #[test]
+    fn projecting_upwards_changes_nothing() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![q("http://e/s", "v", GraphName::DefaultGraph)]);
+        assert_eq!(ds.project_to(RdfVersion::Rdf12), ds);
+    }
 
     /// §9: two representations of one state must not share a strong
     /// validator (RFC 9110 §8.8.1) — the same rule the selected *format*
