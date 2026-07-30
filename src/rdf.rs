@@ -18,6 +18,73 @@ fn media_type(ct: &str) -> &str {
     ct.split(';').next().unwrap_or("").trim()
 }
 
+/// The RDF version labels of [RDF 1.2 Concepts §2.1][labels], verbatim, in
+/// that document's containment order: data valid at a lower label is valid at
+/// a higher one. `PartialOrd` is derived from the variant order, so the whole
+/// capability question is `needed <= available`.
+///
+/// One type for three roles — what a store can hold
+/// ([`SparqlStore::rdf_version`](crate::store::SparqlStore::rdf_version)),
+/// what a representation claims (the `version` media-type parameter), and what
+/// a deployment declares. Nothing translates between a store-side vocabulary
+/// and a wire-side one, because there is only one.
+///
+/// [labels]: https://www.w3.org/TR/rdf12-concepts/#defined-version-labels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RdfVersion {
+    /// RDF 1.1 syntax, without a version directive.
+    Rdf11,
+    /// RDF 1.2 syntax **without** triple terms — directional language-tagged
+    /// strings, and nothing else new. Not a curiosity: it is the exact name
+    /// for a store that can hold one addition and not the other.
+    Rdf12Basic,
+    /// Full RDF 1.2 syntax.
+    Rdf12,
+}
+
+impl RdfVersion {
+    /// The label as it appears in a `version` media-type parameter.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rdf11 => "1.1",
+            Self::Rdf12Basic => "1.2-basic",
+            Self::Rdf12 => "1.2",
+        }
+    }
+
+    /// **The only place the `version` media-type parameter is read** — see
+    /// `docs/constraints.md`. `Content-Type` on write and `Accept` on read ask
+    /// the same question of the same syntax; a second reader is how `1.2`
+    /// comes to mean one thing on the way in and another on the way out. Same
+    /// failure the single q-value parse in [`ranked_accept`] guards against.
+    ///
+    /// An **absent** parameter is [`Rdf11`](Self::Rdf11). That is deliberately
+    /// stricter than RDF 1.2 Concepts, which says systems can assume `1.2`
+    /// when none is given: every deployed Solid client is an RDF 1.1 parser,
+    /// and the cost of being wrong is asymmetric — too conservative is merely
+    /// less useful, too eager is unreadable.
+    ///
+    /// `None` is an **unrecognised** label, which the write path answers with
+    /// `415`. Keeping the two apart is what stops a client that named a
+    /// version this server does not know from being silently served another.
+    pub fn from_media_type(mt: &str) -> Option<Self> {
+        let mut found = None;
+        for p in mt.split(';').skip(1) {
+            let (name, value) = p.trim().split_once('=')?;
+            if !name.trim().eq_ignore_ascii_case("version") {
+                continue;
+            }
+            found = Some(match value.trim() {
+                "1.1" => Self::Rdf11,
+                "1.2-basic" => Self::Rdf12Basic,
+                "1.2" => Self::Rdf12,
+                _ => return None,
+            });
+        }
+        Some(found.unwrap_or(Self::Rdf11))
+    }
+}
+
 /// A media type this pod stores and echoes back.
 ///
 /// [`Format`] answers "can I parse this as RDF?" and its `media_type` is a
@@ -357,6 +424,56 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
 mod tests {
     use super::*;
     use oxigraph::model::{GraphName, Literal, NamedNode, Quad};
+
+    /// §2.1: the labels are ordered by containment — data valid at a lower
+    /// label is valid at a higher one. The whole capability check is a `<=`
+    /// against this order, so the order is load-bearing.
+    #[test]
+    fn version_labels_are_ordered_by_containment() {
+        assert!(RdfVersion::Rdf11 < RdfVersion::Rdf12Basic);
+        assert!(RdfVersion::Rdf12Basic < RdfVersion::Rdf12);
+    }
+
+    /// §4: silence means 1.1 — deliberately stricter than RDF 1.2 Concepts,
+    /// which says a missing parameter means 1.2.
+    #[test]
+    fn a_missing_version_parameter_means_1_1() {
+        assert_eq!(RdfVersion::from_media_type("text/turtle"), Some(RdfVersion::Rdf11));
+    }
+
+    #[test]
+    fn every_concepts_label_is_recognised() {
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle;version=1.1"),
+            Some(RdfVersion::Rdf11)
+        );
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle;version=1.2-basic"),
+            Some(RdfVersion::Rdf12Basic)
+        );
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle; version=1.2"),
+            Some(RdfVersion::Rdf12)
+        );
+    }
+
+    /// §6: an unrecognised label is a 415, so it must be distinguishable from
+    /// an absent one — `None`, not a silent fallback to 1.1.
+    #[test]
+    fn an_unknown_version_label_is_refused_not_defaulted() {
+        assert_eq!(RdfVersion::from_media_type("text/turtle;version=1.3"), None);
+        assert_eq!(RdfVersion::from_media_type("text/turtle;version="), None);
+    }
+
+    /// Parameter names are case-insensitive per RFC 9110 §5.6.6; the values
+    /// Concepts defines are lowercase tokens.
+    #[test]
+    fn the_parameter_name_is_case_insensitive() {
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle;VERSION=1.2"),
+            Some(RdfVersion::Rdf12)
+        );
+    }
 
     /// RDF 1.2 triple terms are refused, so the wire contract stays RDF 1.1
     /// even though the linked parser understands more (root spec §3).
