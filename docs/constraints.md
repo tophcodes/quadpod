@@ -93,6 +93,16 @@ Only `blob::BlobKey` builds an object key.
     published operator promise with nothing else enforcing it.
     check: rg -qU '#\[cfg\(test\)\]\s*\n\s*pub fn permissive' src/auth/safe_fetch.rs
 
+Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
+    → 2026-07-30-shape-validation-design.md §2.1. `rudof_lib` pulls
+    `http-client` into the tree, which gives a bare `SparqlEvaluator::new()`
+    a live `SERVICE` handler by default — a capability this pod's own
+    server-authored queries never use and nothing here should be able to
+    reach for. The compiler does not require the opt-out:
+    `.without_default_http_service_handler()` is a builder call a future
+    query site can simply omit and still compile.
+    check: [ "$(rg -o 'SparqlEvaluator::new\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
+
 `SparqlStore` has exactly one implementor.
     → 2026-07-24-sparql-solid-pod-design.md §16 ADR-2;
     2026-07-28-jsonld-datasets-design.md §5.2. A tripwire, not a prohibition:
