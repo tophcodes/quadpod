@@ -26,13 +26,16 @@ pub struct AppState {
     pub resolver: Arc<dyn JwksResolver>,
     pub webid_verifier: Arc<dyn WebIdIssuerVerifier>,
     pub auth_config: Arc<AuthConfig>,
+    pub max_body_bytes: usize,
 }
 
 pub fn router(state: AppState) -> Router {
+    let max_body_bytes = state.max_body_bytes;
     // axum 0.8 wildcard capture syntax: "/{*path}" (NOT the old "/*path").
     Router::new()
         .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root))
         .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete))
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
         .with_state(state)
 }
@@ -926,6 +929,7 @@ mod tests {
         store: Arc<dyn crate::store::SparqlStore>,
         blobs: Arc<dyn crate::blob::BlobStore>,
         space: StorageSpace,
+        max_body_bytes: usize,
         idp: TestIdp,
         client: TestClient,
         /// Held for the test's whole lifetime: these tests authenticate
@@ -940,6 +944,10 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with_body_limit(64 * 1024 * 1024).await
+    }
+
+    async fn fixture_with_body_limit(max_body_bytes: usize) -> Fixture {
         assert!(
             !FIXTURE_HELD.with(|f| f.replace(true)),
             "call fixture() once per test: it holds the process-wide DPoP replay lock \
@@ -966,9 +974,10 @@ mod tests {
             resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
             webid_verifier: Arc::new(issuers),
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
+            max_body_bytes,
         };
         Fixture {
-            app: router(state), store, blobs, space, idp, client, _replay_guard,
+            app: router(state), store, blobs, space, max_body_bytes, idp, client, _replay_guard,
             _reentrancy: ReentrancyGuard,
         }
     }
@@ -1033,6 +1042,7 @@ mod tests {
                 resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
                 webid_verifier: Arc::new(issuers),
                 auth_config: Arc::new(crate::auth::AuthConfig::default()),
+                max_body_bytes: self.max_body_bytes,
             })
         }
     }
@@ -3794,5 +3804,29 @@ mod tests {
         let out = body_string(f.app.oneshot(dataset_get).await.unwrap()).await;
         assert!(out.contains("Alice"), "the blank-named graph's content still round-trips: {out}");
         assert!(out.contains("Bob"), "and the IRI-named graph's content: {out}");
+    }
+
+    // §8.4: axum's own 2 MiB default already applied here. This pins that the
+    // configured number is the one in force — a body over it is refused, and
+    // one under it is not.
+    //
+    // The under-limit body must be a format `put_impl` accepts today (only an
+    // RDF `Content-Type`, so `text/turtle` rather than `text/plain`) to reach
+    // `201` at all. The oversized body's `Content-Type` is irrelevant: axum's
+    // `Bytes` extractor rejects it for size before `put_impl` reads any
+    // header.
+    #[tokio::test]
+    async fn a_body_over_the_configured_limit_is_a_413() {
+        let f = fixture_with_body_limit(64).await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/small.txt")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/big.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(vec![b'x'; 4096])).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
