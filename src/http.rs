@@ -875,6 +875,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // no reserved namespace, no containment triples. It gets its own
     // over-long-key check instead, run here for the same reason the dataset
     // checks are — before the ancestor walk below writes anything.
+    let mut findings = None;
     let skolemized = match &repr {
         Repr::Rdf(dataset, _) => {
             // §3.2.2 — the skolem namespace is the server's.
@@ -892,6 +893,14 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
             if matches!(child, Target::Container(_)) && container::body_sets_containment(&triples_of(dataset)) {
                 return StatusCode::CONFLICT.into_response();
             }
+            // Against the settled child, not the requested slug: the binding
+            // lives on the child's parent, which for a POST is the container
+            // this request targets, and refusing here — before the ancestor
+            // walk below creates anything — leaves nothing behind to clean up.
+            findings = match enforce_shape(&st, &child, dataset).await {
+                Ok(f) => f,
+                Err(res) => return res,
+            };
             Some(Skolemized::skolemize(dataset))
         }
         Repr::Blob(..) => {
@@ -910,7 +919,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     if let Err(res) = authorize_and_materialize(store, &agent, &child).await {
         return with_aux_links(res, &child);
     }
-    match &child {
+    let res = match &child {
         Target::Resource(r) => match repr {
             Repr::Blob(bytes, mt) => match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
                 Ok(()) => created(&child),
@@ -933,11 +942,11 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
                 unreachable!("classify_body refuses a blob for Target::Container")
             };
             let triples = triples_of(&dataset.default_graph_only());
-            if let Err(e) = put_rdf(store, c, &triples).await {
-                return (put_status(&e), e.to_string()).into_response();
-            }
-            match container::ensure_container(store, c).await {
-                Ok(()) => created(&child),
+            match put_rdf(store, c, &triples).await {
+                Ok(()) => match container::ensure_container(store, c).await {
+                    Ok(()) => created(&child),
+                    Err(e) => (put_status(&e), e.to_string()).into_response(),
+                },
                 Err(e) => (put_status(&e), e.to_string()).into_response(),
             }
         }
@@ -945,7 +954,11 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         // the only other shape `classify` can return for a child path is the
         // container the `Link` header asks for.
         Target::Aux(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    };
+    // Mirrors `put_impl`'s tail: findings alone cannot gate the link, or a
+    // body that only warned, followed by a storage failure, would advertise a
+    // report for a child that was never created.
+    if findings.is_some() && res.status().is_success() { report_link(&child, res) } else { res }
 }
 
 /// Answer a CORS preflight — and a bare `OPTIONS`, which the suite also sends
@@ -4959,5 +4972,36 @@ mod tests {
             .unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED,
             "/notes/2026/ carries no binding of its own");
+    }
+
+    /// The child a `POST` allocates is validated against the binding on the
+    /// container it lands in, and a refusal leaves that child unallocated.
+    #[tokio::test]
+    async fn a_violating_post_is_refused_and_creates_nothing() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/notes/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "n1")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/notes/n1")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_conforming_post_is_created() {
+        let f = fixture().await;
+        bind_note_shape(&f).await;
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/notes/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "n1")
+            .body(Body::from("<> a <http://schema.org/NoteDigitalDocument> ; \
+                <http://schema.org/name> \"ok\" ."))
+            .unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
     }
 }
