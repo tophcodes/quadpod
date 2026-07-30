@@ -1499,9 +1499,17 @@ when it is crossed; without this the flag could be read, stored and never applie
     async fn a_body_over_the_configured_limit_is_a_413() {
         let f = fixture_with_body_limit(64).await;
 
-        let res = f.app.clone().oneshot(f.owner_request("PUT", "/small.txt")
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from(vec![b'x'; 32])).unwrap()).await.unwrap();
+        // Turtle, not text/plain, for the under-limit half: the blob dispatch
+        // in `put_impl` does not exist yet, so a non-RDF write is still `415`
+        // at this point in the branch. The over-limit half below keeps
+        // `text/plain` deliberately — `DefaultBodyLimit` is enforced when the
+        // handler's `Bytes` extractor runs, and axum resolves every extractor
+        // before the handler body, so the size check fires before
+        // `Format::from_content_type` is ever consulted.
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/small")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#a> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
 
         let res = f.app.clone().oneshot(f.owner_request("PUT", "/big.txt")
