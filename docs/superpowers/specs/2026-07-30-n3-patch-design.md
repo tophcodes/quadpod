@@ -187,7 +187,11 @@ Checked against the parsed quads, before anything touches the store:
 
 - Exactly one subject carries `rdf:type solid:InsertDeletePatch`.
 - At most one `solid:where`, at most one `solid:deletes`, at most one `solid:inserts` on it.
-- The object of each is a blank node that occurs as a `graph_name` in the same document.
+- The object of each is a blank node that occurs as a `graph_name` in the same document. Both
+  halves are checked: `solid:inserts _:nope` names no formula, and reading it as an empty one
+  answers `204` for a patch that did nothing. An empty formula — `solid:inserts { }` — is the
+  same document once parsed (the parser gives it a blank-node object and emits no quad naming
+  it), so it is refused too. Omitting the predicate is how a patch says it inserts nothing.
 - Neither `?insertions` nor `?deletions` contains a blank node.
 - Every variable in `?insertions` or `?deletions` also occurs in `?conditions`. Note the
   narrowness: only *variables* are constrained this way. `solid:deletes { ?p ex:phone "123" }`

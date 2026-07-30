@@ -237,6 +237,17 @@ fn patch_subject(quads: &[N3Quad]) -> Result<N3Term, PatchError> {
 }
 
 /// The blank node naming one formula of the patch resource, if it has one.
+///
+/// §5.1 asks for two things of the object, and both are checked here: it is a
+/// blank node, and that blank node *occurs as a `graph_name` in the same
+/// document*. Without the second, `solid:inserts _:nope` reads as a formula
+/// with no contents and the patch answers `204` for having done nothing.
+///
+/// An empty formula — `solid:inserts { }` — reaches this function in exactly
+/// that shape: `oxttl` gives it a blank-node object and emits no quad naming
+/// it, so the two documents are indistinguishable here and get the same
+/// refusal. Omitting the predicate is how a patch says it inserts nothing;
+/// §5.1 makes that legal and this leaves it untouched.
 fn formula(
     quads: &[N3Quad],
     subject: &N3Term,
@@ -253,10 +264,18 @@ fn formula(
     }
     match found.as_slice() {
         [] => Ok(None),
-        [N3Term::BlankNode(b)] => Ok(Some(b.clone())),
+        [N3Term::BlankNode(b)] if names_a_formula(quads, b) => Ok(Some(b.clone())),
         [_] => Err(PatchError::Shape("a formula predicate whose object is not a formula")),
         _ => Err(PatchError::Shape("more than one of a formula predicate")),
     }
+}
+
+/// Whether `b` is the `graph_name` of anything in the document — which is what
+/// makes it a formula rather than a blank node that merely sits where one
+/// belongs.
+fn names_a_formula(quads: &[N3Quad], b: &BlankNode) -> bool {
+    let name = GraphName::BlankNode(b.clone());
+    quads.iter().any(|q| q.graph_name == name)
 }
 
 /// Whether a formula may introduce names (`solid:where`) or only use them.
@@ -508,6 +527,38 @@ mod tests {
             )),
             Err(PatchError::Shape(_))
         ));
+    }
+
+    // §5.1: the object of a formula predicate is a blank node that occurs as a
+    // `graph_name` in the same document. A blank node that names no formula is
+    // not an empty one — nothing in the document says what to insert — and
+    // reading it as empty answers `204` for a patch that did nothing.
+    #[test]
+    fn a_formula_predicate_whose_object_names_no_formula_is_refused() {
+        for body in [
+            format!(
+                "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                   solid:inserts _:nope .\n"
+            ),
+            format!(
+                "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                   solid:where   _:nope ;\n\
+                   solid:inserts {{ <> ex:x \"1\" . }} .\n"
+            ),
+            format!(
+                "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
+                   solid:deletes _:nope .\n"
+            ),
+            // An empty formula reaches this module in exactly the same shape:
+            // `oxttl` gives it a blank-node object and emits no quad naming it.
+            // The two are the same document here, so they get the same answer.
+            format!("{PREFIXES}_:patch a solid:InsertDeletePatch ; solid:inserts {{ }} .\n"),
+        ] {
+            assert!(
+                matches!(p(&body), Err(PatchError::Shape(_))),
+                "must refuse: {body}"
+            );
+        }
     }
 
     // §5.1: only the object position admits a literal. oxttl's N3 parser
