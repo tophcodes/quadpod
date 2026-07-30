@@ -25,6 +25,12 @@ pub enum ResourceError {
     Rdf(#[from] RdfError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Blob(#[from] crate::blob::BlobError),
+    #[error("the storage key for this URL is too long")]
+    KeyTooLong,
+    #[error("a binary resource has no stored media type")]
+    BinaryWithoutMediaType,
 }
 
 impl From<SpaceError> for ResourceError {
@@ -36,6 +42,23 @@ impl From<SpaceError> for ResourceError {
 /// Predicate asserting that a resource exists. Server-asserted, and therefore
 /// in the reserved system namespace rather than the user's graph.
 pub const SYS_PRESENT: &str = "urn:quadpod:sys#present";
+
+/// Marks a resource whose representation is bytes rather than triples.
+///
+/// Stored rather than inferred from the media type: inferring it would make
+/// every blob stored under a type `Format` later learns re-interpret as an
+/// empty RDF resource, and `application/rdf+xml` is already on the follow-up
+/// list (`2026-07-28-jsonld-datasets-design.md` §11).
+pub const SYS_BINARY_RESOURCE: &str = "urn:quadpod:sys#BinaryResource";
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// What a resource's representation is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    Rdf,
+    Binary(crate::rdf::MediaType),
+}
 
 /// The system graph holding server-asserted facts about `g`.
 pub fn sys_graph_iri(g: &impl GraphName) -> String {
@@ -156,6 +179,71 @@ pub async fn put_dataset(
     Ok(())
 }
 
+/// §5: replace a resource with bytes, and record what they arrived as.
+///
+/// The object is written **before** the marker, and that order is the design
+/// (§5.1): an interrupted marker write leaves an object no read path can see
+/// and the next write to the same URL overwrites, whereas the reverse order
+/// would leave a resource that exists and cannot be served. The registry read
+/// happens before the drops for the same reason it does in [`put_dataset`] —
+/// it lives in the graph being dropped.
+pub async fn put_blob(
+    store: &dyn SparqlStore,
+    blobs: &dyn crate::blob::BlobStore,
+    r: &ResourceUrl,
+    bytes: bytes::Bytes,
+    media_type: &crate::rdf::MediaType,
+) -> Result<(), ResourceError> {
+    let key = crate::blob::BlobKey::of(r).ok_or(ResourceError::KeyTooLong)?;
+    let shelves = registered_shelves(store, r).await?;
+    blobs.put(&key, bytes).await?;
+
+    let iri = r.graph_iri();
+    let sys = sys_graph_iri(r);
+    let mt = sparql::Literal::new(&oxigraph::model::Literal::new_simple_literal(
+        media_type.as_str(),
+    ));
+    let mut update = String::new();
+    for shelf in shelves {
+        update.push_str(&format!("DROP SILENT GRAPH <{}>; ", shelf.graph_iri()));
+    }
+    update.push_str(&format!(
+        "DROP SILENT GRAPH <{iri}>; DROP SILENT GRAPH <{sys}>; \
+         INSERT DATA {{ GRAPH <{sys}> {{ \
+           <{iri}> <{SYS_PRESENT}> true . \
+           <{iri}> <{RDF_TYPE}> <{SYS_BINARY_RESOURCE}> . \
+           <{iri}> <{SYS_MEDIA_TYPE}> {mt} \
+         }} }}"
+    ));
+    store.update(&update).await?;
+    Ok(())
+}
+
+/// Which kind of representation `r` holds, or `None` if it is absent.
+pub async fn kind_of(
+    store: &dyn SparqlStore,
+    r: &ResourceUrl,
+) -> Result<Option<Kind>, ResourceError> {
+    if !exists(store, r).await? {
+        return Ok(None);
+    }
+    let iri = r.graph_iri();
+    let sys = sys_graph_iri(r);
+    let binary = store
+        .ask(&format!(
+            "ASK {{ GRAPH <{sys}> {{ <{iri}> <{RDF_TYPE}> <{SYS_BINARY_RESOURCE}> }} }}"
+        ))
+        .await?;
+    if !binary {
+        return Ok(Some(Kind::Rdf));
+    }
+    // §3.1 writes both in one INSERT DATA, so a binary resource without a
+    // media type is that invariant broken. Refusing beats serving bytes under
+    // a type the server invented.
+    let mt = stored_media_type(store, r).await?.ok_or(ResourceError::BinaryWithoutMediaType)?;
+    Ok(Some(Kind::Binary(mt)))
+}
+
 /// §6 step 2: the resource graph, the registry, and one `CONSTRUCT` per shelf.
 /// `query_triples` has no graph field, so a single query cannot recover which
 /// shelf a triple came from — 2+N in-process queries, and no fast path that
@@ -210,12 +298,12 @@ pub async fn get_dataset(
 
 /// §6.4: what the representation arrived as, for `*/*` and for the
 /// `mediaType` LWS requires per container member. Stored as its media-type
-/// literal, returned as the type — the string form exists in the registry and
-/// nowhere else.
+/// literal, returned as the media type; the RDF path narrows it to a
+/// [`Format`] — the string form exists in the registry and nowhere else.
 pub async fn stored_media_type(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
-) -> Result<Option<Format>, ResourceError> {
+) -> Result<Option<crate::rdf::MediaType>, ResourceError> {
     let iri = r.graph_iri();
     let sys = sys_graph_iri(r);
     let triples = store.query_triples(&format!(
@@ -223,7 +311,7 @@ pub async fn stored_media_type(
          WHERE {{ GRAPH <{sys}> {{ <{iri}> <{SYS_MEDIA_TYPE}> ?m }} }}"
     )).await?;
     Ok(triples.iter().find_map(|t| match &t.object {
-        oxigraph::model::Term::Literal(l) => Format::from_content_type(l.value()),
+        oxigraph::model::Term::Literal(l) => crate::rdf::MediaType::parse(l.value()),
         _ => None,
     }))
 }
@@ -614,7 +702,7 @@ mod tests {
         assert_eq!(back.quads().len(), 2);
         assert!(back.quads().iter().any(|q| q.graph_name == g.clone().into()),
             "the graph name came back");
-        assert_eq!(stored_media_type(&store, &r).await.unwrap(), Some(jsonld));
+        assert_eq!(stored_media_type(&store, &r).await.unwrap(), Some(crate::rdf::MediaType::from(jsonld)));
     }
 
     // §3.2 invariant 4: a shelf the registry no longer lists is not litter, it
@@ -734,6 +822,102 @@ mod tests {
             matches!(&back.quads()[0].object, crate::dataset::GroundTerm::Literal(l) if l.value() == "Bob"),
             "read-back must be the second write's content, not the first's"
         );
+    }
+
+    /// A `BlobStore` whose `put` always fails, for the write-order test.
+    struct FailingBlobs;
+
+    #[async_trait::async_trait]
+    impl crate::blob::BlobStore for FailingBlobs {
+        async fn put(&self, _: &crate::blob::BlobKey, _: bytes::Bytes)
+            -> Result<(), crate::blob::BlobError> {
+            Err(crate::blob::BlobError::Backend("disk on fire".into()))
+        }
+        async fn get(&self, _: &crate::blob::BlobKey)
+            -> Result<Option<bytes::Bytes>, crate::blob::BlobError> { Ok(None) }
+        async fn delete(&self, _: &crate::blob::BlobKey)
+            -> Result<(), crate::blob::BlobError> { Ok(()) }
+    }
+
+    #[tokio::test]
+    async fn a_blob_round_trips_with_its_declared_media_type() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let r = res("/photos/cat.png");
+        let mt = crate::rdf::MediaType::parse("image/png").unwrap();
+        let payload = bytes::Bytes::from_static(&[0x00, 0xff, 0xfe, b'\r', b'\n', 0x41]);
+
+        put_blob(&store, &blobs, &r, payload.clone(), &mt).await.unwrap();
+
+        assert!(exists(&store, &r).await.unwrap());
+        assert_eq!(kind_of(&store, &r).await.unwrap(), Some(Kind::Binary(mt)));
+        let key = crate::blob::BlobKey::of(&r).unwrap();
+        assert_eq!(
+            crate::blob::BlobStore::get(&blobs, &key).await.unwrap().unwrap(),
+            payload,
+            "bytes survive exactly — a NUL and invalid UTF-8 are in there on purpose"
+        );
+    }
+
+    // §5.1: bytes first, marker second. The reverse order leaves a resource
+    // that exists and cannot be served, and nothing but this test says which
+    // way round the two statements go.
+    #[tokio::test]
+    async fn a_failed_object_write_leaves_no_resource_behind() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let r = res("/photos/cat.png");
+        let mt = crate::rdf::MediaType::parse("image/png").unwrap();
+
+        let err = put_blob(&store, &FailingBlobs, &r, bytes::Bytes::from_static(b"x"), &mt)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ResourceError::Blob(_)));
+        assert!(!exists(&store, &r).await.unwrap(), "the marker must not have been written");
+        assert_eq!(kind_of(&store, &r).await.unwrap(), None);
+    }
+
+    // §3.3: the kind is a stored triple, not an inference from the media type.
+    // Deriving it would silently re-interpret every stored RDF/XML blob on the
+    // day `Format` learns application/rdf+xml.
+    #[tokio::test]
+    async fn an_rdf_resource_and_a_blob_are_distinguishable_by_a_stored_fact() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let rdf = res("/notes");
+        let blob = res("/photo");
+
+        // `put_rdf`, not `put_dataset`: this task must not depend on Task 6's
+        // signature change, and it writes the same presence marker.
+        put_rdf(&store, &rdf, &[]).await.unwrap();
+        put_blob(&store, &blobs, &blob, bytes::Bytes::from_static(b"x"),
+                 &crate::rdf::MediaType::parse("text/plain").unwrap()).await.unwrap();
+
+        assert_eq!(kind_of(&store, &rdf).await.unwrap(), Some(Kind::Rdf));
+        assert!(matches!(kind_of(&store, &blob).await.unwrap(), Some(Kind::Binary(_))));
+        assert_eq!(kind_of(&store, &res("/absent")).await.unwrap(), None);
+    }
+
+    // §3.1's invariant: a binary resource always has a stored media type.
+    // This state should not occur — one INSERT DATA writes both — so the test
+    // pins the fail-closed answer for when it somehow does.
+    #[tokio::test]
+    async fn a_binary_resource_without_a_media_type_fails_closed() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let r = res("/photo");
+        put_blob(&store, &blobs, &r, bytes::Bytes::from_static(b"x"),
+                 &crate::rdf::MediaType::parse("text/plain").unwrap()).await.unwrap();
+
+        let sys = sys_graph_iri(&r);
+        store.update(&format!(
+            "DELETE WHERE {{ GRAPH <{sys}> {{ <{}> <{SYS_MEDIA_TYPE}> ?m }} }}", r.graph_iri()
+        )).await.unwrap();
+
+        assert!(matches!(
+            kind_of(&store, &r).await,
+            Err(ResourceError::BinaryWithoutMediaType)
+        ));
     }
 
     // §3.2.3's invariant: a shelf the registry lists must have a

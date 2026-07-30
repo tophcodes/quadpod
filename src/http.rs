@@ -680,7 +680,11 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // resting on the narrower of the two questions. §6.1 puts the ETag before
     // de-skolemization for the same reason.
     let shape = if stored.has_named_graphs() { Shape::Dataset } else { Shape::Graph };
-    let stored_type = stored_media_type(store, r).await.ok().flatten();
+    let stored_type = stored_media_type(store, r)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| Format::from_content_type(m.as_str()));
     let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), shape, stored_type) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
