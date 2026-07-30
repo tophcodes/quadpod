@@ -76,12 +76,31 @@ pub async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Nex
     let Some(origin) = origin else { return res };
     let h = res.headers_mut();
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    // `append`, not `insert`: a negotiated read has already set `Vary: Accept`,
-    // and replacing it would make a cache serve the wrong representation in
-    // order to satisfy a CORS assertion. The spelling matters too — the suite
-    // compares this field value as a case-sensitive string, and
-    // `header::ORIGIN` is lowercase.
-    h.append(header::VARY, HeaderValue::from_static("Origin"));
+    // `Origin` joins whatever `Vary` the handler already set — typically
+    // `Accept` from a negotiated read — as **one field line**, not a second
+    // one. Appending would be legal (RFC 9110 §5.3 lets a list-valued field
+    // repeat) and still wrong in practice: a client that reads the first line
+    // and stops sees half the list, and the conformance harness is such a
+    // client. Replacing outright would be worse — a cache would then serve one
+    // representation for every `Accept`.
+    //
+    // The spelling matters: the suite compares this field value as a
+    // case-sensitive string, and `header::ORIGIN` is lowercase.
+    let mut parts: Vec<String> = h
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if !parts.iter().any(|p| p.eq_ignore_ascii_case("origin")) {
+        parts.push("Origin".to_owned());
+    }
+    if let Ok(v) = HeaderValue::from_str(&parts.join(", ")) {
+        h.insert(header::VARY, v);
+    }
     h.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static(EXPOSED_HEADERS),
@@ -1434,12 +1453,18 @@ mod tests {
             res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://app.example"
         );
-        // Both, and `Origin` with a capital O: the suite compares the field
-        // value as a case-sensitive string.
+        // One field line carrying both, not one line each. RFC 9110 §5.3 lets a
+        // list-valued field repeat, but a client that reads only the first line
+        // then sees half the list — and that is what the conformance harness
+        // does. Asserting over `get_all` would pass either way, which is why
+        // this asserts the line count first.
         let vary: Vec<&str> = res.headers().get_all(header::VARY)
             .iter().map(|v| v.to_str().unwrap()).collect();
-        assert!(vary.contains(&"Accept"), "{vary:?}");
-        assert!(vary.contains(&"Origin"), "{vary:?}");
+        assert_eq!(vary.len(), 1, "Vary must be one field line: {vary:?}");
+        // `Origin` with a capital O: the suite compares the field value as a
+        // case-sensitive string.
+        assert!(vary[0].contains("Accept"), "{vary:?}");
+        assert!(vary[0].contains("Origin"), "{vary:?}");
     }
 
     #[tokio::test]
