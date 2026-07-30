@@ -69,8 +69,9 @@ A SPARQL literal is never interpolated by hand.
     at all. A hand-written `"{}"` is a value that can close its own literal and
     continue the update as syntax, and it fails by executing rather than by
     erroring. `src/http.rs` and `src/dataset.rs` are excluded: their `\"{`
-    matches build an HTTP `Link`/`Warning` header and an HTTP `ETag`
-    respectively, both quoted per their own RFC, never SPARQL.
+    matches build an HTTP `Link` header, a `Warning` header and an `ETag`
+    (`blob_etag`) in `src/http.rs`, and an `ETag` (`Skolemized::etag`) in
+    `src/dataset.rs` — all quoted per their own RFC, never SPARQL.
     check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs' --glob '!src/dataset.rs'
 
 Only `blob::BlobKey` builds an object key.

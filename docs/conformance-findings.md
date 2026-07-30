@@ -265,11 +265,11 @@ the two gaps above: 13 of `OPTIONS`'s 15 live in `cors/*` (`preflight`, `acao-va
 feature at all) plus all 25 CORS-header failures — `13 + 25 = 38`, matching the per-feature
 table exactly. No CORS-feature scenario in this run fails for a third reason.
 
-### `PATCH` — 66 scenarios (was 2)
+### `PATCH` — 66 scenarios (was 3)
 
 This pod has no `PATCH` route at all (`rg PATCH src/` finds nothing); axum's method dispatch
 answers `405` before authentication, `Content-Type`, or anything else about the request is
-ever inspected. The original 2 were never blocked:
+ever inspected. The original 3 were never blocked:
 
 - `protocol/writing-resource/containment:38` — unchanged from run 1.
 - `protocol/authentication/header:40` — unchanged. The other **five** anonymous rows in this

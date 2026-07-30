@@ -159,8 +159,14 @@ Existence, the kind of representation, and the media type it arrived as are **no
 addressable and not writable. They live in an internal graph (`urn:quadpod:sys:<res>`), and a
 client reads them off the response rather than off a URL: existence as the status code (a
 `200` or a `304` rather than a `404`), the media type as `Content-Type`, and the kind through
-no header of its own; a client infers it from `Content-Type`, since only the media types this
-pod recognises as RDF name an RDF resource, and anything else names a binary one.
+no header of its own — no response carries a promise of it. Today, every media type this pod
+recognises as RDF names an RDF resource, and anything else names a binary one, so a client can
+correlate kind with `Content-Type` in practice. That correlation is not a guarantee: the pod's
+own storage layer stores the kind as a fact independent of the media type precisely because
+`application/rdf+xml` is a plausible future addition to what this pod parses as RDF, and the
+day it lands, every resource already stored under that type would answer with the same
+`Content-Type` it always has while silently changing kind underneath a client that inferred
+one from the other.
 
 For a binary resource `Content-Type` is the stored media type exactly, because there is one
 representation. For an RDF resource it is the negotiated one: a graph stored as Turtle and
