@@ -11,7 +11,7 @@ use axum::{Router, routing::get, extract::{State, Path, RawQuery}, body::Bytes, 
 use oxigraph::model::{NamedNode, Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{triples_of, Dataset, Skolemized},
-    resource::{put_rdf, get_rdf, delete_rdf, exists, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
+    resource::{put_rdf, get_rdf, delete_rdf, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
     rdf::{Format, MediaType, RdfVersion, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
@@ -639,8 +639,8 @@ async fn patch_impl(
     // An auxiliary is written through `aux`, whose subject-existence guard is
     // what keeps a policy document off a path that names nothing, and it
     // answers the same `404` `put_impl` does when the subject is gone. It
-    // takes its own branch here because the `exists` check below is not the
-    // one it needs: §7's creation path is closed for an auxiliary as well, and
+    // takes its own branch here because the `target_exists` check below is not
+    // the one it needs: §7's creation path is closed for an auxiliary as well, and
     // `aux::patch` refuses an absent one itself, with a body that says which
     // of the two is missing.
     let r = match &target {
@@ -659,10 +659,8 @@ async fn patch_impl(
             }
         }
     };
-    match exists(store, &target).await {
-        Ok(true) => {}
-        Ok(false) => return create_by_patch(&st, &agent, &target, &patch).await,
-        Err(e) => return (put_status(&e), e.to_string()).into_response(),
+    if !guard.target_exists() {
+        return create_by_patch(&st, guard, &target, &patch).await;
     }
     match patch_dataset(store, r, &patch).await {
         // A container's type triples are the server's, and a patch names its
@@ -700,7 +698,7 @@ async fn patch_impl(
 /// `aux::patch`, which refuses an absent one itself.
 async fn create_by_patch(
     st: &AppState,
-    agent: &Agent,
+    guard: Guard<'_>,
     target: &Target,
     patch: &crate::patch::Patch,
 ) -> Response {
@@ -711,10 +709,6 @@ async fn create_by_patch(
     if !patch.deletions().is_empty() {
         return patch_response(PatchResult::DeletionMissing, patch);
     }
-    let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
-        Ok(g) => g,
-        Err(res) => return with_aux_links(res, target),
-    };
     if let Err(res) = guard.materialize().await {
         return with_aux_links(res, target);
     }

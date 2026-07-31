@@ -227,6 +227,13 @@ impl<'a> Guard<'a> {
         deny(&self.agent)
     }
 
+    /// Whether the target itself — not its trailing-slash counterpart — is
+    /// present. The fact `PATCH`'s create-vs-update branch needs: unlike
+    /// [`Guard::is_taken`], a counterpart existing does not make this `true`.
+    pub fn target_exists(&self) -> bool {
+        self.present.contains(self.target.graph_iri())
+    }
+
     /// Whether this URL is already spoken for — either it names a resource, or
     /// its trailing-slash counterpart does, which Solid Protocol §3.1 forbids
     /// from coexisting with it.
