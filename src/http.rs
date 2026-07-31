@@ -500,7 +500,7 @@ fn etag_candidates(stored: &Skolemized) -> Vec<String> {
 /// always ground — §3.4 and skolemization at the write path guarantee both)
 /// into the same [`Skolemized`] type a resource's dataset is held as, so the
 /// two paths share one `etag`/`deskolemize` implementation.
-fn ground_dataset(triples: Vec<Triple>) -> Skolemized {
+pub(crate) fn ground_dataset(triples: Vec<Triple>) -> Skolemized {
     let quads: Vec<Quad> = triples.into_iter()
         .map(|t| Quad::new(t.subject, t.predicate, t.object, oxigraph::model::GraphName::DefaultGraph))
         .collect();
@@ -1636,7 +1636,7 @@ async fn validate_view(
 /// and it changes under a backend migration although the content did not. This
 /// is the same rule and the same shape as
 /// [`Skolemized::etag`](crate::dataset::Skolemized::etag).
-fn blob_etag(bytes: &[u8]) -> String {
+pub(crate) fn blob_etag(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);

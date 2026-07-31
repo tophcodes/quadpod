@@ -16,7 +16,9 @@ use std::sync::{Arc, RwLock};
 use axum::response::Response;
 use tokio::sync::broadcast;
 
+use crate::dataset::Skolemized;
 use crate::http::AppState;
+use crate::rdf::Format;
 use crate::space::{AuxUrl, GraphName, Target};
 use crate::wac::guard::Materialized;
 
@@ -230,10 +232,57 @@ pub async fn emit_delete(
     todo!("skeleton")
 }
 
+/// The topic's validator after the write — §5.1.
+///
+/// Called only for a topic [`Bus::live`] returned, which is what keeps a pod
+/// with no subscribers doing no extra I/O. `None` where there is no state to
+/// report: the target is gone (a `Delete`), or the read-back failed, which
+/// must not turn a successful write into a `500` — the protocol makes `state`
+/// optional precisely so this case has an answer.
+async fn state_of(st: &AppState, target: &Target) -> Option<String> {
+    let store = st.store.as_ref();
+    if let Target::Resource(r) = target {
+        if let Ok(Some(crate::resource::Kind::Binary(_))) = crate::resource::kind_of(store, r).await {
+            let key = crate::blob::BlobKey::of(r)?;
+            return st.blobs.get(&key).await.ok().flatten().map(|b| crate::http::blob_etag(&b));
+        }
+        let stored = crate::resource::get_dataset(store, r).await.ok().flatten()?;
+        return Some(etag_of(&stored));
+    }
+    // A container or an auxiliary is always ground and always default-graph,
+    // so it reaches the same `etag` through the same lift the read path uses.
+    let triples = crate::resource::get_rdf(store, target).await.ok().flatten()?;
+    Some(etag_of(&crate::http::ground_dataset(triples)))
+}
+
+/// §5.1: N-Quads at the version the stored state holds. N-Quads because
+/// `Skolemized::etag` renders each quad through oxigraph's `Display`, which is
+/// N-Quads — so the media type keying the hash describes what is under it. The
+/// held version rather than 1.1, or two RDF 1.2 states differing only in triple
+/// terms would share a validator and a real change would report none.
+fn etag_of(stored: &Skolemized) -> String {
+    let held = stored.deskolemize().rdf_version();
+    stored.etag(nquads(), held)
+}
+
+/// The one format `state` is expressed in. Named once, so `docs/constraints.md`
+/// can pin it to this module.
+fn nquads() -> Format {
+    Format::from_content_type("application/n-quads").expect("a static, supported media type")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{AuthConfig, Jwks, StaticJwksResolver, StaticWebIdIssuers};
+    use crate::blob::ObjectStoreBlobs;
+    use crate::container;
+    use crate::rdf::{MediaType, RdfVersion};
+    use crate::resource;
     use crate::space::StorageSpace;
+    use crate::store::OxigraphStore;
+    use bytes::Bytes;
+    use oxigraph::model::Triple;
 
     fn target(path: &str) -> Target {
         StorageSpace::new("https://pod.toph.so/").unwrap().resolve(path).unwrap()
@@ -317,5 +366,133 @@ mod tests {
         assert_eq!(bus.channels.read().unwrap().len(), 0,
             "publish must not register a topic nobody asked for");
         assert!(bus.live(&[topic]).is_empty());
+    }
+
+    /// The pieces every `state_of` fixture shares: a full `AppState` over an
+    /// in-memory store and blob store, exactly as `tests/call_budget.rs`'s
+    /// `app()` assembles one, minus the router — `state_of` is called
+    /// directly, not through a request.
+    fn assemble_state(
+        store: OxigraphStore, blobs: ObjectStoreBlobs, space: StorageSpace,
+    ) -> AppState {
+        AppState {
+            store: Arc::new(store),
+            events: Arc::new(Bus::new()),
+            blobs: Arc::new(blobs),
+            space,
+            resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
+            webid_verifier: Arc::new(StaticWebIdIssuers::new()),
+            auth_config: Arc::new(AuthConfig::default()),
+            max_body_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    /// An `AppState` whose store holds `turtle` (RDF 1.1) at `path`, and the
+    /// `Target` that resolves to.
+    async fn state_fixture(path: &str, turtle: &[u8]) -> (AppState, Target) {
+        let store = OxigraphStore::in_memory().unwrap();
+        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+        container::provision_root(&store, &space.root()).await.unwrap();
+
+        let target = space.resolve(path).unwrap();
+        let Target::Resource(r) = &target else {
+            unreachable!("state_fixture is only called with a resource path")
+        };
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let triples: Vec<Triple> = ttl
+            .parse(turtle, r.graph_iri(), RdfVersion::Rdf11)
+            .unwrap()
+            .quads().iter().cloned().map(Triple::from).collect();
+        resource::put_rdf(&store, r, &triples).await.unwrap();
+
+        let st = assemble_state(store, ObjectStoreBlobs::in_memory(), space);
+        (st, target)
+    }
+
+    /// An `AppState` whose store holds `bytes` as a binary resource at `path`.
+    async fn binary_fixture(path: &str, bytes: &'static [u8]) -> (AppState, Target) {
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = ObjectStoreBlobs::in_memory();
+        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+        container::provision_root(&store, &space.root()).await.unwrap();
+
+        let target = space.resolve(path).unwrap();
+        let Target::Resource(r) = &target else {
+            unreachable!("binary_fixture is only called with a resource path")
+        };
+        let mt = MediaType::parse("image/png").unwrap();
+        resource::put_blob(&store, &blobs, r, Bytes::from_static(bytes), &mt).await.unwrap();
+
+        let st = assemble_state(store, blobs, space);
+        (st, target)
+    }
+
+    /// The value a subscriber receives is the validator the pod would hand out
+    /// for the same state, in the format §5.1 fixes.
+    #[tokio::test]
+    async fn state_is_the_n_quads_etag_at_the_held_version() {
+        let (st, target) = state_fixture("/notes", b"<#it> <http://schema.org/name> \"x\" .").await;
+        let stored = crate::resource::get_dataset(st.store.as_ref(), match &target {
+            Target::Resource(r) => r, _ => unreachable!(),
+        }).await.unwrap().unwrap();
+        let held = stored.deskolemize().rdf_version();
+        let expected = stored.etag(crate::rdf::Format::from_content_type("application/n-quads").unwrap(), held);
+
+        assert_eq!(state_of(&st, &target).await.as_deref(), Some(expected.as_str()));
+    }
+
+    /// A binary resource has one representation and one validator.
+    #[tokio::test]
+    async fn state_of_a_binary_resource_is_its_blob_etag() {
+        let (st, target) = binary_fixture("/photo.png", b"\x89PNG\r\n\x1a\n").await;
+        assert_eq!(
+            state_of(&st, &target).await.as_deref(),
+            Some(crate::http::blob_etag(b"\x89PNG\r\n\x1a\n").as_str()),
+        );
+    }
+
+    /// An absent target has no state, which is what a `Delete` reports.
+    #[tokio::test]
+    async fn state_of_an_absent_target_is_none() {
+        let (st, _) = state_fixture("/notes", b"<#it> <http://schema.org/name> \"x\" .").await;
+        let gone = st.space.resolve("/never-existed").unwrap();
+        assert_eq!(state_of(&st, &gone).await, None);
+    }
+
+    /// `state_is_the_n_quads_etag_at_the_held_version` fixes the format and
+    /// the version by recomputing both independently — but its fixture is
+    /// pure RDF 1.1, so a broken `state_of` that hashed at a hard-coded
+    /// `RdfVersion::Rdf11` instead of the stored state's own held version
+    /// would pass that test too. This one holds an RDF 1.2-basic directional
+    /// literal, where the two versions provably diverge, so it fails if
+    /// `state_of` ever collapses a 1.2 state to its 1.1 projection's
+    /// validator — the exact failure the module doc comment on `etag_of`
+    /// warns about.
+    #[tokio::test]
+    async fn state_of_a_1_2_basic_state_is_not_its_1_1_projections_etag() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+        container::provision_root(&store, &space.root()).await.unwrap();
+
+        let target = space.resolve("/notes").unwrap();
+        let Target::Resource(r) = &target else { unreachable!() };
+        let ttl = crate::rdf::Format::from_content_type("text/turtle").unwrap();
+        let triples: Vec<Triple> = ttl
+            .parse(b"<#it> <http://e/p> \"hi\"@en--ltr .", r.graph_iri(), RdfVersion::Rdf12Basic)
+            .unwrap()
+            .quads().iter().cloned().map(Triple::from).collect();
+        resource::put_rdf(&store, r, &triples).await.unwrap();
+
+        let stored = crate::resource::get_dataset(&store, r).await.unwrap().unwrap();
+        let held = stored.deskolemize().rdf_version();
+        assert_eq!(held, RdfVersion::Rdf12Basic, "fixture must actually hold a 1.2-basic term");
+        let one_one_etag = stored.etag(nquads(), RdfVersion::Rdf11);
+
+        let st = assemble_state(store, ObjectStoreBlobs::in_memory(), space);
+        assert_ne!(
+            state_of(&st, &target).await.as_deref(),
+            Some(one_one_etag.as_str()),
+            "state_of must hash at the state's held version, not silently at 1.1",
+        );
     }
 }
