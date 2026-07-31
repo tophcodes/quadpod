@@ -318,16 +318,21 @@ The config file is never found, only named.
     The rule is cheap to break by accident: adding a "just look in the working
     directory too" convenience is one line, reads as helpful, and silently
     makes two pods with identical invocations behave differently depending on
-    where they were started. The `.toml"` alternative alone is deliberately
-    narrower than "any string ending in `.toml`": that broader form matched a
-    test fixture's own temp-file name — `.join(format!("sparql-pod-{}.toml",
-    uuid::Uuid::new_v4()))` and `.join("sparql-pod-does-not-exist.toml")`,
-    both in `config.rs`'s test module — which is data a test writes, not a
-    path the pod looks for, and it cost both fixtures a rewrite around the
-    check rather than the other way round. Anchoring on the closing quote
-    catches a `.toml`-suffixed literal regardless of what expression it sits
-    in, so `Path::new`, `PathBuf::from`, a bare `.join(...)` argument, and a
-    `static` all count the same as a `const` or `let`. Demonstrated red,
+    where they were started. The `.toml"` alternative is deliberately blunt:
+    it matches *any* string literal ending in `.toml`, whatever expression it
+    sits in, so `Path::new`, `PathBuf::from`, a bare `.join(...)` argument and
+    a `static` all count the same as a `const` or `let`. A narrower pattern
+    anchored on `const`/`let` was tried and abandoned — `PathBuf::from` and
+    `Path::new` are how a path actually gets written in Rust, so it missed the
+    likeliest shape of the very convenience the rule exists to stop.
+    **This over-matches, and that is the accepted trade.** A legitimate
+    `.toml`-suffixed literal in a test fixture trips it too; twice during
+    implementation it did, and both fixtures were rewritten around the check.
+    If you hit it and your literal is data a test writes rather than a path
+    the pod looks for, build the name with `.with_extension("toml")` — as
+    `config.rs`'s `write_temp_toml` does — rather than loosening this rule.
+    A false positive here argues with you out loud; a false negative would
+    let a search path in without a word. Demonstrated red,
     each injected into and then reverted out of `src/config.rs` in turn,
     against `let p = std::path::PathBuf::from("sparql-pod.toml");`, that same
     call as a bare expression with no binding, `let p =
