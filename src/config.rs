@@ -161,8 +161,18 @@ impl FileConfig {
     /// binary does not know: all three are the same answer, an error that
     /// refuses the start.
     fn read(path: &std::path::Path) -> Result<Self, clap::Error> {
-        let _ = path;
-        todo!("2026-07-31-cli-config-design.md §4, §4.1")
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            clap::Error::raw(
+                clap::error::ErrorKind::Io,
+                format!("--config {}: {e}\n", path.display()),
+            )
+        })?;
+        toml::from_str(&text).map_err(|e| {
+            clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                format!("--config {}: {e}\n", path.display()),
+            )
+        })
     }
 
     /// Every key the file set, rendered as the strings clap will parse, keyed
@@ -332,6 +342,49 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Config, clap::Error> {
         Config::try_parse_from(std::iter::once("sparql-pod").chain(args.iter().copied()))
+    }
+
+    fn write_temp_toml(body: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir()
+            .join(format!("sparql-pod-{}", uuid::Uuid::new_v4()))
+            .with_extension("toml");
+        std::fs::write(&p, body).expect("write temp toml");
+        p
+    }
+
+    #[test]
+    fn a_file_supplies_what_it_names_and_leaves_the_rest_unset() {
+        let p = write_temp_toml("owner_webid = \"https://a.example/#me\"\nmax_body_bytes = 42\n");
+        let f = FileConfig::read(&p).expect("reads");
+        assert_eq!(f.owner_webid.as_deref(), Some("https://a.example/#me"));
+        assert_eq!(f.max_body_bytes, Some(42));
+        assert_eq!(f.listen, None);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // §4.1: a key this binary does not know is a typo, and a pod that starts
+    // with less configuration than was written looks exactly like one
+    // configured correctly.
+    #[test]
+    fn an_unknown_key_refuses_the_start() {
+        let p = write_temp_toml("owner_web_id = \"https://a.example/#me\"\n");
+        assert!(FileConfig::read(&p).is_err());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn malformed_toml_refuses_the_start() {
+        let p = write_temp_toml("owner_webid = \n");
+        assert!(FileConfig::read(&p).is_err());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn an_unreadable_path_refuses_the_start() {
+        let p = std::env::temp_dir()
+            .join("sparql-pod-does-not-exist")
+            .with_extension("toml");
+        assert!(FileConfig::read(&p).is_err());
     }
 
     #[test]
