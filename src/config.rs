@@ -177,10 +177,11 @@ impl FileConfig {
 
     /// Every key the file set, rendered as the strings clap will parse, keyed
     /// by argument id — `Config`'s field names, which is what `Command::mut_arg`
-    /// takes. That differs from the long flag for two arguments,
-    /// `trusted_issuers` (`--trusted-issuer`) and `allow_insecure_hosts`
-    /// (`--allow-insecure-host`), which is why [`blame_file`] takes its own
-    /// long-flag-keyed map rather than this one.
+    /// takes. The id differs from the long flag for every multi-word one, by
+    /// kebab-casing alone (`base_uri` / `--base-uri`) — except two, which are
+    /// renamed outright: `trusted_issuers` (`--trusted-issuer`) and
+    /// `allow_insecure_hosts` (`--allow-insecure-host`). [`blame_file`] takes
+    /// its own long-flag-keyed map rather than this one because of those two.
     ///
     /// Rendering to strings is deliberate: the file's values then travel the
     /// same `value_parser` as a typed flag, so a bad `listen` in TOML is caught
@@ -290,9 +291,14 @@ fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>)
 ///
 /// A file-supplied value arrives as a default, so clap phrases its complaint in
 /// terms of a flag the operator never typed. `from_file` maps each long flag
-/// the file supplied to its TOML key; an error naming one of them gets the path
-/// and the key prefixed, and anything else is passed through exactly as clap
-/// wrote it.
+/// the file supplied to its TOML key and the values the file gave it. Knowing
+/// the file supplied that *key* is not enough — a flag overrides a default, so
+/// the value clap rejected may be the flag's own and the file may say nothing
+/// about it. The file is blamed only when the rejected value is one it
+/// actually supplied; a value the operator retypes identically to the file's
+/// is attributed to the file regardless, since it is in both places and
+/// naming the file is not wrong. Anything else is passed through exactly as
+/// clap wrote it.
 ///
 /// Keyed by long flag rather than by argument id because that is what clap puts
 /// in the error, and the two differ wherever `#[arg(long = "…")]` renames one —
@@ -300,7 +306,7 @@ fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>)
 fn blame_file(
     err: clap::Error,
     path: &std::path::Path,
-    from_file: &std::collections::BTreeMap<String, &'static str>,
+    from_file: &std::collections::BTreeMap<String, (&'static str, Vec<String>)>,
 ) -> clap::Error {
     use clap::error::{ContextKind, ContextValue};
     let Some(ContextValue::String(arg)) = err.get(ContextKind::InvalidArg) else {
@@ -308,18 +314,25 @@ fn blame_file(
     };
     // clap renders the argument as it appears on the command line, e.g.
     // "--listen <LISTEN>"; only the flag itself is a stable key.
-    let long = arg
-        .trim_start_matches("--")
-        .split([' ', '=', '<'])
-        .next()
-        .unwrap_or_default();
-    let Some(key) = from_file.get(long) else {
+    let long = arg.trim_start_matches("--").split([' ', '=', '<']).next().unwrap();
+    let Some((key, values)) = from_file.get(long) else {
         return err;
     };
-    clap::Error::raw(
-        err.kind(),
-        format!("{}: `{key}`: {err}\n", path.display()),
-    )
+    let Some(ContextValue::String(bad_value)) = err.get(ContextKind::InvalidValue) else {
+        return err;
+    };
+    if !values.contains(bad_value) {
+        return err;
+    }
+    // clap's own text is the whole message; only its framing as a standalone
+    // error is undone before it is nested inside this one.
+    let rendered = err.to_string();
+    let mut msg = rendered.strip_prefix("error: ").unwrap_or(rendered.as_str());
+    msg = msg.trim_end();
+    if let Some(stripped) = msg.strip_suffix("For more information, try '--help'.") {
+        msg = stripped.trim_end();
+    }
+    clap::Error::raw(err.kind(), format!("{}: `{key}`: {msg}\n", path.display()))
 }
 
 impl Config {
@@ -347,11 +360,11 @@ impl Config {
         let cmd = command_with(defaults.clone());
         // Built from the command rather than guessed, so an id and its long
         // flag can never drift apart here.
-        let from_file: std::collections::BTreeMap<String, &'static str> = cmd
+        let from_file: std::collections::BTreeMap<String, (&'static str, Vec<String>)> = cmd
             .get_arguments()
             .filter_map(|a| {
-                let (id, _) = defaults.get_key_value(a.get_id().as_str())?;
-                Some((a.get_long()?.to_string(), *id))
+                let (id, values) = defaults.get_key_value(a.get_id().as_str())?;
+                Some((a.get_long()?.to_string(), (*id, values.clone())))
             })
             .collect();
         let matches = cmd
@@ -930,15 +943,51 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    // The irregular case the signature exists for.
+    // The lookup bridges an id and a long flag that are different strings —
+    // it is not specific to the two arguments renamed outright
+    // (`trusted_issuers`/`allow_insecure_hosts`), which cannot fail
+    // validation and so cannot be covered by a test like this one.
     #[test]
-    fn a_bad_file_value_under_an_irregular_long_is_still_blamed() {
+    fn a_bad_file_value_under_a_differently_spelled_long_is_still_blamed() {
         let p = write_temp_toml(concat!(
             "owner_webid = \"https://file.example/#me\"\n",
             "base_uri = \"not an absolute uri\"\n",
         ));
         let err = load(&["--config", p.to_str().unwrap()]).expect_err("must fail");
         assert!(err.to_string().contains("base_uri"), "{err}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // A flag overriding a file-supplied key: the failing value is the flag's,
+    // and the file says nothing about it. Blaming the file here is the same
+    // misdirection this function exists to remove, only pointing the other way.
+    #[test]
+    fn a_flag_that_overrides_a_file_key_is_not_blamed_on_the_file() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://file.example/#me\"\n",
+            "listen = \"127.0.0.1:9999\"\n",
+        ));
+        let err = load(&["--config", p.to_str().unwrap(), "--listen", "nope"])
+            .expect_err("must fail");
+        assert!(
+            !err.to_string().contains(p.to_str().unwrap()),
+            "the file supplied a different, valid value: {err}"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    // The message an operator reads is the whole deliverable of this function.
+    #[test]
+    fn a_blamed_message_reads_as_one_error() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://file.example/#me\"\n",
+            "listen = \"not-a-socket-address\"\n",
+        ));
+        let msg = load(&["--config", p.to_str().unwrap()])
+            .expect_err("must fail")
+            .to_string();
+        assert!(!msg.contains("error: error:"), "doubled prefix: {msg}");
+        assert!(!msg.ends_with("\n\n"), "trailing blank line: {msg}");
         std::fs::remove_file(&p).ok();
     }
 }
