@@ -660,24 +660,38 @@ async fn patch_impl(
             }
         }
     };
-    if !guard.target_exists() {
-        return create_by_patch(&st, guard, &target, &patch).await;
-    }
-    match patch_dataset(store, r, &patch).await {
-        // A container's type triples are the server's, and a patch names its
-        // own triples — including them. Re-asserting them here is what
-        // `put_impl` does after writing a container body, and it is why a
-        // container patch is not refused outright: the client stays free to
-        // patch everything else the container's graph holds.
-        Ok(result) => match &target {
-            Target::Container(c) => match container::ensure_container(store, c).await {
-                Ok(()) => patch_response(result, &patch),
-                Err(e) => (put_status(&e), e.to_string()).into_response(),
+    // Read before `materialize` consumes `guard` below (in either branch):
+    // it takes `self`, so this is the only chance to ask.
+    let existence = if guard.target_exists() {
+        crate::notify::Existence::Existed
+    } else {
+        crate::notify::Existence::Absent
+    };
+    let (res, materialized) = if matches!(existence, crate::notify::Existence::Absent) {
+        create_by_patch(&st, guard, &target, &patch).await
+    } else {
+        let res = match patch_dataset(store, r, &patch).await {
+            // A container's type triples are the server's, and a patch names
+            // its own triples — including them. Re-asserting them here is
+            // what `put_impl` does after writing a container body, and it is
+            // why a container patch is not refused outright: the client
+            // stays free to patch everything else the container's graph
+            // holds.
+            Ok(result) => match &target {
+                Target::Container(c) => match container::ensure_container(store, c).await {
+                    Ok(()) => patch_response(result, &patch),
+                    Err(e) => (put_status(&e), e.to_string()).into_response(),
+                },
+                _ => patch_response(result, &patch),
             },
-            _ => patch_response(result, &patch),
-        },
-        Err(e) => (put_status(&e), e.to_string()).into_response(),
-    }
+            Err(e) => (put_status(&e), e.to_string()).into_response(),
+        };
+        // An update materializes nothing: the target already existed, so
+        // there is no ancestor to walk.
+        (res, Materialized::default())
+    };
+    crate::notify::emit_patch(&st, &target, existence, &materialized, res.status()).await;
+    res
 }
 
 /// §7: a target that does not exist is patched against an empty RDF dataset,
@@ -702,17 +716,18 @@ async fn create_by_patch(
     guard: Guard<'_>,
     target: &Target,
     patch: &crate::patch::Patch,
-) -> Response {
+) -> (Response, Materialized) {
     let store = st.store.as_ref();
     let Some(triples) = patch.ground_insertions() else {
-        return patch_response(PatchResult::NoMapping, patch);
+        return (patch_response(PatchResult::NoMapping, patch), Materialized::default());
     };
     if !patch.deletions().is_empty() {
-        return patch_response(PatchResult::DeletionMissing, patch);
+        return (patch_response(PatchResult::DeletionMissing, patch), Materialized::default());
     }
-    if let Err(res) = guard.materialize().await {
-        return with_aux_links(res, target);
-    }
+    let materialized = match guard.materialize().await {
+        Ok(m) => m,
+        Err(res) => return (with_aux_links(res, target), Materialized::default()),
+    };
     let written = match target {
         Target::Resource(r) => {
             let turtle =
@@ -730,8 +745,8 @@ async fn create_by_patch(
         Target::Aux(_) => unreachable!("an auxiliary never reaches the creation branch"),
     };
     match written {
-        Ok(()) => created(target),
-        Err(e) => (put_status(&e), e.to_string()).into_response(),
+        Ok(()) => (created(target), materialized),
+        Err(e) => ((put_status(&e), e.to_string()).into_response(), Materialized::default()),
     }
 }
 
@@ -7159,5 +7174,61 @@ mod tests {
             .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
         assert_eq!(e.state.as_deref(), Some(container_etag.as_str()),
             "the Add's state must be the container's own validator, not the child's");
+    }
+
+    /// The ordinary patch: the resource was there, so it is an `Update`.
+    #[tokio::test]
+    async fn a_patch_on_an_existing_resource_emits_update() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let res = f.app.clone().oneshot(f.owner_request("PATCH", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(
+                "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+                 <> a solid:InsertDeletePatch ; solid:inserts \
+                 { <#it> <http://schema.org/keywords> \"k\" . } .\n")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Update);
+        // Independent of `state_of`: a GET at the same media type and version
+        // §5.1 fixes is the validator the pod would hand a client for the
+        // post-patch state. A bare `is_some()` would pass a read-back of the
+        // wrong resource; this pins the exact value.
+        let etag = f.app.clone().oneshot(f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(e.state.as_deref(), Some(etag.as_str()));
+    }
+
+    /// `create_by_patch`: a patch on an absent resource creates it, so it is a
+    /// `Create` and its parent hears `Add`.
+    #[tokio::test]
+    async fn a_patch_that_creates_emits_create_and_add() {
+        let f = fixture().await;
+        f.put_turtle("/c/other", "<#it> <http://schema.org/name> \"y\" .").await;
+        let target = f.space.resolve("/c/fresh").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        let res = f.app.clone().oneshot(f.owner_request("PATCH", "/c/fresh")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(
+                "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+                 <> a solid:InsertDeletePatch ; solid:inserts \
+                 { <#it> <http://schema.org/name> \"x\" . } .\n")).unwrap())
+            .await.unwrap();
+        assert!(res.status().is_success(), "create-by-patch: {}", res.status());
+
+        assert_eq!(next_event(&mut on_target).await.activity, crate::notify::Activity::Create);
+        let p = next_event(&mut on_parent).await;
+        assert_eq!(p.activity, crate::notify::Activity::Add);
+        assert_eq!(p.object, target.graph_iri());
     }
 }

@@ -284,14 +284,24 @@ pub async fn emit_post(
 }
 
 /// `PATCH`: `Update`, or the `Create` shape when `create_by_patch` ran.
+/// `existence` comes from [`crate::wac::guard::Guard::target_exists`], read
+/// before the guard was consumed — `create_by_patch` takes it by value.
 pub async fn emit_patch(
-    _st: &AppState,
-    _target: &Target,
-    _existence: Existence,
-    _materialized: &Materialized,
-    _status: StatusCode,
+    st: &AppState,
+    target: &Target,
+    existence: Existence,
+    materialized: &Materialized,
+    status: StatusCode,
 ) {
-    todo!("skeleton")
+    if !status.is_success() {
+        return;
+    }
+    let activity = match existence {
+        Existence::Existed => Activity::Update,
+        Existence::Absent => Activity::Create,
+    };
+    publish_own(st, target, activity).await;
+    publish_containment(st, target.graph_iri(), materialized, Activity::Add).await;
 }
 
 /// `DELETE`: `Delete` on the target, `Remove` on its parent, and a `Delete` on
