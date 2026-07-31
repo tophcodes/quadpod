@@ -71,44 +71,72 @@ impl OxigraphStore {
             .map(|inner| Self { inner })
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
+
+    /// Runs `f` against the store on Tokio's blocking pool.
+    ///
+    /// Oxigraph is a synchronous library: `Store::update` and a query's
+    /// `execute` run to completion on the calling thread. Awaiting them
+    /// directly inside an `async fn` occupies a runtime worker for the whole
+    /// evaluation, and a runtime has one worker per core — so a handful of
+    /// concurrent queries stall *every* request in flight, including those
+    /// that never touch the store.
+    ///
+    /// It is invisible against the in-memory store, where an evaluation is
+    /// microseconds; it is not invisible against a durable one, where the
+    /// same call also waits on disk. The offload belongs here, not at the
+    /// call sites, because the trait is `async` precisely so a backend can
+    /// decide how it yields.
+    ///
+    /// **This is the only place that reaches for the store handle** — pinned
+    /// by a rule in `docs/constraints.md`, since a trait method evaluating
+    /// against the handle directly compiles and passes every test.
+    async fn blocking<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        // Cheap: `Store` is a handle over shared backing state, so the clone
+        // is what lets the closure own its reference for the pool's lifetime.
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || f(&store))
+            .await
+            .map_err(|e| StoreError::Backend(format!("store task did not complete: {e}")))?
+    }
 }
 
 #[async_trait::async_trait]
 impl SparqlStore for OxigraphStore {
     async fn update(&self, sparql: &str) -> Result<(), StoreError> {
-        self.inner
-            .update(sparql)
-            .map_err(|e| StoreError::Backend(e.to_string()))
+        let sparql = sparql.to_owned();
+        self.blocking(move |store| {
+            store
+                .update(&sparql)
+                .map_err(|e| StoreError::Backend(e.to_string()))
+        })
+        .await
     }
 
     async fn query_triples(&self, sparql: &str) -> Result<Vec<Triple>, StoreError> {
-        let results = SparqlEvaluator::new()
-            .without_default_http_service_handler()
-            .parse_query(sparql)
-            .map_err(|e| StoreError::Backend(e.to_string()))?
-            .on_store(&self.inner)
-            .execute()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        let QueryResults::Graph(triples) = results else {
-            return Err(StoreError::Backend("expected CONSTRUCT/graph results".into()));
-        };
-        triples
-            .map(|t| t.map_err(|e| StoreError::Backend(e.to_string())))
-            .collect()
+        let sparql = sparql.to_owned();
+        self.blocking(move |store| {
+            let results = evaluate(store, &sparql)?;
+            let QueryResults::Graph(triples) = results else {
+                return Err(StoreError::Backend("expected CONSTRUCT/graph results".into()));
+            };
+            triples
+                .map(|t| t.map_err(|e| StoreError::Backend(e.to_string())))
+                .collect()
+        })
+        .await
     }
 
     async fn ask(&self, sparql: &str) -> Result<bool, StoreError> {
-        let results = SparqlEvaluator::new()
-            .without_default_http_service_handler()
-            .parse_query(sparql)
-            .map_err(|e| StoreError::Backend(e.to_string()))?
-            .on_store(&self.inner)
-            .execute()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        match results {
+        let sparql = sparql.to_owned();
+        self.blocking(move |store| match evaluate(store, &sparql)? {
             QueryResults::Boolean(b) => Ok(b),
             _ => Err(StoreError::Backend("expected ASK/boolean results".into())),
-        }
+        })
+        .await
     }
 
 
@@ -126,20 +154,33 @@ impl SparqlStore for OxigraphStore {
     }
 
     async fn query_solutions(&self, sparql: &str) -> Result<Vec<QuerySolution>, StoreError> {
-        let results = SparqlEvaluator::new()
-            .without_default_http_service_handler()
-            .parse_query(sparql)
-            .map_err(|e| StoreError::Backend(e.to_string()))?
-            .on_store(&self.inner)
-            .execute()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        let QueryResults::Solutions(solutions) = results else {
-            return Err(StoreError::Backend("expected SELECT/solution results".into()));
-        };
-        solutions
-            .map(|s| s.map_err(|e| StoreError::Backend(e.to_string())))
-            .collect()
+        let sparql = sparql.to_owned();
+        self.blocking(move |store| {
+            let QueryResults::Solutions(solutions) = evaluate(store, &sparql)? else {
+                return Err(StoreError::Backend("expected SELECT/solution results".into()));
+            };
+            solutions
+                .map(|s| s.map_err(|e| StoreError::Backend(e.to_string())))
+                .collect()
+        })
+        .await
     }
+}
+
+/// Parses and evaluates a read query against `store`, synchronously.
+///
+/// The three read shapes differ only in which `QueryResults` variant they
+/// accept, so the parse and the `execute` live here once. The evaluator is
+/// built without a default `SERVICE` handler: a federated query would
+/// otherwise make the store issue outbound requests to a URL the query names.
+fn evaluate<'a>(store: &'a Store, sparql: &str) -> Result<QueryResults<'a>, StoreError> {
+    SparqlEvaluator::new()
+        .without_default_http_service_handler()
+        .parse_query(sparql)
+        .map_err(|e| StoreError::Backend(e.to_string()))?
+        .on_store(store)
+        .execute()
+        .map_err(|e| StoreError::Backend(e.to_string()))
 }
 
 #[cfg(test)]
