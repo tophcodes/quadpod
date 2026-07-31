@@ -208,7 +208,7 @@ async fn materialize(self) -> Result<(), Response>;
 
 After it returns, the guard does not exist, and nothing can read a stale answer from it because
 there is nothing left to read from. Any pre-write fact a handler still wants is read from
-`existed()` **before** the call — which is a borrow the compiler orders, not a rule anyone has
+`is_taken()` **before** the call — which is a borrow the compiler orders, not a rule anyone has
 to remember.
 
 An earlier draft had `materialize` return a `Created { target_existed }`, on the belief that
