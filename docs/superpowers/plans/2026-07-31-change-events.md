@@ -13,6 +13,7 @@
 ## Global Constraints
 
 - **The skeleton's signatures are given.** `src/notify.rs` and `wac::guard::Materialized` already exist with their public API fixed (commits `4415225`, `afebaf9`). Tasks fill bodies. **No new public functions, no new modules, no changed public signatures.** Two visibility widenings are explicitly permitted and named in Task 3.
+- **`emit_*` takes a `StatusCode`, not a `&Response`.** `axum::body::Body` is not `Sync`, so a `&Response` held across an await makes the handler's future `!Send` and no longer an axum `Handler`. The skeleton compiled only because `todo!()` has no await points. Found in Task 4 and applied to all four signatures.
 - **Build and test through the flake:** `nix develop -c cargo build`, `nix develop -c cargo test`. A bare `cargo` fails on `openssl-sys`.
 - **`arch-check` must be green after every task.** Run it; 25 rules today, 0 violated, 0 broken.
 - **No `#[allow]` attributes anywhere in `src/`** — pinned by `docs/constraints.md`. If a lint fires, fix the code.
@@ -482,7 +483,7 @@ git commit -m "feat(notify): compute a topic's state from the stored state"
 
 **Interfaces:**
 - Consumes: `Bus::live`, `Bus::publish`, `state_of` (Task 3), `Materialized` (Task 2), `Guard::target_exists`.
-- Produces: `emit_put(&AppState, &Target, Existence, &Materialized, &Response)`, plus two private helpers Tasks 5–7 reuse: `publish_own(&AppState, &Target, Activity)` and `publish_containment(&AppState, target_iri: &str, &Materialized, Activity)`.
+- Produces: `emit_put(&AppState, &Target, Existence, &Materialized, StatusCode)`, plus two private helpers Tasks 5–7 reuse: `publish_own(&AppState, &Target, Activity)` and `publish_containment(&AppState, target_iri: &str, &Materialized, Activity)`.
 
 - [ ] **Step 1: Give the test fixture access to the bus**
 
@@ -621,9 +622,9 @@ pub async fn emit_put(
     target: &Target,
     existence: Existence,
     materialized: &Materialized,
-    res: &Response,
+    status: StatusCode,
 ) {
-    if !res.status().is_success() {
+    if !status.is_success() {
         return;
     }
     let activity = match existence {
@@ -706,7 +707,7 @@ and add the wrapper above it:
 ```rust
 async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let (res, existence, materialized) = put_write(&st, agent, &target, headers, body).await;
-    crate::notify::emit_put(&st, &target, existence, &materialized, &res).await;
+    crate::notify::emit_put(&st, &target, existence, &materialized, res.status()).await;
     res
 }
 ```
@@ -786,7 +787,7 @@ git commit -m "feat(http): emit change events on PUT"
 
 **Interfaces:**
 - Consumes: `publish_own`, `publish_containment` (Task 4).
-- Produces: `emit_post(&AppState, &Target, &Materialized, &Response)`.
+- Produces: `emit_post(&AppState, &Target, &Materialized, StatusCode)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -829,9 +830,9 @@ pub async fn emit_post(
     st: &AppState,
     child: &Target,
     materialized: &Materialized,
-    res: &Response,
+    status: StatusCode,
 ) {
-    if !res.status().is_success() {
+    if !status.is_success() {
         return;
     }
     // No `Existence` parameter: `post_impl` allocates an unused name, so the
@@ -846,7 +847,7 @@ pub async fn emit_post(
 At the tail of `post_impl`, after the `report_link` decision and before the value is returned, using the `Materialized` returned by `child_guard.materialize()`:
 
 ```rust
-    crate::notify::emit_post(&st, &child, &materialized, &res).await;
+    crate::notify::emit_post(&st, &child, &materialized, res.status()).await;
     res
 ```
 
@@ -872,7 +873,7 @@ git commit -m "feat(http): emit change events on POST"
 
 **Interfaces:**
 - Consumes: `publish_own`, `publish_containment` (Task 4), `Guard::target_exists`.
-- Produces: `emit_patch(&AppState, &Target, Existence, &Materialized, &Response)`.
+- Produces: `emit_patch(&AppState, &Target, Existence, &Materialized, StatusCode)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -941,9 +942,9 @@ pub async fn emit_patch(
     target: &Target,
     existence: Existence,
     materialized: &Materialized,
-    res: &Response,
+    status: StatusCode,
 ) {
-    if !res.status().is_success() {
+    if !status.is_success() {
         return;
     }
     let activity = match existence {
@@ -960,7 +961,7 @@ pub async fn emit_patch(
 `patch_impl` already reads `guard.target_exists()` for its own create-vs-update branch. Reuse that value — do not call it twice — and emit at the tail:
 
 ```rust
-    crate::notify::emit_patch(&st, &target, existence, &materialized, &res).await;
+    crate::notify::emit_patch(&st, &target, existence, &materialized, res.status()).await;
     res
 ```
 
@@ -988,7 +989,7 @@ git commit -m "feat(http): emit change events on PATCH"
 
 **Interfaces:**
 - Consumes: `publish_own` (Task 4), `Guard::authorize_aux`.
-- Produces: `emit_delete(&AppState, &Target, &[AuxUrl], &Response)`.
+- Produces: `emit_delete(&AppState, &Target, &[AuxUrl], StatusCode)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1094,9 +1095,9 @@ pub async fn emit_delete(
     st: &AppState,
     target: &Target,
     auxiliaries: &[AuxUrl],
-    res: &Response,
+    status: StatusCode,
 ) {
-    if !res.status().is_success() {
+    if !status.is_success() {
         return;
     }
     publish_own(st, target, Activity::Delete).await;
@@ -1146,7 +1147,7 @@ pub async fn emit_delete(
 Then bind the response instead of returning it directly from the final `match`, and emit at the tail:
 
 ```rust
-    crate::notify::emit_delete(&st, &target, &present_auxes, &res).await;
+    crate::notify::emit_delete(&st, &target, &present_auxes, res.status()).await;
     res
 ```
 

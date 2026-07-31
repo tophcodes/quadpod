@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use axum::http::StatusCode;
-use axum::response::Response;
 use tokio::sync::broadcast;
 
 use crate::dataset::Skolemized;
@@ -273,7 +272,7 @@ pub async fn emit_post(
     _st: &AppState,
     _child: &Target,
     _materialized: &Materialized,
-    _res: &Response,
+    _status: StatusCode,
 ) {
     todo!("skeleton")
 }
@@ -284,7 +283,7 @@ pub async fn emit_patch(
     _target: &Target,
     _existence: Existence,
     _materialized: &Materialized,
-    _res: &Response,
+    _status: StatusCode,
 ) {
     todo!("skeleton")
 }
@@ -296,7 +295,7 @@ pub async fn emit_delete(
     _st: &AppState,
     _target: &Target,
     _auxiliaries: &[AuxUrl],
-    _res: &Response,
+    _status: StatusCode,
 ) {
     todo!("skeleton")
 }
