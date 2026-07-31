@@ -415,7 +415,12 @@ impl<'a> Guard<'a> {
     /// root, which has none. `DELETE` needs it because removing a member
     /// rewrites the parent's containment triples.
     pub fn authorize_parent(&self, mode: Mode) -> Result<Option<Decision>, Response> {
-        todo!("design §5")
+        // chain[0] is the subject, so chain[1] is its parent — absent only at
+        // the root, whose `ancestors()` is empty.
+        if self.chain.len() < 2 {
+            return Ok(None);
+        }
+        self.decide_from(1, mode).map(Some)
     }
 
     /// The same question for the target's auxiliary of `kind` — `None` when
@@ -425,7 +430,12 @@ impl<'a> Guard<'a> {
     /// auxiliaries with it, and a narrowing ACL must not be removable by
     /// someone holding merely `Write`.
     pub fn authorize_aux(&self, kind: AuxKind) -> Result<Option<Decision>, Response> {
-        todo!("design §5")
+        let aux = self.chain[0].aux(kind);
+        if !self.present.contains(aux.graph_iri()) {
+            return Ok(None); // nothing there to authorize
+        }
+        // An auxiliary is decided against its subject, which is chain[0].
+        self.decide_from(0, required_mode_for_aux(kind)).map(Some)
     }
 
     /// Refuse, in the way that tells this agent the truth without leaking
@@ -784,5 +794,46 @@ mod tests {
         let target = sp().resolve("/.aux/box/doc.acl").unwrap();
         assert!(authorize_and_materialize(&store, &bob(), &target).await.is_ok(),
             "Control alone must suffice when nothing is materialized");
+    }
+
+    #[tokio::test]
+    async fn authorize_parent_decides_one_level_up_and_is_none_at_the_root() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_container(&store, "/box/").await;
+        seed_acl(&store, "/box/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/> ; \
+             <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; <{ACL_MODE}> <{ACL_WRITE}> ."
+        )).await;
+        let g = guard_for(&store, alice(), "/box/item").await;
+        assert!(g.authorize_parent(Mode::Write).unwrap().is_some());
+
+        let root = guard_for(&store, alice(), "/").await;
+        assert!(root.authorize_parent(Mode::Write).unwrap().is_none(), "the root has no parent");
+    }
+
+    #[tokio::test]
+    async fn authorize_aux_is_none_when_the_auxiliary_does_not_exist() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/box/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
+             <{ACL_MODE}> <{ACL_CONTROL}> ."
+        )).await;
+        crate::resource::put_rdf(&store, &resource("/box/doc"), &[]).await.unwrap();
+        let g = guard_for(&store, alice(), "/box/doc").await;
+        assert!(g.authorize_aux(AuxKind::Acl).unwrap().is_none());
+    }
+
+    // Control on the subject is what an ACL auxiliary requires — Write is not
+    // enough, or a narrowing ACL could be erased by someone holding merely Write.
+    #[tokio::test]
+    async fn authorize_aux_requires_control_over_the_subject() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/box/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
+             <{ACL_MODE}> <{ACL_WRITE}> ."
+        )).await;
+        seed_acl(&store, "/box/doc", "").await;
+        let g = guard_for(&store, alice(), "/box/doc").await;
+        assert_eq!(status(g.authorize_aux(AuxKind::Acl)), Some(StatusCode::FORBIDDEN));
     }
 }
