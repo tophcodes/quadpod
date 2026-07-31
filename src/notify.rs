@@ -233,7 +233,7 @@ pub async fn emit_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::space::{StorageSpace, GraphName};
+    use crate::space::StorageSpace;
 
     fn target(path: &str) -> Target {
         StorageSpace::new("https://pod.toph.so/").unwrap().resolve(path).unwrap()
@@ -260,13 +260,30 @@ mod tests {
         assert_eq!(bus.live(&[watched.clone(), other]), vec![watched]);
     }
 
+    /// `Drop` is what unregisters, not `live`. Asserted on the map directly and
+    /// *before* any `live` call, because `live` evicts a zero-receiver sender
+    /// itself and would satisfy this assertion on its own.
     #[test]
     fn dropping_the_last_receiver_unregisters_the_channel() {
         let bus = Arc::new(Bus::new());
         let topic = Topic::from(&target("/notes"));
         drop(bus.subscribe(topic.clone()));
-        assert!(bus.live(&[topic]).is_empty(), "a dropped receiver must leave no entry behind");
-        assert_eq!(bus.channels.read().unwrap().len(), 0, "and no empty sender either");
+        assert_eq!(bus.channels.read().unwrap().len(), 0,
+            "the last receiver's Drop must remove the entry, without help from live()");
+    }
+
+    /// And only the *last* one: an unconditional eviction would cut off every
+    /// other reader of the same topic.
+    #[test]
+    fn dropping_one_of_two_receivers_leaves_the_channel_alone() {
+        let bus = Arc::new(Bus::new());
+        let topic = Topic::from(&target("/notes"));
+        let keep = bus.subscribe(topic.clone());
+        drop(bus.subscribe(topic.clone()));
+        assert_eq!(bus.channels.read().unwrap().len(), 1,
+            "a second reader is still there, so the channel must survive");
+        assert_eq!(bus.live(&[topic]), vec![Topic::from(&target("/notes"))]);
+        drop(keep);
     }
 
     #[tokio::test]
