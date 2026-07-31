@@ -289,7 +289,7 @@ async fn a_delete_stays_within_budget() {
     assert!(c.total() <= DELETE_BUDGET, "DELETE /seeded cost {c:?}, budget {DELETE_BUDGET}");
 }
 
-const PATCH_BUDGET: usize = 7;
+const PATCH_BUDGET: usize = 6;
 
 #[tokio::test]
 async fn a_patch_stays_within_budget() {
