@@ -26,6 +26,7 @@ pub use dpop::verify_dpop;
 pub use http_jwks::HttpJwksResolver;
 pub use jwks::{Jwks, JwksResolver, StaticJwksResolver};
 pub use middleware::auth_layer;
+pub use safe_fetch::GuardedClient;
 pub use webid_issuer::{HttpWebIdIssuers, StaticWebIdIssuers, WebIdIssuerVerifier, SOLID_OIDC_ISSUER};
 
 use thiserror::Error;

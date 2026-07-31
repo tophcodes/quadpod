@@ -147,6 +147,17 @@ impl FetchPolicy {
         self.insecure_hosts.contains(&(host.clone(), None))
             || self.insecure_hosts.contains(&(host, Some(port)))
     }
+
+    /// Whether the operator named this host on *any* port. Weaker than
+    /// [`FetchPolicy::permits_insecure`] by exactly the port, and used only
+    /// by [`PolicyResolver`], which resolves a name and therefore never
+    /// learns which port the request is for. The port-exact rule is not lost
+    /// by this: [`guarded_get`] asks `permits_insecure` before the client is
+    /// ever handed the URL, so a request to a port the operator did not name
+    /// is refused before resolution begins.
+    fn permits_insecure_host(&self, host: &str) -> bool {
+        self.insecure_hosts.iter().any(|(h, _)| h == host)
+    }
 }
 
 /// Parse one `--allow-insecure-host` / `POD_ALLOW_INSECURE_HOSTS` entry into
@@ -385,13 +396,36 @@ pub(crate) async fn resolve_allowed(
             .collect(),
     };
 
+    screen_addresses(
+        resolved,
+        policy.allow_private_ips || policy.permits_insecure(host, port),
+    )
+}
+
+/// Decide whether a resolved address set may be contacted: it must be
+/// non-empty, and unless `allow_private` every address in it must be public.
+/// The rule is `any`, not `filter` — a name answering with one public and one
+/// private record is refused outright rather than connected to on its public
+/// half, because a resolver free to pick between them is a resolver an
+/// attacker can steer.
+///
+/// The only classifier of a resolved address set in this crate, called by
+/// both [`resolve_allowed`] (which decides per (host, port)) and
+/// [`PolicyResolver::resolve`] (which decides per host, having no port). Those
+/// two compute `allow_private` differently — that difference is the whole
+/// point of the split and is argued at [`FetchPolicy::permits_insecure_host`]
+/// — but they must not come to disagree about what a *screened* set is, which
+/// is what living here prevents.
+fn screen_addresses(
+    resolved: Vec<SocketAddr>,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, AuthError> {
     if resolved.is_empty() {
         return Err(AuthError::FetchBlocked(
             "host resolved to no addresses".to_string(),
         ));
     }
 
-    let allow_private = policy.allow_private_ips || policy.permits_insecure(host, port);
     if !allow_private && resolved.iter().any(|addr| is_forbidden_ip(addr.ip())) {
         return Err(AuthError::FetchBlocked(
             "target resolves to a forbidden (private/loopback/link-local) IP".to_string(),
@@ -401,6 +435,71 @@ pub(crate) async fn resolve_allowed(
     Ok(resolved)
 }
 
+/// The DNS resolver a [`GuardedClient`] is built with: it resolves a name and
+/// screens the result through [`screen_addresses`], so an address the policy
+/// forbids never reaches the connector at all.
+///
+/// This is what closes DNS rebinding. The earlier design validated the
+/// addresses and then pinned the connection to one of them, which needed a
+/// fresh `reqwest::Client` per request (a built client's DNS overrides are
+/// fixed at construction) and so gave up connection reuse entirely. Screening
+/// inside the resolver reaches the same end by a shorter route: there is no
+/// window between the check and the connect, because the check *is* the
+/// resolution — `reqwest` has no other way to learn an address.
+///
+/// It knows the host but not the port, so its private-IP exemption is the
+/// host-wide [`FetchPolicy::permits_insecure_host`]. [`guarded_get`] has
+/// already applied the port-exact rule before any request is sent.
+struct PolicyResolver {
+    policy: FetchPolicy,
+}
+
+impl reqwest::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = self.policy.clone();
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            // Port 0: `reqwest` substitutes the URL's port (or the scheme's
+            // default) into whatever this returns.
+            let resolved: Vec<SocketAddr> = lookup_host((host.as_str(), 0)).await?.collect();
+            let allow_private = policy.allow_private_ips || policy.permits_insecure_host(&host);
+            let screened = screen_addresses(resolved, allow_private)?;
+            Ok(Box::new(screened.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The only `reqwest::Client` this crate builds, and the only client
+/// [`guarded_get`] will accept. Cloning shares the underlying connection pool,
+/// so every guarded fetch in the process reuses connections and TLS sessions
+/// with every other one to the same origin.
+///
+/// The newtype is load-bearing rather than cosmetic: [`guarded_get`] trusts
+/// its client to have been built with a screening resolver, and a bare
+/// `reqwest::Client` would satisfy the old signature while silently resolving
+/// through the system resolver — no SSRF filter, no rebinding protection, and
+/// nothing about the call site looking wrong. Only [`GuardedClient::new`]
+/// constructs one, and it takes the policy it must enforce.
+#[derive(Clone)]
+pub struct GuardedClient {
+    inner: reqwest::Client,
+}
+
+impl GuardedClient {
+    pub fn new(policy: &FetchPolicy) -> Self {
+        let inner = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(TOTAL_TIMEOUT)
+            .dns_resolver(std::sync::Arc::new(PolicyResolver {
+                policy: policy.clone(),
+            }))
+            .build()
+            .expect("reqwest client with timeouts should always build");
+        Self { inner }
+    }
+}
+
 /// Fetch `url` with the `accept` header, refusing to run at all unless it
 /// passes `policy`: https-only (unless `allow_http`, or the host is on the
 /// operator's `insecure_hosts` list), and every IP the host resolves to
@@ -408,17 +507,17 @@ pub(crate) async fn resolve_allowed(
 /// that same list). Fails closed on any parse, resolution, network, status,
 /// size, or encoding error.
 ///
-/// The connection is pinned to the exact validated address (via a
-/// per-request client built with reqwest's DNS override) rather than
-/// handing the hostname to `reqwest` to resolve again — closing the
-/// DNS-rebinding race where a name resolves to a public IP for this
-/// check and a private one for the real connection. The `_client`
-/// parameter is accepted for API stability but unused: pinning requires
-/// a fresh `ClientBuilder` per request (a built `reqwest::Client`'s DNS
-/// overrides can't be changed after construction), so the connection
-/// always goes out on a client built here, not the one passed in.
+/// DNS rebinding is closed by the client itself: a [`GuardedClient`] resolves
+/// through [`PolicyResolver`], which screens every address before the
+/// connector sees it, so there is no window in which a name can answer public
+/// for a check and private for the connection.
+///
+/// The pre-flight [`resolve_allowed`] below is therefore not the rebinding
+/// guard — it is the **port-exact** policy decision, which the resolver cannot
+/// make because a DNS resolver is given no port. It is also what turns a
+/// refusal into a specific reason rather than an opaque connect failure.
 pub async fn guarded_get(
-    _client: &reqwest::Client,
+    client: &GuardedClient,
     url: &str,
     accept: &str,
     policy: &FetchPolicy,
@@ -447,24 +546,10 @@ pub async fn guarded_get(
         }
     }
 
-    let pinned_addr = *resolve_allowed(host, port, policy).await?.first().expect(
-        "resolve_allowed only returns Ok with a non-empty Vec (empty case is its own Err)",
-    );
+    resolve_allowed(host, port, policy).await?;
 
-    // Build a fresh client for this one request, pinned to the validated
-    // address: reqwest's DNS override is baked into a `Client` at build
-    // time, so there is no way to point an already-built client at a
-    // different address per call. The Host header + TLS SNI still use
-    // `host` (only the socket target is overridden).
-    let pinned_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(TOTAL_TIMEOUT)
-        .resolve(host, pinned_addr)
-        .build()
-        .map_err(|e| AuthError::FetchBlocked(format!("failed to build pinned client: {e}")))?;
-
-    let mut response = pinned_client
+    let mut response = client
+        .inner
         .get(parsed)
         .header(reqwest::header::ACCEPT, accept)
         .send()
@@ -529,6 +614,8 @@ pub async fn guarded_get(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn forbidden_ip_classification() {
@@ -581,7 +668,7 @@ mod tests {
         // Exercises the `lookup_host` branch (not the IP-literal
         // fast-path): "localhost" resolves via the system resolver, not a
         // network DNS query, so this stays hermetic.
-        let c = reqwest::Client::new();
+        let c = GuardedClient::new(&FetchPolicy::default());
         let r = guarded_get(&c, "https://localhost/x", "text/turtle", &FetchPolicy::default())
             .await;
         assert!(r.is_err());
@@ -589,14 +676,14 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_http_scheme_by_default() {
-        let c = reqwest::Client::new();
+        let c = GuardedClient::new(&FetchPolicy::default());
         let r = guarded_get(&c, "http://example.com/x", "text/turtle", &FetchPolicy::default()).await;
         assert!(r.is_err());
     }
 
     #[tokio::test]
     async fn rejects_loopback_target_by_default() {
-        let c = reqwest::Client::new();
+        let c = GuardedClient::new(&FetchPolicy::default());
         let r = guarded_get(&c, "https://127.0.0.1/x", "text/turtle", &FetchPolicy::default()).await;
         assert!(r.is_err());
     }
@@ -645,8 +732,8 @@ mod tests {
     #[tokio::test]
     async fn streamed_body_over_cap_is_rejected_without_full_buffering() {
         let url = spawn_oversized_chunked_server().await;
-        let c = reqwest::Client::new();
         let policy = FetchPolicy::permissive();
+        let c = GuardedClient::new(&policy);
         let r = guarded_get(&c, &url, "text/plain", &policy).await;
         assert!(r.is_err(), "oversized streamed body must be rejected");
     }
@@ -734,7 +821,7 @@ mod tests {
     // from "the network was unavailable". Pinning the message closes that.
     #[tokio::test]
     async fn http_is_refused_for_an_unnamed_host() {
-        let c = reqwest::Client::new();
+        let c = GuardedClient::new(&named(&["other.example"]));
         let r = guarded_get(&c, "http://example.com/x", "text/turtle", &named(&["other.example"]))
             .await;
         match r {
@@ -779,6 +866,94 @@ mod tests {
         addr
     }
 
+    /// Like [`spawn_ok_server`] but keep-alive (serves every request on a
+    /// connection until the peer closes it) and counting *accepts*, not
+    /// requests — the only observable that distinguishes a reused connection
+    /// from a new one.
+    async fn spawn_keepalive_server() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut req_buf = [0u8; 1024];
+                    // One response per read: these requests are small enough
+                    // to arrive whole, and the client sends the next one only
+                    // after reading the previous response.
+                    while let Ok(n) = socket.read(&mut req_buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\n\
+                                  Content-Type: text/plain\r\n\
+                                  Content-Length: 2\r\n\r\n\
+                                  ok",
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, accepts)
+    }
+
+    /// The point of [`GuardedClient`]: two fetches through one client open one
+    /// connection, not two. Before it, `guarded_get` built a throwaway client
+    /// per request — every fetch paid a fresh TCP and TLS handshake, and no
+    /// pool could ever be shared between the JWKS resolver and the WebID
+    /// verifier.
+    #[tokio::test]
+    async fn one_client_reuses_one_connection_across_fetches() {
+        let (addr, accepts) = spawn_keepalive_server().await;
+        let policy = FetchPolicy::with_insecure_hosts(vec![addr.to_string()]);
+        let c = GuardedClient::new(&policy);
+        let url = format!("http://{addr}/x");
+
+        guarded_get(&c, &url, "text/plain", &policy).await.unwrap();
+        guarded_get(&c, &url, "text/plain", &policy).await.unwrap();
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "two fetches through one GuardedClient must reuse a single connection"
+        );
+    }
+
+    /// A clone shares the pool rather than opening its own — this is what
+    /// makes handing the same client to both auth fetchers worth doing.
+    #[tokio::test]
+    async fn a_cloned_client_shares_the_connection_pool() {
+        let (addr, accepts) = spawn_keepalive_server().await;
+        let policy = FetchPolicy::with_insecure_hosts(vec![addr.to_string()]);
+        let c = GuardedClient::new(&policy);
+        let clone = c.clone();
+        let url = format!("http://{addr}/x");
+
+        guarded_get(&c, &url, "text/plain", &policy).await.unwrap();
+        guarded_get(&clone, &url, "text/plain", &policy)
+            .await
+            .unwrap();
+
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    }
+
     /// Pins the headline relaxation itself, not just its absence of an
     /// error: a listed host must actually succeed over **plain http**
     /// against a **private** address. Before this test, the scheme and IP
@@ -794,7 +969,7 @@ mod tests {
     async fn a_named_host_succeeds_over_plain_http() {
         let addr = spawn_ok_server().await;
         let policy = FetchPolicy::with_insecure_hosts(vec![addr.to_string()]);
-        let c = reqwest::Client::new();
+        let c = GuardedClient::new(&policy);
         let url = format!("http://{addr}/x");
         let r = guarded_get(&c, &url, "text/plain", &policy).await;
         let (body, _content_type) = r.expect("a named host must succeed over http");
@@ -844,7 +1019,7 @@ mod tests {
 
         let entry = format!("[::1]:{}", addr.port());
         let policy = FetchPolicy::with_insecure_hosts(vec![entry]);
-        let c = reqwest::Client::new();
+        let c = GuardedClient::new(&policy);
         let url = format!("http://{addr}/x");
         let r = guarded_get(&c, &url, "text/plain", &policy).await;
         let (body, _) = r.expect("a bracketed IPv6 entry must permit its host over http");
@@ -1083,7 +1258,7 @@ mod tests {
     // port", covered here so the reorder itself is under test.
     #[tokio::test]
     async fn non_special_scheme_fails_closed_with_no_port_error() {
-        let c = reqwest::Client::new();
+        let c = GuardedClient::new(&FetchPolicy::default());
         let r = guarded_get(&c, "foo://example.com/x", "text/turtle", &FetchPolicy::default())
             .await;
         match r {
@@ -1095,12 +1270,10 @@ mod tests {
     #[tokio::test]
     async fn redirect_to_forbidden_target_is_not_followed() {
         let url = spawn_redirect_server().await;
-        // Mirrors the production client construction: redirects disabled.
-        let c = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
         let policy = FetchPolicy::permissive();
+        // The production client construction, which is where redirects are
+        // disabled — there is no other way to build one.
+        let c = GuardedClient::new(&policy);
         let r = guarded_get(&c, &url, "text/plain", &policy).await;
         assert!(
             r.is_err(),

@@ -110,6 +110,20 @@ Only `blob::BlobKey` builds an object key.
     exists for: before the offload, all four trait methods evaluated inline
     and the count was 4.
     check: [ "$(rg -c 'self\.inner' src/store.rs)" = 1 ] && rg -q 'spawn_blocking' src/store.rs
+    
+`GuardedClient` is the only `reqwest::Client` this crate builds.
+    → 2026-07-31-auth-caching-design.md §1; `safe_fetch.rs`'s own comment on the
+    type. `guarded_get` no longer validates addresses for the connection it is
+    about to make — its client does, in the DNS resolver it was built with. That
+    is what allows one client to be shared, and it is also what makes a bare
+    `reqwest::Client` dangerous here: it satisfies nothing at the type level but
+    resolves through the system resolver, so an SSRF filter that reads as present
+    at every call site is absent at the only place it acts. The private field
+    makes `GuardedClient::new` the only constructor today; nothing stops a second
+    one, or an `inner()`, being added — the same membership gap the
+    `DirectlyWritable` rule exists for. Counts constructions, not mentions: the
+    `reqwest::Client` type is named in `GuardedClient`'s own field.
+    check: [ "$(rg -o 'reqwest::Client::(builder|new)' src | wc -l)" = 1 ]
 
 Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     → 2026-07-30-shape-validation-design.md §2.1. `rudof_lib` pulls
