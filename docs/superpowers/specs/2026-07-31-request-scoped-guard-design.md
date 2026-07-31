@@ -1,7 +1,7 @@
 # One probe per request — the guard as a stateful enforcement point
 
 **Date:** 2026-07-31
-**Status:** Proposed (pre-implementation)
+**Status:** Implemented — see `src/wac/guard.rs`
 **Author:** Christopher Mühl (with Claude)
 **Parent spec:** [2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md) §6, §8, §16 ADR-1, ADR-2
 **Origin:** [2026-07-26-wac-enforcement-design.md](2026-07-26-wac-enforcement-design.md) fixed *what* the
@@ -152,18 +152,24 @@ table — the exact thing this design exists to remove.
 ## 5. `Guard`
 
 ```rust
-impl Guard {
-    async fn probe(store: &dyn SparqlStore, agent: Agent, target: Target) -> Result<Self, Response>;
+impl<'a> Guard<'a> {
+    async fn probe(store: &'a dyn SparqlStore, agent: Agent, target: Target) -> Result<Self, Response>;
 
     fn authorize(&self, mode: Mode) -> Result<Decision, Response>;
-    fn authorize_parent(&self, mode: Mode) -> Result<Decision, Response>;
-    fn authorize_aux(&self, kind: AuxKind) -> Result<Decision, Response>;
+    fn authorize_parent(&self, mode: Mode) -> Result<Option<Decision>, Response>;
+    fn authorize_aux(&self, kind: AuxKind) -> Result<Option<Decision>, Response>;
 
     fn is_taken(&self) -> bool;
     fn deny(&self) -> Response;
     async fn materialize(self) -> Result<(), Response>;
 }
 ```
+
+The lifetime ties a guard to the store reference it was probed with, so it cannot be stashed in
+anything that outlives the request's snapshot of the store. `authorize_parent` and
+`authorize_aux` answer `Ok(None)` rather than a `Decision` where §3 says there is nothing to
+authorize — no parent at the root, no auxiliary that does not exist — so a handler cannot
+mistake "nothing to check" for a grant.
 
 `authorize` takes no target. There is one per request and the guard owns it; the two variants
 name the only other things §3 permits a handler to ask about. A handler cannot construct a
@@ -175,10 +181,11 @@ function over ACL triples (ADR-1). The claim in `guard::authorize`'s current doc
 resolving the ACL twice would repeat the ancestor walk and could straddle a concurrent
 write — stops being a warning and becomes a property of the signatures.
 
-**The guard holds only what the target implies:** store, agent, target, the probed presence set,
-and the ACL triples it loaded. Not `AppState`, not the blob store, not headers, not the request
-body. Without that line it becomes the place everything per-request accumulates, and an
-enforcement point that holds the request body is no longer an enforcement point.
+**The guard holds only what the target implies:** store, agent, target, the chain derived from
+it, the probed presence set, and the ACL triples it loaded. Not `AppState`, not the blob store,
+not headers, not the request body. Without that line it becomes the place everything per-request
+accumulates, and an enforcement point that holds the request body is no longer an enforcement
+point.
 
 **The chain's ACL triples are read eagerly, in one query.** `prp::load_chain_acls` takes the
 probe's presence set and fetches every ACL the chain actually has, keyed by the IRI it governs;
@@ -292,8 +299,12 @@ estimated, and the diff shows the improvement instead of claiming it.
 Restoring a store parameter to any of the three decision methods makes it three, and that is the
 failure this whole design is built to prevent. Anchoring on the count rather than on a regex over
 one signature is the shape *"`space::GraphName` stays sealed"* already uses: it pins the
-declaration, so it cannot be satisfied by a method spelled differently. It must be demonstrated
-red against a real edit before the rule is added, per the file's own standard.
+declaration, which catches the `dyn SparqlStore` spelling every decision method and every call
+site in this codebase actually uses. It does not catch every way a store could reach a decision
+method in principle — a non-generic wrapper type, or a type alias, would leave the count at two —
+but those are not spellings this codebase writes anywhere else, so the rule catches the mistake a
+real edit here would make. It must be demonstrated red against a real edit before the rule is
+added, per the file's own standard.
 
 The tests inside `guard.rs` construct `OxigraphStore` by its concrete type and so do not
 contribute to the count — which is also why the rule reads `src/wac/guard.rs` rather than `src`.

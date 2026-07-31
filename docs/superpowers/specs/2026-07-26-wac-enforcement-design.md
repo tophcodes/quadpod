@@ -56,7 +56,7 @@ New module `src/wac/`, one responsibility per file:
 
 | File | Responsibility | Depends on |
 |---|---|---|
-| `wac/prp.rs` | ACL resolution: `effective_acl(store, space, path) -> Option<EffectiveAcl>` | store, space, container |
+| `wac/prp.rs` | ACL resolution: `load_chain_acls(store, chain, present) -> HashMap<String, Vec<Triple>>`, one query for the whole chain (`2026-07-31-request-scoped-guard-design.md` §5) | store |
 | `wac/pdp.rs` | pure decision: `(ACL triples, agent, target, inherited?) -> AccessModes` | RDF types only |
 | `wac/provision.rs` | root ACL bootstrap for the configured owner (idempotent) | store, space |
 | `wac/guard.rs` | `authorize(store, space, agent, path, mode) -> Result<(), Response>` | prp + pdp |
@@ -173,8 +173,8 @@ so a stale one can always be repaired or removed.
 
 **An ACL cannot have an ACL of its own.** `<res>.acl.acl` is refused outright. Otherwise the
 subject-existence rule would be satisfiable one level up — `/box/.acl` does exist — and
-since `authorize("/box/.acl.acl")` resolves through `effective_acl("/box/.acl")` to that
-very document, its author would own it permanently: unremovable, uncascaded, invisible in
+since authorizing `/box/.acl.acl` would resolve through `/box/.acl`'s own governing ACL — which
+is that very document — to itself, its author would own it permanently: unremovable, uncascaded, invisible in
 listings, and extensible without limit (`.acl.acl.acl`, …). That would hand an agent
 holding no `Write` or `Append` anywhere an unbounded write primitive.
 
