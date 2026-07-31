@@ -105,14 +105,20 @@ mod tests {
         assert_eq!(got.state.as_deref(), Some("\"abc\""));
     }
 
+    /// Publishing must not be what creates a channel — otherwise the registry
+    /// fills up with every topic ever written to, which is the unbounded growth
+    /// `live`'s eviction exists to prevent.
     #[tokio::test]
-    async fn publishing_to_an_unwatched_topic_is_not_an_error() {
+    async fn publishing_to_an_unwatched_topic_creates_no_channel() {
         let bus = Arc::new(Bus::new());
         let topic = Topic::from(&target("/notes"));
         bus.publish(Event {
-            topic, activity: Activity::Delete,
+            topic: topic.clone(), activity: Activity::Delete,
             object: "x".to_owned(), target: None, state: None,
         });
+        assert_eq!(bus.channels.read().unwrap().len(), 0,
+            "publish must not register a topic nobody asked for");
+        assert!(bus.live(&[topic]).is_empty());
     }
 }
 ```
