@@ -50,7 +50,7 @@ second pass, built from existing, non-rotting components plus a thin custom core
 | **Rust** | Not perf-bound (personal scale) but *plumbing*-bound; Rust has the best non-JS RDF tooling and Oxigraph is a Rust project. Live ecosystem, static binary → fits Fleet/Nomad. |
 | **Build thin server, don't fork one** | Forking any server (CSS, Melvin's, DreamLab, jeswr's) means inheriting conventions/off-spec choices we'd fight. jeswr's `solid-server-rs` is explicitly "not a foundation." Manas-the-server is **dormant** (last commit 2024-07). |
 | **Reuse Manas *leaf crates*, not its `Repo` trait** | The leaf crates are published, downloaded in the wild, and encode frozen specs → low rot. The `manas_repo` storage trait is heavy typestate + an 80-file reference backend → high effort, high coupling. Deep-reuse rejected; shallow-reuse chosen. |
-| **Oxigraph default, behind a `SparqlStore` trait** | Target SPARQL 1.1 Protocol only (no vendor extensions) → Fuseki/GraphDB swappable. HTTP endpoint (not embedded) keeps multi-writer (Windmill pipelines) and avoids the single-writer RocksDB constraint. |
+| **Oxigraph default, behind a `SparqlStore` trait** | Target SPARQL 1.1 Protocol only (no vendor extensions) → Fuseki/GraphDB swappable. ~~HTTP endpoint (not embedded) keeps multi-writer (Windmill pipelines) and avoids the single-writer RocksDB constraint.~~ — **withdrawn, see §16 ADR-7.** Embedded Oxigraph is the default and recommended deployment; the multi-writer rationale contradicted §3, which routes every write through LDP. An external SPARQL 1.1 endpoint remains a supported configuration behind the same trait, for the case where several pod processes must share one dataset (`2026-07-31-cli-config-design.md` §2). |
 | **RDF 1.2 behind an explicit declaration; provenance is app data** | Solid mandates Turtle + JSON-LD, and every deployed Solid client is an RDF 1.1 parser — so 1.2 is opt-in per representation and never the default (`2026-07-30-rdf12-design.md` §4). Backend-pluggability and RDF 1.2 are **not** mutually exclusive, which is what the original entry got wrong: once §13 names a *capability* instead of a product class, a store that cannot hold triple terms is a configuration the pod degrades against, not a counterexample. Provenance/PROV-O remains **not** a server concern — pipelines write it as ordinary triples. See §16 ADR-6. |
 | **WAC only (v1), ACP-ready by architecture** | Solid CG consensus recommends WAC; community adoption favors it. The standalone `acp` crate makes ACP a near-zero-cost future plug behind the same PDP seam. |
 | **Verify-only auth, external IdP** | Running an IdP is a whole subsystem. Verify-only is far less surface; WebID profile docs can still live in the pod. |
@@ -231,6 +231,10 @@ template); the matcher is still built so the seam exists.
   forwarded Host for space-routing — v1 n/a.)
 - **Bind to localhost / private interface.** Plain HTTP must never be exposed directly; only the
   proxy reaches it. Tune proxy buffering for large blob transfers.
+- **The pod owns a state directory** when configured with `--store rocksdb:<dir>` — a backup and
+  restore concern, and a mutual-exclusion one: only one process may hold it (§16 ADR-7,
+  `2026-07-31-cli-config-design.md` §2.1). Multi-tenancy does not collide with this; §9 runs
+  many spaces in one process, as named graphs in one store.
 
 ## 11. Optional Modules (seams present in v1, bodies deferred)
 
@@ -450,3 +454,39 @@ rather than inheriting it, so the capability stops being a dependency's private 
 at which point Concepts' "absence means 1.2" becomes the right default and §4 of the design
 inverts. Or a `SparqlStore` implementor that declares `Rdf11`, which turns the degradation path
 from a specified case into an exercised one.
+
+### ADR-7 — Embedded Oxigraph is the default; the multi-writer rationale is withdrawn
+
+**Context.** §4 preferred an Oxigraph HTTP endpoint over an embedded store, to keep several
+writers — named as Windmill pipelines — able to write the same dataset. The implementation
+embedded the store anyway, and `2026-07-30-rdf12-design.md` §8 recorded the divergence without
+resolving it: *"The multi-writer rationale is therefore currently unmet — a pre-existing
+divergence, out of scope here."*
+
+**Decision.** Embedded Oxigraph, selected by `--store rocksdb:<dir>`, is the default and the
+recommended deployment. The multi-writer rationale is withdrawn, not deferred. `memory` remains
+the default spec value, so an unconfigured pod is still uniformly ephemeral.
+
+**Why the premise was wrong.** §3 already routes every write through LDP, so that WAC and SHACL
+are enforced on all of them. A second process writing raw SPARQL UPDATE would bypass more than
+those two: presence markers in `urn:quadpod:sys:` graphs (`resource.rs`), shelf IRIs minted with
+a `0x00` separator (`shelf.rs`), containment triples, and ETags — and it would break ADR-2's
+`;`-sequence atomicity, which every write path rests on and none can check. That is not a
+multi-writer capability; it is corruption with extra steps. §4 bought a property §3 forbids.
+
+**What the constraint actually is.** Oxigraph permits one read-write `Store` at a time — a
+statement about *processes*, not threads; within this process any number of tasks write
+concurrently. Multi-tenancy (§9) therefore does not collide with it: many spaces run in one
+process as named graphs in one store. The constraint binds only when several pod *processes*
+must see one dataset.
+
+**Consequences.** One pod process per store directory. Horizontal scale needs either a process
+per space with its own directory — the natural fit for the subdomain topology of §9 caveat 2 —
+or the external-endpoint configuration, which shares a store rather than removing its
+single-writer property. The `SparqlStore` seam stays open for that client; it is not written,
+and `docs/constraints.md`'s one-implementor tripwire still guards the atomicity decision it
+would reopen.
+
+**What would reopen this.** A writer that genuinely cannot go through LDP — a bulk load whose
+volume makes HTTP untenable — or a requirement that the pod stay available across a process
+restart.
