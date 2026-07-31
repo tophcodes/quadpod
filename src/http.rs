@@ -681,7 +681,7 @@ async fn patch_impl(
 
 /// §7: a target that does not exist is patched against an empty RDF dataset,
 /// so a patch that asks nothing of the prior state creates it — through the
-/// same [`authorize_and_materialize`] walk, the same containment linking and
+/// same [`crate::wac::guard::Guard::materialize`] walk, the same containment linking and
 /// the same [`created`] response `PUT` uses. There is no second creation path.
 ///
 /// A patch creates only when the empty dataset answers everything it asks:
@@ -3338,8 +3338,8 @@ mod tests {
     // A `Slug` is a hint, and §3.1 makes the other half of a slash pair as
     // unavailable as the name itself — so a POSTed container whose name is
     // held by an existing *resource* gets another name, not the `409` a
-    // client-named PUT would get. Same rule `name_is_taken` already applied in
-    // the other direction.
+    // client-named PUT would get. Same rule `Guard::is_taken` already applies
+    // in the other direction.
     #[tokio::test]
     async fn posted_container_avoids_a_name_its_slash_counterpart_holds() {
         let f = fixture().await;
@@ -3994,7 +3994,7 @@ mod tests {
     }
 
     // The residual from the previous round: an ACL is exempt from containment
-    // (it is never listed via `ldp:contains`), but `authorize_and_materialize`
+    // (it is never listed via `ldp:contains`), but `Guard::materialize`
     // still materializes any missing ancestor containers for
     // `PUT /.aux/a/b/c.acl` exactly as it would for `PUT /a/b/c`. Bob's grant
     // here is `acl:Control` via the ROOT ACL's `acl:default` — inherited onto
@@ -4048,7 +4048,7 @@ mod tests {
     // The counterweight to THIS test above's counterweight: when the ACL's
     // immediate parent already exists, creating the ACL is a zero-mutation
     // event — an `Aux` target is never a containment member (that's
-    // `authorize_and_materialize`'s `may_be_member` match on the `Target`
+    // `Guard::materialize`'s `may_be_member` match on the `Target`
     // variant, a property of the type rather than something `add_containment`
     // has to notice at runtime), and `ensure_container` is a no-op on a
     // container that already has its type triples. So an agent holding
@@ -4170,11 +4170,11 @@ mod tests {
     }
 
     // Finding 2: the same refusal, but for a subject whose ancestors don't
-    // exist either. Before the existence check inside
-    // `authorize_and_materialize` (see its doc comment), `aux::put` was the
-    // only thing that ever said no here — and by the time it ran,
-    // `authorize_and_materialize` had already created and linked `/a/` and
-    // `/a/b/` for a write that was always going to be refused. A 404 that
+    // exist either. `Guard::materialize`'s existence check (see its doc
+    // comment) is what refuses this before anything is created: without it,
+    // `aux::put` would be the only thing that ever said no here, and by the
+    // time it ran, `materialize` would already have created and linked `/a/`
+    // and `/a/b/` for a write that was always going to be refused. A 404 that
     // mutates the store either way, but silently so: the caller is told
     // nothing happened.
     #[tokio::test]
@@ -4333,7 +4333,7 @@ mod tests {
             "no auxiliary may have been created");
     }
 
-    // The other half of `authorize_and_materialize`'s exemption, and the one
+    // The other half of `Guard::materialize`'s exemption, and the one
     // that makes calling it unconditionally safe: overwriting a resource that
     // already exists adds no containment triple its parent does not already
     // hold, so it must NOT start demanding `Append` there. Bob here holds
@@ -4392,9 +4392,10 @@ mod tests {
     // check on the target itself.
     //
     // The orphan is `/box/doc`'s ACL. It is the shape that keeps Bob
-    // authorized on the target after his delegation is revoked:
-    // `effective_acl("/box/doc")` finds that ACL directly, i.e. the document
-    // Bob wrote about himself. That is precisely the case that matters — Bob
+    // authorized on the target after his delegation is revoked: the guard's
+    // nearest-ACL search finds that ACL directly — the document Bob wrote
+    // about himself — with no ancestor ever consulted. That is precisely the
+    // case that matters — Bob
     // passes the target check on his own say-so and must still be stopped
     // from touching `/`.
     //
@@ -4540,8 +4541,9 @@ mod tests {
     // A narrowing ACL is WAC's ONLY mechanism for revoking rights that an
     // ancestor hands down through acl:default. If deleting the resource also
     // deleted that ACL, an agent holding merely Write could remove the
-    // narrowing, recreate the resource, and have `effective_acl` walk back up
-    // to the wider ancestor grant — escalating themselves to Control without
+    // narrowing, recreate the resource, and have the guard's nearest-ACL
+    // search walk back up to the wider ancestor grant — escalating themselves
+    // to Control without
     // ever being allowed to touch the ACL directly.
     #[tokio::test]
     async fn deleting_a_resource_needs_control_over_the_acl_it_would_cascade_into() {

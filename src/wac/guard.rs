@@ -1,4 +1,7 @@
-//! The enforcement point: one call handlers make before touching the store.
+//! The enforcement point: a `Guard`, probed once per request. `probe` is the
+//! store round trip; `authorize`, `authorize_parent` and `authorize_aux`
+//! decide synchronously against what it resolved; `materialize` performs the
+//! writes a decision allows.
 //!
 //! Fails closed in every direction — a missing ACL, a store error, or an
 //! unroutable path all deny. The only path to `Ok(())` is an ACL that
@@ -35,11 +38,14 @@ const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256 RS256\"";
 /// Deny in the way that tells the caller the truth without leaking anything:
 /// an anonymous caller learns that credentials would help (401), a verified
 /// one that theirs are insufficient (403). Neither learns whether the
-/// resource exists — `authorize` runs before any existence check.
+/// resource exists: no refusal that reads a probed existence fact is
+/// produced before the corresponding [`Guard::authorize`] has returned `Ok`
+/// — knowing early, which [`Guard::probe`] does for the whole chain, is fine;
+/// answering early from what it knows is not (design §7).
 ///
 /// Public to the crate for the one refusal this module cannot make itself:
 /// a patch's required modes are known only after the body is parsed, and
-/// re-running [`authorize`] to say no would resolve the ACL a second time.
+/// re-running [`Guard::authorize`] to say no would resolve the ACL a second time.
 /// It stays the single place the `401`/`403` split and [`DPOP_CHALLENGE`] are
 /// decided, which is what a handler-side refusal would break.
 pub(crate) fn deny(agent: &Agent) -> Response {
@@ -245,11 +251,10 @@ impl<'a> Guard<'a> {
     /// a `Link: rel="type"` can make an allocated child a container, and the
     /// pair rule reads the same from that side.
     ///
-    /// Reads only the probe's already-resolved presence set — this is the
-    /// question `name_is_taken` used to answer with its own two queries, now
-    /// read from [`Guard::probe`]'s single one. Refuses nothing on its own;
-    /// callers read it after [`Guard::authorize`] returned `Ok`, which is the
-    /// ordering the store lookup it replaces already obeyed (design §7).
+    /// Reads only the probe's already-resolved presence set, so answering it
+    /// costs no query of its own. Refuses nothing on its own; callers read it
+    /// after [`Guard::authorize`] returned `Ok`, which is the ordering any
+    /// store lookup for the same fact would have to obey too (design §7).
     pub fn is_taken(&self) -> bool {
         if self.present.contains(self.target.graph_iri()) {
             return true;
@@ -510,10 +515,9 @@ mod tests {
         assert!(guard_for(&store, alice(), "/box").await.is_taken());
     }
 
-    // A `Link: rel="type"` can make an allocated child a container, so the
-    // counterpart checked for a `Container` target must be its own resource
-    // URL's counterpart — the case `name_is_taken`'s `Target::Container` arm
-    // singled out.
+    // A `Link: rel="type"` can make an allocated child a container, so a
+    // container's counterpart is its own resource URL's counterpart — the one
+    // case `is_taken`'s `Container` arm has to single out.
     #[tokio::test]
     async fn is_taken_checks_the_containers_own_resource_counterpart() {
         let store = OxigraphStore::in_memory().unwrap();

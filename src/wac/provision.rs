@@ -114,8 +114,7 @@ mod tests {
 
     /// Probe a guard for `path` as `agent`, panicking on a store failure —
     /// these tests read `provision_root_acl`'s effect through the same
-    /// enforcement point a request would, rather than through the retired
-    /// `prp::effective_acl` walk.
+    /// enforcement point a request would.
     async fn guard_for<'a>(store: &'a OxigraphStore, agent: Agent, path: &str) -> Guard<'a> {
         Guard::probe(store, agent, sp().resolve(path).unwrap()).await.expect("probe")
     }
