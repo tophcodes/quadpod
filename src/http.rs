@@ -11,16 +11,17 @@ use axum::{Router, routing::get, extract::{State, Path, RawQuery}, body::Bytes, 
 use oxigraph::model::{NamedNode, Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{triples_of, Dataset, Skolemized},
-    resource::{put_rdf, get_rdf, delete_rdf, exists, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
+    resource::{put_rdf, get_rdf, delete_rdf, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
     rdf::{Format, MediaType, RdfVersion, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize, deny}, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::Guard, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn SparqlStore>,
+    pub events: Arc<crate::notify::Bus>,
     pub blobs: Arc<dyn crate::blob::BlobStore>,
     pub space: StorageSpace,
     pub resolver: Arc<dyn JwksResolver>,
@@ -558,11 +559,15 @@ async fn patch_impl(
     body: Bytes,
 ) -> Response {
     let store = st.store.as_ref();
+    let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
     // Append is the weakest mode any patch §5.1 admits can need, and
     // `AccessModes::allows` makes Write subsume it — so this refuses exactly
     // those callers who could do nothing anyway, and it runs before the body
     // is looked at so an unauthorized caller learns nothing.
-    let decision = match authorize(store, &agent, &target, Mode::Append).await {
+    let decision = match guard.authorize(Mode::Append) {
         Ok(d) => d,
         Err(res) => return with_aux_links(res, &target),
     };
@@ -597,7 +602,7 @@ async fn patch_impl(
     // from the patch's parts would demand `Read` or `Write` on top of
     // `Control` — refusing an ACL patch from an agent WAC says may make it.
     if !matches!(target, Target::Aux(_)) && !patch.required_modes().satisfied_by(decision.user) {
-        return with_aux_links(deny(&agent), &target);
+        return with_aux_links(guard.deny(), &target);
     }
 
     // §8: `text/n3` is a perfectly good request body, so the conflict is with
@@ -635,8 +640,8 @@ async fn patch_impl(
     // An auxiliary is written through `aux`, whose subject-existence guard is
     // what keeps a policy document off a path that names nothing, and it
     // answers the same `404` `put_impl` does when the subject is gone. It
-    // takes its own branch here because the `exists` check below is not the
-    // one it needs: §7's creation path is closed for an auxiliary as well, and
+    // takes its own branch here because the `target_exists` check below is not
+    // the one it needs: §7's creation path is closed for an auxiliary as well, and
     // `aux::patch` refuses an absent one itself, with a body that says which
     // of the two is missing.
     let r = match &target {
@@ -655,10 +660,8 @@ async fn patch_impl(
             }
         }
     };
-    match exists(store, &target).await {
-        Ok(true) => {}
-        Ok(false) => return create_by_patch(&st, &agent, &target, &patch).await,
-        Err(e) => return (put_status(&e), e.to_string()).into_response(),
+    if !guard.target_exists() {
+        return create_by_patch(&st, guard, &target, &patch).await;
     }
     match patch_dataset(store, r, &patch).await {
         // A container's type triples are the server's, and a patch names its
@@ -679,7 +682,7 @@ async fn patch_impl(
 
 /// §7: a target that does not exist is patched against an empty RDF dataset,
 /// so a patch that asks nothing of the prior state creates it — through the
-/// same [`authorize_and_materialize`] walk, the same containment linking and
+/// same [`crate::wac::guard::Guard::materialize`] walk, the same containment linking and
 /// the same [`created`] response `PUT` uses. There is no second creation path.
 ///
 /// A patch creates only when the empty dataset answers everything it asks:
@@ -696,7 +699,7 @@ async fn patch_impl(
 /// `aux::patch`, which refuses an absent one itself.
 async fn create_by_patch(
     st: &AppState,
-    agent: &Agent,
+    guard: Guard<'_>,
     target: &Target,
     patch: &crate::patch::Patch,
 ) -> Response {
@@ -707,7 +710,7 @@ async fn create_by_patch(
     if !patch.deletions().is_empty() {
         return patch_response(PatchResult::DeletionMissing, patch);
     }
-    if let Err(res) = authorize_and_materialize(store, agent, target).await {
+    if let Err(res) = guard.materialize().await {
         return with_aux_links(res, target);
     }
     let written = match target {
@@ -1090,7 +1093,11 @@ fn report_link(target: &Target, mut res: Response) -> Response {
 
 async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Write).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
+    if let Err(res) = guard.authorize(Mode::Write) {
         return with_aux_links(res, &target);
     }
     let repr = match classify_body(&headers, &body, &target, st.store.rdf_version()) {
@@ -1114,7 +1121,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
                 return res;
             }
-            if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
+            if let Err(res) = guard.materialize().await {
                 return with_aux_links(res, &target);
             }
             return match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
@@ -1228,7 +1235,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // rule belongs to the same one traversal, because the set of URLs it
     // applies to is the set of URLs this call would create; there is no
     // separate check here that could drift from it.
-    if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
+    if let Err(res) = guard.materialize().await {
         return with_aux_links(res, &target);
     }
     let res = match &target {
@@ -1303,32 +1310,6 @@ async fn handle_post_root(
     }
 }
 
-/// Whether a name a `POST` would allocate is already spoken for — by a
-/// resource of its own, or by the other half of its trailing-slash pair,
-/// which Protocol §3.1 forbids it from coming to exist beside.
-///
-/// A `Slug` is a hint, so a taken name is answered by picking another rather
-/// than by the `409` a client-named `PUT` gets: the counterpart is exactly as
-/// unavailable as the name itself, and for the same reason. Store errors read
-/// as "not taken" here, as the direct existence check always has — the write
-/// that follows is what reports them.
-async fn name_is_taken(store: &dyn SparqlStore, child: &Target) -> bool {
-    if matches!(exists(store, child).await, Ok(true)) {
-        return true;
-    }
-    let subject = match child {
-        Target::Resource(r) => r,
-        // A `Link: rel="type"` can make the allocated child a container, and
-        // the pair rule reads the same from that side.
-        Target::Container(c) => c.as_resource(),
-        Target::Aux(_) => return false,
-    };
-    match subject.slash_counterpart() {
-        Some(counterpart) => matches!(exists(store, &counterpart).await, Ok(true)),
-        None => false,
-    }
-}
-
 async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let store = st.store.as_ref();
     // Authorize the target FIRST, even though Append on a non-container is a
@@ -1337,7 +1318,11 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // runs, so an unauthorized caller never learns even that much about the
     // path they probed. An auxiliary lands here too — POST is how one would
     // try to create one, and it is refused as "not a container".
-    if let Err(res) = authorize(store, &agent, &target, Mode::Append).await {
+    let parent_guard = match Guard::probe(store, agent.clone(), target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
+    if let Err(res) = parent_guard.authorize(Mode::Append) {
         return with_aux_links(res, &target);
     }
     let Target::Container(parent) = &target else {
@@ -1363,14 +1348,22 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         Ok(t) => t,
         Err(status) => return status.into_response(),
     };
-    // Note: this existence check followed by the write below is not
-    // transactional; a concurrent write landing between them could be missed.
-    // Accepted for single-user v1.
-    if name_is_taken(store, &child).await {
+    // Note: this probe followed by the write below is not transactional; a
+    // concurrent write landing between them could be missed. Accepted for
+    // single-user v1.
+    let mut child_guard = match Guard::probe(store, agent.clone(), child.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &child),
+    };
+    if child_guard.is_taken() {
         let unique = format!("{name}-{}{suffix}", uuid::Uuid::new_v4());
         child = match classify(&st.space, &format!("{}{unique}", parent.path())) {
             Ok(t) => t,
             Err(status) => return status.into_response(),
+        };
+        child_guard = match Guard::probe(store, agent.clone(), child.clone()).await {
+            Ok(g) => g,
+            Err(res) => return with_aux_links(res, &child),
         };
     }
     // The container's Append is not enough to authorize the CHILD: it may
@@ -1379,7 +1372,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // check above, or the append-only inbox pattern this design targets would
     // break — every legitimate append-only POST would suddenly need Write on
     // the child it creates.
-    if let Err(res) = authorize(store, &agent, &child, Mode::Append).await {
+    if let Err(res) = child_guard.authorize(Mode::Append) {
         return with_aux_links(res, &child);
     }
     let repr = match classify_body(&headers, &body, &child, st.store.rdf_version()) {
@@ -1431,7 +1424,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // POSTing into a container that does not exist yet materializes it and
     // its missing ancestors, so those need authorizing too — the same single
     // traversal `put_impl` uses.
-    if let Err(res) = authorize_and_materialize(store, &agent, &child).await {
+    if let Err(res) = child_guard.materialize().await {
         return with_aux_links(res, &child);
     }
     let res = match &child {
@@ -1566,7 +1559,11 @@ async fn validate_view(
     st: AppState, agent: Agent, target: Target, headers: HeaderMap,
 ) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Read).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
+    if let Err(res) = guard.authorize(Mode::Read) {
         return with_aux_links(res, &target);
     }
     // The container whose `ldp:constrainedBy` binds a shape to `target` —
@@ -1688,7 +1685,11 @@ async fn blob_read(st: AppState, target: Target, headers: HeaderMap, mt: MediaTy
 
 async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap) -> Response {
     let store = st.store.as_ref();
-    let decision = match authorize(store, &agent, &target, Mode::Read).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
+    let decision = match guard.authorize(Mode::Read) {
         Ok(d) => d,
         Err(res) => return with_aux_links(res, &target),
     };
@@ -1905,7 +1906,11 @@ async fn handle_delete_root(
 
 async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Write).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
+    if let Err(res) = guard.authorize(Mode::Write) {
         return with_aux_links(res, &target);
     }
     let subject = match &target {
@@ -1924,10 +1929,8 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
         Target::Container(c) => c.as_resource(),
     };
     // Removing a member rewrites the parent's containment triples.
-    if let Some(parent) = subject.parent() {
-        if let Err(res) = authorize(store, &agent, &Target::Container(parent), Mode::Write).await {
-            return with_aux_links(res, &target);
-        }
+    if let Err(res) = guard.authorize_parent(Mode::Write) {
+        return with_aux_links(res, &target);
     }
     // Deleting a subject takes every auxiliary it has with it (that cascade
     // is `aux::delete_subject`'s definition, not a step remembered here), so
@@ -1939,19 +1942,8 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     // an auxiliary of kind k") is only ever observable to a caller who
     // already holds Write on it.
     for kind in AuxKind::ALL {
-        let aux = subject.aux(*kind);
-        match exists(store, &aux).await {
-            Ok(false) => {}
-            Ok(true) => {
-                // `authorize` ignores this `Mode::Write` for an `Aux` target
-                // and requires `Control` instead — passed here only to match
-                // every other call site's shape, not because the mode itself
-                // matters.
-                if let Err(res) = authorize(store, &agent, &Target::Aux(aux), Mode::Write).await {
-                    return with_aux_links(res, &target);
-                }
-            }
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        if let Err(res) = guard.authorize_aux(*kind) {
+            return with_aux_links(res, &target);
         }
     }
     if let Target::Container(c) = &target {
@@ -2088,6 +2080,7 @@ mod tests {
 
         let state = AppState {
             store: store.clone(),
+            events: Arc::new(crate::notify::Bus::new()),
             blobs: blobs.clone(),
             space: space.clone(),
             resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
@@ -2194,6 +2187,7 @@ mod tests {
             issuers.allow(webid, ISSUER);
             router(AppState {
                 store: self.store.clone(),
+                events: Arc::new(crate::notify::Bus::new()),
                 blobs: self.blobs.clone(),
                 space: self.space.clone(),
                 resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
@@ -3349,8 +3343,8 @@ mod tests {
     // A `Slug` is a hint, and §3.1 makes the other half of a slash pair as
     // unavailable as the name itself — so a POSTed container whose name is
     // held by an existing *resource* gets another name, not the `409` a
-    // client-named PUT would get. Same rule `name_is_taken` already applied in
-    // the other direction.
+    // client-named PUT would get. Same rule `Guard::is_taken` already applies
+    // in the other direction.
     #[tokio::test]
     async fn posted_container_avoids_a_name_its_slash_counterpart_holds() {
         let f = fixture().await;
@@ -4005,7 +3999,7 @@ mod tests {
     }
 
     // The residual from the previous round: an ACL is exempt from containment
-    // (it is never listed via `ldp:contains`), but `authorize_and_materialize`
+    // (it is never listed via `ldp:contains`), but `Guard::materialize`
     // still materializes any missing ancestor containers for
     // `PUT /.aux/a/b/c.acl` exactly as it would for `PUT /a/b/c`. Bob's grant
     // here is `acl:Control` via the ROOT ACL's `acl:default` — inherited onto
@@ -4059,7 +4053,7 @@ mod tests {
     // The counterweight to THIS test above's counterweight: when the ACL's
     // immediate parent already exists, creating the ACL is a zero-mutation
     // event — an `Aux` target is never a containment member (that's
-    // `authorize_and_materialize`'s `may_be_member` match on the `Target`
+    // `Guard::materialize`'s `may_be_member` match on the `Target`
     // variant, a property of the type rather than something `add_containment`
     // has to notice at runtime), and `ensure_container` is a no-op on a
     // container that already has its type triples. So an agent holding
@@ -4181,11 +4175,11 @@ mod tests {
     }
 
     // Finding 2: the same refusal, but for a subject whose ancestors don't
-    // exist either. Before the existence check inside
-    // `authorize_and_materialize` (see its doc comment), `aux::put` was the
-    // only thing that ever said no here — and by the time it ran,
-    // `authorize_and_materialize` had already created and linked `/a/` and
-    // `/a/b/` for a write that was always going to be refused. A 404 that
+    // exist either. `Guard::materialize`'s existence check (see its doc
+    // comment) is what refuses this before anything is created: without it,
+    // `aux::put` would be the only thing that ever said no here, and by the
+    // time it ran, `materialize` would already have created and linked `/a/`
+    // and `/a/b/` for a write that was always going to be refused. A 404 that
     // mutates the store either way, but silently so: the caller is told
     // nothing happened.
     #[tokio::test]
@@ -4344,7 +4338,7 @@ mod tests {
             "no auxiliary may have been created");
     }
 
-    // The other half of `authorize_and_materialize`'s exemption, and the one
+    // The other half of `Guard::materialize`'s exemption, and the one
     // that makes calling it unconditionally safe: overwriting a resource that
     // already exists adds no containment triple its parent does not already
     // hold, so it must NOT start demanding `Append` there. Bob here holds
@@ -4403,9 +4397,10 @@ mod tests {
     // check on the target itself.
     //
     // The orphan is `/box/doc`'s ACL. It is the shape that keeps Bob
-    // authorized on the target after his delegation is revoked:
-    // `effective_acl("/box/doc")` finds that ACL directly, i.e. the document
-    // Bob wrote about himself. That is precisely the case that matters — Bob
+    // authorized on the target after his delegation is revoked: the guard's
+    // nearest-ACL search finds that ACL directly — the document Bob wrote
+    // about himself — with no ancestor ever consulted. That is precisely the
+    // case that matters — Bob
     // passes the target check on his own say-so and must still be stopped
     // from touching `/`.
     //
@@ -4551,8 +4546,9 @@ mod tests {
     // A narrowing ACL is WAC's ONLY mechanism for revoking rights that an
     // ancestor hands down through acl:default. If deleting the resource also
     // deleted that ACL, an agent holding merely Write could remove the
-    // narrowing, recreate the resource, and have `effective_acl` walk back up
-    // to the wider ancestor grant — escalating themselves to Control without
+    // narrowing, recreate the resource, and have the guard's nearest-ACL
+    // search walk back up to the wider ancestor grant — escalating themselves
+    // to Control without
     // ever being allowed to touch the ACL directly.
     #[tokio::test]
     async fn deleting_a_resource_needs_control_over_the_acl_it_would_cascade_into() {

@@ -728,7 +728,7 @@ Confirmed still present, one instance per `write-access-{agent,bob,public}` feat
 |---|---|
 | **Test wants** | `404` for `POST …/dahut3/foo/` where `dahut3` exists as a *resource* |
 | **Pod does** | `409` with body `another resource already exists whose URI differs from this one only in the trailing slash` |
-| **Why** | Ancestor materialisation would have to create `dahut3/` beside the existing `dahut3`, which Protocol §3.1 forbids; `refuse_slash_pair` (`src/wac/guard.rs:81`) stops it. |
+| **Why** | Ancestor materialisation would have to create `dahut3/` beside the existing `dahut3`, which Protocol §3.1 forbids; the slash-pair check in `Guard::materialize` (`src/wac/guard.rs:319-328`) stops it. |
 
 **This is the only failure the trailing-slash-pair rule touches, and it did not create
 it.** Without the rule the pod would have materialised `dahut3/` and answered `201` —
@@ -793,7 +793,7 @@ rows, 2 per feature (`resource: W` and `resource: A`, `container: no`).
 |---|---|
 | **Test wants** | `POST` into an existing, empty *nested* container succeeds when that container holds a *direct* (`acl:accessTo`) Append/Write grant on itself |
 | **Pod does** | Denies (retry against `[200, 201, 204, 205]` exhausts 3 attempts) |
-| **Why** | `post_impl` authorizes twice: `Mode::Append` on the container being posted into (`src/http.rs:638`), then `Mode::Append` on the *newly-allocated child* (`src/http.rs:680`, via `authorize_and_materialize`, `src/wac/guard.rs:216-232`). The container check passes — it finds the container's own `accessTo` grant. The child check does not: the child has no ACL of its own, so it walks up to the container's ACL and is evaluated as *inherited*, which `pdp::decide` scores against `acl:default` only, never `acl:accessTo` (`src/wac/pdp.rs:54-55`, deliberately: "The two never cross over"). A grant written as `acl:accessTo` alone — exactly what the suite's fixture writes when the container itself, not its future children, is what's being tested — never satisfies the child gate. |
+| **Why** | `post_impl` authorizes twice: `Mode::Append` on the container being posted into (`src/http.rs:1324`), then `Mode::Append` on the *newly-allocated child* (`src/http.rs:1374`, via `Guard::authorize`, `src/wac/guard.rs:189-195`). The container check passes — it finds the container's own `accessTo` grant. The child check does not: the child has no ACL of its own, so it walks up to the container's ACL and is evaluated as *inherited*, which `pdp::decide` scores against `acl:default` only, never `acl:accessTo` (`src/wac/pdp.rs:54-55`, deliberately: "The two never cross over"). A grant written as `acl:accessTo` alone — exactly what the suite's fixture writes when the container itself, not its future children, is what's being tested — never satisfies the child gate. |
 
 Confirmed unchanged from the blob-alone measurement: `container: W` / `resource:
 inherited` passes; `container: no` / `resource: W` fails, cross-checked against the

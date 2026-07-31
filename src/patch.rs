@@ -82,7 +82,8 @@ pub struct RequiredModes {
 }
 
 impl RequiredModes {
-    /// Whether modes already resolved by `wac::guard::authorize` cover this.
+    /// Whether modes already resolved by [`crate::wac::guard::Guard::authorize`]
+    /// cover this.
     ///
     /// Takes the held set rather than the store: §9's whole point is that the
     /// one `authorize` call already answered this, and a second ACL resolution

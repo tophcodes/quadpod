@@ -32,7 +32,7 @@ pub enum AuxError {
 
 /// The `404` body for an auxiliary write refused for [`AuxError::SubjectMissing`].
 ///
-/// Two call sites answer this: `wac::guard::authorize_and_materialize` (the
+/// Two call sites answer this: [`crate::wac::guard::Guard::materialize`] (the
 /// ancestor-authorization walk, which can tell a missing subject apart from a
 /// missing ancestor before writing anything) and `http::put_impl`'s
 /// `aux::put` match arm (the in-update guard, for the window between that

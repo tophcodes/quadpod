@@ -58,6 +58,7 @@ async fn main() {
     };
     let state = AppState {
         store,
+        events: Arc::new(sparql_pod::notify::Bus::new()),
         blobs,
         space,
         // One client for every outbound auth fetch in the process: cloning it

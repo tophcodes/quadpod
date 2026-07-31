@@ -24,18 +24,16 @@
 //!   another `AuxUrl`. The path space offers none either: `resolve` refuses a
 //!   decoded subject that itself re-enters the reserved namespace
 //!   (`src/space.rs:330-332`), at every nesting depth.
-//! * **Twin traversals.** `ResourceUrl::ancestors` (`src/space.rs:246-254`) is
+//! * **Twin traversals.** `ResourceUrl::ancestors` (`src/space.rs:264-272`) is
 //!   the only function that walks more than one `.parent()` hop, so it is the
-//!   sole derivation of the container chain. `wac::guard::authorize_and_materialize`
-//!   builds both its authorization loop and its materialization plan from one
-//!   call to it (`src/wac/guard.rs:156`), which is what stops the two from
-//!   diverging into different chains, as Plan 6's separate walks could.
-//!   `ancestors` has one other caller, `wac::prp::effective_acl`'s
-//!   ACL-inheritance walk (`src/wac/prp.rs:47`) — a different question (which
-//!   ACL governs a path) sharing the same chain, not a second derivation of
-//!   it. (The brief for this task described `authorize_and_materialize` as
-//!   the *only* consumer of `ancestors`; that overstates it, so this doc
-//!   states the weaker, true claim instead.)
+//!   sole derivation of the container chain. `Guard::probe` (`src/wac/guard.rs:124`)
+//!   calls it once per request to build the chain that both authorization and
+//!   `prp::load_chain_acls`'s ACL inheritance read from — one call feeding two
+//!   questions, not two derivations of the chain. `Guard::materialize`
+//!   (`src/wac/guard.rs:285`) walks `ancestors` a second time to derive its
+//!   containment plan, but from the same `subject` the probe used, so it
+//!   recomputes the identical, deterministic chain rather than risking a
+//!   second one that could diverge, as Plan 6's separate walks did.
 //! * **A blank node in the store.** `dataset::Skolemized` wraps
 //!   `dataset::GroundQuad`, whose subject is a `NamedNode`, object a
 //!   `GroundTerm` (`NamedNode | Literal`) and graph name a `GroundGraphName`
@@ -81,7 +79,6 @@ use sparql_pod::{
     aux, resource,
     space::{AuxKind, StorageSpace, Target},
     store::OxigraphStore,
-    wac,
 };
 
 // A Slug names a child in the resource space; nothing it can contain routes
@@ -125,7 +122,13 @@ async fn an_auxiliary_never_outlives_its_subject() {
     // recreate the same path: it inherits, it does not resurrect
     resource::put_rdf(&store, &doc, &[]).await.unwrap();
     assert!(
-        wac::prp::effective_acl(&store, &doc).await.unwrap().is_none(),
+        !resource::exists(&store, &doc.aux(AuxKind::Acl)).await.unwrap(),
         "the recreated resource must not pick up the deleted one's ACL"
     );
+    for ancestor in doc.ancestors() {
+        assert!(
+            !resource::exists(&store, &ancestor.as_resource().aux(AuxKind::Acl)).await.unwrap(),
+            "nor may an ancestor's ACL have been left governing it"
+        );
+    }
 }

@@ -5,6 +5,7 @@ pub mod config;
 pub mod container;
 pub mod dataset;
 pub mod http;
+pub mod notify;
 pub mod patch;
 pub mod rdf;
 pub mod resource;
