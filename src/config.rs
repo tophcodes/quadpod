@@ -307,7 +307,20 @@ impl Config {
     /// Shares its name with the field it reads; the field is the spec string,
     /// this is the thing it names.
     pub fn rdf_store(&self) -> Result<std::sync::Arc<dyn crate::store::SparqlStore>, String> {
-        todo!("2026-07-31-cli-config-design.md §3")
+        let spec = self.rdf_store.trim();
+        if spec == "memory" {
+            return crate::store::OxigraphStore::in_memory()
+                .map(|s| std::sync::Arc::new(s) as std::sync::Arc<dyn crate::store::SparqlStore>)
+                .map_err(|e| format!("--rdf-store memory: {e}"));
+        }
+        if let Some(dir) = spec.strip_prefix("rocksdb:") {
+            return crate::store::OxigraphStore::open(std::path::Path::new(dir))
+                .map(|s| std::sync::Arc::new(s) as std::sync::Arc<dyn crate::store::SparqlStore>)
+                .map_err(|e| format!("--rdf-store rocksdb: {e}"));
+        }
+        Err(format!(
+            "--rdf-store: expected `memory` or `rocksdb:<dir>`, got `{spec}`"
+        ))
     }
 }
 
@@ -541,5 +554,27 @@ mod tests {
     fn max_body_bytes_has_an_explicit_default() {
         let cfg = Config::parse_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
         assert_eq!(cfg.max_body_bytes, 64 * 1024 * 1024);
+    }
+
+    // Mirrors `blob_store_selects_a_backend_and_refuses_an_unknown_one`. The
+    // rejected `http://…` pins the unimplemented remote backend as a refusal
+    // rather than leaving it to be assumed.
+    #[test]
+    fn rdf_store_selects_a_backend_and_refuses_an_unknown_one() {
+        let mut cfg =
+            Config::parse_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+        assert_eq!(cfg.rdf_store, "memory", "the default is the in-memory store");
+        assert!(cfg.rdf_store().is_ok());
+
+        let dir = std::env::temp_dir()
+            .join(format!("sparql-pod-cfg-store-{}", uuid::Uuid::new_v4()));
+        cfg.rdf_store = format!("rocksdb:{}", dir.display());
+        assert!(cfg.rdf_store().is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+
+        cfg.rdf_store = "http://oxigraph:7878/".into();
+        assert!(cfg.rdf_store().is_err(), "an unimplemented backend must refuse to start");
+        cfg.rdf_store = "nonsense".into();
+        assert!(cfg.rdf_store().is_err());
     }
 }

@@ -80,8 +80,9 @@ impl OxigraphStore {
     /// (root spec §16 ADR-7): it is about processes, not about the tasks inside
     /// this one, which write concurrently as before.
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
-        let _ = dir;
-        todo!("2026-07-31-cli-config-design.md §3")
+        Store::open(dir)
+            .map(|inner| Self { inner })
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     /// Runs `f` against the store on Tokio's blocking pool.
@@ -276,5 +277,29 @@ mod tests {
         // A query of the wrong shape is an error, not an empty answer — the
         // same line `query_triples` and `ask` already draw.
         assert!(store.query_solutions("ASK { ?s ?p ?o }").await.is_err());
+    }
+
+    // The property the flag exists for. A test that only asserts `open`
+    // returns `Ok` passes against a backend that persists nothing.
+    #[tokio::test]
+    async fn rocksdb_backend_survives_a_reopen() {
+        let dir = std::env::temp_dir()
+            .join(format!("sparql-pod-store-{}", uuid::Uuid::new_v4()));
+        {
+            let store = OxigraphStore::open(&dir).expect("open");
+            store
+                .update("INSERT DATA { GRAPH <urn:t> { <urn:s> <urn:p> <urn:o> } }")
+                .await
+                .expect("write");
+            // Dropped here: RocksDB's exclusive lock is released by the drop,
+            // and the reopen below is what proves the bytes outlived it.
+        }
+        let reopened = OxigraphStore::open(&dir).expect("reopen");
+        assert!(reopened
+            .ask("ASK { GRAPH <urn:t> { <urn:s> <urn:p> <urn:o> } }")
+            .await
+            .expect("read"));
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
