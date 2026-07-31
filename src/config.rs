@@ -222,6 +222,12 @@ impl FileConfig {
 /// is that flag's value or the next flag, and can walk past `--config`
 /// entirely. So this scans the argv by hand instead, and falls back to
 /// `POD_CONFIG` when no `--config` is present.
+///
+/// Deliberately looser than clap: it does not stop at a `--` separator, it
+/// takes the first `--config` rather than rejecting a repeat, and it does not
+/// check whether the value looks like another flag. Every input where that
+/// looseness would matter is one the real parse in [`Config::try_load_from`]
+/// refuses to start on, so none of them can run a pod against the wrong file.
 fn config_path_from<I, T>(argv: I) -> Option<std::path::PathBuf>
 where
     I: IntoIterator<Item = T>,
@@ -232,8 +238,13 @@ where
         if arg == "--config" {
             return args.next().map(std::path::PathBuf::from);
         }
-        if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix("--config=")) {
-            return Some(std::path::PathBuf::from(value));
+        if let Some(rest) = arg.as_encoded_bytes().strip_prefix(b"--config=") {
+            // SAFETY: the split is on an ASCII boundary of the original `OsStr`,
+            // which is exactly the condition `from_encoded_bytes_unchecked`
+            // documents.
+            return Some(std::path::PathBuf::from(unsafe {
+                std::ffi::OsStr::from_encoded_bytes_unchecked(rest)
+            }));
         }
     }
     std::env::var_os("POD_CONFIG").map(std::path::PathBuf::from)
@@ -693,8 +704,8 @@ mod tests {
 
     // The pre-parser runs before anything is known, so it must survive an argv
     // it cannot fully understand — here a required flag it has never heard of.
-    // That is the case `ignore_errors` exists for, and the one most likely to
-    // break silently.
+    // That is the case the hand-written scan exists for, and the one most
+    // likely to break silently.
     #[test]
     fn the_pre_parser_finds_config_beside_arguments_it_does_not_know() {
         let found = config_path_from([
@@ -713,5 +724,34 @@ mod tests {
     fn the_pre_parser_returns_none_without_config() {
         let found = config_path_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
         assert_eq!(found, None);
+    }
+
+    // A path the joined form must carry through untouched: `OsStr::to_str`
+    // answers `None` for it, and a scan that asks for UTF-8 first would drop
+    // the argument and start the pod against no file at all.
+    #[test]
+    fn the_pre_parser_reads_a_non_utf8_path_in_either_spelling() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/pod-\xFF\xFE");
+        let joined = {
+            let mut s = std::ffi::OsString::from("--config=");
+            s.push(raw);
+            s
+        };
+        let want = Some(std::path::PathBuf::from(raw));
+        assert_eq!(
+            config_path_from([std::ffi::OsString::from("sparql-pod"), joined]),
+            want,
+            "--config=<path>"
+        );
+        assert_eq!(
+            config_path_from([
+                std::ffi::OsString::from("sparql-pod"),
+                std::ffi::OsString::from("--config"),
+                raw.to_os_string(),
+            ]),
+            want,
+            "--config <path>"
+        );
     }
 }
