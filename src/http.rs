@@ -16,7 +16,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize, deny}, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::{authorize, authorize_and_materialize, Guard}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -558,11 +558,15 @@ async fn patch_impl(
     body: Bytes,
 ) -> Response {
     let store = st.store.as_ref();
+    let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return res,
+    };
     // Append is the weakest mode any patch §5.1 admits can need, and
     // `AccessModes::allows` makes Write subsume it — so this refuses exactly
     // those callers who could do nothing anyway, and it runs before the body
     // is looked at so an unauthorized caller learns nothing.
-    let decision = match authorize(store, &agent, &target, Mode::Append).await {
+    let decision = match guard.authorize(Mode::Append) {
         Ok(d) => d,
         Err(res) => return with_aux_links(res, &target),
     };
@@ -597,7 +601,7 @@ async fn patch_impl(
     // from the patch's parts would demand `Read` or `Write` on top of
     // `Control` — refusing an ACL patch from an agent WAC says may make it.
     if !matches!(target, Target::Aux(_)) && !patch.required_modes().satisfied_by(decision.user) {
-        return with_aux_links(deny(&agent), &target);
+        return with_aux_links(guard.deny(), &target);
     }
 
     // §8: `text/n3` is a perfectly good request body, so the conflict is with
@@ -1566,7 +1570,11 @@ async fn validate_view(
     st: AppState, agent: Agent, target: Target, headers: HeaderMap,
 ) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Read).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return res,
+    };
+    if let Err(res) = guard.authorize(Mode::Read) {
         return with_aux_links(res, &target);
     }
     // The container whose `ldp:constrainedBy` binds a shape to `target` —
@@ -1688,7 +1696,11 @@ async fn blob_read(st: AppState, target: Target, headers: HeaderMap, mt: MediaTy
 
 async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap) -> Response {
     let store = st.store.as_ref();
-    let decision = match authorize(store, &agent, &target, Mode::Read).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return res,
+    };
+    let decision = match guard.authorize(Mode::Read) {
         Ok(d) => d,
         Err(res) => return with_aux_links(res, &target),
     };
@@ -1905,7 +1917,11 @@ async fn handle_delete_root(
 
 async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Write).await {
+    let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return res,
+    };
+    if let Err(res) = guard.authorize(Mode::Write) {
         return with_aux_links(res, &target);
     }
     let subject = match &target {
