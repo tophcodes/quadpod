@@ -93,6 +93,24 @@ Only `blob::BlobKey` builds an object key.
     published operator promise with nothing else enforcing it.
     check: rg -qU '#\[cfg\(test\)\]\s*\n\s*pub fn permissive' src/auth/safe_fetch.rs
 
+`OxigraphStore` reaches for its store handle in exactly one place.
+    → `store.rs`'s doc comment on `OxigraphStore::blocking`. Oxigraph is
+    synchronous: an evaluation runs to completion on the calling thread, so a
+    `SparqlStore` method that awaits it directly occupies a Tokio worker for
+    the whole query. A runtime has one worker per core, which makes a handful
+    of concurrent reads a stall on *every* request in flight, including those
+    that never touch the store. Nothing catches it: the method is already
+    `async`, so the blocking body compiles, and against the in-memory store an
+    evaluation is microseconds — the tests cannot see the difference, and only
+    a durable backend under load makes it visible. `blocking` is the one
+    offload point, so the property reduces to the handle having one reader.
+    The check counts `self.inner`, which is why the doc comment above says
+    "store handle" rather than spelling the field — prose would count as a
+    second reader. It was demonstrated red against the real violation it
+    exists for: before the offload, all four trait methods evaluated inline
+    and the count was 4.
+    check: [ "$(rg -c 'self\.inner' src/store.rs)" = 1 ] && rg -q 'spawn_blocking' src/store.rs
+
 Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     → 2026-07-30-shape-validation-design.md §2.1. `rudof_lib` pulls
     `http-client` into the tree, which gives a bare `SparqlEvaluator::new()`
