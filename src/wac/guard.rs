@@ -459,6 +459,26 @@ impl<'a> Guard<'a> {
         self.present.contains(self.target.graph_iri())
     }
 
+    /// Whether the target's trailing-slash counterpart — `/box/` for `/box`,
+    /// `/box` for `/box/` — was present when this guard was probed. `false`
+    /// for an `Aux` target, which never has one ([`ResourceUrl::slash_counterpart`]
+    /// is a resource-space concept only), and for the root, whose counterpart
+    /// is no URL at all.
+    ///
+    /// This is the presence half of Solid Protocol §3.1 that [`Guard::existed`]
+    /// does not answer: a caller minting a name (a `POST` `Slug`) needs to know
+    /// this side is taken too, before it authorizes or materializes anything —
+    /// exactly the fact `name_is_taken`'s second half used to fetch with its own
+    /// query, now read from the probe's already-resolved presence set.
+    pub fn counterpart_existed(&self) -> bool {
+        let subject: &ResourceUrl = match &self.target {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource(),
+            Target::Aux(_) => return false,
+        };
+        subject.slash_counterpart().is_some_and(|c| self.present.contains(c.graph_iri()))
+    }
+
     /// Authorize and perform the container materialization this write implies,
     /// then give up the guard.
     ///

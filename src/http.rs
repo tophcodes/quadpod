@@ -16,7 +16,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{authorize, authorize_and_materialize, Guard}, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::Guard, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -711,7 +711,11 @@ async fn create_by_patch(
     if !patch.deletions().is_empty() {
         return patch_response(PatchResult::DeletionMissing, patch);
     }
-    if let Err(res) = authorize_and_materialize(store, agent, target).await {
+    let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, target),
+    };
+    if let Err(res) = guard.materialize().await {
         return with_aux_links(res, target);
     }
     let written = match target {
@@ -1094,7 +1098,11 @@ fn report_link(target: &Target, mut res: Response) -> Response {
 
 async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let store = st.store.as_ref();
-    if let Err(res) = authorize(store, &agent, &target, Mode::Write).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
+    if let Err(res) = guard.authorize(Mode::Write) {
         return with_aux_links(res, &target);
     }
     let repr = match classify_body(&headers, &body, &target, st.store.rdf_version()) {
@@ -1118,7 +1126,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
                 return res;
             }
-            if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
+            if let Err(res) = guard.materialize().await {
                 return with_aux_links(res, &target);
             }
             return match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
@@ -1232,7 +1240,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // rule belongs to the same one traversal, because the set of URLs it
     // applies to is the set of URLs this call would create; there is no
     // separate check here that could drift from it.
-    if let Err(res) = authorize_and_materialize(store, &agent, &target).await {
+    if let Err(res) = guard.materialize().await {
         return with_aux_links(res, &target);
     }
     let res = match &target {
@@ -1341,7 +1349,11 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // runs, so an unauthorized caller never learns even that much about the
     // path they probed. An auxiliary lands here too — POST is how one would
     // try to create one, and it is refused as "not a container".
-    if let Err(res) = authorize(store, &agent, &target, Mode::Append).await {
+    let parent_guard = match Guard::probe(store, agent.clone(), target.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &target),
+    };
+    if let Err(res) = parent_guard.authorize(Mode::Append) {
         return with_aux_links(res, &target);
     }
     let Target::Container(parent) = &target else {
@@ -1367,14 +1379,22 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         Ok(t) => t,
         Err(status) => return status.into_response(),
     };
-    // Note: this existence check followed by the write below is not
-    // transactional; a concurrent write landing between them could be missed.
-    // Accepted for single-user v1.
-    if name_is_taken(store, &child).await {
+    // Note: this probe followed by the write below is not transactional; a
+    // concurrent write landing between them could be missed. Accepted for
+    // single-user v1.
+    let mut child_guard = match Guard::probe(store, agent.clone(), child.clone()).await {
+        Ok(g) => g,
+        Err(res) => return with_aux_links(res, &child),
+    };
+    if child_guard.existed() || child_guard.counterpart_existed() {
         let unique = format!("{name}-{}{suffix}", uuid::Uuid::new_v4());
         child = match classify(&st.space, &format!("{}{unique}", parent.path())) {
             Ok(t) => t,
             Err(status) => return status.into_response(),
+        };
+        child_guard = match Guard::probe(store, agent.clone(), child.clone()).await {
+            Ok(g) => g,
+            Err(res) => return with_aux_links(res, &child),
         };
     }
     // The container's Append is not enough to authorize the CHILD: it may
@@ -1383,7 +1403,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // check above, or the append-only inbox pattern this design targets would
     // break — every legitimate append-only POST would suddenly need Write on
     // the child it creates.
-    if let Err(res) = authorize(store, &agent, &child, Mode::Append).await {
+    if let Err(res) = child_guard.authorize(Mode::Append) {
         return with_aux_links(res, &child);
     }
     let repr = match classify_body(&headers, &body, &child, st.store.rdf_version()) {
@@ -1435,7 +1455,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // POSTing into a container that does not exist yet materializes it and
     // its missing ancestors, so those need authorizing too — the same single
     // traversal `put_impl` uses.
-    if let Err(res) = authorize_and_materialize(store, &agent, &child).await {
+    if let Err(res) = child_guard.materialize().await {
         return with_aux_links(res, &child);
     }
     let res = match &child {
@@ -1917,7 +1937,7 @@ async fn handle_delete_root(
 
 async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     let store = st.store.as_ref();
-    let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
+    let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
         Err(res) => return with_aux_links(res, &target),
     };
@@ -1940,10 +1960,8 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
         Target::Container(c) => c.as_resource(),
     };
     // Removing a member rewrites the parent's containment triples.
-    if let Some(parent) = subject.parent() {
-        if let Err(res) = authorize(store, &agent, &Target::Container(parent), Mode::Write).await {
-            return with_aux_links(res, &target);
-        }
+    if let Err(res) = guard.authorize_parent(Mode::Write) {
+        return with_aux_links(res, &target);
     }
     // Deleting a subject takes every auxiliary it has with it (that cascade
     // is `aux::delete_subject`'s definition, not a step remembered here), so
@@ -1955,19 +1973,8 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     // an auxiliary of kind k") is only ever observable to a caller who
     // already holds Write on it.
     for kind in AuxKind::ALL {
-        let aux = subject.aux(*kind);
-        match exists(store, &aux).await {
-            Ok(false) => {}
-            Ok(true) => {
-                // `authorize` ignores this `Mode::Write` for an `Aux` target
-                // and requires `Control` instead — passed here only to match
-                // every other call site's shape, not because the mode itself
-                // matters.
-                if let Err(res) = authorize(store, &agent, &Target::Aux(aux), Mode::Write).await {
-                    return with_aux_links(res, &target);
-                }
-            }
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        if let Err(res) = guard.authorize_aux(*kind) {
+            return with_aux_links(res, &target);
         }
     }
     if let Target::Container(c) = &target {
