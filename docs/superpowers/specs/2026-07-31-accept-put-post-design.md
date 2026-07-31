@@ -151,8 +151,12 @@ shape, on both `GET` and `OPTIONS`, because `allowed_methods` has three arms:
 One test in `rdf.rs`: every member of `Format::ALL` round-trips through `from_content_type` on
 its own `media_type`, and the array has one entry per arm of `media_type`'s match.
 
-Then the conformance run. The suite exercises these headers as part of the protocol manifest;
-the report is the deliverable either way.
+Then the conformance run — as a regression check, not as evidence for this feature. The official
+harness (protocol + web-access-control manifests, version as pinned by `conformance/run.sh`)
+**does not assert either header**: a run's `harness.log` contains no occurrence of `Accept-Put`
+or `Accept-Post` at all. Protocol §5.3 is a MUST the suite leaves untested, so the unit tests
+above are the whole of the evidence, and a live `OPTIONS` against a running pod is the only
+end-to-end confirmation available.
 
 ## 8. Out of scope
 
