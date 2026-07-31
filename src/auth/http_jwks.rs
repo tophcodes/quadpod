@@ -17,12 +17,12 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use super::jwks::{Jwks, JwksResolver};
-use super::safe_fetch::{guarded_get, FetchPolicy};
+use super::safe_fetch::{guarded_get, FetchPolicy, GuardedClient};
 use super::AuthError;
 
 /// How long a resolved `Jwks` is trusted before this resolver re-fetches it
 /// from the issuer.
-const CACHE_TTL: Duration = Duration::from_secs(300);
+pub(crate) const CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// How long a discovery/JWKS FAILURE is remembered before this resolver
 /// will attempt to fetch the same issuer again. Short by design (unlike
@@ -34,7 +34,7 @@ const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// An HTTP `JwksResolver` for production use: resolves an issuer's signing
 /// keys via OIDC discovery, caching the result per issuer for `CACHE_TTL`.
 pub struct HttpJwksResolver {
-    client: reqwest::Client,
+    client: GuardedClient,
     cache: RwLock<HashMap<String, (Jwks, Instant)>>,
     negative_cache: RwLock<HashMap<String, Instant>>,
     policy: FetchPolicy,
@@ -44,8 +44,12 @@ impl HttpJwksResolver {
     /// Production constructor: fetches are SSRF-guarded with the policy the
     /// operator configured — [`FetchPolicy::default`] (https-only, private
     /// IPs blocked) unless they named hosts via `--allow-insecure-host`.
-    pub fn new(policy: FetchPolicy) -> Self {
-        Self::build(policy)
+    ///
+    /// `client` is shared with every other guarded fetcher in the process, so
+    /// discovery and JWKS fetches reuse connections and TLS sessions with each
+    /// other and with WebID profile lookups to the same origin.
+    pub fn new(client: GuardedClient, policy: FetchPolicy) -> Self {
+        Self::build(client, policy)
     }
 
     /// Construct with an explicit [`FetchPolicy`] — used by hermetic tests
@@ -55,16 +59,10 @@ impl HttpJwksResolver {
     /// through [`Self::new`].
     #[cfg(test)]
     pub fn with_policy(policy: FetchPolicy) -> Self {
-        Self::build(policy)
+        Self::build(GuardedClient::new(&policy), policy)
     }
 
-    fn build(policy: FetchPolicy) -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .expect("reqwest client with timeouts should always build");
+    fn build(client: GuardedClient, policy: FetchPolicy) -> Self {
         Self {
             client,
             cache: RwLock::new(HashMap::new()),

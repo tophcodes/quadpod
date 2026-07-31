@@ -25,8 +25,9 @@ control that closes it, and by default it refuses:
   (`::1`, `fc00::/7`, `fe80::/10`, and the IPv4-mapped/compatible forms of all of the
   above);
 - redirects — a 3xx is a failure, never followed;
-- re-resolution: the connection is pinned to the exact address that was validated, so a
-  name cannot answer public for the check and private for the connection;
+- re-resolution: the filter runs inside the client's own DNS resolver, so the only
+  addresses a connection can reach are ones it passed — a name cannot answer public for
+  the check and private for the connection;
 - bodies over 1 MiB, and anything slower than a 5 s connect / 10 s total timeout.
 
 ## `--allow-insecure-host`
@@ -95,7 +96,8 @@ Entry form:
 ### What it does not relax, for any host including a listed one
 
 - redirects are still refused;
-- the connection is still pinned to the validated IP, so DNS rebinding is still closed;
+- the connection still reaches only addresses the filter passed, so DNS rebinding is still
+  closed;
 - the 1 MiB body cap and the connect/total timeouts still hold;
 - every other host on earth keeps the full default posture. Naming one host unblocks
   exactly that host.
