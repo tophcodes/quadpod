@@ -336,7 +336,66 @@ impl<'a> Guard<'a> {
         agent: Agent,
         target: Target,
     ) -> Result<Self, Response> {
-        todo!("design §4: chain + ACLs + slash counterparts in one exists_many, then load_chain_acls")
+        let subject: ResourceUrl = match &target {
+            Target::Resource(r) => r.clone(),
+            Target::Container(c) => c.as_resource().clone(),
+            Target::Aux(a) => a.subject().clone(),
+        };
+        // Nearest first, ending at the root: the one chain this request touches
+        // (design §3). `ResourceUrl::ancestors` is the only derivation of it.
+        let mut chain = vec![subject.clone()];
+        chain.extend(subject.ancestors().iter().map(|c| c.as_resource().clone()));
+
+        // Everything anyone in this request may ask about, unconditionally —
+        // a probe set that varied by method would be a second derivation of the
+        // same table (design §4).
+        let auxes: Vec<_> = chain
+            .iter()
+            .flat_map(|r| AuxKind::ALL.iter().map(move |k| r.aux(*k)))
+            .collect();
+        let counterparts: Vec<_> = chain.iter().filter_map(|r| r.slash_counterpart()).collect();
+        let mut candidates: Vec<&dyn GraphName> = Vec::new();
+        candidates.extend(chain.iter().map(|r| r as &dyn GraphName));
+        candidates.extend(auxes.iter().map(|a| a as &dyn GraphName));
+        candidates.extend(counterparts.iter().map(|r| r as &dyn GraphName));
+
+        let present = resource::exists_many(store, &candidates)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+        let acls = prp::load_chain_acls(store, &chain, &present)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        Ok(Self { store, agent, target, chain, present, acls })
+    }
+
+    /// Decide `required` against the nearest ACL at or above `chain[start]`.
+    ///
+    /// Nearest wins entirely: ancestor rules are never merged in, because
+    /// merging would make revoking access on a subtree impossible. `inherited`
+    /// is true for anything above `start`, which is what makes `acl:default`
+    /// apply rather than `acl:accessTo`.
+    fn decide_from(&self, start: usize, required: Mode) -> Result<Decision, Response> {
+        let found = self.chain[start..]
+            .iter()
+            .enumerate()
+            .find_map(|(offset, element)| {
+                self.acls.get(element.graph_iri()).map(|t| (element, t, offset > 0))
+            });
+        let Some((element, triples, inherited)) = found else {
+            return Err(deny(&self.agent)); // WAC has no implicit grant
+        };
+        let governed = element.graph_iri();
+        let user = pdp::decide(triples, &self.agent, governed, inherited);
+        let public = match self.agent {
+            Agent::Public => user,
+            Agent::WebId(_) => pdp::decide(triples, &Agent::Public, governed, inherited),
+        };
+        if user.allows(required) {
+            Ok(Decision { user, public })
+        } else {
+            Err(deny(&self.agent))
+        }
     }
 
     /// May this agent perform `mode` on the target?
@@ -345,7 +404,11 @@ impl<'a> Guard<'a> {
     /// auxiliary is decided against its subject and requires the mode its
     /// [`AuxKind`] demands, exactly as the free function it replaces.
     pub fn authorize(&self, mode: Mode) -> Result<Decision, Response> {
-        todo!("design §5: pick the governing ACL from `acls`, then pdp::decide")
+        let required = match &self.target {
+            Target::Aux(a) => required_mode_for_aux(a.kind()),
+            _ => mode,
+        };
+        self.decide_from(0, required)
     }
 
     /// The same question for the container above the target — `None` at the
@@ -374,7 +437,7 @@ impl<'a> Guard<'a> {
     /// has already established is the wrong one. The guard owns the agent, so
     /// this is where that refusal now comes from.
     pub fn deny(&self) -> Response {
-        todo!("design §5: deny(&self.agent)")
+        deny(&self.agent)
     }
 
     /// Whether the target was present when this guard was probed.
@@ -383,7 +446,7 @@ impl<'a> Guard<'a> {
     /// returned `Ok`, which is the ordering the store lookup it replaces
     /// already obeyed (design §7).
     pub fn existed(&self) -> bool {
-        todo!("design §6")
+        self.present.contains(self.target.graph_iri())
     }
 
     /// Authorize and perform the container materialization this write implies,
@@ -471,6 +534,88 @@ mod tests {
             ))
             .await
             .unwrap()
+    }
+
+    /// Probe a guard for `path` as `agent`, panicking on a store failure.
+    async fn guard_for<'a>(store: &'a OxigraphStore, agent: Agent, path: &str) -> Guard<'a> {
+        Guard::probe(store, agent, sp().resolve(path).unwrap()).await.expect("probe")
+    }
+
+    #[tokio::test]
+    async fn a_probed_guard_grants_what_the_free_function_grants() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/foo", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        let g = guard_for(&store, alice(), "/foo").await;
+        assert!(g.authorize(Mode::Read).is_ok());
+        assert_eq!(status(g.authorize(Mode::Write)), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn a_guard_denies_an_anonymous_caller_with_a_challenge() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/foo", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        let g = guard_for(&store, Agent::Public, "/foo").await;
+        let res = g.authorize(Mode::Read).expect_err("denied");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_some());
+        // `deny` is the same refusal, for the caller that has to make it itself.
+        assert_eq!(g.deny().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_guard_inherits_from_the_nearest_ancestor_acl() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/box/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        let g = guard_for(&store, alice(), "/box/item").await;
+        assert!(g.authorize(Mode::Read).is_ok());
+    }
+
+    // The resource's own empty ACL wins over the ancestor grant it was written to
+    // override — the fixture that fails if the chain is searched in the wrong
+    // direction, or if an empty ACL is treated as an absent one.
+    #[tokio::test]
+    async fn a_guard_lets_an_own_empty_acl_win() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/", &format!(
+            "<#root> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        seed_acl(&store, "/foo", "").await;
+        let g = guard_for(&store, alice(), "/foo").await;
+        assert_eq!(status(g.authorize(Mode::Read)), Some(StatusCode::FORBIDDEN));
+    }
+
+    // An auxiliary is decided against its subject and requires Control, whatever
+    // mode the caller names.
+    #[tokio::test]
+    async fn a_guard_requires_control_for_an_acl_target() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/foo", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        let g = guard_for(&store, alice(), "/.aux/foo.acl").await;
+        assert_eq!(status(g.authorize(Mode::Read)), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn existed_reports_the_pre_request_state() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/foo", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
+             <{ACL_MODE}> <{ACL_READ}> ."
+        )).await;
+        assert!(guard_for(&store, alice(), "/foo").await.existed());
+        assert!(!guard_for(&store, alice(), "/nothing").await.existed());
     }
 
     #[tokio::test]
