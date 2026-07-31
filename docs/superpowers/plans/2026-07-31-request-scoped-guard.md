@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **The skeleton's signatures are given.** Commits `275b092` and `433a160` fixed the public surface of `resource::exists_many`, `prp::load_chain_acls`, `wac::guard::Guard` and `wac::guard::Created`. Tasks fill bodies and migrate callers. **No new public functions, no new modules.** One exception is called out explicitly in Task 2 (a `?Sized` bound on an existing helper).
+- **The skeleton's signatures are given.** Commits `275b092` and `433a160` fixed the public surface of `resource::exists_many`, `prp::load_chain_acls`, `wac::guard::Guard`. Tasks fill bodies and migrate callers. **No new public functions, no new modules.** One exception is called out explicitly in Task 2 (a `?Sized` bound on an existing helper).
 - **Build and test only inside the Nix dev shell.** Every `cargo` command in this plan must be run as `nix develop --command cargo …`. A bare `cargo` fails on `openssl-sys` because `pkg-config` is not on the ambient PATH.
 - **`docs/constraints.md` must stay green.** Run `arch-check` before every commit; it prints nothing when all 22 rules hold. Two rules bear directly on this work: *"Only `resource` builds a system-graph IRI"* (so the `urn:quadpod:sys:` prefix may appear only in `src/resource.rs`) and *"`SparqlStore` has exactly one implementor"* (so the counting store must live in `tests/`, never in `src/`).
 - **No `#[allow]` attributes anywhere in `src/`.** This is rule 15 and it has no exceptions.
@@ -930,26 +930,30 @@ git commit -m "feat(wac): the two derived targets a handler may ask about"
 
 **Interfaces:**
 - Consumes: `Guard::decide_from`, `self.present`, `container::ensure_container`, `container::add_containment`.
-- Produces: `async fn materialize(self) -> Result<Created, Response>`, where `Created { target_existed: bool }`.
+- Produces: `async fn materialize(self) -> Result<(), Response>`.
+
+**A correction to be aware of.** An earlier draft of the skeleton had this return a `Created { target_existed }`, on the belief that `put_impl` chose `201` over `204` from it. It does not — `created()` (`src/http.rs:405`) answers `201` unconditionally — so the type had no consumer and was removed before this task was dispatched. `existed()` from Task 4 remains, and `POST` in Task 8 is its consumer.
 
 Read the doc comment on the existing `authorize_and_materialize` before starting. The logic below is that function with two substitutions — `resource::exists(store, x)` becomes `self.present.contains(x.graph_iri())`, and `authorize(store, agent, Target::Container(a), Append)` becomes `self.decide_from(i + 1, Mode::Append)` — and no change at all to the order in which it decides, checks and writes.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
+// An existing target gains no containment triple — its parent already records
+// it — so materializing over one must not demand Append at the level above.
+// This is the "you may edit this file" grant, where an agent holds Write on
+// one document and nothing on the container around it.
 #[tokio::test]
-async fn materialize_reports_whether_the_target_was_there() {
+async fn materializing_over_an_existing_target_needs_nothing_above_it() {
     let store = OxigraphStore::in_memory().unwrap();
-    seed_acl(&store, "/", &format!(
-        "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
-         <{ACL_DEFAULT}> <https://pod.toph.so/> ; <{ACL_MODE}> <{ACL_WRITE}> ."
+    seed_container(&store, "/box/").await;
+    crate::resource::put_rdf(&store, &resource("/box/doc"), &[]).await.unwrap();
+    seed_acl(&store, "/box/doc", &format!(
+        "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/doc> ; \
+         <{ACL_MODE}> <{ACL_WRITE}> ."
     )).await;
-    let fresh = guard_for(&store, alice(), "/a/b/c").await.materialize().await.unwrap();
-    assert!(!fresh.target_existed);
-
-    crate::resource::put_rdf(&store, &resource("/a/b/c"), &[]).await.unwrap();
-    let again = guard_for(&store, alice(), "/a/b/c").await.materialize().await.unwrap();
-    assert!(again.target_existed);
+    let g = guard_for(&store, alice(), "/box/doc").await;
+    assert!(g.materialize().await.is_ok(), "an overwrite adds no containment");
 }
 
 #[tokio::test]
@@ -1027,7 +1031,7 @@ Expected: six FAILs at `not yet implemented: design §6`.
 - [ ] **Step 3: Implement `materialize`**
 
 ```rust
-pub async fn materialize(self) -> Result<Created, Response> {
+pub async fn materialize(self) -> Result<(), Response> {
     let subject = &self.chain[0];
     let target_existed = self.existed();
     let may_be_member = !matches!(self.target, Target::Aux(_));
@@ -1087,7 +1091,7 @@ pub async fn materialize(self) -> Result<Created, Response> {
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
         }
     }
-    Ok(Created { target_existed })
+    Ok(())
 }
 ```
 
@@ -1192,7 +1196,7 @@ git commit -m "refactor(http): read paths and PATCH decide through the guard"
 - Test: `src/http.rs` test module
 
 **Interfaces:**
-- Consumes: `Guard::probe`, `authorize`, `authorize_parent`, `authorize_aux`, `existed`, `materialize`, `Created`.
+- Consumes: `Guard::probe`, `authorize`, `authorize_parent`, `authorize_aux`, `existed`, `materialize`.
 - Produces: nothing new.
 
 - [ ] **Step 1: Migrate `put_impl` (lines 1093, 1115) and drop its second read**
@@ -1209,24 +1213,23 @@ if let Err(res) = guard.authorize(Mode::Write) {
 }
 ```
 
-At the site where the walk runs (line 1117 in the blob branch and its RDF counterpart), replace `authorize_and_materialize(store, &agent, &target).await` with `guard.materialize().await`, binding its result:
+At the site where the walk runs (line 1117 in the blob branch and its RDF counterpart), replace `authorize_and_materialize(store, &agent, &target).await` with `guard.materialize().await`:
 
 ```rust
-let created = match guard.materialize().await {
-    Ok(c) => c,
-    Err(res) => return with_aux_links(res, &target),
-};
+if let Err(res) = guard.materialize().await {
+    return with_aux_links(res, &target);
+}
 ```
 
-Then wherever the handler currently re-reads existence to choose `201` from `204`, use `created.target_existed`. **Delete that store read** — it is the duplicate this design was written to remove. Search the handler for `exists(store` and remove only the call that answers created-vs-updated; leave conditional-request reads alone.
+**Change no status code.** `created()` answers `201` unconditionally today and must still answer `201` unconditionally after this task; whether that is right is design §10's explicitly out-of-scope question. This task is a refactor whose entire claim is that behaviour is unchanged, and a `204` appearing here would falsify it.
 
-Note the borrow: `guard.materialize()` consumes the guard, so any `guard.existed()` a branch still wants must be read **before** it. If the compiler objects, that is the design working — move the read up, do not clone the guard.
+Note the borrow: `guard.materialize()` consumes the guard, so anything a branch still wants from `guard.existed()` must be read **before** it. If the compiler objects, that is the design working — move the read up, do not clone the guard.
 
 - [ ] **Step 2: Run the tests**
 
 Run: `nix develop --command cargo test --lib http::tests`
 
-Expected: all PASS. The `201` vs `204` tests are the ones that prove `Created` carries the right answer.
+Expected: all PASS — unchanged, since no status code changes in this step.
 
 - [ ] **Step 3: Migrate `post_impl` (lines 1340, 1382, 1434) to two guards**
 
@@ -1297,8 +1300,8 @@ Expected: all tests pass, no `arch-check` output.
 git add src/http.rs
 git commit -m "refactor(http): write paths decide through the guard
 
-put_impl takes created-vs-updated from Created instead of reading the
-same snapshot twice, and POST's child probe absorbs name_is_taken."
+POST's child probe absorbs name_is_taken, and delete_impl drops its
+per-auxiliary existence read. No status code changes."
 ```
 
 ---

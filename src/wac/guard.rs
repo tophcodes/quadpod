@@ -292,16 +292,6 @@ pub async fn authorize_and_materialize(
     Ok(())
 }
 
-/// What a materialization found and made — the pre-write state, carried past
-/// the moment it stops being readable from the store.
-///
-/// `target_existed` is what chooses `201` over `204`, and it is the reason
-/// `put_impl` no longer reads the same snapshot twice: the probe knew it
-/// before anything was written. See `2026-07-31-request-scoped-guard-design.md` §6.
-pub struct Created {
-    pub target_existed: bool,
-}
-
 /// The LDP door's enforcement point, for one request.
 ///
 /// Built once from the target, it resolves every existence fact the request
@@ -401,8 +391,9 @@ impl<'a> Guard<'a> {
     ///
     /// Takes `self` because the probe describes the store *before* these
     /// writes: after this returns there is no guard left to read a stale
-    /// answer from, and what the request still needs travels in [`Created`].
-    pub async fn materialize(self) -> Result<Created, Response> {
+    /// answer from. A pre-write fact a caller still wants is read from
+    /// [`Guard::existed`] beforehand, which the borrow checker orders for it.
+    pub async fn materialize(self) -> Result<(), Response> {
         todo!("design §6: the decide-then-write walk, now deciding from `present`")
     }
 }

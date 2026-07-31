@@ -148,7 +148,8 @@ impl Guard {
     fn authorize_aux(&self, kind: AuxKind) -> Result<Decision, Response>;
 
     fn existed(&self) -> bool;
-    async fn materialize(self) -> Result<Created, Response>;
+    fn deny(&self) -> Response;
+    async fn materialize(self) -> Result<(), Response>;
 }
 ```
 
@@ -190,14 +191,20 @@ The probe describes the store as it was when the guard was built. `materialize` 
 that stops being true, so it takes `self`:
 
 ```rust
-async fn materialize(self) -> Result<Created, Response>;
+async fn materialize(self) -> Result<(), Response>;
 ```
 
-After it returns, the guard does not exist. Anything that still needs the pre-write state reads
-it from `Created`, which reports what the walk found and what it made. That is precisely the
-question `put_impl` answers today by reading the same snapshot a second time
-(`http.rs:1093`, `http.rs:1115`) to choose between `201` and `204`: the guard knew it at probe
-time, and `Created` carries it forward.
+After it returns, the guard does not exist, and nothing can read a stale answer from it because
+there is nothing left to read from. Any pre-write fact a handler still wants is read from
+`existed()` **before** the call — which is a borrow the compiler orders, not a rule anyone has
+to remember.
+
+An earlier draft had `materialize` return a `Created { target_existed }`, on the belief that
+`put_impl` chose `201` over `204` by reading the same snapshot a second time. It does not:
+`created()` (`http.rs:405`) answers `201` unconditionally on every successful `PUT`, so there is
+no such choice and no consumer for the value. The type is dropped rather than kept for a caller
+that does not exist. Whether that unconditional `201` is itself correct is a separate question
+and deliberately not this design's — see §10.
 
 The internal ordering of `materialize` is unchanged. It still decides the whole plan before
 writing any of it, for the reason `authorize_and_materialize`'s doc comment gives: a denial
@@ -295,9 +302,18 @@ No existing rule changes. The `SparqlStore`-has-one-implementor check stays as i
   that means adding a shape to `SparqlStore`, which ADR-2 makes a load-bearing contract, and §5
   removes so many calls that the per-call parse cost is a different question afterwards than it
   is now. Revisit against measurements, not before.
+- **`get_rdf`'s duplicate existence check** (`resource.rs:620`). It asks the store whether the
+  graph is present and then reads it, which is one call more than a caller who already knows.
+  Removing it means either a second entry point that skips the check — a way to read a graph
+  without establishing it exists, which is the shape this codebase spent Plan 7 making
+  unrepresentable — or folding presence and content into one query, which is its own design. An
+  earlier draft of this section claimed it disappeared for free as a consequence of §4. It does
+  not: §4 batches the *guard's* existence questions and never touches `get_rdf`.
+- **`PUT` answering `201` unconditionally.** `created()` (`http.rs:405`) never answers `204` for
+  an overwrite. That is a protocol question, not a cost one, and fixing it here would smuggle a
+  behaviour change into a refactor whose whole claim is that behaviour is unchanged.
 - **The read path's remaining queries.** Content, shelves and conditional requests are work, not
-  overhead. `get_rdf`'s duplicate existence check disappears as a consequence of §4, but the
-  reads themselves stay.
+  overhead.
 - **`ensure_container` / `add_containment` as separate updates.** Two updates per created level
   where one `;`-sequence would do. Real, small, and independent of everything above — an issue,
   not part of this.
