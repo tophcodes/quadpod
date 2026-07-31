@@ -1107,9 +1107,8 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
 /// The write itself, reporting what the emit above cannot re-derive: whether
 /// the target was there beforehand, and what the ancestor walk materialized.
 ///
-/// Every failing exit reports `Existence::Absent` and an empty `Materialized`;
-/// neither is ever read, because `emit_put` returns on a non-success status
-/// before it touches them.
+/// A failing exit's `existence` and `materialized` are never read: `emit_put`
+/// gates emission on `status` alone, before it looks at either value.
 async fn put_write(
     st: &AppState, agent: Agent, target: &Target, headers: HeaderMap, body: Bytes,
 ) -> (Response, crate::notify::Existence, Materialized) {
@@ -1152,8 +1151,8 @@ async fn put_write(
                 Ok(m) => m,
                 Err(res) => return (with_aux_links(res, target), existence, Materialized::default()),
             };
-            // Still an early exit, but no longer one that outruns the emit:
-            // what `emit_put` needs travels out with the response (§6.3).
+            // An early exit that carries what `emit_put` needs out alongside
+            // the response (§6.3).
             return (match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
                 Ok(()) => created(target),
                 Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
@@ -6975,6 +6974,17 @@ mod tests {
         assert_eq!(p.activity, crate::notify::Activity::Add);
         assert_eq!(p.object, target.graph_iri(), "the object of an Add is the child");
         assert_eq!(p.target.as_deref(), Some(parent.graph_iri()));
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state. Catches an Add reporting
+        // back the child's state instead of the topic's — the one place the
+        // "state describes the topic, not the object" rule can break.
+        let container_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(p.state.as_deref(), Some(container_etag.as_str()),
+            "the Add's state must be the container's own validator, not the child's");
     }
 
     /// `/c/` did not exist either, so the same write created it — and a
@@ -6998,6 +7008,30 @@ mod tests {
         assert_eq!(second.target.as_deref(), Some(parent.graph_iri()));
     }
 
+    /// `Materialized::created` always includes the request's own target, and
+    /// for a container target `as_container` does not screen it back out —
+    /// so a fresh container's own channel must hear its `Create` exactly
+    /// once, not once from `publish_own` and again from `publish_containment`.
+    #[tokio::test]
+    async fn a_put_that_creates_a_container_emits_exactly_one_create_on_its_own_topic() {
+        let f = fixture().await;
+        let target = f.space.resolve("/fresh/").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/fresh/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Create);
+        assert_eq!(e.object, target.graph_iri());
+        assert_eq!(e.target, None);
+        stays_silent(&mut on_target,
+            "the container's own topic must hear one Create, not a second one for the same target").await;
+    }
+
     /// An overwrite changes no containment, so the parent hears nothing at all.
     #[tokio::test]
     async fn a_put_that_overwrites_emits_update_and_nothing_on_the_parent() {
@@ -7016,8 +7050,9 @@ mod tests {
         stays_silent(&mut on_parent, "containment did not change, so the parent is silent").await;
     }
 
-    /// The regression test for the `Repr::Blob` arm's early return: a binary
-    /// write must not bypass the tail where emission happens.
+    /// The blob arm's early return carries `existence` and `materialized` out
+    /// alongside the response (§6.3), so a binary `PUT` emits every field a
+    /// graph `PUT` does.
     #[tokio::test]
     async fn a_binary_put_emits() {
         let f = fixture().await;
@@ -7032,6 +7067,8 @@ mod tests {
 
         let e = next_event(&mut on_target).await;
         assert_eq!(e.activity, crate::notify::Activity::Create);
+        assert_eq!(e.object, target.graph_iri());
+        assert_eq!(e.target, None);
         assert_eq!(e.state.as_deref(), Some(blob_etag(b"\x89PNG\r\n\x1a\n").as_str()));
     }
 
