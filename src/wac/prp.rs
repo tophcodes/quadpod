@@ -82,11 +82,14 @@ pub async fn load_chain_acls(
         else {
             continue;
         };
-        let (Some(key), Ok(subject), oxigraph::model::Term::NamedNode(predicate)) = (
-            governed.get(g.as_str()),
-            oxigraph::model::Subject::try_from(s.clone()),
-            p.clone(),
-        ) else {
+        let subject = match s {
+            oxigraph::model::Term::NamedNode(n) => oxigraph::model::NamedOrBlankNode::NamedNode(n.clone()),
+            oxigraph::model::Term::BlankNode(b) => oxigraph::model::NamedOrBlankNode::BlankNode(b.clone()),
+            _ => continue,
+        };
+        let (Some(key), oxigraph::model::Term::NamedNode(predicate)) =
+            (governed.get(g.as_str()), p.clone())
+        else {
             continue;
         };
         out.entry(key.clone())
