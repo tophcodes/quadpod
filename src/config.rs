@@ -184,7 +184,32 @@ impl FileConfig {
     /// a field by a route that skips validation. `Vec<String>` covers both the
     /// scalar arguments and the repeatable ones without a second shape.
     fn as_defaults(&self) -> std::collections::BTreeMap<&'static str, Vec<String>> {
-        todo!("2026-07-31-cli-config-design.md §5")
+        let mut out = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("base_uri", &self.base_uri),
+            ("owner_webid", &self.owner_webid),
+            ("expected_audience", &self.expected_audience),
+            ("listen", &self.listen),
+            ("rdf_store", &self.rdf_store),
+            ("blob_store", &self.blob_store),
+        ] {
+            if let Some(v) = value {
+                out.insert(key, vec![v.clone()]);
+            }
+        }
+        if let Some(v) = &self.trusted_issuers {
+            out.insert("trusted_issuers", v.clone());
+        }
+        if let Some(v) = &self.allow_insecure_hosts {
+            out.insert("allow_insecure_hosts", v.clone());
+        }
+        if let Some(v) = self.reset_root_acl {
+            out.insert("reset_root_acl", vec![v.to_string()]);
+        }
+        if let Some(v) = self.max_body_bytes {
+            out.insert("max_body_bytes", vec![v.to_string()]);
+        }
+        out
     }
 }
 
@@ -629,5 +654,29 @@ mod tests {
         assert!(cfg.rdf_store().is_err(), "an unimplemented backend must refuse to start");
         cfg.rdf_store = "nonsense".into();
         assert!(cfg.rdf_store().is_err());
+    }
+
+    // Everything is rendered to a string so the file's values travel the same
+    // `value_parser` as a typed flag. The keys are argument ids, which is what
+    // `Command::mut_arg` takes.
+    #[test]
+    fn as_defaults_renders_only_the_keys_the_file_set() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://a.example/#me\"\n",
+            "trusted_issuers = [\"https://one.example/\", \"https://two.example/\"]\n",
+            "reset_root_acl = true\n",
+            "max_body_bytes = 42\n",
+        ));
+        let d = FileConfig::read(&p).expect("reads").as_defaults();
+        assert_eq!(d.get("owner_webid"), Some(&vec!["https://a.example/#me".to_string()]));
+        assert_eq!(
+            d.get("trusted_issuers"),
+            Some(&vec!["https://one.example/".to_string(), "https://two.example/".to_string()]),
+            "a list becomes several values, not one joined string"
+        );
+        assert_eq!(d.get("reset_root_acl"), Some(&vec!["true".to_string()]));
+        assert_eq!(d.get("max_body_bytes"), Some(&vec!["42".to_string()]));
+        assert_eq!(d.get("listen"), None, "an unset key must not become a default");
+        std::fs::remove_file(&p).ok();
     }
 }
