@@ -375,6 +375,18 @@ impl<'a> Guard<'a> {
         todo!("design §5")
     }
 
+    /// Refuse, in the way that tells this agent the truth without leaking
+    /// anything — the `401`/`403` split of the free [`deny`].
+    ///
+    /// For the one refusal the decision methods cannot make: a patch's
+    /// required modes are known only after its body is parsed, and re-running
+    /// [`Guard::authorize`] to say no would decide against a mode the handler
+    /// has already established is the wrong one. The guard owns the agent, so
+    /// this is where that refusal now comes from.
+    pub fn deny(&self) -> Response {
+        todo!("design §5: deny(&self.agent)")
+    }
+
     /// Whether the target was present when this guard was probed.
     ///
     /// Refuses nothing on its own. Callers read it after [`Guard::authorize`]
