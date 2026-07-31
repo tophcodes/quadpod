@@ -72,8 +72,14 @@ impl Bus { pub fn live(&self, topics: &[Topic]) -> Vec<Topic> }
 
 The emit path asks which of the topics a request touched have a live channel, and computes
 `state` only for those. A `Sender` whose `receiver_count()` has fallen to zero is evicted
-during that lookup; a subscription handle also removes its own entry when the last receiver
-drops. Without the eviction the map grows without bound over client-chosen paths.
+during that lookup; the `Receiver` `Bus::subscribe` hands out also removes its own entry when
+the last one drops. Without the eviction the map grows without bound over client-chosen paths.
+
+`Receiver` is a reader of one topic's channel and nothing else. The Solid *notification channel*
+— a channel type, a `receiveFrom` or `sendTo`, an `accept`, the optional
+`startAt`/`endAt`/`rate` features, and for webhooks a lifetime longer than the process — is #18's
+and #19's object, and each of those holds a `Receiver` to get its events. None of that protocol
+state belongs on this type, which is why it is not called `Subscription`.
 
 Expressing the gate as "which topics are live" rather than "is anyone listening" is what makes
 it checkable: `state` is computed in one place, behind one call, instead of at four sites that

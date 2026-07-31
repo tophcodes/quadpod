@@ -101,11 +101,11 @@ impl Bus {
         todo!("skeleton")
     }
 
-    /// Take `topic`'s channel, creating it if this is its first subscriber.
+    /// Take `topic`'s channel, creating it if this is its first receiver.
     ///
-    /// Takes `&Arc<Self>` because the returned [`Subscription`] unregisters
-    /// itself when the last receiver drops.
-    pub fn subscribe(self: &Arc<Self>, _topic: Topic) -> Subscription {
+    /// Takes `&Arc<Self>` because the returned [`Receiver`] unregisters itself
+    /// when the last one drops.
+    pub fn subscribe(self: &Arc<Self>, _topic: Topic) -> Receiver {
         todo!("skeleton")
     }
 }
@@ -116,33 +116,52 @@ impl Default for Bus {
     }
 }
 
-/// A live subscription to one topic. Unregisters its channel on drop when no
-/// other receiver is left.
-pub struct Subscription {
+/// A live reader of one topic's channel. Unregisters that channel on drop when
+/// no other reader is left.
+///
+/// Not a Solid notification channel and deliberately not named one. A
+/// `WebSocketChannel2023` or `WebhookChannel2023` is #18's and #19's object —
+/// it carries a channel type, a `receiveFrom` or `sendTo`, an `accept`, the
+/// optional `startAt`/`endAt`/`rate` features, and for webhooks it outlives the
+/// process. Each of those *holds* one of these to get its events. Nothing about
+/// the protocol belongs on this type.
+pub struct Receiver {
     _bus: Arc<Bus>,
     _topic: Topic,
     _rx: broadcast::Receiver<Event>,
 }
 
-impl Subscription {
+impl Receiver {
     pub async fn recv(&mut self) -> Result<Event, broadcast::error::RecvError> {
         todo!("skeleton")
     }
 }
 
-impl Drop for Subscription {
+impl Drop for Receiver {
     fn drop(&mut self) {
         todo!("skeleton")
     }
 }
 
+/// Whether the target was there before the write — what decides `Create` from
+/// `Update`.
+///
+/// A `bool`, for the reason [`crate::rdf::Shape`] is not one:
+/// `emit_put(&st, &target, true, …)` says nothing at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existence {
+    Existed,
+    Absent,
+}
+
 /// `PUT`: `Create` or `Update` on the target, and `Add` on each container that
-/// gained a child. `existed` is [`crate::wac::guard::Guard::target_exists`],
-/// read before the guard was consumed.
+/// gained a child. `existence` comes from
+/// [`crate::wac::guard::Guard::target_exists`], read before the guard was
+/// consumed.
 pub async fn emit_put(
     _st: &AppState,
     _target: &Target,
-    _existed: bool,
+    _existence: Existence,
     _materialized: &Materialized,
     _res: &Response,
 ) {
@@ -164,7 +183,7 @@ pub async fn emit_post(
 pub async fn emit_patch(
     _st: &AppState,
     _target: &Target,
-    _existed: bool,
+    _existence: Existence,
     _materialized: &Materialized,
     _res: &Response,
 ) {
