@@ -467,7 +467,66 @@ impl<'a> Guard<'a> {
     /// answer from. A pre-write fact a caller still wants is read from
     /// [`Guard::existed`] beforehand, which the borrow checker orders for it.
     pub async fn materialize(self) -> Result<(), Response> {
-        todo!("design §6: the decide-then-write walk, now deciding from `present`")
+        let subject = &self.chain[0];
+        let target_existed = self.existed();
+        let may_be_member = !matches!(self.target, Target::Aux(_));
+        // An auxiliary is never a container member, and neither is a target that
+        // already exists: re-inserting the containment triple changes nothing, so
+        // demanding Append for it would refuse the ordinary "you may edit this
+        // file" grant.
+        let is_member = may_be_member && !target_existed;
+
+        let mut creations: Vec<&ResourceUrl> = Vec::new();
+        if is_member {
+            creations.push(subject);
+        }
+        let mut child_iri = self.target.graph_iri().to_string();
+        let mut record_child = is_member;
+        let mut plan: Vec<(ContainerUrl, Option<String>)> = Vec::new();
+        for (i, ancestor) in subject.ancestors().into_iter().enumerate() {
+            let existed = self.present.contains(ancestor.graph_iri());
+            if existed && !record_child {
+                break; // nothing observable changes at or above this level
+            }
+            self.decide_from(i + 1, Mode::Append)?;
+            plan.push((ancestor.clone(), record_child.then(|| child_iri.clone())));
+            if existed {
+                break;
+            }
+            creations.push(&self.chain[i + 1]);
+            child_iri = ancestor.graph_iri().to_string();
+            record_child = true;
+        }
+
+        // Every ancestor is authorized by here, so a missing subject may finally
+        // be reported — before the plan below materializes anything for a write
+        // that could never succeed.
+        if matches!(self.target, Target::Aux(_)) && !self.present.contains(subject.graph_iri()) {
+            return Err((StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response());
+        }
+
+        // Protocol §3.1, over everything this write would create. Deliberately
+        // after the whole chain is authorized: a caller about to be refused for an
+        // ancestor must be refused without learning what else exists.
+        for created in &creations {
+            if let Some(counterpart) = created.slash_counterpart() {
+                if self.present.contains(counterpart.graph_iri()) {
+                    return Err((StatusCode::CONFLICT, SLASH_PAIR_MESSAGE).into_response());
+                }
+            }
+        }
+
+        for (ancestor, child_iri) in plan {
+            container::ensure_container(self.store, &ancestor)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+            if let Some(child_iri) = child_iri {
+                container::add_containment(self.store, &ancestor, &child_iri)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -843,5 +902,87 @@ mod tests {
         )).await;
         let g = guard_for(&store, alice(), "/box/doc").await;
         assert_eq!(status(g.authorize_aux(AuxKind::Acl)), Some(StatusCode::FORBIDDEN));
+    }
+
+    // An existing target gains no containment triple — its parent already records
+    // it — so materializing over one must not demand Append at the level above.
+    // This is the "you may edit this file" grant, where an agent holds Write on
+    // one document and nothing on the container around it.
+    #[tokio::test]
+    async fn materializing_over_an_existing_target_needs_nothing_above_it() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_container(&store, "/box/").await;
+        crate::resource::put_rdf(&store, &resource("/box/doc"), &[]).await.unwrap();
+        seed_acl(&store, "/box/doc", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/doc> ; \
+             <{ACL_MODE}> <{ACL_WRITE}> ."
+        )).await;
+        let g = guard_for(&store, alice(), "/box/doc").await;
+        assert!(g.materialize().await.is_ok(), "an overwrite adds no containment");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_deep_create_materializes_and_links_the_whole_chain() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
+             <{ACL_DEFAULT}> <https://pod.toph.so/> ; <{ACL_MODE}> <{ACL_WRITE}> ."
+        )).await;
+        guard_for(&store, alice(), "/a/b/c").await.materialize().await.unwrap();
+
+        for path in ["/a/b/", "/a/", "/"] {
+            assert!(resource::exists(&store, &container(path)).await.unwrap(), "{path} must exist");
+        }
+        assert!(contains(&store, &container("/a/b/"), "https://pod.toph.so/a/b/c").await);
+    }
+
+    #[tokio::test]
+    async fn a_guarded_walk_writes_nothing_when_a_level_denies() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/box/", &format!(
+            "<#bob> <{ACL_AGENT}> <{BOB}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
+             <{ACL_MODE}> <{ACL_WRITE}> ."
+        )).await;
+        let g = guard_for(&store, bob(), "/box/sub/file").await;
+        assert!(g.materialize().await.is_err(), "creating /box/sub/ mutates /box/");
+        assert!(!resource::exists(&store, &container("/box/sub/")).await.unwrap(),
+            "nothing may be materialized when the walk denies");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_walk_stops_at_the_first_existing_ancestor() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_container(&store, "/inbox/").await;
+        seed_acl(&store, "/inbox/", &format!(
+            "<#bob> <{ACL_AGENT}> <{BOB}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/inbox/> ; \
+             <{ACL_MODE}> <{ACL_APPEND}> ."
+        )).await;
+        guard_for(&store, bob(), "/inbox/note").await.materialize().await.unwrap();
+        assert!(contains(&store, &container("/inbox/"), "https://pod.toph.so/inbox/note").await);
+        assert!(!resource::exists(&store, &container("/")).await.unwrap(),
+            "the walk must never touch the root");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_write_refuses_the_other_half_of_a_slash_pair() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
+             <{ACL_DEFAULT}> <https://pod.toph.so/> ; <{ACL_MODE}> <{ACL_WRITE}> ."
+        )).await;
+        crate::resource::put_rdf(&store, &resource("/box"), &[]).await.unwrap();
+        let g = guard_for(&store, alice(), "/box/").await;
+        assert_eq!(status(g.materialize().await), Some(StatusCode::CONFLICT));
+    }
+
+    #[tokio::test]
+    async fn a_guarded_aux_write_still_needs_its_subject_to_exist() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
+             <{ACL_DEFAULT}> <https://pod.toph.so/> ; <{ACL_MODE}> <{ACL_CONTROL}> ."
+        )).await;
+        let g = guard_for(&store, alice(), "/.aux/ghost.acl").await;
+        assert_eq!(status(g.materialize().await), Some(StatusCode::NOT_FOUND));
     }
 }
