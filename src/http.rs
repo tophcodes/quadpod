@@ -1461,9 +1461,10 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // POSTing into a container that does not exist yet materializes it and
     // its missing ancestors, so those need authorizing too — the same single
     // traversal `put_impl` uses.
-    if let Err(res) = child_guard.materialize().await {
-        return with_aux_links(res, &child);
-    }
+    let materialized = match child_guard.materialize().await {
+        Ok(m) => m,
+        Err(res) => return with_aux_links(res, &child),
+    };
     let res = match &child {
         Target::Resource(r) => match repr {
             Repr::Blob(bytes, mt) => match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
@@ -1503,7 +1504,9 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // Mirrors `put_impl`'s tail: findings alone cannot gate the link, or a
     // body that only warned, followed by a storage failure, would advertise a
     // report for a child that was never created.
-    if findings.is_some() && res.status().is_success() { report_link(&child, res) } else { res }
+    let res = if findings.is_some() && res.status().is_success() { report_link(&child, res) } else { res };
+    crate::notify::emit_post(&st, &child, &materialized, res.status()).await;
+    res
 }
 
 /// Answer a CORS preflight — and a bare `OPTIONS`, which the suite also sends
@@ -7107,5 +7110,54 @@ mod tests {
         assert!(!res.status().is_success(), "the fixture's premise: {}", res.status());
         stays_silent(&mut on_target, "a refused write is not a change").await;
         stays_silent(&mut on_parent, "a refused write materialized nothing to report either").await;
+    }
+
+    /// The allocated child is always new, so `POST` is always a `Create` — and
+    /// the container that received it hears `Add`, with the child as
+    /// `object`. `/c/` is made to exist first (as
+    /// `a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent`
+    /// does), so this write's only containment change there is the `Add`.
+    #[tokio::test]
+    async fn a_post_emits_create_on_the_child_and_add_on_the_container() {
+        let f = fixture().await;
+        f.put_turtle("/c/other", "<#it> <http://schema.org/name> \"y\" .").await;
+        let container = f.space.resolve("/c/").unwrap();
+        let child = f.space.resolve("/c/child").unwrap();
+        let mut on_container = f.events.subscribe(crate::notify::Topic::from(&container));
+        // Subscribed up front, alongside the container: a broken `emit_post`
+        // that only ran `publish_containment` and never `publish_own` on the
+        // child would still satisfy an assertion made solely on the
+        // container's channel, so the child's own `Create` is checked too.
+        let mut on_child = f.events.subscribe(crate::notify::Topic::from(&child));
+
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/c/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "child")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let location = res.headers()[header::LOCATION].to_str().unwrap().to_owned();
+        assert_eq!(location, child.graph_iri(), "the fixture's premise: no slug collision");
+
+        let created = next_event(&mut on_child).await;
+        assert_eq!(created.activity, crate::notify::Activity::Create);
+        assert_eq!(created.object, child.graph_iri());
+        assert_eq!(created.target, None);
+        assert!(created.state.is_some(), "a create reports the state it produced");
+
+        let e = next_event(&mut on_container).await;
+        assert_eq!(e.activity, crate::notify::Activity::Add);
+        assert_eq!(e.object, location, "the object of an Add is the allocated child");
+        assert_eq!(e.target.as_deref(), Some(container.graph_iri()));
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state. Catches an Add reporting
+        // back the child's state instead of the topic's.
+        let container_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(e.state.as_deref(), Some(container_etag.as_str()),
+            "the Add's state must be the container's own validator, not the child's");
     }
 }

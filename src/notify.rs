@@ -269,12 +269,18 @@ async fn publish_containment(
 /// `POST`: as [`emit_put`], on the allocated child rather than the request
 /// target, and always a `Create` — the name is fresh by construction.
 pub async fn emit_post(
-    _st: &AppState,
-    _child: &Target,
-    _materialized: &Materialized,
-    _status: StatusCode,
+    st: &AppState,
+    child: &Target,
+    materialized: &Materialized,
+    status: StatusCode,
 ) {
-    todo!("skeleton")
+    if !status.is_success() {
+        return;
+    }
+    // No `Existence` parameter: `post_impl` allocates an unused name, so the
+    // child is new by construction.
+    publish_own(st, child, Activity::Create).await;
+    publish_containment(st, child.graph_iri(), materialized, Activity::Add).await;
 }
 
 /// `PATCH`: `Update`, or the `Create` shape when `create_by_patch` ran.
