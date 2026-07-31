@@ -52,7 +52,7 @@ pub fn router(state: AppState) -> Router {
 /// emits. Both properties are asserted: `protocol/cors/enumerate-headers`
 /// requires the header to be present and to differ from `*`.
 const EXPOSED_HEADERS: &str =
-    "Accept-Patch, Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
+    "Accept-Patch, Accept-Post, Accept-Put, Allow, Content-Type, ETag, Link, Location, Vary, WAC-Allow, Warning, WWW-Authenticate";
 
 /// Reflect a request's `Origin` onto its response.
 ///
@@ -2374,6 +2374,23 @@ mod tests {
             .body(Body::empty()).unwrap()).await.unwrap();
         let exposed = res.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS].to_str().unwrap();
         assert!(exposed.contains("Accept-Patch"), "{exposed}");
+    }
+
+    /// A browser cannot read a response header that is not enumerated here, so
+    /// an advertisement missing from this list is invisible to exactly the
+    /// clients that most need to discover what they may write.
+    #[tokio::test]
+    async fn the_write_advertisement_is_exposed_to_cross_origin_readers() {
+        let f = fixture().await;
+        f.put_turtle("/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let res = f.app.clone().oneshot(f.owner_request("GET", "/thing")
+            .header(header::ORIGIN, "https://app.example")
+            .header(header::ACCEPT, "text/turtle")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let exposed = res.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS].to_str().unwrap();
+        assert!(exposed.contains("Accept-Put"), "{exposed}");
+        assert!(exposed.contains("Accept-Post"), "{exposed}");
     }
 
     // The reason the middleware wraps `auth_layer` instead of sitting inside
