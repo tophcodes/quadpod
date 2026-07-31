@@ -59,6 +59,29 @@ const DISABLE_INTERNAL_CLOCK_CHECK_SECONDS: i64 = 999_999_999_999;
 const MAX_AGE_SECONDS: i64 = 300;
 const FUTURE_SKEW_SECONDS: i64 = 5;
 
+/// How far `now_unix` must move, in either direction, before
+/// [`record_jti_or_reject_replay`] runs another eviction sweep.
+///
+/// The sweep is O(n) over the whole set, and n scales with throughput —
+/// every accepted request records a `jti` that lives for the freshness
+/// window, so n ≈ requests-per-second × `MAX_AGE_SECONDS`. Sweeping on
+/// every call therefore puts an O(n) scan inside the process-wide mutex on
+/// a tokio worker thread, and the serialized cost per request grows with
+/// the very throughput it is trying to serve: the sustainable rate
+/// collapses to `sqrt(1 / (per-entry cost × window))`, a few hundred
+/// requests a second, and no number of cores moves it. Sweeping at most
+/// once per interval makes it O(1) amortized and leaves an O(1) hash
+/// insert as the whole critical section.
+///
+/// The cost is that an entry can outlive the freshness window by up to
+/// this interval. That is strictly *more* replay rejection than the window
+/// alone, never less, so it cannot admit a replay — and it cannot reject a
+/// legitimate proof either, because a `jti` re-presented that late is
+/// re-presented on a proof `verify_dpop`'s own `iat` freshness check has
+/// already rejected. The bound on the set becomes
+/// `throughput × (MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS + this)`.
+const EVICTION_INTERVAL_SECONDS: i64 = 60;
+
 /// Replay-detection storage backing the `jti` check, shared across all
 /// calls to `verify_dpop` in this process.
 ///
@@ -70,10 +93,25 @@ const FUTURE_SKEW_SECONDS: i64 = 5;
 /// stores the `now_unix` at which it was recorded, so stale entries can be
 /// evicted (see `record_jti_or_reject_replay`) and the set stays bounded
 /// instead of growing for the process's lifetime.
-static REPLAY_JTIS: OnceLock<Mutex<HashMap<[u8; 32], i64>>> = OnceLock::new();
+static REPLAY_JTIS: OnceLock<Mutex<ReplaySet>> = OnceLock::new();
 
-fn replay_jtis() -> &'static Mutex<HashMap<[u8; 32], i64>> {
-    REPLAY_JTIS.get_or_init(|| Mutex::new(HashMap::new()))
+/// The replay set together with the bookkeeping its amortized eviction
+/// needs. `last_eviction` lives under the same lock as `jtis` because the
+/// two are only ever read and written together, in one critical section.
+struct ReplaySet {
+    /// `jti` hash -> the `now_unix` at which that `jti` was recorded.
+    jtis: HashMap<[u8; 32], i64>,
+    /// The `now_unix` at which the last eviction sweep ran.
+    last_eviction: i64,
+}
+
+fn replay_jtis() -> &'static Mutex<ReplaySet> {
+    REPLAY_JTIS.get_or_init(|| {
+        Mutex::new(ReplaySet {
+            jtis: HashMap::new(),
+            last_eviction: 0,
+        })
+    })
 }
 
 /// Serializes tests that record a `jti` into the process-wide
@@ -113,24 +151,45 @@ fn hash_jti(jti: &str) -> [u8; 32] {
 /// only a fully-valid proof does. A *second* submission of that same valid
 /// proof is then rejected here as a replay.
 ///
-/// Before checking/inserting, evicts every entry recorded further back than
-/// the freshness window (`MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS`) from
-/// `now_unix`. This is safe because a `jti` can never be legitimately
-/// replayed *within* that window (this function rejects it), and *outside*
-/// the window `verify_dpop`'s own freshness check (Fix 1, above) already
+/// Entries recorded further back than the freshness window
+/// (`MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS`) from `now_unix` are evicted,
+/// which is what keeps the set bounded rather than growing for the
+/// process's lifetime. Dropping them is safe because a `jti` can never be
+/// legitimately replayed *within* that window (this function rejects it),
+/// and *outside* the window `verify_dpop`'s own freshness check already
 /// rejects the proof on `iat` staleness before we ever get here — so
-/// nothing that still needs replay protection is ever evicted, and the set
-/// stays bounded instead of growing for the process's lifetime. Note: this
-/// is still an in-process, single-instance store (see `REPLAY_JTIS`); a
-/// shared/persistent store (e.g. Redis) is required for multi-replica
-/// deployments, which is out of scope here.
+/// nothing that still needs replay protection is ever evicted.
+///
+/// The sweep is deliberately NOT run on every call: it runs only once
+/// `now_unix` has moved `EVICTION_INTERVAL_SECONDS` away from the last
+/// one, which is what keeps this function's cost O(1) per request instead
+/// of O(set size). See that constant for the throughput argument and for
+/// why the resulting slightly-longer entry lifetime is safe.
+///
+/// The interval is compared in absolute value, so a `now_unix` that moves
+/// *backwards* — a stepped wall clock in production, or the widely
+/// different simulated clocks the tests use against this one shared set —
+/// also forces a sweep instead of suppressing eviction until the clock
+/// catches up.
+///
+/// Note: this is still an in-process, single-instance store (see
+/// `REPLAY_JTIS`); a shared/persistent store (e.g. Redis) is required for
+/// multi-replica deployments, which is out of scope here.
 fn record_jti_or_reject_replay(jti: &str, now_unix: i64) -> Result<(), AuthError> {
-    let mut jtis = replay_jtis().lock().unwrap();
-    let cutoff = now_unix - (MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS);
-    jtis.retain(|_, recorded_at| *recorded_at >= cutoff);
+    let mut replay = replay_jtis().lock().unwrap();
+
+    if now_unix
+        .saturating_sub(replay.last_eviction)
+        .saturating_abs()
+        >= EVICTION_INTERVAL_SECONDS
+    {
+        let cutoff = now_unix.saturating_sub(MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS);
+        replay.jtis.retain(|_, recorded_at| *recorded_at >= cutoff);
+        replay.last_eviction = now_unix;
+    }
 
     let hash = hash_jti(jti);
-    if let std::collections::hash_map::Entry::Vacant(entry) = jtis.entry(hash) {
+    if let std::collections::hash_map::Entry::Vacant(entry) = replay.jtis.entry(hash) {
         entry.insert(now_unix);
         Ok(())
     } else {
@@ -1344,5 +1403,46 @@ mod tests {
         assert!(verify_dpop(&p2, "https://pod.toph.so/a", "GET", &client.jkt(), 1_000_010)
             .await
             .is_ok());
+    }
+
+    /// The eviction sweep is O(n) over the whole set, and the set's size
+    /// scales with throughput — so running it on every call is what would
+    /// cap this pod's request rate (see [`EVICTION_INTERVAL_SECONDS`]).
+    /// This pins that it does *not* run on every call, in the one way that
+    /// is observable from outside the function: an entry that has passed
+    /// the freshness window survives until the next sweep is actually due.
+    ///
+    /// Restoring a per-call sweep flips the assertion at `310` — with a
+    /// sweep there, the entry recorded at `0` is gone and its `jti` is
+    /// accepted again.
+    ///
+    /// This calls `record_jti_or_reject_replay` directly rather than going
+    /// through `verify_dpop`: the timings it needs are ones no proof could
+    /// reach through the public path, where an `iat` that old is rejected
+    /// for staleness long before the replay set is consulted.
+    #[tokio::test]
+    async fn the_eviction_sweep_is_amortized_rather_than_run_per_call() {
+        let _guard = test_lock().lock().await;
+
+        assert!(record_jti_or_reject_replay("jti-amort", 0).is_ok());
+        // Each of these is a full interval on from the one before, so each
+        // sweeps; the last leaves the sweep clock at 300.
+        for t in [60, 120, 180, 240, 300] {
+            assert!(record_jti_or_reject_replay(&format!("jti-amort-{t}"), t).is_ok());
+        }
+
+        // 310 is past the freshness window for the entry recorded at 0
+        // (300 + 5 = 305), but only 10 seconds on from the last sweep — so
+        // no sweep runs and the entry is still there to catch the replay.
+        assert!(
+            record_jti_or_reject_replay("jti-amort", 310).is_err(),
+            "no sweep is due at 310, so the entry recorded at 0 must still be held"
+        );
+
+        // 360 is a full interval on from that sweep, so this one does sweep.
+        assert!(
+            record_jti_or_reject_replay("jti-amort", 360).is_ok(),
+            "the sweep due at 360 must evict the entry recorded at 0"
+        );
     }
 }
