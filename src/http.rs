@@ -560,7 +560,7 @@ async fn patch_impl(
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
         Ok(g) => g,
-        Err(res) => return res,
+        Err(res) => return with_aux_links(res, &target),
     };
     // Append is the weakest mode any patch §5.1 admits can need, and
     // `AccessModes::allows` makes Write subsume it — so this refuses exactly
@@ -1572,7 +1572,7 @@ async fn validate_view(
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return res,
+        Err(res) => return with_aux_links(res, &target),
     };
     if let Err(res) = guard.authorize(Mode::Read) {
         return with_aux_links(res, &target);
@@ -1698,7 +1698,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return res,
+        Err(res) => return with_aux_links(res, &target),
     };
     let decision = match guard.authorize(Mode::Read) {
         Ok(d) => d,
@@ -1919,7 +1919,7 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
         Ok(g) => g,
-        Err(res) => return res,
+        Err(res) => return with_aux_links(res, &target),
     };
     if let Err(res) = guard.authorize(Mode::Write) {
         return with_aux_links(res, &target);
