@@ -164,6 +164,13 @@ already in `Cargo.lock` transitively, so nothing new compiles.
 `cargo add toml` would otherwise take 1.1, putting two majors of a TOML parser in one binary
 to no end. The pin is what makes the sentence above true rather than nearly true.
 
+`clap` gains the `string` feature, alongside the existing `derive` and `env`. Without it,
+`clap::builder::OsStr` implements `From<&'static str>` but not `From<String>`, and the file's
+values reach `clap` as defaults built at runtime — owned `String`s, not `'static` string
+literals — which is exactly the case that feature exists to accept. The feature is empty: it
+adds no dependency and produces no `Cargo.lock` change, the same free lunch as `serde` and
+`toml` above.
+
 ## 5. Precedence, without hand-written precedence
 
 **Flag > environment > file > default.**
@@ -174,13 +181,31 @@ precedence logic on top of it."*
 
 Two passes:
 
-1. A minimal pre-parser — a `Command` carrying only `--config`, with `ignore_errors` set —
-   extracts the path from the argv and `POD_CONFIG`. It must tolerate every other argument,
-   including a missing required `--owner-webid`, because it runs before the real parse.
+1. A hand-written scan of the argv, `config_path_from`, looks for `--config <value>` or
+   `--config=<value>` and takes the first match; failing that, it falls back to
+   `std::env::var_os("POD_CONFIG")`. It must tolerate every other argument, including a
+   missing required `--owner-webid`, because it runs before the real parse.
 2. The file is read and deserialized. The real `Command` is then built with
-   `.default_value(…)` set for every key the file supplied. clap applies its own precedence,
+   `.default_values(…)` set for every key the file supplied. clap applies its own precedence,
    and the file lands exactly one rung below the environment because that is where a default
    sits.
+
+**Why pass 1 is a hand-written scan, not a `Command`.** The first draft tried a minimal
+pre-parser — a `Command` carrying only `--config`, with `ignore_errors` set — on the theory
+that it could extract the path and tolerate everything else about the argv. It cannot: `clap`
+does not skip unrecognised tokens by name, it skips them positionally, one per argument, on the
+assumption that an unrecognised *flag* takes no value. `--owner-webid https://…/#me --config
+pod.toml` is not a corner case here — `--owner-webid` is required, so it is present in every
+real invocation — and `clap` reads `https://…/#me` as the unrecognised token belonging to
+`--owner-webid`, consumes it, and moves on with `--config` still ahead in the stream but no
+longer where a positional skip expects a flag. The path is missed in exactly the invocations
+this pass exists to handle. This is the kind of failure that only shows up against a realistic
+argv, not against `--config pod.toml` in isolation, which is why it is worth naming rather than
+leaving for the next implementor to rediscover: a `Command`-based pre-parser is not a smaller
+version of the real parser, it is a different, token-position-sensitive algorithm, and
+`ignore_errors` does not change that. `config_path_from` instead reads the argv as an opaque
+sequence of OS strings looking only for its own two spellings, so it cannot be thrown off by an
+argument it does not recognise.
 
 No merge function, no per-field arm, nothing to forget when a flag is added later: a new field
 picks up file support from the same table that gives it its flag.
@@ -191,10 +216,30 @@ A malformed value from the file surfaces as a clap error phrased in terms of the
 `invalid value 'nope' for '--listen'` — when no `--listen` was typed. Left alone, that
 misdirects an operator into checking a command line that is correct.
 
-So the error is rewritten before it is printed: `clap::Error::get(ContextKind::InvalidArg)`
-names the argument, and the set of keys the file supplied is known from pass 2, so an error
-whose argument is in that set gets the config path and the TOML key prefixed onto it. An error
-about an argument the file did not supply is left exactly as clap phrased it.
+The naive fix is wrong, and it is wrong in the direction that matters: deciding whether to
+blame the file from the argument name alone. `--listen` is in the file-supplied set whenever
+the file mentions `listen` at all — including when the operator also typed `--listen` on the
+command line and *that* value is the one clap rejected. The flag overrides the file's value,
+clap's error is about the flag's value, and a rule keyed only on "did the file supply
+`--listen`" prefixes the config path onto an error that has nothing to do with the file. That
+is the same misdirection this feature exists to remove, now pointing the other way: an operator
+checking a file that named the key but not the bad value.
+
+So `blame_file` checks two things, not one. `clap::Error::get(ContextKind::InvalidArg)` names
+the argument by its long flag; `from_file` — a map from long flag to `(TOML key, the file's
+values)`, built by pass 2 from the `Command` itself — says whether the file supplied that flag
+at all. If it did, `clap::Error::get(ContextKind::InvalidValue)` is compared against the
+values `from_file` recorded for that flag, and the config path and TOML key are prefixed onto
+the error only when the rejected value is one the file actually gave it. An error about a flag
+the file did not supply, or about a value the file did not supply for a flag it did, is left
+exactly as clap phrased it.
+
+The documented corner: if the operator retypes the file's value verbatim on the command line,
+the value that gets rejected is in both places, and the file is named even though the flag is
+what put it in the argv. That is a false positive in one direction only — never a false
+negative, and never a case that points at the wrong file — and it is accepted because the
+alternative is tracking which rung of clap's precedence produced the value clap ultimately saw,
+which `ContextValue::String` does not carry.
 
 `ArgMatches::value_source()` was the alternative: parse normally, then overwrite every field
 whose source is `DefaultValue` from the file. Simpler mechanically, and rejected because it
@@ -204,15 +249,21 @@ omission but a missing test.
 
 ### 5.2 A file value satisfies a required argument
 
-`--owner-webid` is required. Once the file supplies it, clap sees an argument with a default
-and treats it as present, so the requirement is met without special-casing — the order in
-`clap_builder-4.6.0/src/parser/parser.rs` is `add_env`, then `add_defaults`, then
-`Validator::validate`. A file that omits it, with no flag and no environment variable, still
-fails with clap's own missing-argument error.
+`--owner-webid` is required. A default does not satisfy that on its own:
+`ValueSource::is_explicit()` is defined as `self != Self::DefaultValue`, and
+`Validator::validate_required` filters candidate arguments through `check_explicit`, so an
+argument that has nothing but a default is invisible to the required check — clap's own
+`missing-argument` error is what a `.default_value(…)` with no `required(false)` still produces.
 
-The same ordering is what makes the pre-parser of step 1 work: its `ignore_errors` path also
-runs `add_env`, so `POD_CONFIG` is still seen when the partial parse fails — which it always
-does, since the pre-parser knows none of the real arguments.
+What actually satisfies it is `command_with` chaining an explicit `.required(false)` onto every
+id the file supplied, alongside the default. That lifts the requirement precisely for the
+arguments the file gave a value to, and only those: an id the file is silent about keeps
+whatever `required` state `Config`'s own derive gave it, so `--owner-webid` still fails with
+clap's missing-argument error when neither the file nor a flag nor the environment supplies it.
+
+Pass 1 needs no equivalent trick. It never builds a `Command` at all — `config_path_from` is a
+plain scan over the argv and a fallback to `std::env::var_os`, so `POD_CONFIG` is read directly
+rather than through anything clap resolves.
 
 ### 5.3 Validation belongs in the parser, not after it
 

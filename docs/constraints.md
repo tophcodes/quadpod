@@ -318,9 +318,20 @@ The config file is never found, only named.
     The rule is cheap to break by accident: adding a "just look in the working
     directory too" convenience is one line, reads as helpful, and silently
     makes two pods with identical invocations behave differently depending on
-    where they were started. Demonstrated red against a
-    `const SEARCH_PATH: &str = "sparql-pod.toml"`.
-    check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|\.toml"' src
+    where they were started. The `.toml"` alternative alone is deliberately
+    narrower than "any string ending in `.toml`": that broader form matched a
+    test fixture's own temp-file name — `.join(format!("sparql-pod-{}.toml",
+    uuid::Uuid::new_v4()))` and `.join("sparql-pod-does-not-exist.toml")`,
+    both in `config.rs`'s test module — which is data a test writes, not a
+    path the pod looks for, and it cost both fixtures a rewrite around the
+    check rather than the other way round. Requiring a `const` or `let` whose
+    literal value ends in `.toml` keeps the rule pointed at a name a lookup
+    would use while leaving a temp-file argument alone. Demonstrated red
+    against `const SEARCH_PATH: &str = "sparql-pod.toml";`, injected into and
+    then reverted out of `src/config.rs`; demonstrated to stay green against
+    the two fixture lines above, reintroduced the same way, on which the
+    untightened `\.toml"` alternative alone went red.
+    check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|(const|let)\s.*=\s*"[^"]*\.toml"' src
 
 Precedence is clap's, never hand-written.
     → 2026-07-31-cli-config-design.md §5, §5.1; `config.rs`'s module header,

@@ -156,3 +156,53 @@ sparql-pod \
 
 A production deployment reaching a real IdP over https needs none of this and should
 pass no `--allow-insecure-host` at all.
+
+## Where the data lives
+
+    --rdf-store memory            (default) triples in this process, gone on restart
+    --rdf-store rocksdb:<dir>     triples in <dir>
+    --blob-store memory           (default) non-RDF bytes in this process
+    --blob-store local:<dir>      non-RDF bytes mirroring the URL tree under <dir>
+
+A `rocksdb:` directory is held by **one process at a time** — Oxigraph takes an exclusive
+lock, so a second pod aimed at the same path refuses to start. That is a bound on processes,
+not on concurrency: within the running pod, requests are served in parallel as before. Root
+spec §16 ADR-7 has the reasoning, including why multi-tenancy does not collide with it (§9
+runs many spaces in one process, as named graphs in one store).
+
+Back up the store directory and the blob directory together. They are one dataset: a blob is
+addressed by the resource path recorded in the triples, so a store restored without its blobs
+describes bytes that are not there.
+
+## The config file
+
+    --config <path>
+    POD_CONFIG=<path>
+
+TOML, flat, with the flag names as keys. There is **no search path** — nothing is read unless
+this names it, so a pod cannot start against a file that is invisible to whoever reads the
+command line. A path that is named but unreadable, is not valid TOML, or carries a key this
+binary does not know refuses the start.
+
+```toml
+base_uri     = "https://pod.toph.so/"
+owner_webid  = "https://toph.so/profile/card#me"
+rdf_store    = "rocksdb:/var/lib/sparql-pod/store"
+blob_store   = "local:/var/lib/sparql-pod/blobs"
+listen       = "127.0.0.1:3000"
+
+trusted_issuers       = ["https://idp.toph.so/"]
+expected_audience     = "https://pod.toph.so/"
+allow_insecure_hosts  = []
+reset_root_acl        = false
+max_body_bytes        = 67108864
+```
+
+**Precedence: flag > environment > file > default.** A value in the file loses to the same
+value in `POD_*`, which loses to the flag. Lists are TOML arrays, which is the reason to
+prefer the file for `trusted_issuers` and `allow_insecure_hosts`: the comma-separated
+environment form has to be split, trimmed and filtered, and an array does not.
+
+An error caused by a value the file supplied names the file and the key. An error about
+`--rdf-store`, `--blob-store` or `--allow-insecure-host` names the flag even when the value
+came from the file — those three are checked after the parse rather than inside it.
