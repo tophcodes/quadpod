@@ -450,27 +450,26 @@ impl<'a> Guard<'a> {
         deny(&self.agent)
     }
 
-    /// Whether the target was present when this guard was probed.
+    /// Whether this URL is already spoken for — either it names a resource, or
+    /// its trailing-slash counterpart does, which Solid Protocol §3.1 forbids
+    /// from coexisting with it.
     ///
-    /// Refuses nothing on its own. Callers read it after [`Guard::authorize`]
-    /// returned `Ok`, which is the ordering the store lookup it replaces
-    /// already obeyed (design §7).
-    pub fn existed(&self) -> bool {
-        self.present.contains(self.target.graph_iri())
-    }
-
-    /// Whether the target's trailing-slash counterpart — `/box/` for `/box`,
-    /// `/box` for `/box/` — was present when this guard was probed. `false`
-    /// for an `Aux` target, which never has one ([`ResourceUrl::slash_counterpart`]
-    /// is a resource-space concept only), and for the root, whose counterpart
-    /// is no URL at all.
+    /// `false` for an `Aux` target's counterpart half: an auxiliary never has
+    /// one ([`ResourceUrl::slash_counterpart`] is a resource-space concept
+    /// only), though the target itself can of course still be taken outright.
+    /// For a `Container`, the counterpart checked is its own resource URL's —
+    /// a `Link: rel="type"` can make an allocated child a container, and the
+    /// pair rule reads the same from that side.
     ///
-    /// This is the presence half of Solid Protocol §3.1 that [`Guard::existed`]
-    /// does not answer: a caller minting a name (a `POST` `Slug`) needs to know
-    /// this side is taken too, before it authorizes or materializes anything —
-    /// exactly the fact `name_is_taken`'s second half used to fetch with its own
-    /// query, now read from the probe's already-resolved presence set.
-    pub fn counterpart_existed(&self) -> bool {
+    /// Reads only the probe's already-resolved presence set — this is the
+    /// question `name_is_taken` used to answer with its own two queries, now
+    /// read from [`Guard::probe`]'s single one. Refuses nothing on its own;
+    /// callers read it after [`Guard::authorize`] returned `Ok`, which is the
+    /// ordering the store lookup it replaces already obeyed (design §7).
+    pub fn is_taken(&self) -> bool {
+        if self.present.contains(self.target.graph_iri()) {
+            return true;
+        }
         let subject: &ResourceUrl = match &self.target {
             Target::Resource(r) => r,
             Target::Container(c) => c.as_resource(),
@@ -485,10 +484,13 @@ impl<'a> Guard<'a> {
     /// Takes `self` because the probe describes the store *before* these
     /// writes: after this returns there is no guard left to read a stale
     /// answer from. A pre-write fact a caller still wants is read from
-    /// [`Guard::existed`] beforehand, which the borrow checker orders for it.
+    /// [`Guard::is_taken`] beforehand, which the borrow checker orders for it.
     pub async fn materialize(self) -> Result<(), Response> {
         let subject = &self.chain[0];
-        let target_existed = self.existed();
+        // Target-existence only, never the counterpart: materializing a target
+        // whose counterpart merely exists is not "already there" — it is the
+        // slash-pair conflict [`Guard::materialize`] refuses further down.
+        let target_existed = self.present.contains(self.target.graph_iri());
         let may_be_member = !matches!(self.target, Target::Aux(_));
         // An auxiliary is never a container member, and neither is a target that
         // already exists: re-inserting the containment triple changes nothing, so
@@ -696,15 +698,54 @@ mod tests {
         assert_eq!(status(g.authorize(Mode::Read)), Some(StatusCode::FORBIDDEN));
     }
 
+    // A target that is itself present is taken, regardless of its counterpart.
     #[tokio::test]
-    async fn existed_reports_the_pre_request_state() {
+    async fn is_taken_is_true_for_a_present_target() {
         let store = OxigraphStore::in_memory().unwrap();
         seed_acl(&store, "/foo", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/foo> ; \
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
-        assert!(guard_for(&store, alice(), "/foo").await.existed());
-        assert!(!guard_for(&store, alice(), "/nothing").await.existed());
+        assert!(guard_for(&store, alice(), "/foo").await.is_taken());
+        assert!(!guard_for(&store, alice(), "/nothing").await.is_taken());
+    }
+
+    // Neither half exists: /box/ is free.
+    #[tokio::test]
+    async fn is_taken_is_false_when_neither_half_exists() {
+        let store = OxigraphStore::in_memory().unwrap();
+        assert!(!guard_for(&store, alice(), "/box/").await.is_taken());
+    }
+
+    // /box does not exist itself, but its trailing-slash counterpart /box/
+    // does — the Protocol §3.1 half `existed` alone never answered.
+    #[tokio::test]
+    async fn is_taken_is_true_when_only_the_counterpart_exists() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_container(&store, "/box/").await;
+        assert!(guard_for(&store, alice(), "/box").await.is_taken());
+    }
+
+    // A `Link: rel="type"` can make an allocated child a container, so the
+    // counterpart checked for a `Container` target must be its own resource
+    // URL's counterpart — the case `name_is_taken`'s `Target::Container` arm
+    // singled out.
+    #[tokio::test]
+    async fn is_taken_checks_the_containers_own_resource_counterpart() {
+        let store = OxigraphStore::in_memory().unwrap();
+        crate::resource::put_rdf(&store, &resource("/box"), &[]).await.unwrap();
+        assert!(guard_for(&store, alice(), "/box/").await.is_taken());
+    }
+
+    // An `Aux` target has no counterpart concept at all — `is_taken` must
+    // answer only from the aux's own presence, never fall through to a
+    // counterpart lookup that `ResourceUrl::slash_counterpart` cannot even
+    // form for it.
+    #[tokio::test]
+    async fn is_taken_ignores_the_counterpart_for_an_aux_target() {
+        let store = OxigraphStore::in_memory().unwrap();
+        crate::resource::put_rdf(&store, &resource("/box/doc"), &[]).await.unwrap();
+        assert!(!guard_for(&store, alice(), "/.aux/box/doc.acl").await.is_taken());
     }
 
     #[tokio::test]

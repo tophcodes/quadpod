@@ -1386,7 +1386,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         Ok(g) => g,
         Err(res) => return with_aux_links(res, &child),
     };
-    if child_guard.existed() || child_guard.counterpart_existed() {
+    if child_guard.is_taken() {
         let unique = format!("{name}-{}{suffix}", uuid::Uuid::new_v4());
         child = match classify(&st.space, &format!("{}{unique}", parent.path())) {
             Ok(t) => t,
