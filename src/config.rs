@@ -256,25 +256,27 @@ where
 /// default; putting the file in the default slot lands it exactly one rung
 /// below the environment without a line of merge logic, and a flag added later
 /// picks up file support from the same derive that gives it its flag.
+///
+/// Two visible consequences follow from defaults being how the file is
+/// represented. With a file supplying a required argument, `--help`'s usage
+/// line changes from `sparql-pod --owner-webid <OWNER_WEBID>` to `sparql-pod
+/// [OPTIONS]` — correct, since help reflects the effective configuration, but
+/// a visible change. And a repeatable flag given on the command line replaces
+/// the file's whole list rather than appending to it, because clap skips
+/// defaults entirely for an argument that is present — the same rule as every
+/// other rung.
 fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>) -> clap::Command {
     use clap::CommandFactory;
     let mut cmd = Config::command();
     for (id, values) in defaults {
-        // Leaked rather than borrowed: `Arg::default_values` needs `Into<OsStr>`,
-        // and without clap's `string` feature (not enabled in this workspace)
-        // `clap::builder::OsStr` can only be built from a `'static str`. These
-        // values live for the process anyway, so leaking them is the process's
-        // own allocation outliving nothing it didn't already own.
-        let values: Vec<&'static str> = values
-            .into_iter()
-            .map(|v| -> &'static str { Box::leak(v.into_boxed_str()) })
-            .collect();
         // `required(false)` alongside the default: clap's own required check
         // looks only at whether the value came from the command line or the
         // environment (`ValueSource::is_explicit`), never at whether a
         // default was set — so a required argument with nothing but a
         // default still reports missing. Explicitly lifting the requirement
-        // is what lets a file-supplied value satisfy it.
+        // is what lets a file-supplied value satisfy it. Chained only onto
+        // ids the file actually supplied, not onto the whole argument list —
+        // see `a_file_that_omits_owner_webid_still_refuses_the_start`.
         cmd = cmd.mut_arg(id, move |a| a.default_values(values).required(false));
     }
     cmd
@@ -797,12 +799,25 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    // §5.2: a file value satisfies a required argument, because clap sees an
-    // argument carrying a default and treats it as present.
+    // §5.2: a file value satisfies a required argument. Not because clap
+    // treats a default as present — it does not — but because `command_with`
+    // chains `.required(false)` onto every id the file supplied.
     #[test]
     fn a_file_satisfies_the_required_owner_webid() {
         let p = write_temp_toml("owner_webid = \"https://file.example/#me\"\n");
         assert!(load(&["--config", p.to_str().unwrap()]).is_ok());
+        std::fs::remove_file(&p).ok();
+    }
+
+    // The bound on `required(false)`: it is chained only onto ids the file
+    // actually supplied, so an argument the file is silent about keeps its
+    // requirement. Widening it — to `mut_args`, or across the whole argument
+    // list — would let a pod start with no owner, and nothing else in this
+    // suite would notice.
+    #[test]
+    fn a_file_that_omits_owner_webid_still_refuses_the_start() {
+        let p = write_temp_toml("listen = \"127.0.0.1:9999\"\n");
+        assert!(load(&["--config", p.to_str().unwrap()]).is_err());
         std::fs::remove_file(&p).ok();
     }
 
@@ -834,7 +849,10 @@ mod tests {
             "trusted_issuers = [\"https://one.example/\", \"https://two.example/\"]\n",
         ));
         let c = load(&["--config", p.to_str().unwrap()]).expect("loads");
-        assert_eq!(c.trusted_issuers.len(), 2);
+        assert_eq!(
+            c.trusted_issuers,
+            vec!["https://one.example/".to_string(), "https://two.example/".to_string()]
+        );
         std::fs::remove_file(&p).ok();
     }
 
