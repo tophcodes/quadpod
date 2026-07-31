@@ -398,13 +398,18 @@ and `state`. Beyond those, four that can actually fail:
 - No subscriber ⇒ no `state`: demonstrated with a query counter, not with "it did not crash". A
   test that cannot go red is the mistake `docs/constraints.md` opens by warning about.
 
-  The counter is a `#[cfg(test)]` field on `OxigraphStore`, incremented in `blocking`. Not a
-  wrapping second `SparqlStore` — that would turn the "`SparqlStore` has exactly one implementor"
-  check red, and `tests/` is not an escape route because every write path needs authentication
-  and `auth::testsupport` is `#[cfg(test)]`-gated, hence invisible to an integration test.
-  `blocking` is the single offload point every trait method routes through, so counting there
-  counts Oxigraph evaluations rather than trait calls, and it adds no second reader of the store
-  handle.
+  The harness already exists. `tests/call_budget.rs` holds `CountingStore`, a decorator that
+  forwards every `SparqlStore` call and tallies it, and its own header states why it lives in
+  `tests/`: `docs/constraints.md` pins `SparqlStore` to one implementor *under `src/`*, and that
+  rule is about a backend carrying ADR-2's atomicity obligation rather than about a decorator.
+  Its fixture needs no authentication either — the root ACL there grants `foaf:Agent` everything.
+
+  Better still, the budgets in that file are the test. They are upper bounds on the store calls
+  one request costs, asserted with no subscriber present. Any unconditional I/O this feature adds
+  to the write path breaks `a_put_on_an_existing_resource_stays_within_budget` or
+  `PUT_DEEP_BUDGET` without a line being written for it. The change events add one case: subscribe
+  to a topic, repeat the same request, and assert the count *rises* — which is what proves the
+  gate is a gate rather than a dead branch.
 - A binary `PUT` emits — the regression test for §6.3.
 
 ## 10. Out of scope
@@ -429,9 +434,8 @@ of its own rather than a line added here.
   the store exactly twice" stays green.
 - **`src/http.rs`** gains one emit call per write handler and loses one early `return` (§6.3).
 - **`AppState`** gains `pub events: Arc<Bus>`.
-- **`OxigraphStore`** gains a `#[cfg(test)]` evaluation counter incremented in `blocking` (§9).
-  Neither the "exactly one implementor" rule nor the "one reader of the store handle" rule is
-  touched: no second `impl SparqlStore`, no second `self.inner`.
+- **`tests/call_budget.rs`** gains the no-subscriber and one-subscriber cases (§9). Its existing
+  budgets already assert the no-cost property; nothing in `src/` changes for it.
 - **`docs/constraints.md`** gains three rules, each demonstrated red against a real violation
   before being added:
   1. Every write-path `*_impl` has exactly one `notify::emit_*` call.

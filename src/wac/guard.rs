@@ -274,7 +274,7 @@ impl<'a> Guard<'a> {
     /// writes: after this returns there is no guard left to read a stale
     /// answer from. A pre-write fact a caller still wants is read from
     /// [`Guard::is_taken`] beforehand, which the borrow checker orders for it.
-    pub async fn materialize(self) -> Result<(), Response> {
+    pub async fn materialize(self) -> Result<Materialized, Response> {
         let subject = &self.chain[0];
         // Target-existence only, never the counterpart: materializing a target
         // whose counterpart merely exists is not "already there" — it is the
@@ -337,8 +337,29 @@ impl<'a> Guard<'a> {
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
             }
         }
-        Ok(())
+        // skeleton: the two lists this method already built, not yet handed back.
+        Ok(Materialized::default())
     }
+}
+
+/// What a [`Guard::materialize`] call brought about, for the change events the
+/// write path emits (`docs/superpowers/specs/2026-07-31-change-events-design.md`).
+///
+/// Owned rather than borrowed: `materialize` consumes the guard the URLs came
+/// from, so nothing is left to borrow out of.
+///
+/// This is the same walk the method already performs, no longer discarded.
+/// Re-deriving the ancestor set at the HTTP layer would be a second multi-hop
+/// walk, which `docs/constraints.md` forbids. It deliberately does **not**
+/// carry whether the target existed: [`Guard::target_exists`] answers that,
+/// and a caller must read it before `materialize` takes the guard anyway.
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+pub struct Materialized {
+    /// Every URL this write brought into existence, nearest first.
+    pub created: Vec<ResourceUrl>,
+    /// One entry per containment triple added: the container, and the graph
+    /// IRI of the child linked into it.
+    pub linked: Vec<(ContainerUrl, String)>,
 }
 
 #[cfg(test)]

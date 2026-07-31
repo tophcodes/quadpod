@@ -184,6 +184,7 @@ mod tests {
     fn app_with(resolver: Arc<dyn crate::auth::jwks::JwksResolver>) -> Router {
         let state = crate::http::AppState {
             store: Arc::new(OxigraphStore::in_memory().unwrap()),
+            events: Arc::new(crate::notify::Bus::new()),
             blobs: Arc::new(crate::blob::ObjectStoreBlobs::in_memory()),
             space: StorageSpace::new("https://pod.toph.so/").unwrap(),
             resolver,

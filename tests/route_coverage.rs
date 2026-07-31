@@ -59,6 +59,7 @@ async fn app() -> axum::Router {
 
     router(AppState {
         store,
+        events: Arc::new(sparql_pod::notify::Bus::new()),
         blobs: Arc::new(sparql_pod::blob::ObjectStoreBlobs::in_memory()),
         space,
         resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),

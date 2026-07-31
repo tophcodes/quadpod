@@ -21,6 +21,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn SparqlStore>,
+    pub events: Arc<crate::notify::Bus>,
     pub blobs: Arc<dyn crate::blob::BlobStore>,
     pub space: StorageSpace,
     pub resolver: Arc<dyn JwksResolver>,
@@ -2077,6 +2078,7 @@ mod tests {
 
         let state = AppState {
             store: store.clone(),
+            events: Arc::new(crate::notify::Bus::new()),
             blobs: blobs.clone(),
             space: space.clone(),
             resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
@@ -2183,6 +2185,7 @@ mod tests {
             issuers.allow(webid, ISSUER);
             router(AppState {
                 store: self.store.clone(),
+                events: Arc::new(crate::notify::Bus::new()),
                 blobs: self.blobs.clone(),
                 space: self.space.clone(),
                 resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
