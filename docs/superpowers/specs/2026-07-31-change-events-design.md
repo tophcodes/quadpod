@@ -23,8 +23,8 @@ Four properties are decided beyond "events exist":
   must not make every write anywhere in the pod compute a validator.
 - **Nothing is computed for a topic nobody is listening to.** The `state` of an event is read
   only after the registry has confirmed a live channel for its topic. With no subscribers the
-  write path does no extra I/O, with one exception it cannot: a `PUT` on an auxiliary pays one
-  `exists` probe that has to run before the write and therefore before the gate (§4.3).
+  write path does no extra I/O at all: every pre-write fact the mapping needs is already in
+  `Guard`'s one probe (§4.3).
 - **`state` is the ETag of the N-Quads representation at the held RDF version**, or the blob
   ETag for a binary resource, and it always describes the *topic* — never the `object`.
 - **Emission is synchronous with the request.** The state a notification reports must be the
@@ -194,23 +194,27 @@ auxiliary is never a container member […] so there is no containment to repair
 containment, no `Add`/`Remove`, and no `Update` on a parent that did not change.
 
 The cascade in the other direction is real: `aux::delete_subject` takes every auxiliary of a
-deleted subject with it, so each of those is a `Delete` on its own topic. `delete_impl` already
-probes `exists` for every `AuxKind` to authorize the cascade, so which auxiliaries were there is
-known without a further read.
+deleted subject with it, so each of those is a `Delete` on its own topic. Which ones were there
+needs no read: `delete_impl` already calls `Guard::authorize_aux` for every `AuxKind`, and that
+method answers `Ok(None)` for an auxiliary the probe did not find.
 
 ### 4.3 Telling `Create` from `Update`
 
-Requires knowing whether the target existed *before* the write. For a resource or a container
-`authorize_and_materialize` already computes it (`is_member = !exists(target)`) and can report
-it (§6.1) at no cost.
+Requires knowing whether the target existed *before* the write, and that answer is already
+public and already free: `Guard::target_exists()`, which reads the presence set `Guard::probe`
+resolved once for the whole request. `patch_impl` uses it for its own create-vs-update branch
+already.
 
-For an auxiliary it does not: the `exists` call in that function asks about the aux's *subject*,
-and `aux::put`'s asks after the update, answering "did my write land" rather than "was it there
-before". A `PUT` on an auxiliary therefore costs one additional `exists` probe, before the
-write, outside the `live` gate — because it has to run before the write and the gate is
-evaluated after it. This is a documented cost on the ACL write path and nowhere else.
-`aux::patch` needs nothing: it already probes beforehand and a patch never creates, so an
-auxiliary `PATCH` is always `Update`.
+It covers auxiliaries too, which is not obvious and is worth pinning: `probe` builds its
+candidate set as every chain member, *every `AuxKind` of every chain member*, and every
+slash counterpart. An `Aux` target's own presence is therefore in the set, so the mapping needs
+nothing from `aux::put` — whose own `exists` call runs after the update and answers "did my
+write land", not "was it there before". An auxiliary `PATCH` never creates (`aux::patch` refuses
+an absent auxiliary), so it is always `Update`.
+
+The read has to happen before `Guard::materialize`, which consumes the guard. The borrow checker
+enforces that ordering rather than a rule in this document — which is the point `materialize`'s
+own doc comment makes about pre-write facts.
 
 ## 5. `state`
 
@@ -308,16 +312,22 @@ does not hold the parent's full triple set, and the graph a `PATCH` produces "ne
 
 ## 6. Where it is emitted
 
-### 6.1 `authorize_and_materialize` stops discarding its plan
+### 6.1 `Guard::materialize` stops discarding its plan
 
 Its signature becomes `Result<Materialized, Response>`. `Materialized` carries the two lists the
-function already builds — `creations` (what this write brings into existence) and `plan` (which
-container is ensured and which child is linked into it) — plus the existence answer it already
-computes in `is_member`.
+method already builds and drops on the floor — `creations` (what this write brings into
+existence) and `plan` (which container is ensured, and which child is linked into it).
+
+The existence answer is *not* part of it: `Guard::target_exists()` already gives that, and
+`materialize` takes `self`, so a caller has to read it beforehand anyway. Folding it into the
+return value would be a second way to ask one question.
 
 Nothing new is derived. Reconstructing the ancestor set at the HTTP layer would be a second
 multi-hop walk, which the constraint "`ResourceUrl::ancestors` is the only multi-hop walk up the
 container chain" exists to prevent; this is the same walk, no longer thrown away.
+
+`Materialized` holds URLs and IRIs, no store, so the WAC rule "the guard names the store exactly
+twice" is untouched.
 
 ### 6.2 One call per handler
 
@@ -413,9 +423,10 @@ of its own rather than a line added here.
 - **[2026-07-24-sparql-solid-pod-design.md](2026-07-24-sparql-solid-pod-design.md) §41** listed the
   Solid Notifications Protocol as out of scope. This lifts that for the change-event layer only;
   the protocol surface stays out until #18.
-- **`wac::guard::authorize_and_materialize`** changes signature from `Result<(), Response>` to
-  `Result<Materialized, Response>`. No behavioural change; the value returned is what the
-  function already computed.
+- **`wac::guard::Guard::materialize`** changes signature from `Result<(), Response>` to
+  `Result<Materialized, Response>`. No behavioural change; the value returned is what the method
+  already computed and discarded. `Materialized` holds no store, so the WAC rule "the guard names
+  the store exactly twice" stays green.
 - **`src/http.rs`** gains one emit call per write handler and loses one early `return` (§6.3).
 - **`AppState`** gains `pub events: Arc<Bus>`.
 - **`OxigraphStore`** gains a `#[cfg(test)]` evaluation counter incremented in `blocking` (§9).
