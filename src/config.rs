@@ -1,5 +1,7 @@
-//! Process configuration: command-line flags with environment-variable
-//! fallbacks. `clap` provides the precedence (flag > env > default); there is
+//! Process configuration: command-line flags, environment-variable
+//! fallbacks, and an optional TOML file read via `--config`/`POD_CONFIG`.
+//! `clap` provides the precedence (flag > env > file > default), the file's
+//! values reaching it as defaults installed by [`command_with`]; there is
 //! deliberately no hand-written precedence logic on top of it.
 
 use std::collections::HashSet;

@@ -140,10 +140,17 @@ reset_root_acl        = false
 max_body_bytes        = 67108864
 ```
 
-Lists are TOML arrays, which is the whole reason a file helps: `trusted_issuers` as an array
-has no comma-splitting, no trimming and no empty-entry problem, so the defensive parsing that
-`auth_config()` and `try_fetch_policy()` perform on the environment form is simply not
-exercised. That parsing stays exactly as it is — it still guards the environment path.
+Lists are TOML arrays, which is easier to read than the comma-separated environment form and
+needs no quoting of the separator. It is not free of the comma problem, though:
+`trusted_issuers` and `allow_insecure_hosts` carry `value_delimiter = ','` so the environment
+form can be split, and clap applies that same delimiter to a default value — which is how a
+file-supplied array reaches clap. A TOML array entry containing a comma is therefore still
+split into two, exactly as the environment form would split it, and there is no way to write
+one entry that contains a literal comma. The defensive trimming and empty-entry filtering that
+`auth_config()` and `try_fetch_policy()` perform is not specific to the environment path either
+— it runs on `self.trusted_issuers` / `self.allow_insecure_hosts` regardless of which rung
+supplied them, and a file-supplied value exercises it exactly as an environment-supplied one
+does.
 
 ### 4.1 An unknown key refuses the start
 

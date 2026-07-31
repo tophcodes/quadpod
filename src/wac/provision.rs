@@ -57,11 +57,10 @@ use super::pdp::{
 pub async fn provision_root_acl(
     store: &dyn SparqlStore,
     space: &StorageSpace,
-    owner_webid: &str,
+    owner_webid: &NamedNode,
     reset: bool,
 ) -> Result<(), ResourceError> {
-    // Validated because it is interpolated into Turtle below.
-    NamedNode::new(owner_webid).map_err(|_| ResourceError::InvalidIri)?;
+    let owner_webid = owner_webid.as_str();
 
     let root = space.root();
     let acl = root.as_resource().aux(AuxKind::Acl);
@@ -115,6 +114,8 @@ mod tests {
 
     const OWNER: &str = "https://alice.example/card#me";
 
+    fn owner() -> NamedNode { NamedNode::new(OWNER).unwrap() }
+
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
     fn res(path: &str) -> ResourceUrl {
@@ -128,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn provisioned_root_acl_grants_the_owner_full_control() {
         let store = OxigraphStore::in_memory().unwrap();
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap();
 
         let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("root acl");
         let owner = Agent::WebId(OWNER.to_string());
@@ -142,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn provisioned_root_acl_is_inherited_by_descendants() {
         let store = OxigraphStore::in_memory().unwrap();
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap();
 
         let acl = effective_acl(&store, &res("/a/b/c")).await.unwrap().expect("inherited");
         assert!(acl.inherited);
@@ -153,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn nobody_else_gets_anything_from_the_default_root_acl() {
         let store = OxigraphStore::in_memory().unwrap();
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap();
 
         let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("inherited");
         let stranger = Agent::WebId("https://bob.example/card#me".to_string());
@@ -174,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn existing_root_acl_is_never_overwritten() {
         let store = OxigraphStore::in_memory().unwrap();
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap();
         // simulate the owner editing their ACL: grant the public read
         let g = sp().root().as_resource().aux(AuxKind::Acl).graph_iri().to_string();
         store.update(&format!(
@@ -184,7 +185,7 @@ mod tests {
              <{ACL_MODE}> <{ACL_READ}> }} }}"
         )).await.unwrap();
 
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap(); // restart
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap(); // restart
 
         let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("acl");
         assert!(decide(&acl.triples, &Agent::Public, &acl.governed_iri, true).allows(Mode::Read),
@@ -199,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn reset_flag_overwrites_an_emptied_root_acl() {
         let store = OxigraphStore::in_memory().unwrap();
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap();
         // simulate an emptied root ACL: DELETE WHERE with no restriction on
         // the subject removes every triple but leaves the presence marker
         // (and thus `exists`) untouched, exactly as `aux::put` with an empty
@@ -210,12 +211,12 @@ mod tests {
         // Without the flag, the owner stays locked out — this is the bug the
         // flag exists to escape, pinned here so the counterweight below means
         // something.
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap(); // restart, no flag
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap(); // restart, no flag
         let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("acl");
         let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, acl.inherited);
         assert!(!m.allows(Mode::Control), "an emptied ACL must stay empty without the flag");
 
-        provision_root_acl(&store, &sp(), OWNER, true).await.unwrap(); // restart --reset-root-acl
+        provision_root_acl(&store, &sp(), &owner(), true).await.unwrap(); // restart --reset-root-acl
 
         let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("acl");
         let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, acl.inherited);
@@ -231,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn provisioning_does_not_resurrect_a_removed_owner_rule() {
         let store = OxigraphStore::in_memory().unwrap();
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap();
         let g = sp().root().as_resource().aux(AuxKind::Acl).graph_iri().to_string();
         // the owner hands control to a successor, then removes their own rule
         store.update(&format!(
@@ -244,7 +245,7 @@ mod tests {
             "DELETE WHERE {{ GRAPH <{g}> {{ <{g}#owner> ?p ?o }} }}"
         )).await.unwrap();
 
-        provision_root_acl(&store, &sp(), OWNER, false).await.unwrap(); // restart
+        provision_root_acl(&store, &sp(), &owner(), false).await.unwrap(); // restart
 
         let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("acl");
         let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, acl.inherited);
@@ -253,13 +254,10 @@ mod tests {
         assert!(!m.allows(Mode::Write));
     }
 
-    // The WebID is interpolated into SPARQL; an unvalidated one would be an
-    // injection vector (the Plan-1 lesson).
-    #[tokio::test]
-    async fn non_iri_owner_is_rejected_not_interpolated() {
-        let store = OxigraphStore::in_memory().unwrap();
-        let err = provision_root_acl(&store, &sp(), "not an iri> } ; DROP ALL ; #", false).await;
-        assert!(matches!(err, Err(ResourceError::InvalidIri)));
-        assert!(effective_acl(&store, sp().root().as_resource()).await.unwrap().is_none());
-    }
+    // The WebID is interpolated into Turtle; an unvalidated one would be an
+    // injection vector (the Plan-1 lesson). No runtime test remains for this:
+    // `owner_webid: &NamedNode` makes `provision_root_acl("not an iri> } ; DROP
+    // ALL ; #", ...)` a compile error rather than a runtime rejection — the
+    // expression that would exercise it does not compile, the same shape as
+    // the invariants in `tests/unrepresentable.rs`.
 }

@@ -74,7 +74,7 @@ async fn main() {
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
         .await.expect("provision root container");
     sparql_pod::wac::provision::provision_root_acl(
-        state.store.as_ref(), &state.space, cfg.owner_webid.as_str(), cfg.reset_root_acl,
+        state.store.as_ref(), &state.space, &cfg.owner_webid, cfg.reset_root_acl,
     ).await.expect("provision root ACL");
     let listener = tokio::net::TcpListener::bind(cfg.listen).await.unwrap();
     tracing::info!("sparql-pod listening on {}", cfg.listen);

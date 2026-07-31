@@ -2077,7 +2077,9 @@ mod tests {
         let _replay_guard = crate::auth::dpop::test_replay_lock().lock().await;
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space.root()).await.unwrap();
-        crate::wac::provision::provision_root_acl(store.as_ref(), &space, OWNER, false).await.unwrap();
+        crate::wac::provision::provision_root_acl(
+            store.as_ref(), &space, &NamedNode::new(OWNER).unwrap(), false,
+        ).await.unwrap();
 
         let idp = TestIdp::new();
         let client = TestClient::new();

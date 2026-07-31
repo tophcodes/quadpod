@@ -24,7 +24,9 @@ async fn app() -> axum::Router {
     let store = Arc::new(OxigraphStore::in_memory().unwrap());
     let space = StorageSpace::new("https://pod.toph.so/").unwrap();
     container::provision_root(store.as_ref(), &space.root()).await.unwrap();
-    wac::provision::provision_root_acl(store.as_ref(), &space, OWNER, false).await.unwrap();
+    wac::provision::provision_root_acl(
+        store.as_ref(), &space, &oxigraph::model::NamedNode::new(OWNER).unwrap(), false,
+    ).await.unwrap();
     // Seed content so that "not found" can never be the reason for a refusal,
     // and seed its ACL too so the reserved namespace is populated as well.
     let Target::Resource(seeded) = space.resolve("/seeded").unwrap() else {

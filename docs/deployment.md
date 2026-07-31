@@ -194,14 +194,20 @@ listen       = "127.0.0.1:3000"
 trusted_issuers       = ["https://idp.toph.so/"]
 expected_audience     = "https://pod.toph.so/"
 allow_insecure_hosts  = []
-reset_root_acl        = false
+reset_root_acl        = false  # a recovery lever, not a setting: leaving this `true` in
+                                # a file resets the root ACL on *every* start, silently
+                                # discarding any grant made to it over HTTP since. Turn
+                                # it on for one restart, then turn it back off.
 max_body_bytes        = 67108864
 ```
 
 **Precedence: flag > environment > file > default.** A value in the file loses to the same
-value in `POD_*`, which loses to the flag. Lists are TOML arrays, which is the reason to
-prefer the file for `trusted_issuers` and `allow_insecure_hosts`: the comma-separated
-environment form has to be split, trimmed and filtered, and an array does not.
+value in `POD_*`, which loses to the flag. Lists are TOML arrays, which is easier to read than
+the comma-separated environment form and needs no quoting of the separator — but it is not
+free of the comma problem: `trusted_issuers` and `allow_insecure_hosts` still carry the comma
+delimiter that the environment form needs, clap applies it to a file-supplied value too, and a
+single array entry containing a comma is split in two and cannot be expressed. The same
+trimming and filtering the environment form needs still runs on a file-supplied value as well.
 
 An error caused by a value the file supplied names the file and the key. An error about
 `--rdf-store`, `--blob-store` or `--allow-insecure-host` names the flag even when the value

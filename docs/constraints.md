@@ -343,6 +343,14 @@ The config file is never found, only named.
     stay green on the unmodified tree, where the two fixture lines above
     build their temp filename through `std::env::temp_dir().join(...)` and
     `.with_extension("toml")` rather than a `.toml`-suffixed string literal.
+    **What it does not catch:** a search path built by joining a non-literal
+    base — `std::env::current_dir().unwrap().join("sparql-pod").with_extension("toml")`,
+    the very idiom this rule's own prose recommends above for a test
+    fixture's filename — produces no matching string literal and passes
+    unseen, and a search path whose filename does not end in `.toml` at all
+    is invisible to a check anchored on that suffix, even though `--config`
+    itself accepts any path. Both were verified to pass unseen against the
+    unmodified tree.
     check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|\.toml"' src
 
 Precedence is clap's, never hand-written.
@@ -353,5 +361,9 @@ Precedence is clap's, never hand-written.
     and overwriting whatever came from a default — needs one arm per field,
     and a field whose arm is forgotten silently ignores the file. Nothing but
     a missing test would catch that, which is what makes it worth a rule.
-    Demonstrated red against a `value_source("listen")` merge helper.
-    check: ! rg -q 'value_source' src/config.rs
+    Scoped to all of `src`, not just `config.rs`: `Config::load()`'s result is
+    actually consumed in `main.rs`, so a merge helper placed there instead
+    would be the same hand-written precedence and a check confined to
+    `config.rs` would not see it. Demonstrated red against a
+    `value_source("listen")` merge helper injected into `main.rs`.
+    check: ! rg -q 'value_source' src
