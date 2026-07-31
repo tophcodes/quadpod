@@ -130,7 +130,11 @@ impl WebIdIssuerVerifier for HttpWebIdIssuers {
                 Format::from_content_type("text/turtle").expect("text/turtle is always supported")
             });
         let dataset = fmt
-            .parse(body.as_bytes(), doc_url)
+            // No version constraint: this document belongs to someone else,
+            // is never stored here, and is read only for `solid:oidcIssuer`
+            // triples. Refusing a 1.2 profile would break authentication over
+            // a term nothing in this path looks at.
+            .parse(body.as_bytes(), doc_url, crate::rdf::RdfVersion::Rdf12)
             .map_err(|e| AuthError::FetchBlocked(format!("invalid profile document: {e}")))?;
 
         Ok(dataset.quads().iter().any(|t| {

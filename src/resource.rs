@@ -685,7 +685,7 @@ mod tests {
 
     fn triples(turtle: &str, base: &str) -> Vec<Triple> {
         Format::from_content_type("text/turtle").unwrap()
-            .parse(turtle.as_bytes(), base).unwrap()
+            .parse(turtle.as_bytes(), base, crate::rdf::RdfVersion::Rdf11).unwrap()
             .quads().iter().cloned().map(Triple::from).collect()
     }
 

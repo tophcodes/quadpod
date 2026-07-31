@@ -33,7 +33,10 @@ second pass, built from existing, non-rotting components plus a thin custom core
 ## 3. Non-Goals (v1)
 
 - **Not** an Identity Provider. Auth is **verify-only** against an external Solid-OIDC IdP.
-- **No RDF-star / RDF 1.2 on the wire** — Solid is RDF-1.1-anchored (see §5).
+- ~~**No RDF-star / RDF 1.2 on the wire**~~ — **reversed, see §16 ADR-6.** RDF 1.2 is
+  supported, and it is an explicit act: a representation declares itself with the `version`
+  media-type parameter, in both directions, and silence means RDF 1.1
+  (`2026-07-30-rdf12-design.md` §4).
 - **No SPARQL UPDATE** write path (writes go through LDP, which already enforces WAC+SHACL).
 - **No Solid Notifications Protocol.**
 - **No multi-tenant registry / provisioning** — the *seam* exists (§9), the machinery is deferred.
@@ -48,7 +51,7 @@ second pass, built from existing, non-rotting components plus a thin custom core
 | **Build thin server, don't fork one** | Forking any server (CSS, Melvin's, DreamLab, jeswr's) means inheriting conventions/off-spec choices we'd fight. jeswr's `solid-server-rs` is explicitly "not a foundation." Manas-the-server is **dormant** (last commit 2024-07). |
 | **Reuse Manas *leaf crates*, not its `Repo` trait** | The leaf crates are published, downloaded in the wild, and encode frozen specs → low rot. The `manas_repo` storage trait is heavy typestate + an 80-file reference backend → high effort, high coupling. Deep-reuse rejected; shallow-reuse chosen. |
 | **Oxigraph default, behind a `SparqlStore` trait** | Target SPARQL 1.1 Protocol only (no vendor extensions) → Fuseki/GraphDB swappable. HTTP endpoint (not embedded) keeps multi-writer (Windmill pipelines) and avoids the single-writer RocksDB constraint. |
-| **Strict RDF 1.1 everywhere; provenance is app data** | Solid mandates Turtle + JSON-LD (RDF 1.1). Backend-pluggability and RDF-star are mutually exclusive (not all stores support RDF-star). Provenance/PROV-O is **not** a server concern — pipelines write it as ordinary triples. |
+| **RDF 1.2 behind an explicit declaration; provenance is app data** | Solid mandates Turtle + JSON-LD, and every deployed Solid client is an RDF 1.1 parser — so 1.2 is opt-in per representation and never the default (`2026-07-30-rdf12-design.md` §4). Backend-pluggability and RDF 1.2 are **not** mutually exclusive, which is what the original entry got wrong: once §13 names a *capability* instead of a product class, a store that cannot hold triple terms is a configuration the pod degrades against, not a counterexample. Provenance/PROV-O remains **not** a server concern — pipelines write it as ordinary triples. See §16 ADR-6. |
 | **WAC only (v1), ACP-ready by architecture** | Solid CG consensus recommends WAC; community adoption favors it. The standalone `acp` crate makes ACP a near-zero-cost future plug behind the same PDP seam. |
 | **Verify-only auth, external IdP** | Running an IdP is a whole subsystem. Verify-only is far less surface; WebID profile docs can still live in the pod. |
 | **URI-template config for topology** | One declarative knob (§9) expresses single/multi user/pod and subdomain-vs-path, instead of ad-hoc flags. Realizes the `StorageSpace` abstraction from day one. |
@@ -259,7 +262,11 @@ registry/provisioning, Notifications, SPARQL UPDATE, data migration from the exi
 - A third-party Solid app can authenticate (external IdP), read/write RDF resources and blobs,
   and be correctly allowed/denied by WAC.
 - Every triple lives in exactly **one** authoritative store; there is no sync process.
-- Swapping Oxigraph for another SPARQL-1.1 store requires only config, no code change.
+- Swapping Oxigraph for another store requires only config, no code change — **provided the
+  replacement satisfies the capabilities the write path depends on**: the SPARQL 1.1 Protocol,
+  atomic `;`-separated update sequences (§16 ADR-2), and the RDF version it declares
+  (`SparqlStore::rdf_version`, §16 ADR-6). The list is the criterion; naming a product class
+  was what made this untrue twice over.
 
 ## 14. Risks & Spikes (validate before/early in implementation)
 
@@ -396,3 +403,50 @@ has since been superseded. It reads as if it were part of the dead text. It is n
 **What would reopen it.** ACP, or a conformance scenario that requires the type triple. The
 current run does not exercise one: roughly 370 WAC rows are unmeasured behind the `text/plain`
 gap.
+
+### ADR-6 — This pod speaks RDF 1.2, declared per representation
+
+**Decision.** §3's non-goal and the first half of §4's "strict RDF 1.1" row are reversed. The
+pod stores and serves RDF 1.2; a representation declares itself with the `version` media-type
+parameter on the way in and is told what it got on the way out, and **silence means RDF 1.1**.
+§13's fourth criterion becomes a capability list. Full design:
+`2026-07-30-rdf12-design.md`.
+
+**Why the non-goal never held.** It was true by accident, not by construction. Nothing in the
+dependency graph had enabled oxigraph's `rdf-12` feature, so nobody had to enforce anything.
+`rudof_lib` enabled it transitively, and the shape-validation work added a refusal — which
+covered **one** of RDF 1.2's two new term kinds. `oxrdf` gates `BaseDirection` behind the same
+feature as `Term::Triple`, so `"x"@en--ltr` is a `Term::Literal` and walked past a match on
+`Term::Triple` into storage. `docs/constraints.md` asserted the wire contract was checked while
+half of it was not.
+
+**Alternatives considered.**
+
+- **Keep the non-goal and enforce it at all three places** (`version` parameter, in-band
+  `VERSION` directive, terms). Rejected by the user after the question was put: the pod would
+  refuse content the store demonstrably holds, for a restriction whose stated rationale had
+  already dissolved.
+- **Follow RDF 1.2 Concepts' default, where an absent `version` means `1.2`.** Rejected.
+  Concepts is written for a world where 1.2 is ambient; every deployed Solid client — rdflib.js,
+  SolidOS, the Inrupt libraries, CSS — is a 1.1 parser, and §13's first criterion is passing the
+  Solid conformance suites. The cost is asymmetric: too conservative is less useful, too eager
+  is unreadable. This pod is therefore deliberately stricter than the specification it follows.
+- **A marker subtrait `Rdf12Store: SparqlStore`** for the capability. Rejected: it makes the
+  capability a property of the *type*, which the remote case is not — one generic client, two
+  capabilities depending on which endpoint it is configured against. `AppState` holds
+  `Arc<dyn SparqlStore>` (ADR-2), so a subtrait would be reachable only by `Any` downcasting.
+- **Announcing `version` on every response.** Rejected during implementation, on Concepts' own
+  guidance that only documents *using* 1.2 functionality should announce a version — and
+  because it would break every client comparing `Content-Type` for equality.
+
+**The measurement that decided feasibility.** The pod talks to the store only in SPARQL strings,
+so holding triple terms means the store parses SPARQL 1.2. `spargebra` has its own `sparql-12`
+feature that is **not** in its defaults; `oxrdf/rdf-12` alone would have produced a pod that
+reads 1.2 off the wire and cannot write it. The chain that saves it is
+`oxigraph/rdf-12` → `spareval/sparql-12`, and `Cargo.toml` now declares `oxigraph/rdf-12`
+rather than inheriting it, so the capability stops being a dependency's private choice.
+
+**What would reopen it.** RDF 1.2 reaching Recommendation *and* the Solid ecosystem following,
+at which point Concepts' "absence means 1.2" becomes the right default and §4 of the design
+inverts. Or a `SparqlStore` implementor that declares `Rdf11`, which turns the degradation path
+from a specified case into an exercised one.

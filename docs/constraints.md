@@ -222,16 +222,45 @@ The query string is read in exactly one place.
 
 ## RDF version
 
-The wire contract is RDF 1.1, and it is checked rather than assumed — in both parsers that can
-build a `Dataset`, not just the first.
-    → 2026-07-24-sparql-solid-pod-design.md §3; 2026-07-30-shape-validation-design.md §2.1.
-    `rudof_lib` turns on oxigraph's `rdf-12` feature transitively, and Cargo
-    unifies features crate-wide, so every parser built on `oxttl` accepts RDF
-    1.2 whether this pod wants it or not. Before that dependency the non-goal
-    held because nothing had enabled the feature — an accident, not a
-    property. `oxttl` has no version switch, so the refusal is ours. It has to
-    be in two places because a patch is the only way into the store that does
-    not go through `Format::parse`: a `text/n3` body reaches
-    `patch::Patch::parse` instead, which builds no `Dataset` and so sits
-    outside a refusal that lived only in `rdf.rs`.
-    check: rg -q 'Term::Triple\(_\)' src/rdf.rs && rg -q 'N3Term::Triple\(_\)' src/patch.rs
+The RDF version of a dataset is classified in exactly one place.
+    → 2026-07-30-rdf12-design.md §3.1, §10. The write-side refusal and the
+    read-side projection ask the same question, and two classifiers is how
+    they drift apart — silently, because both answer and one answers wrong.
+    That already happened once: the refusal this replaced matched
+    `Term::Triple` and never looked at `Literal::direction`, so every
+    directional language-tagged string walked into storage while the rule
+    above it claimed the wire was RDF 1.1. The check counts the
+    classification *body*, not the name: `SparqlStore::rdf_version` has the
+    same signature for a different question (what a backend can hold).
+    check: [ "$(rg -o 'Term::Triple\(_\) => RdfVersion' src | wc -l)" = 1 ]
+
+The N3 Patch path refuses both RDF 1.2 additions, not just triple terms.
+    → 2026-07-30-rdf12-design.md §2; 2026-07-30-n3-patch-design.md. A patch is
+    the only way into the store that does not go through `Format::parse`: a
+    `text/n3` body builds no `Dataset`, so it cannot ask
+    `Dataset::rdf_version`, and the refusal has to be repeated in `patch.rs`.
+    It is repeated over **both** additions, because a directional
+    language-tagged string is an ordinary `Literal` and a match on
+    `N3Term::Triple` alone lets it through — the exact half-check
+    `Format::parse` shipped with.
+    **Honest about its own strength:** measured, `oxttl`'s N3 parser already
+    refuses both at the syntax level (`<<(` is "not a valid RDF value",
+    `@en--ltr` is "rdf:dirLangString is not supported in N3"), so today these
+    two arms are depth behind the parser rather than the live refusal. The
+    rule pins them so they are still there if `oxttl` gains RDF 1.2 syntax for
+    N3 — which is the only way they become load-bearing.
+    check: rg -q 'N3Term::Triple\(_\) => Err' src/patch.rs && rg -q 'l.direction\(\).is_some\(\) => Err' src/patch.rs
+
+The `version` media-type parameter is read in exactly one place.
+    → 2026-07-30-rdf12-design.md §4, §10. `Content-Type` on write and
+    `Accept` on read ask the same question of the same syntax; a second
+    reader is how `1.2` comes to mean one thing on the way in and another on
+    the way out. Mirrors the single q-value parse rule above, and it is why
+    `Repr::Rdf` carries the declared version through the write path instead
+    of the handler re-reading the header it already parsed.
+    The check counts the idioms that *extract* the value, not every mention
+    of the word: calling `RdfVersion::from_media_type` twice is the one
+    reader being used twice and is fine, while a hand-rolled second parse is
+    what this forbids. A looser pattern counted a test assertion as a
+    violation.
+    check: [ "$(rg -o 'eq_ignore_ascii_case\("version"\)|strip_prefix\("version="\)|starts_with\("version="\)' src | wc -l)" = 1 ]

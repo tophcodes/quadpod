@@ -145,7 +145,10 @@ pub fn validate(shapes_turtle: &str, body: &Dataset) -> Result<Report, ShapeErro
         .map_err(|e| ShapeError::Engine(e.to_string()))?;
 
     let report = turtle()
-        .parse(&out, "urn:quadpod:report")
+        // No version constraint: this is rudof's own report being read back,
+        // not client data. Refusing a term the engine chose to emit would
+        // turn a validation result into a 500.
+        .parse(&out, "urn:quadpod:report", crate::rdf::RdfVersion::Rdf12)
         .map_err(|e| ShapeError::Engine(e.to_string()))?;
     Ok(Report(report))
 }
@@ -313,7 +316,7 @@ mod tests {
     fn turtle(ttl: &str) -> Dataset {
         Format::from_content_type("text/turtle")
             .expect("turtle is a supported format")
-            .parse(ttl.as_bytes(), "https://pod.toph.so/n1")
+            .parse(ttl.as_bytes(), "https://pod.toph.so/n1", crate::rdf::RdfVersion::Rdf11)
             .expect("parses")
     }
 
@@ -357,6 +360,7 @@ mod tests {
             .parse(
                 b"<urn:example:g> { <https://pod.toph.so/n1> a <http://schema.org/NoteDigitalDocument> . }",
                 "https://pod.toph.so/n1",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .expect("parses");
         let report = validate(NOTE_SHAPE_VIOLATION, &body).expect("validates");
@@ -414,7 +418,7 @@ mod tests {
         let shape = resource(&sp, "/shapes/note");
         let shape_triples = Format::from_content_type("text/turtle")
             .unwrap()
-            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note")
+            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note", crate::rdf::RdfVersion::Rdf11)
             .unwrap();
         put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
 
@@ -424,6 +428,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/note> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -442,6 +447,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/gone> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -461,6 +467,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/a>, <https://pod.toph.so/shapes/b> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -482,6 +489,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> \"not-an-iri\" .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -500,6 +508,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://elsewhere.example/s> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -523,6 +532,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so.evil.example/x> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -549,7 +559,7 @@ mod tests {
         let shape = resource(&sp, "/shapes/evil");
         let shape_triples = Format::from_content_type("text/turtle")
             .unwrap()
-            .parse(EVIL_SHAPE_SPARQL.as_bytes(), "https://pod.toph.so/shapes/evil")
+            .parse(EVIL_SHAPE_SPARQL.as_bytes(), "https://pod.toph.so/shapes/evil", crate::rdf::RdfVersion::Rdf11)
             .unwrap();
         put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
 
@@ -559,6 +569,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/evil> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -588,7 +599,7 @@ mod tests {
         let shape = resource(&sp, "/shapes/evil-rule");
         let shape_triples = Format::from_content_type("text/turtle")
             .unwrap()
-            .parse(EVIL_SHAPE_SPARQL_RULE.as_bytes(), "https://pod.toph.so/shapes/evil-rule")
+            .parse(EVIL_SHAPE_SPARQL_RULE.as_bytes(), "https://pod.toph.so/shapes/evil-rule", crate::rdf::RdfVersion::Rdf11)
             .unwrap();
         put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
 
@@ -598,6 +609,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/evil-rule> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -614,7 +626,7 @@ mod tests {
         let shape = resource(&sp, "/shapes/note");
         let shape_triples = Format::from_content_type("text/turtle")
             .unwrap()
-            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note")
+            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note", crate::rdf::RdfVersion::Rdf11)
             .unwrap();
         put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
 
@@ -624,6 +636,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/note> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -645,6 +658,7 @@ mod tests {
                 b"<https://pod.toph.so/notes/other> <http://www.w3.org/ns/ldp#constrainedBy> \
                   <https://pod.toph.so/shapes/note> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();
@@ -662,7 +676,7 @@ mod tests {
         let shape = resource(&sp, "/shapes/note");
         let shape_triples = Format::from_content_type("text/turtle")
             .unwrap()
-            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note")
+            .parse(NOTE_SHAPE_VIOLATION.as_bytes(), "https://pod.toph.so/shapes/note", crate::rdf::RdfVersion::Rdf11)
             .unwrap();
         put_rdf(&store, &shape, &crate::dataset::triples_of(&shape_triples)).await.unwrap();
 
@@ -672,6 +686,7 @@ mod tests {
             .parse(
                 b"<> <http://www.w3.org/ns/ldp#constrainedBy> <https://pod.toph.so/shapes/note> .",
                 "https://pod.toph.so/notes/",
+                crate::rdf::RdfVersion::Rdf11,
             )
             .unwrap();
         put_rdf(&store, &c, &crate::dataset::triples_of(&binding)).await.unwrap();

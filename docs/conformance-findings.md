@@ -536,6 +536,39 @@ unimplemented feature on the list at all.
 
 ---
 
+## Seventh run — after RDF 1.2 support
+
+| | |
+|---|---|
+| **Date** | 2026-07-30 |
+| **Pod commit** | `35ee057` (RDF 1.2 on the wire, merged with `main`) |
+
+| | Features | Scenarios | Passed | Failed |
+|---|---|---|---|---|
+| karate (everything that ran) | 41 | 652 | 632 | 20 |
+| harness's MUST-linked subset | 38 | 649 | 621 | 20 |
+
+**Identical to the sixth run, and that is the result being reported.** RDF 1.2 support adds a
+`version` media-type parameter to responses and three new refusals to the write path; the
+question this run answers is whether any of it reached a scenario that was passing before.
+None did — same 632 / 20, same seven failing features.
+
+That outcome is designed rather than lucky. `2026-07-30-rdf12-design.md` §5 emits the `version`
+parameter **only** on resources that classify above RDF 1.1, and no conformance scenario creates
+one, so every response the harness sees is byte-identical to the sixth run's — a strict
+`Content-Type: text/turtle` comparison never meets a parameter it did not expect. The design's
+first draft stamped the parameter on every RDF response; five of this repo's own tests caught
+that before the harness could, and the rule was narrowed (design §5, §11 risk 3). The write-side
+refusals — `400` for a body richer than it declared, `415` for an unknown version label or one
+the store cannot hold, `409` for a write below a resource's own version — are all unreachable
+from a 1.1 client, which is what the harness is.
+
+An earlier measurement of this work reported 567 / 85. That number described the pre-merge
+branch, which forked before N3 Patch and shape validation reached `main`; it is superseded by
+this one rather than contradicted by it.
+
+The 20 residual failures are unchanged and are the same ones reconciled below.
+
 ## Bucket 1 — Expected gap (3 scenarios, as of the sixth run)
 
 Features this pod deliberately does not have, or environment limits the harness cannot

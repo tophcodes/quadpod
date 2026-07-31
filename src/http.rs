@@ -12,7 +12,7 @@ use oxigraph::model::{NamedNode, Quad, Triple};
 use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{triples_of, Dataset, Skolemized},
     resource::{put_rdf, get_rdf, delete_rdf, exists, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
-    rdf::{Format, MediaType, Shape, negotiate, accept_allows},
+    rdf::{Format, MediaType, RdfVersion, Shape, negotiate, accept_allows},
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
@@ -401,24 +401,36 @@ async fn current_tags(
         };
         // A format missing from `SERVABLE` can still be served but its
         // validator would never match, which is a legitimate conditional
-        // write refused forever.
-        return Ok(Some(
-            SERVABLE.iter()
-                .filter_map(|ct| Format::from_content_type(ct))
-                .map(|f| stored.etag(f))
-                .collect(),
-        ));
+        // write refused forever. The same holds one axis over: a resource has
+        // one validator per *(format, served version)*, so a 1.2 client's
+        // `If-Match` needs its pair listed here too.
+        return Ok(Some(etag_candidates(&stored)));
     }
     let Some(triples) = get_rdf(store, target).await? else {
         return Ok(None);
     };
     let ground = ground_dataset(triples);
-    Ok(Some(
-        SERVABLE.iter()
-            .filter_map(|ct| Format::from_content_type(ct))
-            .map(|f| ground.etag(f))
-            .collect(),
-    ))
+    Ok(Some(etag_candidates(&ground)))
+}
+
+/// Every validator this stored state could legitimately have been served
+/// with: each servable format, at RDF 1.1 and at the state's own version.
+///
+/// The version comes from [`Dataset::rdf_version`] via de-skolemization
+/// rather than from a second classifier over the stored quads — one
+/// classifier is a rule (`docs/constraints.md`), and this is the caller that
+/// would most naturally have broken it.
+fn etag_candidates(stored: &Skolemized) -> Vec<String> {
+    let held = stored.deskolemize().rdf_version();
+    let versions = if held == RdfVersion::Rdf11 {
+        vec![RdfVersion::Rdf11]
+    } else {
+        vec![RdfVersion::Rdf11, held]
+    };
+    SERVABLE.iter()
+        .filter_map(|ct| Format::from_content_type(ct))
+        .flat_map(|f| versions.iter().map(move |v| stored.etag(f, *v)))
+        .collect()
 }
 
 /// Lifts a container's or auxiliary's raw triples (always default-graph,
@@ -783,7 +795,11 @@ async fn handle_patch_root(
 
 /// What a request body is, once its `Content-Type` has been read.
 enum Repr {
-    Rdf(Dataset, Format),
+    /// The declared [`RdfVersion`] travels with the parsed body because the
+    /// write path needs it after `classify_body` has returned, and re-reading
+    /// it from the header there would be a second reader of the `version`
+    /// parameter — which `docs/constraints.md` forbids.
+    Rdf(Dataset, Format, RdfVersion),
     Blob(Bytes, MediaType),
 }
 
@@ -798,7 +814,12 @@ enum Repr {
 /// The error is boxed for `clippy::result_large_err`, which measures the
 /// `Err` type: `Response` is large, and boxing it keeps `Result<Repr, _>`
 /// from being sized by it.
-fn classify_body(headers: &HeaderMap, body: &Bytes, target: &Target) -> Result<Repr, Box<Response>> {
+fn classify_body(
+    headers: &HeaderMap,
+    body: &Bytes,
+    target: &Target,
+    store_version: RdfVersion,
+) -> Result<Repr, Box<Response>> {
     let ct = header_str(headers, header::CONTENT_TYPE).trim();
     if ct.is_empty() {
         if !body.is_empty() {
@@ -807,8 +828,25 @@ fn classify_body(headers: &HeaderMap, body: &Bytes, target: &Target) -> Result<R
         return Err(Box::new(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()));
     }
     if let Some(fmt) = Format::from_content_type(ct) {
-        return match fmt.parse(body, target.graph_iri()) {
-            Ok(d) => Ok(Repr::Rdf(d, fmt)),
+        // §4/§6, all three refusals in the one funnel the write path already
+        // has. `None` is an unrecognised label rather than an absent one, and
+        // a `415` for the same reason the next check is one: `version` is a
+        // media-type parameter, so "I do not accept this media type" is
+        // literally what the status says.
+        let Some(declared) = RdfVersion::from_media_type(ct) else {
+            return Err(Box::new(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()));
+        };
+        if declared > store_version {
+            return Err(Box::new((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!(
+                    "this pod's store holds RDF {} at most",
+                    store_version.label()
+                ),
+            ).into_response()));
+        }
+        return match fmt.parse(body, target.graph_iri(), declared) {
+            Ok(d) => Ok(Repr::Rdf(d, fmt, declared)),
             Err(e) => Err(Box::new((StatusCode::BAD_REQUEST, e.to_string()).into_response())),
         };
     }
@@ -993,12 +1031,12 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     if let Err(res) = authorize(store, &agent, &target, Mode::Write).await {
         return with_aux_links(res, &target);
     }
-    let repr = match classify_body(&headers, &body, &target) {
+    let repr = match classify_body(&headers, &body, &target, st.store.rdf_version()) {
         Ok(r) => r,
         Err(res) => return *res,
     };
-    let (dataset, fmt) = match repr {
-        Repr::Rdf(d, f) => (d, f),
+    let (dataset, fmt, declared) = match repr {
+        Repr::Rdf(d, f, v) => (d, f, v),
         Repr::Blob(bytes, mt) => {
             // A blob has none of the dataset checks below to run: no named
             // graphs, no reserved namespace, no containment triples. It does
@@ -1040,6 +1078,32 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // putting ldp:contains in a named graph.
     if matches!(target, Target::Container(_)) && container::body_sets_containment(&triples_of(&dataset)) {
         return StatusCode::CONFLICT.into_response();
+    }
+    // The version half of the same argument, and it applies to every format
+    // rather than only the graph-shaped ones: a client that declared 1.1 was
+    // served the 1.1 projection, so replacing from it would delete exactly
+    // the terms that projection hid. The read must not become the template
+    // for its own destruction.
+    //
+    // Compared against what the *client declared*, not against what its body
+    // classifies as: declaring 1.2 and sending 1.1 content is a deliberate
+    // replacement by a client that can see the whole resource, and refusing
+    // that would make the higher version a trap rather than a capability.
+    if let Target::Resource(r) = &target {
+        let existing = match get_dataset(store, r).await {
+            Ok(v) => v,
+            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+        };
+        if let Some(existing) = existing {
+            let held = existing.deskolemize().rdf_version();
+            if declared < held {
+                return (StatusCode::CONFLICT, format!(
+                    "this resource holds RDF {} terms that {} cannot carry; \
+                     send Content-Type with version={}, or DELETE it first",
+                    held.label(), declared.label(), held.label()
+                )).into_response();
+            }
+        }
     }
     // §6.2.1 — a graph-format write must not silently discard what a graph
     // format could not have shown the client in the first place.
@@ -1256,7 +1320,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     if let Err(res) = authorize(store, &agent, &child, Mode::Append).await {
         return with_aux_links(res, &child);
     }
-    let repr = match classify_body(&headers, &body, &child) {
+    let repr = match classify_body(&headers, &body, &child, st.store.rdf_version()) {
         Ok(r) => r,
         Err(res) => return *res,
     };
@@ -1266,7 +1330,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // checks are — before the ancestor walk below writes anything.
     let mut findings = None;
     let skolemized = match &repr {
-        Repr::Rdf(dataset, _) => {
+        Repr::Rdf(dataset, _, _) => {
             // §3.2.2 — the skolem namespace is the server's.
             if dataset.uses_reserved_namespace() {
                 return (StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response();
@@ -1315,7 +1379,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
                 Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
                 Err(e) => (put_status(&e), e.to_string()).into_response(),
             },
-            Repr::Rdf(_, fmt) => {
+            Repr::Rdf(_, fmt, _) => {
                 let skolemized = skolemized.expect("Repr::Rdf produced a skolemized dataset above");
                 match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
                     Ok(()) => created(&child),
@@ -1327,7 +1391,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         // read-then-merge `put_impl` does for an existing container has
         // nothing to read here.
         Target::Container(c) => {
-            let Repr::Rdf(dataset, _) = &repr else {
+            let Repr::Rdf(dataset, _, _) = &repr else {
                 unreachable!("classify_body refuses a blob for Target::Container")
             };
             let triples = triples_of(&dataset.default_graph_only());
@@ -1484,7 +1548,9 @@ async fn validate_view(
         Err(e) => return shape_status(e),
     };
     let accept = header_str(&headers, header::ACCEPT);
-    let Some(fmt) = negotiate(accept, Shape::Graph, None) else {
+    // The report is this pod's own RDF; there is no stored version to
+    // project, so the negotiated version is not carried further.
+    let Some((fmt, _)) = negotiate(accept, Shape::Graph, None) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
     match fmt.serialize(&report.into_dataset()) {
@@ -1595,10 +1661,15 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         .ok()
         .flatten()
         .and_then(|m| Format::from_content_type(m.as_str()));
-    let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), shape, stored_type) else {
+    let Some((fmt, requested)) = negotiate(header_str(&headers, header::ACCEPT), shape, stored_type) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
-    let tag = stored.etag(fmt);
+    // §5: what is actually served is the lower of what the client asked for
+    // and what the resource is — asking for 1.2 of a plain 1.1 resource is
+    // answered, and advertised, as 1.1.
+    let held = visible.rdf_version();
+    let served_version = requested.min(held);
+    let tag = stored.etag(fmt, served_version);
     if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
         let mut out = HeaderMap::new();
         out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
@@ -1608,14 +1679,46 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     }
     // §6.2: a graph format gets the default graph, and is told what it missed.
     let served = if fmt.carries_dataset() { visible.clone() } else { visible.default_graph_only() };
+    let served = served.project_to(served_version);
     let bytes = match fmt.serialize(&served) {
         Ok(b) => b,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let mut out = HeaderMap::new();
-    out.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
+    // §5: the response states the version it carries — but only where a
+    // version is in play at all. RDF 1.2 Concepts encourages announcing a
+    // version for "documents that make use of RDF 1.2-specific
+    // functionality"; stamping `version=1.1` on every plain Turtle response
+    // would contradict that, and would break every client comparing
+    // `Content-Type` for equality, the conformance harness included.
+    //
+    // On a resource that *is* 1.2, the parameter carries real information in
+    // both directions: `version=1.2` says the triple terms are here, and
+    // `version=1.1` says they were left out — which, with the `alternate`
+    // link below, is the whole loss signal. No minted vocabulary, because a
+    // version is a property of the representation as a whole and has no
+    // parts to enumerate.
+    out.insert(
+        header::CONTENT_TYPE,
+        if held > RdfVersion::Rdf11 {
+            format!("{};version={}", fmt.media_type(), served_version.label())
+                .parse().expect("media type and version label are token-safe")
+        } else {
+            fmt.media_type().parse().expect("static media type")
+        },
+    );
     out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
     out.insert(header::VARY, "Accept".parse().expect("static"));
+    // §5: only when the version actually cost something. The link names the
+    // resource's *own* classification, not a blanket 1.2 — promising triple
+    // terms a `1.2-basic` resource does not have would be a worse answer than
+    // saying nothing.
+    if served_version < held {
+        out.append(header::LINK, format!(
+            "<{}>; rel=\"alternate\"; type=\"{};version={}\"",
+            r.graph_iri(), fmt.media_type(), held.label()
+        ).parse().expect("media type and version label are token-safe"));
+    }
     // Only when something was actually left out — an ordinary graph-shaped
     // resource served as Turtle has nothing to point `alternate` at, and
     // must not carry these headers just because Turtle itself is lossy.
@@ -1653,13 +1756,18 @@ async fn legacy_graph_read(
     st: AppState, decision: &Decision, target: Target, headers: HeaderMap,
 ) -> Response {
     let store = st.store.as_ref();
-    let Some(fmt) = negotiate(header_str(&headers, header::ACCEPT), Shape::Graph, None) else {
+    let Some((fmt, requested)) = negotiate(header_str(&headers, header::ACCEPT), Shape::Graph, None) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
     match get_rdf(store, &target).await {
         Ok(Some(triples)) => {
             let ground = ground_dataset(triples);
-            let tag = ground.etag(fmt);
+            // De-skolemized first, because the served version is a property
+            // of what the client would see and the ETag has to cover it.
+            let visible = ground.deskolemize();
+            let held = visible.rdf_version();
+            let served_version = requested.min(held);
+            let tag = ground.etag(fmt, served_version);
             if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
                 // `Vary: Accept` on every negotiated response (§6.3), and this
                 // path negotiates as much as the resource path does.
@@ -1670,13 +1778,26 @@ async fn legacy_graph_read(
                     (StatusCode::NOT_MODIFIED, out).into_response(), &target, decision,
                 );
             }
-            let visible = ground.deskolemize();
-            match fmt.serialize(&visible) {
+            match fmt.serialize(&visible.project_to(served_version)) {
                 Ok(bytes) => {
                     let mut headers = HeaderMap::new();
-                    headers.insert(header::CONTENT_TYPE, fmt.media_type().parse().expect("static media type"));
+                    headers.insert(
+                        header::CONTENT_TYPE,
+                        if held > RdfVersion::Rdf11 {
+                            format!("{};version={}", fmt.media_type(), served_version.label())
+                                .parse().expect("media type and version label are token-safe")
+                        } else {
+                            fmt.media_type().parse().expect("static media type")
+                        },
+                    );
                     headers.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
                     headers.insert(header::VARY, "Accept".parse().expect("static"));
+                    if served_version < held {
+                        headers.append(header::LINK, format!(
+                            "<{}>; rel=\"alternate\"; type=\"{};version={}\"",
+                            target.graph_iri(), fmt.media_type(), held.label()
+                        ).parse().expect("media type and version label are token-safe"));
+                    }
                     with_read_headers((headers, bytes).into_response(), &target, decision)
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2277,6 +2398,168 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "application/ld+json");
         assert!(body_string(res).await.contains("schema.org/name"));
+    }
+
+    const TRIPLE_TERM_TTL: &str =
+        "<#it> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .";
+    const DIRECTIONAL_TTL: &str = "<#it> <http://e/p> \"hi\"@en--ltr .";
+
+    async fn put_versioned(f: &Fixture, path: &str, ct: &str, ttl: &'static str)
+        -> axum::response::Response
+    {
+        let req = f.owner_request("PUT", path)
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from(ttl)).unwrap();
+        f.app.clone().oneshot(req).await.unwrap()
+    }
+
+    /// §4: silence means 1.1, so an undeclared body carrying a triple term
+    /// contradicts its own declaration. Deliberately stricter than RDF 1.2
+    /// Concepts, which reads a missing parameter as 1.2.
+    #[tokio::test]
+    async fn an_undeclared_triple_term_is_a_400() {
+        let f = fixture().await;
+        let res = put_versioned(&f, "/foo", "text/turtle", TRIPLE_TERM_TTL).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The same body, declared, is stored.
+    #[tokio::test]
+    async fn a_declared_triple_term_is_accepted() {
+        let f = fixture().await;
+        let res = put_versioned(&f, "/foo", "text/turtle;version=1.2", TRIPLE_TERM_TTL).await;
+        assert_eq!(res.status(), StatusCode::CREATED, "{}", res.status());
+    }
+
+    /// The gap the old refusal had, now on the wire: a directional
+    /// language-tagged string is RDF 1.2 too, and needs declaring.
+    #[tokio::test]
+    async fn a_directional_literal_needs_a_declaration() {
+        let f = fixture().await;
+        let undeclared = put_versioned(&f, "/a", "text/turtle", DIRECTIONAL_TTL).await;
+        assert_eq!(undeclared.status(), StatusCode::BAD_REQUEST);
+
+        let declared =
+            put_versioned(&f, "/b", "text/turtle;version=1.2-basic", DIRECTIONAL_TTL).await;
+        assert_eq!(declared.status(), StatusCode::CREATED, "{}", declared.status());
+    }
+
+    /// §6: an unrecognised label is not a silent fallback to 1.1 — a client
+    /// that named a version this server does not know must not be quietly
+    /// served a different one.
+    #[tokio::test]
+    async fn an_unknown_version_label_is_a_415() {
+        let f = fixture().await;
+        let res = put_versioned(
+            &f, "/foo", "text/turtle;version=1.3",
+            "<#it> <http://schema.org/name> \"Toph\" .",
+        ).await;
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// §6, the conflict that protects §5's read. Without it, GET as 1.1,
+    /// edit, PUT back deletes every triple term with a 2xx and no warning —
+    /// the read-side projection must not become the template for its own
+    /// destruction. Mirrors §6.2.1's named-graph refusal exactly.
+    #[tokio::test]
+    async fn writing_below_a_resources_version_is_a_409() {
+        let f = fixture().await;
+        let created =
+            put_versioned(&f, "/foo", "text/turtle;version=1.2", TRIPLE_TERM_TTL).await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let clobber = put_versioned(
+            &f, "/foo", "text/turtle", "<#it> <http://schema.org/name> \"Toph\" .",
+        ).await;
+        assert_eq!(clobber.status(), StatusCode::CONFLICT);
+    }
+
+    async fn get_accepting(f: &Fixture, path: &str, accept: &str) -> axum::response::Response {
+        let req = f.owner_request("GET", path)
+            .header(header::ACCEPT, accept)
+            .body(Body::empty()).unwrap();
+        f.app.clone().oneshot(req).await.unwrap()
+    }
+
+    fn links_of(res: &axum::response::Response) -> String {
+        res.headers().get_all(header::LINK).iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>().join(", ")
+    }
+
+    /// §5: a 1.1 client gets the projection, a `200`, and is told both what
+    /// it got and where the whole thing is.
+    #[tokio::test]
+    async fn a_1_1_read_of_a_1_2_resource_says_what_it_served() {
+        let f = fixture().await;
+        assert_eq!(
+            put_versioned(&f, "/foo", "text/turtle;version=1.2", TRIPLE_TERM_TTL).await.status(),
+            StatusCode::CREATED,
+        );
+
+        let res = get_accepting(&f, "/foo", "text/turtle").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/turtle;version=1.1");
+        let link = links_of(&res);
+        assert!(
+            link.contains("rel=\"alternate\"") && link.contains("version=1.2"),
+            "an alternate link must name the fuller representation, got {link}"
+        );
+        assert!(
+            !body_string(res).await.contains("<<("),
+            "the triple term must not be in a 1.1 body"
+        );
+    }
+
+    /// The `alternate` link names the resource's *own* classification, so a
+    /// resource whose only excess is a directional literal advertises
+    /// `1.2-basic` rather than promising triple terms it does not have.
+    #[tokio::test]
+    async fn the_alternate_link_names_the_resources_own_version() {
+        let f = fixture().await;
+        put_versioned(&f, "/foo", "text/turtle;version=1.2-basic", DIRECTIONAL_TTL).await;
+
+        let res = get_accepting(&f, "/foo", "text/turtle").await;
+        let link = links_of(&res);
+        assert!(link.contains("version=1.2-basic"), "got {link}");
+    }
+
+    /// Asking for 1.2 explicitly gets the whole thing, undegraded.
+    #[tokio::test]
+    async fn asking_for_1_2_gets_the_triple_term() {
+        let f = fixture().await;
+        put_versioned(&f, "/foo", "text/turtle;version=1.2", TRIPLE_TERM_TTL).await;
+
+        let res = get_accepting(&f, "/foo", "text/turtle;version=1.2").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/turtle;version=1.2");
+        assert!(body_string(res).await.contains("<<("), "the triple term must be present");
+    }
+
+    /// A plain RDF 1.1 resource is byte-identical to what it was before this
+    /// feature: no `version` parameter at all. RDF 1.2 Concepts encourages
+    /// announcing a version only for documents using 1.2 functionality, and
+    /// every deployed client compares `Content-Type` for equality.
+    #[tokio::test]
+    async fn an_ordinary_resource_carries_no_version_parameter() {
+        let f = fixture().await;
+        f.put_turtle("/foo", "<#it> <http://schema.org/name> \"Toph\" .").await;
+
+        let res = get_accepting(&f, "/foo", "text/turtle").await;
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/turtle");
+        assert!(!links_of(&res).contains("version="), "nothing to advertise");
+    }
+
+    /// §9: the two representations of one state must not share a strong
+    /// validator (RFC 9110 §8.8.1).
+    #[tokio::test]
+    async fn the_two_versions_do_not_share_an_etag() {
+        let f = fixture().await;
+        put_versioned(&f, "/foo", "text/turtle;version=1.2", TRIPLE_TERM_TTL).await;
+
+        let at_11 = get_accepting(&f, "/foo", "text/turtle").await;
+        let at_12 = get_accepting(&f, "/foo", "text/turtle;version=1.2").await;
+        assert_ne!(at_11.headers()[header::ETAG], at_12.headers()[header::ETAG]);
     }
 
     #[tokio::test]
@@ -5437,6 +5720,12 @@ mod tests {
         }
         async fn ask(&self, sparql: &str) -> Result<bool, crate::store::StoreError> {
             self.inner.ask(sparql).await
+        }
+        /// Delegated, not pinned: this double exists to fail *writes*, and
+        /// answering anything else here would make it quietly also a test of
+        /// version refusal.
+        fn rdf_version(&self) -> crate::rdf::RdfVersion {
+            self.inner.rdf_version()
         }
         async fn query_solutions(&self, sparql: &str)
             -> Result<Vec<oxigraph::sparql::QuerySolution>, crate::store::StoreError>

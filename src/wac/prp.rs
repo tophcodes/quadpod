@@ -80,7 +80,7 @@ mod tests {
         put_rdf(store, &subject, &[]).await.unwrap();
         let aux = subject.aux(AuxKind::Acl);
         let t: Vec<Triple> = Format::from_content_type("text/turtle").unwrap()
-            .parse(turtle.as_bytes(), aux.graph_iri()).unwrap()
+            .parse(turtle.as_bytes(), aux.graph_iri(), crate::rdf::RdfVersion::Rdf11).unwrap()
             .quads().iter().cloned().map(Triple::from).collect();
         crate::aux::put(store, &aux, &t).await.unwrap();
     }
@@ -165,7 +165,7 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         let foo = res("/foo");
         let t: Vec<Triple> = Format::from_content_type("text/turtle").unwrap()
-            .parse(b"<#it> <http://schema.org/name> \"Toph\" .", foo.graph_iri()).unwrap()
+            .parse(b"<#it> <http://schema.org/name> \"Toph\" .", foo.graph_iri(), crate::rdf::RdfVersion::Rdf11).unwrap()
             .quads().iter().cloned().map(Triple::from).collect();
         put_rdf(&store, &foo, &t).await.unwrap();
         assert!(effective_acl(&store, &foo).await.unwrap().is_none());

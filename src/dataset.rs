@@ -16,8 +16,8 @@
 //! the quads come from outside this type system and refusing them is a parse
 //! and not a self-check.
 
-use crate::rdf::Format;
-use oxigraph::model::{Literal, NamedNode, Quad, Triple};
+use crate::rdf::{Format, RdfVersion};
+use oxigraph::model::{Literal, NamedNode, Quad, Term, Triple};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -68,10 +68,29 @@ pub struct GroundQuad {
 }
 
 /// `Term` minus its blank node — the object position of a [`GroundQuad`].
+///
+/// Recursive since RDF 1.2: a triple term's own object is a term, and it is
+/// ground under exactly the same rule. `Box` because a type cannot contain
+/// itself by value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroundTerm {
     NamedNode(NamedNode),
     Literal(Literal),
+    Triple(Box<GroundTriple>),
+}
+
+/// An RDF 1.2 triple term, ground throughout.
+///
+/// Its subject is a `NamedNode` rather than a `NamedOrBlankNode` for the same
+/// reason a [`GroundQuad`]'s is: a blank node anywhere in a stored quad is
+/// what skolemization removes, and nesting does not exempt it. Without that,
+/// `skolemize`'s totality claim — *no input maps to something that still
+/// holds a blank node* — would be false one level down, and false silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroundTriple {
+    pub subject: NamedNode,
+    pub predicate: NamedNode,
+    pub object: GroundTerm,
 }
 
 /// `GraphName` minus its blank node. Every graph a stored quad names is
@@ -122,15 +141,29 @@ impl From<GroundGraphName> for oxigraph::model::GraphName {
     }
 }
 
+/// The one widening from the ground term type back to oxigraph's. Every
+/// caller that needs a `Term` goes through it, so the triple-term recursion
+/// is written once rather than at each site that happens to need it.
+impl From<&GroundTerm> for Term {
+    fn from(t: &GroundTerm) -> Self {
+        match t {
+            GroundTerm::NamedNode(n) => Term::NamedNode(n.clone()),
+            GroundTerm::Literal(l) => Term::Literal(l.clone()),
+            GroundTerm::Triple(t) => Term::Triple(Box::new(Triple::new(
+                t.subject.clone(),
+                t.predicate.clone(),
+                Term::from(&t.object),
+            ))),
+        }
+    }
+}
+
 impl From<&GroundQuad> for Quad {
     fn from(q: &GroundQuad) -> Self {
         Quad::new(
             q.subject.clone(),
             q.predicate.clone(),
-            match &q.object {
-                GroundTerm::NamedNode(n) => oxigraph::model::Term::NamedNode(n.clone()),
-                GroundTerm::Literal(l) => oxigraph::model::Term::Literal(l.clone()),
-            },
+            Term::from(&q.object),
             q.graph_name.clone(),
         )
     }
@@ -144,6 +177,10 @@ impl fmt::Display for GroundTerm {
         match self {
             GroundTerm::NamedNode(n) => n.fmt(f),
             GroundTerm::Literal(l) => l.fmt(f),
+            // `Triple`'s own `Display` writes RDF 1.2 triple-term syntax,
+            // which is what `resource::serialize_for_insert` must emit for
+            // the store to parse it back (SPARQL 1.2).
+            GroundTerm::Triple(_) => Term::from(self).fmt(f),
         }
     }
 }
@@ -151,6 +188,71 @@ impl fmt::Display for GroundTerm {
 impl Dataset {
     pub fn new(quads: Vec<Quad>) -> Self {
         Self(quads)
+    }
+
+    /// The least [`RdfVersion`] under which every term here is expressible.
+    ///
+    /// **The only place a dataset's version is classified** — see
+    /// `docs/constraints.md`. Two classifiers is how the write-side check and
+    /// the read-side projection drift apart, and the drift is silent: both
+    /// answer, one answers wrong. The check that this replaced saw only
+    /// triple terms, and every directional literal walked past it.
+    ///
+    /// Only the object position can hold a triple term — subjects are
+    /// `NamedOrBlankNode` — and only a literal can carry a base direction, so
+    /// one pass over the objects decides it.
+    pub fn rdf_version(&self) -> RdfVersion {
+        let mut found = RdfVersion::Rdf11;
+        for q in &self.0 {
+            let here = match &q.object {
+                Term::Triple(_) => RdfVersion::Rdf12,
+                Term::Literal(l) if l.direction().is_some() => RdfVersion::Rdf12Basic,
+                _ => continue,
+            };
+            found = found.max(here);
+            if found == RdfVersion::Rdf12 {
+                break;
+            }
+        }
+        found
+    }
+
+    /// This dataset as it can be expressed at `target`.
+    ///
+    /// The two RDF 1.2 additions degrade unequally, and that asymmetry is the
+    /// point. A base direction is presentation metadata *on* a literal —
+    /// strip it and the statement survives. A triple term *is* the object:
+    /// there is nothing to strip, so the whole triple goes.
+    ///
+    /// The result is a **subset** of what was written, never a rewriting of
+    /// it. Approximating a triple term with something a 1.1 client could read
+    /// would manufacture assertions the document never made — the same
+    /// argument §6.2 of the datasets design makes against merging named
+    /// graphs into the default one.
+    pub fn project_to(&self, target: RdfVersion) -> Dataset {
+        if self.rdf_version() <= target {
+            return self.clone();
+        }
+        let quads = self.0.iter().filter_map(|q| {
+            if target < RdfVersion::Rdf12 && matches!(q.object, Term::Triple(_)) {
+                return None;
+            }
+            let object = match &q.object {
+                Term::Literal(l)
+                    if target < RdfVersion::Rdf12Basic && l.direction().is_some() =>
+                {
+                    let language =
+                        l.language().expect("a directional literal is language-tagged");
+                    Term::Literal(
+                        Literal::new_language_tagged_literal(l.value(), language)
+                            .expect("the tag came off a literal that already validated it"),
+                    )
+                }
+                other => other.clone(),
+            };
+            Some(Quad { object, ..q.clone() })
+        }).collect();
+        Dataset::new(quads)
     }
 
     pub fn quads(&self) -> &[Quad] {
@@ -251,9 +353,9 @@ impl Skolemized {
     /// directions of the word: every input maps, and no input can map to
     /// something that still holds a blank node.
     pub fn skolemize(dataset: &Dataset) -> Self {
-        use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
+        use oxigraph::model::{BlankNode, GraphName, NamedOrBlankNode};
         let mut minted: std::collections::HashMap<String, NamedNode> = std::collections::HashMap::new();
-        let mut iri_for = |b: &oxigraph::model::BlankNode| -> NamedNode {
+        let mut iri_for = |b: &BlankNode| -> NamedNode {
             minted.entry(b.as_str().to_owned())
                 .or_insert_with(|| {
                     NamedNode::new(format!("{SKOLEM_PREFIX}{}", uuid::Uuid::new_v4()))
@@ -261,21 +363,32 @@ impl Skolemized {
                 })
                 .clone()
         };
+        // Recursive, because a triple term's subject and object are terms in
+        // their own right and the totality claim above has to hold at every
+        // depth. A blank node left un-skolemized inside a triple term breaks
+        // the round trip and the ETag, and it does so without erroring.
+        fn ground(t: &Term, iri_for: &mut impl FnMut(&BlankNode) -> NamedNode) -> GroundTerm {
+            match t {
+                Term::NamedNode(n) => GroundTerm::NamedNode(n.clone()),
+                Term::BlankNode(b) => GroundTerm::NamedNode(iri_for(b)),
+                Term::Literal(l) => GroundTerm::Literal(l.clone()),
+                Term::Triple(inner) => GroundTerm::Triple(Box::new(GroundTriple {
+                    subject: match &inner.subject {
+                        NamedOrBlankNode::NamedNode(n) => n.clone(),
+                        NamedOrBlankNode::BlankNode(b) => iri_for(b),
+                    },
+                    predicate: inner.predicate.clone(),
+                    object: ground(&inner.object, iri_for),
+                })),
+            }
+        }
         let quads = dataset.quads().iter().map(|q| GroundQuad {
             subject: match &q.subject {
                 NamedOrBlankNode::NamedNode(n) => n.clone(),
                 NamedOrBlankNode::BlankNode(b) => iri_for(b),
             },
             predicate: q.predicate.clone(),
-            object: match &q.object {
-                Term::NamedNode(n) => GroundTerm::NamedNode(n.clone()),
-                Term::BlankNode(b) => GroundTerm::NamedNode(iri_for(b)),
-                Term::Literal(l) => GroundTerm::Literal(l.clone()),
-                Term::Triple(_) => unreachable!(
-                    "Format::parse refuses RDF 1.2 triple terms, and every Dataset \
-                     skolemized here came from it"
-                ),
-            },
+            object: ground(&q.object, &mut iri_for),
             graph_name: match &q.graph_name {
                 GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
                 GraphName::NamedNode(n) => GroundGraphName::NamedNode(n.clone()),
@@ -297,7 +410,28 @@ impl Skolemized {
     /// [`new`](Self::new) — because a check that runs on our own values is
     /// the check that quietly stops running.
     pub fn from_store(quads: Vec<Quad>) -> Option<Self> {
-        use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
+        use oxigraph::model::{GraphName, NamedOrBlankNode};
+        // A triple term is ground exactly when everything inside it is. It
+        // must be *accepted* here: refusing it would make the pod report
+        // data it stored correctly as corruption.
+        fn ground(t: Term) -> Option<GroundTerm> {
+            Some(match t {
+                Term::NamedNode(n) => GroundTerm::NamedNode(n),
+                Term::Literal(l) => GroundTerm::Literal(l),
+                Term::BlankNode(_) => return None,
+                Term::Triple(inner) => {
+                    let inner = *inner;
+                    GroundTerm::Triple(Box::new(GroundTriple {
+                        subject: match inner.subject {
+                            NamedOrBlankNode::NamedNode(n) => n,
+                            NamedOrBlankNode::BlankNode(_) => return None,
+                        },
+                        predicate: inner.predicate,
+                        object: ground(inner.object)?,
+                    }))
+                }
+            })
+        }
         quads.into_iter().map(|q| {
             Some(GroundQuad {
                 subject: match q.subject {
@@ -305,12 +439,7 @@ impl Skolemized {
                     NamedOrBlankNode::BlankNode(_) => return None,
                 },
                 predicate: q.predicate,
-                object: match q.object {
-                    Term::NamedNode(n) => GroundTerm::NamedNode(n),
-                    Term::Literal(l) => GroundTerm::Literal(l),
-                    Term::BlankNode(_) => return None,
-                    Term::Triple(_) => return None,
-                },
+                object: ground(q.object)?,
                 graph_name: match q.graph_name {
                     GraphName::DefaultGraph => GroundGraphName::DefaultGraph,
                     GraphName::NamedNode(n) => GroundGraphName::NamedNode(n),
@@ -366,13 +495,27 @@ impl Skolemized {
                 Some(b) => NamedOrBlankNode::BlankNode(b),
                 None => NamedOrBlankNode::NamedNode(q.subject.clone()),
             };
-            let object = match &q.object {
-                GroundTerm::NamedNode(n) => match blank_for(n) {
-                    Some(b) => Term::BlankNode(b),
-                    None => Term::NamedNode(n.clone()),
-                },
-                GroundTerm::Literal(l) => Term::Literal(l.clone()),
-            };
+            // Recursive for the same reason `skolemize` is: a skolem IRI
+            // sitting inside a triple term is one this pod minted, so it must
+            // come back as the blank node it replaced.
+            fn term_for(t: &GroundTerm) -> Term {
+                match t {
+                    GroundTerm::NamedNode(n) => match blank_for(n) {
+                        Some(b) => Term::BlankNode(b),
+                        None => Term::NamedNode(n.clone()),
+                    },
+                    GroundTerm::Literal(l) => Term::Literal(l.clone()),
+                    GroundTerm::Triple(inner) => Term::Triple(Box::new(Triple::new(
+                        match blank_for(&inner.subject) {
+                            Some(b) => NamedOrBlankNode::BlankNode(b),
+                            None => NamedOrBlankNode::NamedNode(inner.subject.clone()),
+                        },
+                        inner.predicate.clone(),
+                        term_for(&inner.object),
+                    ))),
+                }
+            }
+            let object = term_for(&q.object);
             let graph_name = match &q.graph_name {
                 GroundGraphName::NamedNode(n) => match blank_for(n) {
                     Some(b) => GraphName::BlankNode(b),
@@ -393,11 +536,18 @@ impl Skolemized {
     /// this value: hashing something else, or hashing after the blank nodes
     /// come back, is the mistake — and both are harder to write by accident
     /// when the hash belongs to the stored form.
-    pub fn etag(&self, fmt: Format) -> String {
+    pub fn etag(&self, fmt: Format, served: RdfVersion) -> String {
         let mut lines: Vec<String> = self.0.iter().map(|q| Quad::from(q).to_string()).collect();
         lines.sort();
         let mut h = Sha256::new();
         h.update(fmt.media_type().as_bytes());
+        h.update(b"\n");
+        // The version participates for the same reason the format does: one
+        // stored state has more than one representation, and RFC 9110 §8.8.1
+        // forbids them sharing a strong validator. Without this the 1.1
+        // projection and the full 1.2 representation are indistinguishable to
+        // a conditional request.
+        h.update(served.label().as_bytes());
         h.update(b"\n");
         for l in &lines {
             h.update(l.as_bytes());
@@ -411,6 +561,227 @@ impl Skolemized {
 mod tests {
     use super::*;
     use oxigraph::model::{BlankNode, Literal, NamedNode, Quad};
+
+    /// §5: a triple term cannot be stripped, so the triple goes.
+    #[test]
+    fn projecting_to_1_1_drops_triples_with_triple_terms() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![
+            q("http://e/s", "v", GraphName::DefaultGraph),
+            q_triple_term("http://e/s2", GraphName::DefaultGraph),
+        ]);
+        let projected = ds.project_to(RdfVersion::Rdf11);
+        assert_eq!(projected.quads().len(), 1);
+        assert_eq!(projected.rdf_version(), RdfVersion::Rdf11);
+    }
+
+    /// §5: a base direction *is* strippable — the triple survives, and only
+    /// the presentation metadata is lost.
+    #[test]
+    fn projecting_to_1_1_strips_the_base_direction() {
+        use oxigraph::model::{GraphName, Term};
+        let ds = Dataset::new(vec![q_directional("http://e/s", GraphName::DefaultGraph)]);
+        let projected = ds.project_to(RdfVersion::Rdf11);
+        assert_eq!(projected.quads().len(), 1, "the triple must survive");
+        let Term::Literal(l) = &projected.quads()[0].object else { panic!() };
+        assert!(l.direction().is_none(), "the direction must be gone");
+        assert_eq!(l.language(), Some("en"), "the language tag must remain");
+    }
+
+    /// `1.2-basic` keeps directions and drops only triple terms — the middle
+    /// label earning its place.
+    #[test]
+    fn projecting_to_1_2_basic_keeps_the_direction() {
+        use oxigraph::model::{GraphName, Term};
+        let ds = Dataset::new(vec![
+            q_directional("http://e/s", GraphName::DefaultGraph),
+            q_triple_term("http://e/s2", GraphName::DefaultGraph),
+        ]);
+        let projected = ds.project_to(RdfVersion::Rdf12Basic);
+        assert_eq!(projected.quads().len(), 1, "the triple term goes");
+        let Term::Literal(l) = &projected.quads()[0].object else { panic!() };
+        assert!(l.direction().is_some(), "the direction stays");
+    }
+
+    /// Projecting to a target at or above the dataset's own version is
+    /// identity.
+    #[test]
+    fn projecting_upwards_changes_nothing() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![q("http://e/s", "v", GraphName::DefaultGraph)]);
+        assert_eq!(ds.project_to(RdfVersion::Rdf12), ds);
+    }
+
+    /// §9: two representations of one state must not share a strong
+    /// validator (RFC 9110 §8.8.1) — the same rule the selected *format*
+    /// already answers to, one axis over.
+    #[test]
+    fn the_served_version_changes_the_etag() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![q("http://e/s", "v", GraphName::DefaultGraph)]);
+        let stored = Skolemized::skolemize(&ds);
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        assert_ne!(
+            stored.etag(fmt, RdfVersion::Rdf11),
+            stored.etag(fmt, RdfVersion::Rdf12),
+        );
+    }
+
+    /// §7's silent-failure case. A blank node inside a triple term must
+    /// skolemize like any other, or the round trip and the ETag come apart
+    /// with nothing to signal it.
+    #[test]
+    fn a_blank_node_inside_a_triple_term_skolemizes() {
+        use oxigraph::model::{GraphName, Term, Triple};
+        let inner = Triple::new(
+            BlankNode::new("b0").unwrap(),
+            NamedNode::new("http://e/b").unwrap(),
+            NamedNode::new("http://e/c").unwrap(),
+        );
+        let ds = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://e/s").unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(inner)),
+            GraphName::DefaultGraph,
+        )]);
+
+        let stored = Skolemized::skolemize(&ds);
+        let GroundTerm::Triple(t) = &stored.quads()[0].object else {
+            panic!("the triple term must survive skolemization as a triple term");
+        };
+        assert!(
+            t.subject.as_str().starts_with(SKOLEM_PREFIX),
+            "the inner blank node must have become a skolem IRI, got {}",
+            t.subject.as_str()
+        );
+    }
+
+    /// The totality claim in `skolemize`'s own doc comment must survive the
+    /// recursion: no input maps to something that still holds a blank node.
+    #[test]
+    fn skolemizing_a_nested_blank_node_round_trips() {
+        use oxigraph::model::{GraphName, NamedOrBlankNode, Term, Triple};
+        let inner = Triple::new(
+            BlankNode::new("b0").unwrap(),
+            NamedNode::new("http://e/b").unwrap(),
+            NamedNode::new("http://e/c").unwrap(),
+        );
+        let ds = Dataset::new(vec![Quad::new(
+            NamedNode::new("http://e/s").unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(inner)),
+            GraphName::DefaultGraph,
+        )]);
+
+        let stored = Skolemized::skolemize(&ds);
+        let back = stored.deskolemize();
+        let Term::Triple(t) = &back.quads()[0].object else {
+            panic!("expected a triple term back");
+        };
+        assert!(
+            matches!(t.subject, NamedOrBlankNode::BlankNode(_)),
+            "the inner term must be a blank node again after de-skolemization"
+        );
+        assert_eq!(stored.deskolemize(), back, "two reads must agree (§6.4)");
+    }
+
+    /// `from_store` is documented as a *parse* of what the store hands back.
+    /// A correctly stored triple term is ground; reading it as non-ground
+    /// would make the pod report its own data as corruption (§7).
+    #[test]
+    fn from_store_accepts_a_triple_term_as_ground() {
+        use oxigraph::model::GraphName;
+        assert!(Skolemized::from_store(vec![q_triple_term(
+            "http://e/s",
+            GraphName::DefaultGraph
+        )])
+        .is_some());
+    }
+
+    /// A blank node *inside* a triple term is still not ground.
+    #[test]
+    fn from_store_refuses_a_blank_node_inside_a_triple_term() {
+        use oxigraph::model::{GraphName, Term, Triple};
+        let inner = Triple::new(
+            BlankNode::new("b0").unwrap(),
+            NamedNode::new("http://e/b").unwrap(),
+            NamedNode::new("http://e/c").unwrap(),
+        );
+        let quads = vec![Quad::new(
+            NamedNode::new("http://e/s").unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(inner)),
+            GraphName::DefaultGraph,
+        )];
+        assert!(Skolemized::from_store(quads).is_none());
+    }
+
+    /// A quad whose object is an RDF 1.2 triple term.
+    fn q_triple_term(s: &str, g: oxigraph::model::GraphName) -> Quad {
+        use oxigraph::model::{Term, Triple};
+        Quad::new(
+            NamedNode::new(s).unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Term::Triple(Box::new(Triple::new(
+                NamedNode::new("http://e/a").unwrap(),
+                NamedNode::new("http://e/b").unwrap(),
+                NamedNode::new("http://e/c").unwrap(),
+            ))),
+            g,
+        )
+    }
+
+    /// A quad whose object is a directional language-tagged string — the
+    /// RDF 1.2 addition that is *not* a triple term (§2).
+    fn q_directional(s: &str, g: oxigraph::model::GraphName) -> Quad {
+        use oxigraph::model::BaseDirection;
+        Quad::new(
+            NamedNode::new(s).unwrap(),
+            NamedNode::new("http://e/p").unwrap(),
+            Literal::new_directional_language_tagged_literal("hi", "en", BaseDirection::Ltr)
+                .unwrap(),
+            g,
+        )
+    }
+
+    /// §3.1: the least label under which every term is expressible.
+    #[test]
+    fn a_plain_dataset_classifies_as_1_1() {
+        let ds = Dataset::new(vec![q("http://e/s", "v", oxigraph::model::GraphName::DefaultGraph)]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf11);
+    }
+
+    /// The term kind today's refusal cannot see. §2.
+    #[test]
+    fn a_directional_literal_classifies_as_1_2_basic() {
+        let ds = Dataset::new(vec![q_directional(
+            "http://e/s",
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf12Basic);
+    }
+
+    #[test]
+    fn a_triple_term_classifies_as_1_2() {
+        let ds = Dataset::new(vec![q_triple_term(
+            "http://e/s",
+            oxigraph::model::GraphName::DefaultGraph,
+        )]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf12);
+    }
+
+    /// The classification is over the whole dataset, so one 1.2 term among
+    /// many 1.1 quads still classifies 1.2.
+    #[test]
+    fn the_classification_is_the_maximum_over_all_terms() {
+        use oxigraph::model::GraphName;
+        let ds = Dataset::new(vec![
+            q("http://e/s", "v", GraphName::DefaultGraph),
+            q_directional("http://e/s2", GraphName::DefaultGraph),
+            q_triple_term("http://e/s3", GraphName::DefaultGraph),
+        ]);
+        assert_eq!(ds.rdf_version(), RdfVersion::Rdf12);
+    }
 
     fn q(s: &str, o: &str, g: oxigraph::model::GraphName) -> Quad {
         Quad::new(
@@ -671,11 +1042,11 @@ mod tests {
         let in_g1 = Skolemized::new(vec![gq("http://example.org/s", "x", g1.into())]);
         let in_g2 = Skolemized::new(vec![gq("http://example.org/s", "x", g2.into())]);
 
-        assert_ne!(in_g1.etag(jsonld), in_g2.etag(jsonld),
+        assert_ne!(in_g1.etag(jsonld, RdfVersion::Rdf11), in_g2.etag(jsonld, RdfVersion::Rdf11),
             "same triple, different graph — a shared validator would serve the wrong one");
-        assert_ne!(in_g1.etag(jsonld), in_g1.etag(trig),
+        assert_ne!(in_g1.etag(jsonld, RdfVersion::Rdf11), in_g1.etag(trig, RdfVersion::Rdf11),
             "different representations are different entities (RFC 9110 §8.8.1)");
-        assert_eq!(in_g1.etag(jsonld), in_g1.etag(jsonld), "stable between reads");
+        assert_eq!(in_g1.etag(jsonld, RdfVersion::Rdf11), in_g1.etag(jsonld, RdfVersion::Rdf11), "stable between reads");
     }
 
     // Every other etag test uses a single-quad dataset, so it can't tell
@@ -692,7 +1063,7 @@ mod tests {
         let forward = Skolemized::new(vec![q1.clone(), q2.clone()]);
         let backward = Skolemized::new(vec![q2, q1]);
 
-        assert_eq!(forward.etag(jsonld), backward.etag(jsonld),
+        assert_eq!(forward.etag(jsonld, RdfVersion::Rdf11), backward.etag(jsonld, RdfVersion::Rdf11),
             "same quads in a different order must share a validator");
     }
 }

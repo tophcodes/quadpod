@@ -10,12 +10,79 @@ pub enum RdfError {
     Serialize(String),
     #[error("unsupported media type")]
     UnsupportedType,
-    #[error("RDF 1.2 triple terms are not accepted; this pod stores RDF 1.1")]
-    Rdf12TripleTerm,
+    #[error("this representation is RDF {}, and {} was declared", found.label(), allowed.label())]
+    UnsupportedRdfVersion { found: RdfVersion, allowed: RdfVersion },
 }
 
 fn media_type(ct: &str) -> &str {
     ct.split(';').next().unwrap_or("").trim()
+}
+
+/// The RDF version labels of [RDF 1.2 Concepts §2.1][labels], verbatim, in
+/// that document's containment order: data valid at a lower label is valid at
+/// a higher one. `PartialOrd` is derived from the variant order, so the whole
+/// capability question is `needed <= available`.
+///
+/// One type for three roles — what a store can hold
+/// ([`SparqlStore::rdf_version`](crate::store::SparqlStore::rdf_version)),
+/// what a representation claims (the `version` media-type parameter), and what
+/// a deployment declares. Nothing translates between a store-side vocabulary
+/// and a wire-side one, because there is only one.
+///
+/// [labels]: https://www.w3.org/TR/rdf12-concepts/#defined-version-labels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RdfVersion {
+    /// RDF 1.1 syntax, without a version directive.
+    Rdf11,
+    /// RDF 1.2 syntax **without** triple terms — directional language-tagged
+    /// strings, and nothing else new. Not a curiosity: it is the exact name
+    /// for a store that can hold one addition and not the other.
+    Rdf12Basic,
+    /// Full RDF 1.2 syntax.
+    Rdf12,
+}
+
+impl RdfVersion {
+    /// The label as it appears in a `version` media-type parameter.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rdf11 => "1.1",
+            Self::Rdf12Basic => "1.2-basic",
+            Self::Rdf12 => "1.2",
+        }
+    }
+
+    /// **The only place the `version` media-type parameter is read** — see
+    /// `docs/constraints.md`. `Content-Type` on write and `Accept` on read ask
+    /// the same question of the same syntax; a second reader is how `1.2`
+    /// comes to mean one thing on the way in and another on the way out. Same
+    /// failure the single q-value parse in [`ranked_accept`] guards against.
+    ///
+    /// An **absent** parameter is [`Rdf11`](Self::Rdf11). That is deliberately
+    /// stricter than RDF 1.2 Concepts, which says systems can assume `1.2`
+    /// when none is given: every deployed Solid client is an RDF 1.1 parser,
+    /// and the cost of being wrong is asymmetric — too conservative is merely
+    /// less useful, too eager is unreadable.
+    ///
+    /// `None` is an **unrecognised** label, which the write path answers with
+    /// `415`. Keeping the two apart is what stops a client that named a
+    /// version this server does not know from being silently served another.
+    pub fn from_media_type(mt: &str) -> Option<Self> {
+        let mut found = None;
+        for p in mt.split(';').skip(1) {
+            let (name, value) = p.trim().split_once('=')?;
+            if !name.trim().eq_ignore_ascii_case("version") {
+                continue;
+            }
+            found = Some(match value.trim() {
+                "1.1" => Self::Rdf11,
+                "1.2-basic" => Self::Rdf12Basic,
+                "1.2" => Self::Rdf12,
+                _ => return None,
+            });
+        }
+        Some(found.unwrap_or(Self::Rdf11))
+    }
 }
 
 /// A media type this pod stores and echoes back.
@@ -173,8 +240,19 @@ impl Format {
         self.0.supports_datasets()
     }
 
-    pub fn parse(&self, bytes: &[u8], base_iri: &str) -> Result<Dataset, RdfError> {
-        use oxigraph::model::Term;
+    /// `declared` is what the representation claimed, read from its
+    /// `Content-Type` by [`RdfVersion::from_media_type`] — the only reader of
+    /// that parameter. A body richer than its own declaration is refused:
+    /// the document contradicts what it said about itself, which is a
+    /// malformed request rather than an unsupported one.
+    ///
+    /// Callers that are not the wire pass [`RdfVersion::Rdf12`]. The version
+    /// contract is a property of the wire, not of parsing — refusing 1.2 in a
+    /// fetched WebID document or in this pod's own validation report would
+    /// add a failure mode with nothing behind it.
+    pub fn parse(&self, bytes: &[u8], base_iri: &str, declared: RdfVersion)
+        -> Result<Dataset, RdfError>
+    {
         let parser = RdfParser::from_format(self.0)
             .with_base_iri(base_iri)
             .map_err(|e| RdfError::Parse(e.to_string()))?;
@@ -182,15 +260,18 @@ impl Format {
         for quad in parser.for_slice(bytes) {
             out.push(quad.map_err(|e| RdfError::Parse(e.to_string()))?);
         }
-        // The linked oxigraph has `rdf-12` on — a transitive dependency turns
-        // it on and Cargo unifies features crate-wide — so the parser accepts
-        // RDF 1.2. The wire contract is RDF 1.1 (root spec §3), and this is
-        // what keeps that true rather than incidental. Only the object can be
-        // a triple term; subjects are `NamedOrBlankNode`.
-        if out.iter().any(|q| matches!(q.object, Term::Triple(_))) {
-            return Err(RdfError::Rdf12TripleTerm);
+        let parsed = Dataset::new(out);
+        // `Cargo.toml` declares oxigraph's `rdf-12`, so the parser accepts
+        // both of RDF 1.2's additions — triple terms *and* directional
+        // language-tagged strings. The check asks [`Dataset::rdf_version`],
+        // the one classifier, rather than matching on a term kind here:
+        // matching caught triple terms and let every directional literal
+        // through, which is what made the wire contract half true.
+        let found = parsed.rdf_version();
+        if found > declared {
+            return Err(RdfError::UnsupportedRdfVersion { found, allowed: declared });
         }
-        Ok(Dataset::new(out))
+        Ok(parsed)
     }
 
     /// §6.4: a deterministic function of its input. Quads are sorted before
@@ -213,14 +294,19 @@ impl Format {
 }
 
 /// The `Accept` list, highest quality first with earlier entries breaking a
-/// tie, as `(q, position, media range)`.
+/// tie, as `(q, position, media range, the whole entry)`.
 ///
 /// **The only place this header is parsed.** [`negotiate`] asks it which
 /// format to render into; [`accept_allows`] asks it whether a resource's one
 /// representation is admissible. Those are different questions, but a second
 /// copy of the q-value parse is how the two come to disagree about `q=0`.
-fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
-    let mut ranked: Vec<(f32, usize, &str)> = Vec::new();
+///
+/// The fourth element is the entry with its parameters still attached. The
+/// third has them stripped, because matching is by media range — but the
+/// `version` parameter belongs to the range that *wins*, so negotiation needs
+/// the unstripped text to hand to [`RdfVersion::from_media_type`].
+fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str, &str)> {
+    let mut ranked: Vec<(f32, usize, &str, &str)> = Vec::new();
     for (i, part) in accept.split(',').enumerate() {
         let mut bits = part.split(';');
         let mt = bits.next().unwrap_or("").trim();
@@ -228,7 +314,7 @@ fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str)> {
             .filter_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
             .next()
             .unwrap_or(1.0);
-        ranked.push((q, i, mt));
+        ranked.push((q, i, mt, part.trim()));
     }
     ranked.sort_by(|a, b| {
         b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
@@ -250,7 +336,7 @@ pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
     let ty = essence.split('/').next().unwrap_or("");
     let type_wildcard = format!("{ty}/*");
     let mut best: Option<(u8, f32)> = None;
-    for (q, _, range) in ranked_accept(accept) {
+    for (q, _, range, _) in ranked_accept(accept) {
         let range = range.to_ascii_lowercase();
         let specificity = if range == essence {
             3
@@ -276,7 +362,9 @@ pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
 /// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
 /// it. `None` means nothing acceptable is supported at all, which is the only
 /// remaining `406`.
-pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
+pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>)
+    -> Option<(Format, RdfVersion)>
+{
     let usable = |f: Format| shape == Shape::Graph || f.carries_dataset();
     let fallback = || {
         [ "text/turtle", "application/ld+json" ].iter()
@@ -285,7 +373,9 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
     };
     let accept = accept.trim();
     if accept.is_empty() {
-        return stored.filter(|f| usable(*f)).or_else(fallback);
+        // No `Accept` at all names no version either, and §4 reads silence
+        // as RDF 1.1.
+        return stored.filter(|f| usable(*f)).or_else(fallback).map(|f| (f, RdfVersion::Rdf11));
     }
 
     let ranked = ranked_accept(accept);
@@ -295,8 +385,8 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
     // excluded from what a wildcard elsewhere in the list resolves to —
     // `*/*, text/turtle;q=0` means "anything but Turtle".
     let rejected: Vec<String> = ranked.iter()
-        .filter(|(q, _, mt)| *q == 0.0 && !mt.ends_with("/*"))
-        .map(|(_, _, mt)| mt.to_ascii_lowercase())
+        .filter(|(q, _, mt, _)| *q == 0.0 && !mt.ends_with("/*"))
+        .map(|(_, _, mt, _)| mt.to_ascii_lowercase())
         .collect();
     let not_rejected = |f: Format| !rejected.iter().any(|r| r == f.media_type());
     let fallback_avoiding_rejected = || {
@@ -305,10 +395,18 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
             .find(|f| usable(*f) && not_rejected(*f))
     };
 
-    for &(q, _, mt) in &ranked {
+    for &(q, _, mt, whole) in &ranked {
         if q == 0.0 {
             continue;
         }
+        // An unrecognised version label on the read side skips this range
+        // rather than failing the request: another range may still be
+        // acceptable, and §6.3 keeps `406` for the case where nothing is.
+        // The write side answers `415` instead, because there is no second
+        // candidate to fall back to.
+        let Some(version) = RdfVersion::from_media_type(whole) else {
+            continue;
+        };
         // Media-type tokens are case-insensitive per RFC 9110 §8.3.1, so
         // `Text/*` must match the wildcard arms too.
         let candidate = match mt.to_ascii_lowercase().as_str() {
@@ -317,8 +415,8 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
             "application/*" => fallback_avoiding_rejected(),
             other => Format::from_content_type(other).filter(|f| usable(*f)),
         };
-        if candidate.is_some() {
-            return candidate;
+        if let Some(f) = candidate {
+            return Some((f, version));
         }
     }
     // Nothing offered can serve the resource fully — the first pass only
@@ -336,18 +434,21 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>) -> O
             .filter_map(|ct| Format::from_content_type(ct))
             .find(|f| not_rejected(*f))
     };
-    for &(q, _, mt) in &ranked {
+    for &(q, _, mt, whole) in &ranked {
         if q == 0.0 {
             continue;
         }
+        let Some(version) = RdfVersion::from_media_type(whole) else {
+            continue;
+        };
         let candidate = match mt.to_ascii_lowercase().as_str() {
             "*/*" => stored.filter(|f| not_rejected(*f)).or_else(lax_fallback),
             "text/*" => Format::from_content_type("text/turtle").filter(|f| not_rejected(*f)),
             "application/*" => lax_fallback(),
             other => Format::from_content_type(other).filter(|f| not_rejected(*f)),
         };
-        if candidate.is_some() {
-            return candidate;
+        if let Some(f) = candidate {
+            return Some((f, version));
         }
     }
     None
@@ -358,15 +459,86 @@ mod tests {
     use super::*;
     use oxigraph::model::{GraphName, Literal, NamedNode, Quad};
 
-    /// RDF 1.2 triple terms are refused, so the wire contract stays RDF 1.1
-    /// even though the linked parser understands more (root spec §3).
+    /// The negotiated format alone. The version half is asserted by its own
+    /// tests below, so the format tests stay about formats.
+    fn neg(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
+        negotiate(accept, shape, stored).map(|(f, _)| f)
+    }
+
+    /// §2.1: the labels are ordered by containment — data valid at a lower
+    /// label is valid at a higher one. The whole capability check is a `<=`
+    /// against this order, so the order is load-bearing.
+    #[test]
+    fn version_labels_are_ordered_by_containment() {
+        assert!(RdfVersion::Rdf11 < RdfVersion::Rdf12Basic);
+        assert!(RdfVersion::Rdf12Basic < RdfVersion::Rdf12);
+    }
+
+    /// §4: silence means 1.1 — deliberately stricter than RDF 1.2 Concepts,
+    /// which says a missing parameter means 1.2.
+    #[test]
+    fn a_missing_version_parameter_means_1_1() {
+        assert_eq!(RdfVersion::from_media_type("text/turtle"), Some(RdfVersion::Rdf11));
+    }
+
+    #[test]
+    fn every_concepts_label_is_recognised() {
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle;version=1.1"),
+            Some(RdfVersion::Rdf11)
+        );
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle;version=1.2-basic"),
+            Some(RdfVersion::Rdf12Basic)
+        );
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle; version=1.2"),
+            Some(RdfVersion::Rdf12)
+        );
+    }
+
+    /// §6: an unrecognised label is a 415, so it must be distinguishable from
+    /// an absent one — `None`, not a silent fallback to 1.1.
+    #[test]
+    fn an_unknown_version_label_is_refused_not_defaulted() {
+        assert_eq!(RdfVersion::from_media_type("text/turtle;version=1.3"), None);
+        assert_eq!(RdfVersion::from_media_type("text/turtle;version="), None);
+    }
+
+    /// Parameter names are case-insensitive per RFC 9110 §5.6.6; the values
+    /// Concepts defines are lowercase tokens.
+    #[test]
+    fn the_parameter_name_is_case_insensitive() {
+        assert_eq!(
+            RdfVersion::from_media_type("text/turtle;VERSION=1.2"),
+            Some(RdfVersion::Rdf12)
+        );
+    }
+
+    /// The wire contract is RDF 1.1 until the declared version is threaded
+    /// through, and it is now checked over *both* of RDF 1.2's additions
+    /// rather than one.
     #[test]
     fn a_triple_term_is_refused() {
         let fmt = Format::from_content_type("text/turtle").unwrap();
         let ttl = b"<http://e/s> <http://e/p> <<( <http://e/a> <http://e/b> <http://e/c> )>> .";
         assert!(matches!(
-            fmt.parse(ttl, "http://e/"),
-            Err(RdfError::Rdf12TripleTerm)
+            fmt.parse(ttl, "http://e/", crate::rdf::RdfVersion::Rdf11),
+            Err(RdfError::UnsupportedRdfVersion { found: RdfVersion::Rdf12, .. })
+        ));
+    }
+
+    /// The gap this closes: a directional language-tagged string is a
+    /// `Term::Literal`, so the old `Term::Triple` match never saw it and it
+    /// walked into storage. Refusing it *as a version* also measures that the
+    /// parser produces one — `Rdf12Basic` is only reachable if it did.
+    #[test]
+    fn a_directional_literal_is_refused_too() {
+        let fmt = Format::from_content_type("text/turtle").unwrap();
+        let ttl = br#"<http://e/s> <http://e/p> "hello"@en--ltr ."#;
+        assert!(matches!(
+            fmt.parse(ttl, "http://e/", crate::rdf::RdfVersion::Rdf11),
+            Err(RdfError::UnsupportedRdfVersion { found: RdfVersion::Rdf12Basic, .. })
         ));
     }
 
@@ -376,7 +548,7 @@ mod tests {
     fn an_ordinary_triple_still_parses() {
         let fmt = Format::from_content_type("text/turtle").unwrap();
         let ttl = b"<http://e/s> <http://e/p> <http://e/o> .";
-        assert_eq!(fmt.parse(ttl, "http://e/").unwrap().quads().len(), 1);
+        assert_eq!(fmt.parse(ttl, "http://e/", crate::rdf::RdfVersion::Rdf11).unwrap().quads().len(), 1);
     }
 
     // Not superseded by the JSON-LD-named-graph tests below: this pins that
@@ -393,9 +565,9 @@ mod tests {
         )]);
 
         let ttl = turtle.serialize(&ds).unwrap();
-        let via_ttl = turtle.parse(&ttl, "https://pod.toph.so/foo").unwrap();
+        let via_ttl = turtle.parse(&ttl, "https://pod.toph.so/foo", crate::rdf::RdfVersion::Rdf11).unwrap();
         let jsonld_bytes = jsonld.serialize(&via_ttl).unwrap();
-        let via_json = jsonld.parse(&jsonld_bytes, "https://pod.toph.so/foo").unwrap();
+        let via_json = jsonld.parse(&jsonld_bytes, "https://pod.toph.so/foo", crate::rdf::RdfVersion::Rdf11).unwrap();
 
         assert_eq!(via_json.quads().len(), 1);
         assert_eq!(via_json.quads()[0].predicate.as_str(), "http://schema.org/name");
@@ -437,7 +609,7 @@ mod tests {
     #[test]
     fn parse_keeps_the_graph_name() {
         let jsonld = Format::from_content_type("application/ld+json").unwrap();
-        let ds = jsonld.parse(NAMED_GRAPH_JSONLD.as_bytes(), "https://pod.toph.so/c/notes").unwrap();
+        let ds = jsonld.parse(NAMED_GRAPH_JSONLD.as_bytes(), "https://pod.toph.so/c/notes", crate::rdf::RdfVersion::Rdf11).unwrap();
 
         assert_eq!(ds.quads().len(), 2);
         let named: Vec<_> = ds.quads().iter()
@@ -488,31 +660,31 @@ mod tests {
         // The case the old first-match resolver gets wrong: Turtle is listed
         // first, but the client also offered a format that carries everything.
         assert_eq!(
-            negotiate("text/turtle, application/ld+json", Shape::Dataset, None),
+            neg("text/turtle, application/ld+json", Shape::Dataset, None),
             Some(jsonld));
         // On a graph-shaped resource the same header takes the first match.
         assert_eq!(
-            negotiate("text/turtle, application/ld+json", Shape::Graph, None),
+            neg("text/turtle, application/ld+json", Shape::Graph, None),
             Some(turtle));
         // q-values outrank order.
         assert_eq!(
-            negotiate("application/ld+json;q=0.2, text/turtle;q=0.9", Shape::Graph, None),
+            neg("application/ld+json;q=0.2, text/turtle;q=0.9", Shape::Graph, None),
             Some(turtle));
         // `*/*` resolves to what the resource arrived as (§6.4).
-        assert_eq!(negotiate("*/*", Shape::Graph, Some(turtle)), Some(turtle));
-        assert_eq!(negotiate("*/*", Shape::Dataset, Some(turtle)), Some(jsonld),
+        assert_eq!(neg("*/*", Shape::Graph, Some(turtle)), Some(turtle));
+        assert_eq!(neg("*/*", Shape::Dataset, Some(turtle)), Some(jsonld),
             "stored format cannot serve it, so fall to one that can");
         // text/* is scoped by its type.
-        assert_eq!(negotiate("text/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("text/*", Shape::Graph, None), Some(turtle));
         // Nothing supported at all is the only remaining 406.
-        assert_eq!(negotiate("image/png", Shape::Graph, None), None);
+        assert_eq!(neg("image/png", Shape::Graph, None), None);
         // `*/*` with nothing stored falls back to Turtle first (§6.4) — only
         // when Turtle cannot carry the resource does JSON-LD win.
-        assert_eq!(negotiate("*/*", Shape::Graph, None), Some(turtle));
-        assert_eq!(negotiate("*/*", Shape::Dataset, None), Some(jsonld));
+        assert_eq!(neg("*/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("*/*", Shape::Dataset, None), Some(jsonld));
         // application/* must resolve to something that can serve the resource.
-        assert_eq!(negotiate("application/*", Shape::Graph, None), Some(turtle));
-        assert_eq!(negotiate("application/*", Shape::Dataset, None), Some(jsonld));
+        assert_eq!(neg("application/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("application/*", Shape::Dataset, None), Some(jsonld));
     }
 
     // RFC 9110 §12.5.1: q=0 is a refusal, not a low rank.
@@ -520,19 +692,19 @@ mod tests {
     fn q_zero_is_a_refusal_not_a_low_rank() {
         let jsonld = Format::from_content_type("application/ld+json").unwrap();
 
-        assert_eq!(negotiate("text/turtle;q=0", Shape::Graph, None), None);
+        assert_eq!(neg("text/turtle;q=0", Shape::Graph, None), None);
         // The only nominally-acceptable entry is refused, and the other is
         // unsupported outright — nothing left to serve.
-        assert_eq!(negotiate("image/png, text/turtle;q=0", Shape::Graph, None), None);
+        assert_eq!(neg("image/png, text/turtle;q=0", Shape::Graph, None), None);
         // `*/*` must not resolve to a type excluded elsewhere in the list.
-        assert_ne!(negotiate("*/*, text/turtle;q=0", Shape::Graph, None), Some(Format::from_content_type("text/turtle").unwrap()));
-        assert_eq!(negotiate("*/*, text/turtle;q=0", Shape::Graph, None), Some(jsonld));
+        assert_ne!(neg("*/*, text/turtle;q=0", Shape::Graph, None), Some(Format::from_content_type("text/turtle").unwrap()));
+        assert_eq!(neg("*/*, text/turtle;q=0", Shape::Graph, None), Some(jsonld));
     }
 
     #[test]
     fn wildcard_matching_is_case_insensitive() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
-        assert_eq!(negotiate("Text/*", Shape::Graph, None), Some(turtle));
+        assert_eq!(neg("Text/*", Shape::Graph, None), Some(turtle));
     }
 
     // §6.2: a client that names only a graph format still gets an answer —
@@ -542,11 +714,11 @@ mod tests {
     #[test]
     fn a_lone_graph_format_still_serves_a_dataset_shaped_resource() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
-        assert_eq!(negotiate("text/turtle", Shape::Dataset, None), Some(turtle));
+        assert_eq!(neg("text/turtle", Shape::Dataset, None), Some(turtle));
         // q=0 still refuses it outright — this is a fallback, not an override.
-        assert_eq!(negotiate("text/turtle;q=0", Shape::Dataset, None), None);
+        assert_eq!(neg("text/turtle;q=0", Shape::Dataset, None), None);
         // A genuinely unsupported type gets no such fallback.
-        assert_eq!(negotiate("image/png", Shape::Dataset, None), None);
+        assert_eq!(neg("image/png", Shape::Dataset, None), None);
     }
 
     // §6.3: `text/*` admits `text/turtle`, and `406` is for when *nothing*
@@ -559,12 +731,12 @@ mod tests {
     #[test]
     fn a_wildcard_range_still_serves_a_dataset_shaped_resource() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
-        assert_eq!(negotiate("text/*", Shape::Dataset, None), Some(turtle));
-        assert_eq!(negotiate("Text/*", Shape::Dataset, None), Some(turtle),
+        assert_eq!(neg("text/*", Shape::Dataset, None), Some(turtle));
+        assert_eq!(neg("Text/*", Shape::Dataset, None), Some(turtle),
             "media ranges are case-insensitive here too (RFC 9110 §8.3.1)");
         // Still scoped by its type, and still refusable.
-        assert_eq!(negotiate("text/*, text/turtle;q=0", Shape::Dataset, None), None);
-        assert_eq!(negotiate("image/*", Shape::Dataset, None), None);
+        assert_eq!(neg("text/*, text/turtle;q=0", Shape::Dataset, None), None);
+        assert_eq!(neg("image/*", Shape::Dataset, None), None);
     }
 
     #[test]
