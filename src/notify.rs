@@ -17,7 +17,7 @@ use axum::response::Response;
 use tokio::sync::broadcast;
 
 use crate::http::AppState;
-use crate::space::{AuxUrl, Target};
+use crate::space::{AuxUrl, GraphName, Target};
 use crate::wac::guard::Materialized;
 
 /// The channel key: a resource's graph IRI, and the unit #18 authorizes a
@@ -30,14 +30,14 @@ use crate::wac::guard::Materialized;
 pub struct Topic(String);
 
 impl From<&Target> for Topic {
-    fn from(_target: &Target) -> Self {
-        todo!("skeleton")
+    fn from(target: &Target) -> Self {
+        Self(target.graph_iri().to_owned())
     }
 }
 
 impl Topic {
     pub fn as_str(&self) -> &str {
-        todo!("skeleton")
+        &self.0
     }
 }
 
@@ -75,6 +75,11 @@ pub struct Event {
     pub state: Option<String>,
 }
 
+/// Events buffered per channel before a slow reader starts losing them to
+/// `RecvError::Lagged`. Handling that loss is the channel type's business
+/// (#18, #19), not this bus's.
+const CAPACITY: usize = 64;
+
 /// The per-topic registry.
 pub struct Bus {
     channels: RwLock<HashMap<Topic, broadcast::Sender<Event>>>,
@@ -90,23 +95,41 @@ impl Bus {
     ///
     /// Evicts any sender whose receiver count has fallen to zero, which is
     /// what keeps the map from growing without bound over client-chosen paths.
-    pub fn live(&self, _topics: &[Topic]) -> Vec<Topic> {
-        todo!("skeleton")
+    pub fn live(&self, topics: &[Topic]) -> Vec<Topic> {
+        let mut channels = self.channels.write().expect("the bus lock is never held across a panic");
+        topics.iter().filter(|t| {
+            match channels.get(*t) {
+                // A sender whose last receiver went away is evicted here rather
+                // than left to accumulate: the key space is client-chosen.
+                Some(tx) if tx.receiver_count() == 0 => { channels.remove(*t); false }
+                Some(_) => true,
+                None => false,
+            }
+        }).cloned().collect()
     }
 
     /// Deliver `event` to `event.topic`'s channel, if it still has one.
     ///
     /// A send with no receivers is the normal case, not an error.
-    pub fn publish(&self, _event: Event) {
-        todo!("skeleton")
+    pub fn publish(&self, event: Event) {
+        let channels = self.channels.read().expect("the bus lock is never held across a panic");
+        if let Some(tx) = channels.get(&event.topic) {
+            // `send` fails only when there is no receiver left, which is the
+            // normal case rather than an error.
+            let _ = tx.send(event);
+        }
     }
 
     /// Take `topic`'s channel, creating it if this is its first receiver.
     ///
     /// Takes `&Arc<Self>` because the returned [`Receiver`] unregisters itself
     /// when the last one drops.
-    pub fn subscribe(self: &Arc<Self>, _topic: Topic) -> Receiver {
-        todo!("skeleton")
+    pub fn subscribe(self: &Arc<Self>, topic: Topic) -> Receiver {
+        let mut channels = self.channels.write().expect("the bus lock is never held across a panic");
+        let tx = channels
+            .entry(topic.clone())
+            .or_insert_with(|| broadcast::channel(CAPACITY).0);
+        Receiver { rx: tx.subscribe(), bus: Arc::clone(self), topic }
     }
 }
 
@@ -126,20 +149,25 @@ impl Default for Bus {
 /// process. Each of those *holds* one of these to get its events. Nothing about
 /// the protocol belongs on this type.
 pub struct Receiver {
-    _bus: Arc<Bus>,
-    _topic: Topic,
-    _rx: broadcast::Receiver<Event>,
+    bus: Arc<Bus>,
+    topic: Topic,
+    rx: broadcast::Receiver<Event>,
 }
 
 impl Receiver {
     pub async fn recv(&mut self) -> Result<Event, broadcast::error::RecvError> {
-        todo!("skeleton")
+        self.rx.recv().await
     }
 }
 
 impl Drop for Receiver {
     fn drop(&mut self) {
-        todo!("skeleton")
+        let mut channels = self.bus.channels.write().expect("the bus lock is never held across a panic");
+        // `self.rx` is still alive here, so the count includes it: 1 means this
+        // was the last reader.
+        if channels.get(&self.topic).is_some_and(|tx| tx.receiver_count() <= 1) {
+            channels.remove(&self.topic);
+        }
     }
 }
 
@@ -200,4 +228,77 @@ pub async fn emit_delete(
     _res: &Response,
 ) {
     todo!("skeleton")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::space::{StorageSpace, GraphName};
+
+    fn target(path: &str) -> Target {
+        StorageSpace::new("https://pod.toph.so/").unwrap().resolve(path).unwrap()
+    }
+
+    #[test]
+    fn a_topic_is_the_targets_graph_iri() {
+        let t = target("/notes");
+        assert_eq!(Topic::from(&t).as_str(), t.graph_iri());
+    }
+
+    #[test]
+    fn an_unwatched_topic_is_not_live() {
+        let bus = Arc::new(Bus::new());
+        assert!(bus.live(&[Topic::from(&target("/notes"))]).is_empty());
+    }
+
+    #[test]
+    fn a_watched_topic_is_live_and_only_that_one() {
+        let bus = Arc::new(Bus::new());
+        let watched = Topic::from(&target("/notes"));
+        let other = Topic::from(&target("/other"));
+        let _rx = bus.subscribe(watched.clone());
+        assert_eq!(bus.live(&[watched.clone(), other]), vec![watched]);
+    }
+
+    #[test]
+    fn dropping_the_last_receiver_unregisters_the_channel() {
+        let bus = Arc::new(Bus::new());
+        let topic = Topic::from(&target("/notes"));
+        drop(bus.subscribe(topic.clone()));
+        assert!(bus.live(&[topic]).is_empty(), "a dropped receiver must leave no entry behind");
+        assert_eq!(bus.channels.read().unwrap().len(), 0, "and no empty sender either");
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_the_receiver_of_that_topic() {
+        let bus = Arc::new(Bus::new());
+        let topic = Topic::from(&target("/notes"));
+        let mut rx = bus.subscribe(topic.clone());
+        bus.publish(Event {
+            topic: topic.clone(),
+            activity: Activity::Update,
+            object: topic.as_str().to_owned(),
+            target: None,
+            state: Some("\"abc\"".to_owned()),
+        });
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.activity, Activity::Update);
+        assert_eq!(got.state.as_deref(), Some("\"abc\""));
+    }
+
+    /// Publishing must not be what creates a channel — otherwise the registry
+    /// fills up with every topic ever written to, which is the unbounded growth
+    /// `live`'s eviction exists to prevent.
+    #[tokio::test]
+    async fn publishing_to_an_unwatched_topic_creates_no_channel() {
+        let bus = Arc::new(Bus::new());
+        let topic = Topic::from(&target("/notes"));
+        bus.publish(Event {
+            topic: topic.clone(), activity: Activity::Delete,
+            object: "x".to_owned(), target: None, state: None,
+        });
+        assert_eq!(bus.channels.read().unwrap().len(), 0,
+            "publish must not register a topic nobody asked for");
+        assert!(bus.live(&[topic]).is_empty());
+    }
 }
