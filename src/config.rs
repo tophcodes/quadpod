@@ -22,13 +22,26 @@ pub struct InvalidOwnerWebId;
 pub struct Config {
     /// Public base URI of this pod. Absolute, with a trailing slash. All
     /// minted URLs and the DPoP `htu` derive from this, never from the socket.
-    #[arg(long, env = "POD_BASE_URI", default_value = "http://localhost:3000/")]
-    pub base_uri: String,
+    ///
+    /// Held as the space it denotes rather than as the text of it: the value
+    /// is checked where it is parsed, so a `Config` that exists has a usable
+    /// base URI and no later caller has to ask again.
+    #[arg(
+        long,
+        env = "POD_BASE_URI",
+        default_value = "http://localhost:3000/",
+        value_parser = parse_space
+    )]
+    pub base_uri: StorageSpace,
 
     /// WebID of the pod owner. Required: the root ACL is provisioned for it,
     /// and a pod with no known owner could only be all-open or all-closed.
-    #[arg(long, env = "POD_OWNER_WEBID")]
-    pub owner_webid: String,
+    ///
+    /// A `NamedNode` for the same reason `base_uri` is a `StorageSpace`, and
+    /// one more: provisioning interpolates it into SPARQL, so the type is what
+    /// keeps an unchecked string from ever reaching that call.
+    #[arg(long, env = "POD_OWNER_WEBID", value_parser = parse_owner_webid)]
+    pub owner_webid: NamedNode,
 
     /// Trusted access-token issuer. Repeatable; may also be given as a
     /// comma-separated list via the environment variable. Empty = open
@@ -81,8 +94,8 @@ pub struct Config {
     /// Where the RDF lives. `memory` keeps it in this process, so every restart
     /// is a fresh pod. `rocksdb:<dir>` holds it in `<dir>`, which exactly one
     /// process may open at a time — root spec §16 ADR-7.
-    #[arg(long, env = "POD_STORE", default_value = "memory")]
-    pub store: String,
+    #[arg(long, env = "POD_RDF_STORE", default_value = "memory")]
+    pub rdf_store: String,
 
     /// Where non-RDF resource bytes live. `memory` keeps them in process,
     /// matching the triple store, so the pod is uniformly ephemeral rather
@@ -99,6 +112,21 @@ pub struct Config {
     /// ceiling behind this number.
     #[arg(long, env = "POD_MAX_BODY_BYTES", default_value_t = 64 * 1024 * 1024)]
     pub max_body_bytes: usize,
+}
+
+/// Where `--base-uri` becomes the space it names.
+///
+/// A `value_parser` rather than a check after the parse, so that a bad value
+/// is a clap error like any other — which is what lets [`blame_file`] point at
+/// the config file when the value came from there. A check in `main.rs` cannot
+/// be pointed anywhere, because by then the error is a string.
+fn parse_space(s: &str) -> Result<StorageSpace, SpaceError> {
+    StorageSpace::new(s.to_string())
+}
+
+/// Where `--owner-webid` becomes an IRI. Same bargain as [`parse_space`].
+fn parse_owner_webid(s: &str) -> Result<NamedNode, InvalidOwnerWebId> {
+    NamedNode::new(s).map_err(|_| InvalidOwnerWebId)
 }
 
 /// The `--config` file as it is written, before any of it reaches clap.
@@ -123,7 +151,7 @@ struct FileConfig {
     allow_insecure_hosts: Option<Vec<String>>,
     listen: Option<String>,
     reset_root_acl: Option<bool>,
-    store: Option<String>,
+    rdf_store: Option<String>,
     blob_store: Option<String>,
     max_body_bytes: Option<u64>,
 }
@@ -187,7 +215,7 @@ fn blame_file(
     path: &std::path::Path,
     from_file: &std::collections::BTreeMap<&'static str, Vec<String>>,
 ) -> clap::Error {
-    let _ = (path, from_file);
+    let _ = (err, path, from_file);
     todo!("2026-07-31-cli-config-design.md §5.1")
 }
 
@@ -253,18 +281,6 @@ impl Config {
         )
     }
 
-    pub fn space(&self) -> Result<StorageSpace, SpaceError> {
-        StorageSpace::new(self.base_uri.clone())
-    }
-
-    /// The owner WebID, confirmed to be an absolute IRI. Provisioning
-    /// interpolates it into SPARQL, so it must never be unvalidated.
-    pub fn validated_owner_webid(&self) -> Result<String, InvalidOwnerWebId> {
-        NamedNode::new(&self.owner_webid)
-            .map(|_| self.owner_webid.clone())
-            .map_err(|_| InvalidOwnerWebId)
-    }
-
     /// The blob backend this process will use, or the operator-facing reason
     /// it cannot be built. Refusing to start beats starting with a backend
     /// that silently differs from the one configured.
@@ -288,9 +304,9 @@ impl Config {
     /// refuses the start, because a pod running on a backend other than the
     /// configured one looks exactly like a correct one until data is missing.
     ///
-    /// Shares its name with the `store` field it reads; the field is the spec
-    /// string, this is the thing it names.
-    pub fn store(&self) -> Result<std::sync::Arc<dyn crate::store::SparqlStore>, String> {
+    /// Shares its name with the field it reads; the field is the spec string,
+    /// this is the thing it names.
+    pub fn rdf_store(&self) -> Result<std::sync::Arc<dyn crate::store::SparqlStore>, String> {
         todo!("2026-07-31-cli-config-design.md §3")
     }
 }
@@ -299,6 +315,7 @@ impl Config {
 mod tests {
     use super::*;
     use clap::Parser;
+    use crate::space::GraphName;
 
     fn parse(args: &[&str]) -> Result<Config, clap::Error> {
         Config::try_parse_from(std::iter::once("sparql-pod").chain(args.iter().copied()))
@@ -319,7 +336,7 @@ mod tests {
             "--expected-audience", "https://pod.toph.so/",
             "--listen", "0.0.0.0:8080",
         ]).expect("parses");
-        assert_eq!(c.base_uri, "https://pod.toph.so/");
+        assert_eq!(c.base_uri.root().graph_iri(), "https://pod.toph.so/");
         assert_eq!(c.owner_webid, "https://alice.example/card#me");
         assert_eq!(c.trusted_issuers.len(), 2);
         assert_eq!(c.expected_audience.as_deref(), Some("https://pod.toph.so/"));
@@ -344,19 +361,18 @@ mod tests {
         assert!(set.contains("https://idp.example/"));
     }
 
+    // The rejection is the parser's, which is what lets `blame_file` name the
+    // config file when the value came from there — a check after the parse
+    // could only name a flag.
     #[test]
     fn non_iri_owner_webid_is_rejected() {
-        let c = parse(&["--owner-webid", "not an iri"]).unwrap();
-        assert!(c.validated_owner_webid().is_err());
+        assert!(parse(&["--owner-webid", "not an iri"]).is_err());
     }
 
     #[test]
     fn iri_owner_webid_is_accepted() {
         let c = parse(&["--owner-webid", "https://alice.example/card#me"]).unwrap();
-        assert_eq!(
-            c.validated_owner_webid().unwrap(),
-            "https://alice.example/card#me"
-        );
+        assert_eq!(c.owner_webid.as_str(), "https://alice.example/card#me");
     }
 
     #[test]

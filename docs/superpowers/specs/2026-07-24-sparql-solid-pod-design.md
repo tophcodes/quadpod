@@ -231,7 +231,7 @@ template); the matcher is still built so the seam exists.
   forwarded Host for space-routing — v1 n/a.)
 - **Bind to localhost / private interface.** Plain HTTP must never be exposed directly; only the
   proxy reaches it. Tune proxy buffering for large blob transfers.
-- **The pod owns a state directory** when configured with `--store rocksdb:<dir>` — a backup and
+- **The pod owns a state directory** when configured with `--rdf-store rocksdb:<dir>` — a backup and
   restore concern, and a mutual-exclusion one: only one process may hold it (§16 ADR-7,
   `2026-07-31-cli-config-design.md` §2.1). Multi-tenancy does not collide with this; §9 runs
   many spaces in one process, as named graphs in one store.
@@ -463,7 +463,7 @@ embedded the store anyway, and `2026-07-30-rdf12-design.md` §8 recorded the div
 resolving it: *"The multi-writer rationale is therefore currently unmet — a pre-existing
 divergence, out of scope here."*
 
-**Decision.** Embedded Oxigraph, selected by `--store rocksdb:<dir>`, is the default and the
+**Decision.** Embedded Oxigraph, selected by `--rdf-store rocksdb:<dir>`, is the default and the
 recommended deployment. The multi-writer rationale is withdrawn, not deferred. `memory` remains
 the default spec value, so an unconfigured pod is still uniformly ephemeral.
 

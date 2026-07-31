@@ -1,23 +1,16 @@
 use std::sync::Arc;
-use clap::Parser;
 use sparql_pod::{auth::{GuardedClient, HttpJwksResolver, HttpWebIdIssuers}, config::Config,
-    http::{AppState, router}, store::OxigraphStore};
+    http::{AppState, router}};
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let cfg = Config::parse();
-    let space = match cfg.space() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("invalid --base-uri: {e}");
-            std::process::exit(2);
-        }
-    };
-    if cfg.validated_owner_webid().is_err() {
-        eprintln!("invalid --owner-webid: must be an absolute IRI");
-        std::process::exit(2);
-    }
+    // Both the base URI and the owner WebID are checked by the parser that
+    // produced them, so there is nothing left to validate here — and an error
+    // in either still names the config file when that is where it came from,
+    // which a check at this point could not do.
+    let cfg = Config::load().unwrap_or_else(|e| e.exit());
+    let space = cfg.base_uri.clone();
     let (fetch_policy, rejected_insecure_hosts) = cfg.try_fetch_policy();
     if !rejected_insecure_hosts.is_empty() {
         // An entry that reaches here is a non-blank string the operator
@@ -56,8 +49,15 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let store = match cfg.rdf_store() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let state = AppState {
-        store: Arc::new(OxigraphStore::in_memory().expect("store")),
+        store,
         blobs,
         space,
         // One client for every outbound auth fetch in the process: cloning it
@@ -73,9 +73,8 @@ async fn main() {
     };
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
         .await.expect("provision root container");
-    let owner = cfg.validated_owner_webid().expect("owner WebID validated above");
     sparql_pod::wac::provision::provision_root_acl(
-        state.store.as_ref(), &state.space, &owner, cfg.reset_root_acl,
+        state.store.as_ref(), &state.space, cfg.owner_webid.as_str(), cfg.reset_root_acl,
     ).await.expect("provision root ACL");
     let listener = tokio::net::TcpListener::bind(cfg.listen).await.unwrap();
     tracing::info!("sparql-pod listening on {}", cfg.listen);

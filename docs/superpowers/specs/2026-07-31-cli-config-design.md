@@ -74,7 +74,7 @@ single-writer — it moves it behind a socket and makes it *shared*, which is th
 or one directory per space inside one process, which helps blast radius and backup
 granularity but not availability.
 
-## 3. `--store`
+## 3. `--rdf-store`
 
 A spec string, shaped exactly like `--blob-store`:
 
@@ -84,9 +84,9 @@ A spec string, shaped exactly like `--blob-store`:
 | `rocksdb:<dir>` | `OxigraphStore::open(<dir>)`, wrapping `oxigraph::store::Store::open` |
 | anything else | refuse to start, exit 2 |
 
-`Config::store() -> Result<Arc<dyn SparqlStore>, String>` mirrors `Config::blobs()` term for
-term, and `main.rs` consumes it with the same match-and-exit-2 shape as the three validations
-already there. Refusing an unknown spec rather than falling back is the rule the existing
+`Config::rdf_store() -> Result<Arc<dyn SparqlStore>, String>` mirrors `Config::blobs()` term
+for term, and `main.rs` consumes it with the same match-and-exit-2 shape as the blob backend
+beside it. Refusing an unknown spec rather than falling back is the rule the existing
 `blobs()` states: a pod that starts with a backend other than the one configured is
 indistinguishable from one configured correctly, and the difference is discovered only when
 data is missing.
@@ -104,9 +104,17 @@ build requirement, no change to the dev shell.
 
 ### 3.2 Naming
 
+**The flag is `--rdf-store`, not `--store`.** `blob_store` says what it holds; a bare `store`
+says only that it is one, which asks an operator to know that "the store" is the RDF one by
+convention. The two flags now read as a pair, and the `Config` field and method are
+`rdf_store` throughout — including on `FileConfig`, which takes its key names from `Config`.
+
 `rocksdb:` names the storage engine, not the product: `memory` and `rocksdb` are both
 Oxigraph, so `oxigraph:<dir>` would not distinguish them. Should a second embeddable quad
 store ever appear, its spec string names its engine too, and the prefix stays honest.
+
+`AppState`'s field stays `store` — there is only one there, and nothing to distinguish it
+from.
 
 ## 4. The config file
 
@@ -121,7 +129,7 @@ in sync with the flags:
 ```toml
 base_uri     = "https://pod.toph.so/"
 owner_webid  = "https://toph.so/profile/card#me"
-store        = "rocksdb:/var/lib/sparql-pod/store"
+rdf_store    = "rocksdb:/var/lib/sparql-pod/store"
 blob_store   = "local:/var/lib/sparql-pod/blobs"
 listen       = "127.0.0.1:3000"
 
@@ -151,6 +159,10 @@ start. That is the same failure a removed flag produces, and it is loud.
 
 `serde` (with `derive`) and `toml` become direct dependencies. Both, and `serde_derive`, are
 already in `Cargo.lock` transitively, so nothing new compiles.
+
+`toml` is pinned to `0.9` for exactly that reason: `rudof_lib` already pulls in 0.9.12, and
+`cargo add toml` would otherwise take 1.1, putting two majors of a TOML parser in one binary
+to no end. The pin is what makes the sentence above true rather than nearly true.
 
 ## 5. Precedence, without hand-written precedence
 
@@ -202,6 +214,43 @@ The same ordering is what makes the pre-parser of step 1 work: its `ignore_error
 runs `add_env`, so `POD_CONFIG` is still seen when the partial parse fails — which it always
 does, since the pre-parser knows none of the real arguments.
 
+### 5.3 Validation belongs in the parser, not after it
+
+§5.1 can only re-point errors clap produced. That leaves a hole the first draft of this design
+missed: `base_uri` and `owner_webid` were plain `String` to clap and were checked afterwards
+in `main.rs`, so a bad value from the file produced `invalid --owner-webid: must be an
+absolute IRI` — naming a flag nobody typed, with no way to reach the file, because by then the
+error is a printed string rather than a `clap::Error`.
+
+So both become `value_parser`s, and the fields hold the checked types:
+
+| Field | Type | Parser |
+|---|---|---|
+| `base_uri` | `StorageSpace` | `parse_space` — `StorageSpace::new` |
+| `owner_webid` | `NamedNode` | `parse_owner_webid` — `NamedNode::new` |
+
+The validation is the same validation; it moves, it does not change. `Config::space()` and
+`Config::validated_owner_webid()` are retired, because a `Config` that exists now *has* a
+usable base URI and a checked owner IRI — there is nothing left for a later caller to ask.
+Two of `main.rs`'s `exit(2)` blocks go with them.
+
+The typing is load-bearing beyond error messages: `provision_root_acl` interpolates the owner
+WebID into Turtle, and `NamedNode` is what stops an unchecked string from reaching that call
+at all. The old comment there — *"Validated because it is interpolated into Turtle below"* —
+becomes a property of the type rather than a note asking the next reader to keep it true.
+
+**What is deliberately not moved.** `allow_insecure_hosts` keeps its own two-stage treatment:
+it reports every entry it could not understand, with a per-entry hint, which a `value_parser`
+returning one error cannot do. `rdf_store` and `blob_store` keep theirs too — those build a
+backend, which is a resource to acquire, not a string to check, and acquiring RocksDB's
+exclusive lock inside argument parsing would put a side effect somewhere nobody expects one.
+Errors from all three still name a flag rather than the file; that is the residual limit of
+§5.1, and it is bounded to three fields whose values are paths and hostnames rather than the
+IRIs most likely to be mistyped.
+
+`trusted_issuers` and `expected_audience` are checked nowhere at all, before this design and
+after it. Out of scope, tracked as issue #24.
+
 ## 6. What this design does not do
 
 - **No remote SPARQL 1.1 client.** The seam stays open — `SparqlStore` is already
@@ -221,9 +270,12 @@ does, since the pre-parser knows none of the real arguments.
 
 ## 7. Testing
 
-- `store()` selects a backend and refuses an unknown one — the mirror of the existing
+- `rdf_store()` selects a backend and refuses an unknown one — the mirror of the existing
   `blob_store_selects_a_backend_and_refuses_an_unknown_one`, including a rejected
   `http://…` spec so the unimplemented-backend case is pinned rather than assumed.
+- The existing `non_iri_owner_webid_is_rejected` moves from "parses, then fails validation"
+  to "fails to parse". That is the whole of §5.3 in one assertion, and it is where a
+  regression to a post-parse check would show up first.
 - **Persistence round trip:** write through the store, drop it, reopen the same directory,
   read the data back. This is the property the flag exists for; a test that only asserts
   `open` returns `Ok` would pass against a backend that persisted nothing.
@@ -246,10 +298,15 @@ constraint"* — is withdrawn. Replaced by: embedded Oxigraph is the default and
 deployment; an external SPARQL 1.1 endpoint remains a supported configuration behind the same
 trait, for the case where several pod processes must share one dataset. See §16 ADR-7.
 
+**`Config::space()` and `Config::validated_owner_webid()` are retired**, together with the two
+`main.rs` `exit(2)` blocks that consumed them (§5.3). Their validation is unchanged and now
+lives in `parse_space` and `parse_owner_webid`. `main.rs` also drops its `clap::Parser` import,
+since `Config::load` replaces `Config::parse`.
+
 **Root spec §10, Deployment.** Gains the on-disk store: the pod now owns a state directory,
 which is a backup and a restore concern, and only one process may hold it.
 
-**`docs/deployment.md`.** Gains a section covering `--store`, the config file, precedence, and
+**`docs/deployment.md`.** Gains a section covering `--rdf-store`, the config file, precedence, and
 the single-process constraint on a `rocksdb:` directory.
 
 **`docs/constraints.md:110`, the `SparqlStore` one-implementor tripwire, is untouched.** This
