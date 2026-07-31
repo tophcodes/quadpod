@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use clap::Parser;
-use sparql_pod::{auth::{HttpJwksResolver, HttpWebIdIssuers}, config::Config,
+use sparql_pod::{auth::{GuardedClient, HttpJwksResolver, HttpWebIdIssuers}, config::Config,
     http::{AppState, router}, store::OxigraphStore};
 
 #[tokio::main]
@@ -48,6 +48,7 @@ async fn main() {
             "--allow-insecure-host: private-IP and https-only checks are waived for these hosts"
         );
     }
+    let guarded_client = GuardedClient::new(&fetch_policy);
     let blobs = match cfg.blobs() {
         Ok(b) => b,
         Err(e) => {
@@ -59,8 +60,14 @@ async fn main() {
         store: Arc::new(OxigraphStore::in_memory().expect("store")),
         blobs,
         space,
-        resolver: Arc::new(HttpJwksResolver::new(fetch_policy.clone())),
-        webid_verifier: Arc::new(HttpWebIdIssuers::new(fetch_policy)),
+        // One client for every outbound auth fetch in the process: cloning it
+        // shares the connection pool, so discovery, JWKS and WebID profile
+        // lookups to the same origin reuse connections and TLS sessions.
+        resolver: Arc::new(HttpJwksResolver::new(
+            guarded_client.clone(),
+            fetch_policy.clone(),
+        )),
+        webid_verifier: Arc::new(HttpWebIdIssuers::new(guarded_client, fetch_policy)),
         auth_config: Arc::new(cfg.auth_config()),
         max_body_bytes: cfg.max_body_bytes,
     };
