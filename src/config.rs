@@ -176,7 +176,11 @@ impl FileConfig {
     }
 
     /// Every key the file set, rendered as the strings clap will parse, keyed
-    /// by the long flag name.
+    /// by argument id — `Config`'s field names, which is what `Command::mut_arg`
+    /// takes. That differs from the long flag for two arguments,
+    /// `trusted_issuers` (`--trusted-issuer`) and `allow_insecure_hosts`
+    /// (`--allow-insecure-host`), which is why [`blame_file`] takes its own
+    /// long-flag-keyed map rather than this one.
     ///
     /// Rendering to strings is deliberate: the file's values then travel the
     /// same `value_parser` as a typed flag, so a bad `listen` in TOML is caught
@@ -285,16 +289,37 @@ fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>)
 /// Re-point a clap error at the file that actually caused it.
 ///
 /// A file-supplied value arrives as a default, so clap phrases its complaint in
-/// terms of a flag the operator never typed. An error naming an argument the
-/// file supplied gets the path and the TOML key prefixed; anything else is
-/// passed through exactly as clap wrote it.
+/// terms of a flag the operator never typed. `from_file` maps each long flag
+/// the file supplied to its TOML key; an error naming one of them gets the path
+/// and the key prefixed, and anything else is passed through exactly as clap
+/// wrote it.
+///
+/// Keyed by long flag rather than by argument id because that is what clap puts
+/// in the error, and the two differ wherever `#[arg(long = "…")]` renames one —
+/// `--trusted-issuer` carries the id `trusted_issuers`.
 fn blame_file(
     err: clap::Error,
     path: &std::path::Path,
-    from_file: &std::collections::BTreeMap<&'static str, Vec<String>>,
+    from_file: &std::collections::BTreeMap<String, &'static str>,
 ) -> clap::Error {
-    let _ = (err, path, from_file);
-    todo!("2026-07-31-cli-config-design.md §5.1")
+    use clap::error::{ContextKind, ContextValue};
+    let Some(ContextValue::String(arg)) = err.get(ContextKind::InvalidArg) else {
+        return err;
+    };
+    // clap renders the argument as it appears on the command line, e.g.
+    // "--listen <LISTEN>"; only the flag itself is a stable key.
+    let long = arg
+        .trim_start_matches("--")
+        .split([' ', '=', '<'])
+        .next()
+        .unwrap_or_default();
+    let Some(key) = from_file.get(long) else {
+        return err;
+    };
+    clap::Error::raw(
+        err.kind(),
+        format!("{}: `{key}`: {err}\n", path.display()),
+    )
 }
 
 impl Config {
@@ -314,11 +339,24 @@ impl Config {
         // Collected once: the pre-parse and the real parse must see the same
         // arguments, and `I` is consumed by whichever runs first.
         let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
-        let defaults = match config_path_from(argv.clone()) {
-            Some(p) => FileConfig::read(&p)?.as_defaults(),
-            None => std::collections::BTreeMap::new(),
+        let Some(path) = config_path_from(argv.clone()) else {
+            let matches = command_with(Default::default()).try_get_matches_from(argv)?;
+            return <Self as clap::FromArgMatches>::from_arg_matches(&matches);
         };
-        let matches = command_with(defaults).try_get_matches_from(argv)?;
+        let defaults = FileConfig::read(&path)?.as_defaults();
+        let cmd = command_with(defaults.clone());
+        // Built from the command rather than guessed, so an id and its long
+        // flag can never drift apart here.
+        let from_file: std::collections::BTreeMap<String, &'static str> = cmd
+            .get_arguments()
+            .filter_map(|a| {
+                let (id, _) = defaults.get_key_value(a.get_id().as_str())?;
+                Some((a.get_long()?.to_string(), *id))
+            })
+            .collect();
+        let matches = cmd
+            .try_get_matches_from(argv)
+            .map_err(|e| blame_file(e, &path, &from_file))?;
         <Self as clap::FromArgMatches>::from_arg_matches(&matches)
     }
 
@@ -861,5 +899,46 @@ mod tests {
         let c = load(&["--owner-webid", "https://a.example/#me"]).expect("loads");
         assert_eq!(c.rdf_store, "memory");
         assert!(c.config.is_none());
+    }
+
+    // §5.1: without this the operator reads `invalid value for '--listen'` and
+    // goes looking at a command line that is correct.
+    #[test]
+    fn a_bad_file_value_names_the_file_and_the_key() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://file.example/#me\"\n",
+            "listen = \"not-a-socket-address\"\n",
+        ));
+        let err = load(&["--config", p.to_str().unwrap()]).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains(p.to_str().unwrap()), "names the file: {msg}");
+        assert!(msg.contains("listen"), "names the key: {msg}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // The other half of the same rule: an error about a value the file never
+    // supplied must stay exactly as clap wrote it.
+    #[test]
+    fn a_bad_flag_value_is_left_alone() {
+        let p = write_temp_toml("owner_webid = \"https://file.example/#me\"\n");
+        let err = load(&["--config", p.to_str().unwrap(), "--listen", "not-a-socket-address"])
+            .expect_err("must fail");
+        assert!(
+            !err.to_string().contains(p.to_str().unwrap()),
+            "the file did not set `listen`, so it must not be blamed"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    // The irregular case the signature exists for.
+    #[test]
+    fn a_bad_file_value_under_an_irregular_long_is_still_blamed() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://file.example/#me\"\n",
+            "base_uri = \"not an absolute uri\"\n",
+        ));
+        let err = load(&["--config", p.to_str().unwrap()]).expect_err("must fail");
+        assert!(err.to_string().contains("base_uri"), "{err}");
+        std::fs::remove_file(&p).ok();
     }
 }
