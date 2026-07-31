@@ -205,19 +205,26 @@ pub enum Shape {
 }
 
 impl Format {
+    /// Every format the write path parses, and therefore every format
+    /// `Accept-Put` and `Accept-Post` name. One array rather than a second
+    /// literal list beside the parser: `aux_links` builds from `AuxKind::ALL`
+    /// for the same reason, and against the same failure — an advertisement
+    /// and a gate that disagree are both individually plausible.
+    pub const ALL: [Self; 5] = [
+        Self(RdfFormat::Turtle),
+        Self(RdfFormat::NTriples),
+        Self(RdfFormat::JsonLd {
+            profile: oxigraph::io::JsonLdProfileSet::empty(),
+        }),
+        Self(RdfFormat::TriG),
+        Self(RdfFormat::NQuads),
+    ];
+
     /// The formats this pod accepts on write, from a `Content-Type`.
     /// Media-type tokens are case-insensitive per RFC 9110 §8.3.1.
     pub fn from_content_type(ct: &str) -> Option<Self> {
-        match media_type(ct).to_ascii_lowercase().as_str() {
-            "text/turtle" => Some(Self(RdfFormat::Turtle)),
-            "application/n-triples" => Some(Self(RdfFormat::NTriples)),
-            "application/ld+json" => Some(Self(RdfFormat::JsonLd {
-                profile: oxigraph::io::JsonLdProfileSet::empty(),
-            })),
-            "application/trig" => Some(Self(RdfFormat::TriG)),
-            "application/n-quads" => Some(Self(RdfFormat::NQuads)),
-            _ => None,
-        }
+        let mt = media_type(ct).to_ascii_lowercase();
+        Self::ALL.into_iter().find(|f| f.media_type() == mt)
     }
 
     /// What goes in the `Content-Type` of a response.
@@ -463,6 +470,27 @@ mod tests {
     /// tests below, so the format tests stay about formats.
     fn neg(accept: &str, shape: Shape, stored: Option<Format>) -> Option<Format> {
         negotiate(accept, shape, stored).map(|(f, _)| f)
+    }
+
+    /// `ALL` is what `Accept-Put` is built from, and `from_content_type` is
+    /// what the write path admits. A format in one and not the other is
+    /// either an advertisement for a type that is refused, or a type that
+    /// works and cannot be discovered — so the two are one array, and this is
+    /// that array's test.
+    #[test]
+    fn every_advertised_format_is_a_format_the_write_path_parses() {
+        for f in Format::ALL {
+            assert_eq!(
+                Format::from_content_type(f.media_type()),
+                Some(f),
+                "{} is advertised but not parsed",
+                f.media_type()
+            );
+        }
+        let mut seen: Vec<&str> = Format::ALL.iter().map(|f| f.media_type()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), Format::ALL.len(), "two entries share a media type");
     }
 
     /// §2.1: the labels are ordered by containment — data valid at a lower
