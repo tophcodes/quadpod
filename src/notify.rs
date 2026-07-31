@@ -310,13 +310,44 @@ pub async fn emit_patch(
 /// `DELETE`: `Delete` on the target, `Remove` on its parent, and a `Delete` on
 /// each auxiliary the cascade took with it. `auxiliaries` are the ones
 /// `Guard::authorize_aux` found present, collected before the write.
+///
+/// Not [`publish_containment`]: a delete has no [`Materialized`] to walk, and
+/// there is exactly one containment fact to report, computed here directly.
 pub async fn emit_delete(
-    _st: &AppState,
-    _target: &Target,
-    _auxiliaries: &[AuxUrl],
-    _status: StatusCode,
+    st: &AppState,
+    target: &Target,
+    auxiliaries: &[AuxUrl],
+    status: StatusCode,
 ) {
-    todo!("skeleton")
+    if !status.is_success() {
+        return;
+    }
+    publish_own(st, target, Activity::Delete).await;
+    for aux in auxiliaries {
+        publish_own(st, &Target::Aux(aux.clone()), Activity::Delete).await;
+    }
+    // An auxiliary is never a container member, so its removal changes no
+    // containment and its parent hears nothing (design §4.2).
+    let Some(parent) = (match target {
+        Target::Resource(r) => r.parent(),
+        Target::Container(c) => c.as_resource().parent(),
+        Target::Aux(_) => None,
+    }) else {
+        return;
+    };
+    let parent_target = Target::Container(parent.clone());
+    let topic = Topic::from(&parent_target);
+    if st.events.live(std::slice::from_ref(&topic)).is_empty() {
+        return;
+    }
+    let state = state_of(st, &parent_target).await;
+    st.events.publish(Event {
+        topic,
+        activity: Activity::Remove,
+        object: target.graph_iri().to_owned(),
+        target: Some(parent.graph_iri().to_owned()),
+        state,
+    });
 }
 
 /// The topic's validator after the write — §5.1.

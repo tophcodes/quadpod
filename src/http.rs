@@ -1976,63 +1976,79 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     if let Err(res) = guard.authorize(Mode::Write) {
         return with_aux_links(res, &target);
     }
-    let subject = match &target {
+    // The auxiliary arm's response carries no `present_auxes` of its own — an
+    // auxiliary cascades no others — so both arms reach the single emit below
+    // through the same pair.
+    let (res, present_auxes): (Response, Vec<AuxUrl>) = if let Target::Aux(a) = &target {
         // Removing an auxiliary is a complete operation on its own: the path
         // falls back to inherited policy, which is exactly what its absence
         // means. Nothing else refers to it — an auxiliary is never a
         // container member — so there is no containment to repair.
-        Target::Aux(a) => {
-            return match delete_rdf(store, a).await {
-                Ok(true) => StatusCode::NO_CONTENT.into_response(),
-                Ok(false) => StatusCode::NOT_FOUND.into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            };
-        }
-        Target::Resource(r) => r,
-        Target::Container(c) => c.as_resource(),
-    };
-    // Removing a member rewrites the parent's containment triples.
-    if let Err(res) = guard.authorize_parent(Mode::Write) {
-        return with_aux_links(res, &target);
-    }
-    // Deleting a subject takes every auxiliary it has with it (that cascade
-    // is `aux::delete_subject`'s definition, not a step remembered here), so
-    // the caller must be allowed to remove each one that exists. Without
-    // this, a narrowing ACL — WAC's only mechanism for revoking what an
-    // ancestor hands down through `acl:default` — could be erased by someone
-    // holding merely Write: delete the resource, recreate it, and the wider
-    // ancestor grant applies again. The residual signal ("this resource has
-    // an auxiliary of kind k") is only ever observable to a caller who
-    // already holds Write on it.
-    for kind in AuxKind::ALL {
-        if let Err(res) = guard.authorize_aux(*kind) {
+        let res = match delete_rdf(store, a).await {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        (res, Vec::new())
+    } else {
+        let subject = match &target {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource(),
+            Target::Aux(_) => unreachable!("matched above"),
+        };
+        // Removing a member rewrites the parent's containment triples.
+        if let Err(res) = guard.authorize_parent(Mode::Write) {
             return with_aux_links(res, &target);
         }
-    }
-    if let Target::Container(c) = &target {
-        if subject.parent().is_none() {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        match container::container_is_empty(store, c).await {
-            Ok(false) => return StatusCode::CONFLICT.into_response(),
-            Ok(true) => {}
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    }
-    match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
-        Ok(true) => {
-            if let Some(parent) = subject.parent() {
-                if let Err(e) =
-                    container::remove_containment(store, &parent, subject.graph_iri()).await
-                {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
+        // Deleting a subject takes every auxiliary it has with it (that cascade
+        // is `aux::delete_subject`'s definition, not a step remembered here), so
+        // the caller must be allowed to remove each one that exists. Without
+        // this, a narrowing ACL — WAC's only mechanism for revoking what an
+        // ancestor hands down through `acl:default` — could be erased by someone
+        // holding merely Write: delete the resource, recreate it, and the wider
+        // ancestor grant applies again. The residual signal ("this resource has
+        // an auxiliary of kind k") is only ever observable to a caller who
+        // already holds Write on it.
+        //
+        // `authorize_aux` answers `Ok(Some(_))` exactly for a kind the probe
+        // found present, so that same call collects `present_auxes` — the set
+        // `emit_delete` reports — without a second probe.
+        let mut present_auxes: Vec<AuxUrl> = Vec::new();
+        for kind in AuxKind::ALL {
+            match guard.authorize_aux(*kind) {
+                Err(res) => return with_aux_links(res, &target),
+                Ok(Some(_)) => present_auxes.push(subject.aux(*kind)),
+                Ok(None) => {}
             }
-            StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+        if let Target::Container(c) = &target {
+            if subject.parent().is_none() {
+                return StatusCode::METHOD_NOT_ALLOWED.into_response();
+            }
+            match container::container_is_empty(store, c).await {
+                Ok(false) => return StatusCode::CONFLICT.into_response(),
+                Ok(true) => {}
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        let res = match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
+            Ok(true) => {
+                if let Some(parent) = subject.parent() {
+                    if let Err(e) =
+                        container::remove_containment(store, &parent, subject.graph_iri()).await
+                    {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    }
+                }
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(false) => with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        (res, present_auxes)
+    };
+    crate::notify::emit_delete(&st, &target, &present_auxes, res.status()).await;
+    res
 }
 
 #[cfg(test)]
@@ -7305,5 +7321,115 @@ mod tests {
              { <#it> <http://schema.org/name> \"absent\" . } .\n").await;
         assert_eq!(res.status(), StatusCode::CONFLICT, "the fixture's premise");
         stays_silent(&mut on_target, "a refused patch is not a change").await;
+    }
+
+    /// The resource, and its parent losing a member. `Remove` carries the child
+    /// as `object`, exactly as `Add` does.
+    #[tokio::test]
+    async fn a_delete_emits_delete_on_the_target_and_remove_on_the_parent() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/c/notes").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Delete);
+        assert_eq!(e.state, None, "a deleted resource has no state to report");
+
+        let p = next_event(&mut on_parent).await;
+        assert_eq!(p.activity, crate::notify::Activity::Remove);
+        assert_eq!(p.object, target.graph_iri());
+        assert_eq!(p.target.as_deref(), Some(parent.graph_iri()));
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state. Catches a Remove reporting
+        // back the child's (nonexistent) state instead of the parent's.
+        let parent_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(p.state.as_deref(), Some(parent_etag.as_str()),
+            "the parent still exists and reports its new state");
+    }
+
+    /// `aux::delete_subject` takes the ACL with the subject, and its own topic
+    /// hears about it.
+    #[tokio::test]
+    async fn deleting_a_subject_emits_delete_for_the_auxiliaries_it_cascades() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        f.app.clone().oneshot(f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> \
+                 <http://www.w3.org/ns/auth/acl#Read>, <http://www.w3.org/ns/auth/acl#Write>, \
+                 <http://www.w3.org/ns/auth/acl#Control> ."))).unwrap())
+            .await.unwrap();
+
+        let acl = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let mut on_acl = f.events.subscribe(crate::notify::Topic::from(&acl));
+        f.app.clone().oneshot(
+            f.owner_request("DELETE", "/c/notes").body(Body::empty()).unwrap()).await.unwrap();
+
+        let e = next_event(&mut on_acl).await;
+        assert_eq!(e.activity, crate::notify::Activity::Delete);
+    }
+
+    /// An auxiliary is never a container member, so its removal is not a
+    /// containment change and the parent hears nothing (design §4.2).
+    #[tokio::test]
+    async fn deleting_an_auxiliary_emits_no_parent_event() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        f.app.clone().oneshot(f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> \
+                 <http://www.w3.org/ns/auth/acl#Read>, <http://www.w3.org/ns/auth/acl#Write>, \
+                 <http://www.w3.org/ns/auth/acl#Control> ."))).unwrap())
+            .await.unwrap();
+
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/.aux/c/notes.acl").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        stays_silent(&mut on_parent,
+            "an auxiliary is not a member, so nothing about containment changed").await;
+    }
+
+    /// A refused delete emits nothing: the tail returns before touching the bus.
+    #[tokio::test]
+    async fn a_refused_delete_emits_nothing() {
+        let f = fixture().await;
+        let mut on_target = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/never-existed").unwrap()));
+
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/never-existed").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "the fixture's premise");
+        stays_silent(&mut on_target, "a refused delete is not a change").await;
     }
 }
