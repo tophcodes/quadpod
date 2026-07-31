@@ -215,17 +215,28 @@ impl FileConfig {
 
 /// Pass 1: the `--config` path, from the argv or `POD_CONFIG`.
 ///
-/// Parses with `ignore_errors`, because it runs before anything else is known
-/// and must survive an argv it cannot fully understand — including a missing
-/// required `--owner-webid`. clap's error path still applies environment
-/// variables, so `POD_CONFIG` is seen even though this parse fails.
+/// Runs before anything else is known and must survive an argv it cannot
+/// fully understand — including a missing required `--owner-webid` and flags
+/// it has never heard of. A `clap::Command` with `ignore_errors(true)` cannot
+/// do this: on an unrecognized flag it loses track of whether the next token
+/// is that flag's value or the next flag, and can walk past `--config`
+/// entirely. So this scans the argv by hand instead, and falls back to
+/// `POD_CONFIG` when no `--config` is present.
 fn config_path_from<I, T>(argv: I) -> Option<std::path::PathBuf>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let _ = argv.into_iter();
-    todo!("2026-07-31-cli-config-design.md §5 step 1")
+    let mut args = argv.into_iter().map(Into::into);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            return args.next().map(std::path::PathBuf::from);
+        }
+        if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix("--config=")) {
+            return Some(std::path::PathBuf::from(value));
+        }
+    }
+    std::env::var_os("POD_CONFIG").map(std::path::PathBuf::from)
 }
 
 /// Pass 2: `Config`'s own command, with the file's values installed as defaults.
@@ -678,5 +689,29 @@ mod tests {
         assert_eq!(d.get("max_body_bytes"), Some(&vec!["42".to_string()]));
         assert_eq!(d.get("listen"), None, "an unset key must not become a default");
         std::fs::remove_file(&p).ok();
+    }
+
+    // The pre-parser runs before anything is known, so it must survive an argv
+    // it cannot fully understand — here a required flag it has never heard of.
+    // That is the case `ignore_errors` exists for, and the one most likely to
+    // break silently.
+    #[test]
+    fn the_pre_parser_finds_config_beside_arguments_it_does_not_know() {
+        let found = config_path_from([
+            "sparql-pod",
+            "--owner-webid",
+            "https://a.example/#me",
+            "--config",
+            "/tmp/pod.conf",
+            "--trusted-issuer",
+            "https://idp.example/",
+        ]);
+        assert_eq!(found, Some(std::path::PathBuf::from("/tmp/pod.conf")));
+    }
+
+    #[test]
+    fn the_pre_parser_returns_none_without_config() {
+        let found = config_path_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+        assert_eq!(found, None);
     }
 }
