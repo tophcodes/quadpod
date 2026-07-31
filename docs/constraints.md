@@ -308,3 +308,27 @@ The `version` media-type parameter is read in exactly one place.
     what this forbids. A looser pattern counted a test assertion as a
     violation.
     check: [ "$(rg -o 'eq_ignore_ascii_case\("version"\)|strip_prefix\("version="\)|starts_with\("version="\)' src | wc -l)" = 1 ]
+
+## Configuration
+
+The config file is never found, only named.
+    → 2026-07-31-cli-config-design.md §4. A pod must not be able to start
+    against a file that is invisible to whoever reads the command line, so
+    `--config`/`POD_CONFIG` is the only route in and there is no search path.
+    The rule is cheap to break by accident: adding a "just look in the working
+    directory too" convenience is one line, reads as helpful, and silently
+    makes two pods with identical invocations behave differently depending on
+    where they were started. Demonstrated red against a
+    `const SEARCH_PATH: &str = "sparql-pod.toml"`.
+    check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|\.toml"' src
+
+Precedence is clap's, never hand-written.
+    → 2026-07-31-cli-config-design.md §5, §5.1; `config.rs`'s module header,
+    which states the property this pins. File values reach clap as defaults,
+    so flag > env > file > default falls out of clap's own resolution with no
+    merge logic anywhere. The alternative — reading `ArgMatches::value_source`
+    and overwriting whatever came from a default — needs one arm per field,
+    and a field whose arm is forgotten silently ignores the file. Nothing but
+    a missing test would catch that, which is what makes it worth a rule.
+    Demonstrated red against a `value_source("listen")` merge helper.
+    check: ! rg -q 'value_source' src/config.rs

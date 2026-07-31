@@ -70,6 +70,20 @@ pub struct Config {
     )]
     pub reset_root_acl: bool,
 
+    /// A TOML file supplying any of the values below. Nothing is loaded unless
+    /// this names a path: there is no search path, so a pod cannot start
+    /// against a file that is invisible to whoever reads the command line. A
+    /// path that is named but unreadable, or is not valid TOML, refuses the
+    /// start rather than falling back to flags alone.
+    #[arg(long, env = "POD_CONFIG")]
+    pub config: Option<std::path::PathBuf>,
+
+    /// Where the RDF lives. `memory` keeps it in this process, so every restart
+    /// is a fresh pod. `rocksdb:<dir>` holds it in `<dir>`, which exactly one
+    /// process may open at a time — root spec §16 ADR-7.
+    #[arg(long, env = "POD_STORE", default_value = "memory")]
+    pub store: String,
+
     /// Where non-RDF resource bytes live. `memory` keeps them in process,
     /// matching the triple store, so the pod is uniformly ephemeral rather
     /// than making blobs outlive the triples describing them.
@@ -87,7 +101,114 @@ pub struct Config {
     pub max_body_bytes: usize,
 }
 
+/// The `--config` file as it is written, before any of it reaches clap.
+///
+/// Every field is optional because the file supplies what it wants and clap
+/// settles the rest. `deny_unknown_fields` is what makes a mistyped key refuse
+/// the start: a pod that runs with less configuration than the operator wrote
+/// is indistinguishable from one configured correctly, and the difference
+/// surfaces only as failing requests.
+///
+/// The field names are `Config`'s own, so there is no second vocabulary to keep
+/// in sync with the flags. The *types* differ where TOML has a better one —
+/// `max_body_bytes` is an integer here and a string on the command line — which
+/// is why [`FileConfig::as_defaults`] exists rather than a direct assignment.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    base_uri: Option<String>,
+    owner_webid: Option<String>,
+    trusted_issuers: Option<Vec<String>>,
+    expected_audience: Option<String>,
+    allow_insecure_hosts: Option<Vec<String>>,
+    listen: Option<String>,
+    reset_root_acl: Option<bool>,
+    store: Option<String>,
+    blob_store: Option<String>,
+    max_body_bytes: Option<u64>,
+}
+
+impl FileConfig {
+    /// Read and parse `path`. Unreadable, or not TOML, or carrying a key this
+    /// binary does not know: all three are the same answer, an error that
+    /// refuses the start.
+    fn read(path: &std::path::Path) -> Result<Self, clap::Error> {
+        let _ = path;
+        todo!("2026-07-31-cli-config-design.md §4, §4.1")
+    }
+
+    /// Every key the file set, rendered as the strings clap will parse, keyed
+    /// by the long flag name.
+    ///
+    /// Rendering to strings is deliberate: the file's values then travel the
+    /// same `value_parser` as a typed flag, so a bad `listen` in TOML is caught
+    /// by the parser that catches a bad `--listen`, and the file cannot reach
+    /// a field by a route that skips validation. `Vec<String>` covers both the
+    /// scalar arguments and the repeatable ones without a second shape.
+    fn as_defaults(&self) -> std::collections::BTreeMap<&'static str, Vec<String>> {
+        todo!("2026-07-31-cli-config-design.md §5")
+    }
+}
+
+/// Pass 1: the `--config` path, from the argv or `POD_CONFIG`.
+///
+/// Parses with `ignore_errors`, because it runs before anything else is known
+/// and must survive an argv it cannot fully understand — including a missing
+/// required `--owner-webid`. clap's error path still applies environment
+/// variables, so `POD_CONFIG` is seen even though this parse fails.
+fn config_path_from<I, T>(argv: I) -> Option<std::path::PathBuf>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let _ = argv.into_iter();
+    todo!("2026-07-31-cli-config-design.md §5 step 1")
+}
+
+/// Pass 2: `Config`'s own command, with the file's values installed as defaults.
+///
+/// This is the whole precedence mechanism. clap already resolves flag > env >
+/// default; putting the file in the default slot lands it exactly one rung
+/// below the environment without a line of merge logic, and a flag added later
+/// picks up file support from the same derive that gives it its flag.
+fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>) -> clap::Command {
+    let _ = defaults;
+    todo!("2026-07-31-cli-config-design.md §5 step 2")
+}
+
+/// Re-point a clap error at the file that actually caused it.
+///
+/// A file-supplied value arrives as a default, so clap phrases its complaint in
+/// terms of a flag the operator never typed. An error naming an argument the
+/// file supplied gets the path and the TOML key prefixed; anything else is
+/// passed through exactly as clap wrote it.
+fn blame_file(
+    err: clap::Error,
+    path: &std::path::Path,
+    from_file: &std::collections::BTreeMap<&'static str, Vec<String>>,
+) -> clap::Error {
+    let _ = (path, from_file);
+    todo!("2026-07-31-cli-config-design.md §5.1")
+}
+
 impl Config {
+    /// This process's configuration, from the real argv and environment.
+    pub fn load() -> Result<Self, clap::Error> {
+        todo!("2026-07-31-cli-config-design.md §5")
+    }
+
+    /// [`Config::load`] against a supplied argv, which is what makes the file
+    /// reachable from a test: the path arrives as `--config <tmpfile>` rather
+    /// than from a fixed location.
+    pub fn try_load_from<I, T>(argv: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let _ = argv.into_iter();
+        todo!("2026-07-31-cli-config-design.md §5")
+    }
+
     pub fn auth_config(&self) -> AuthConfig {
         let set: HashSet<String> = self
             .trusted_issuers
@@ -160,6 +281,17 @@ impl Config {
         Err(format!(
             "--blob-store: expected `memory` or `local:<dir>`, got `{spec}`"
         ))
+    }
+
+    /// The triple store this process will use, or the operator-facing reason it
+    /// cannot be built. Same bargain as [`Config::blobs`]: an unrecognised spec
+    /// refuses the start, because a pod running on a backend other than the
+    /// configured one looks exactly like a correct one until data is missing.
+    ///
+    /// Shares its name with the `store` field it reads; the field is the spec
+    /// string, this is the thing it names.
+    pub fn store(&self) -> Result<std::sync::Arc<dyn crate::store::SparqlStore>, String> {
+        todo!("2026-07-31-cli-config-design.md §3")
     }
 }
 

@@ -72,6 +72,18 @@ impl OxigraphStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    /// The store held in `dir`, created if it is not there yet.
+    ///
+    /// Only one process may hold a directory at a time — `Store::open` takes an
+    /// exclusive lock, so a second pod aimed at the same path fails here rather
+    /// than sharing it. That bound is the whole of the single-writer constraint
+    /// (root spec §16 ADR-7): it is about processes, not about the tasks inside
+    /// this one, which write concurrently as before.
+    pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
+        let _ = dir;
+        todo!("2026-07-31-cli-config-design.md §3")
+    }
+
     /// Runs `f` against the store on Tokio's blocking pool.
     ///
     /// Oxigraph is a synchronous library: `Store::update` and a query's
