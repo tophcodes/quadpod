@@ -87,6 +87,17 @@ parent container (`http.rs:1928`) and every existing auxiliary of the subject
 server-minted, so its non-existence is known without asking. A `PUT` to an auxiliary computes
 from its subject.
 
+**`POST` is the one method that builds two guards, and it has to.** Its second target does not
+exist until its first authorization has passed: the container is authorized before the child's
+name is minted, precisely so that nothing — not even the name-collision check — answers ahead of
+the guard (`http.rs:1337`'s comment). So `post_impl` probes the container, authorizes `Append`,
+settles the name, then probes the child. The child's chain is the container's chain plus one
+element, so the second probe is one more query, not another ladder. Two guards, still one chain.
+
+The child probe also absorbs `name_is_taken`: "is this name free" is the presence question the
+probe already answers, and reading it from the guard removes a store call rather than adding
+one. A collision costs a third probe, which is what a collision is worth.
+
 This is what makes a single probe complete rather than merely helpful. It is not an
 optimization that happens to work today: it is a consequence of LDP addressing one resource per
 request, and a handler that broke it would have no way to express itself through the API in §5.
