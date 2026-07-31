@@ -257,8 +257,27 @@ where
 /// below the environment without a line of merge logic, and a flag added later
 /// picks up file support from the same derive that gives it its flag.
 fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>) -> clap::Command {
-    let _ = defaults;
-    todo!("2026-07-31-cli-config-design.md §5 step 2")
+    use clap::CommandFactory;
+    let mut cmd = Config::command();
+    for (id, values) in defaults {
+        // Leaked rather than borrowed: `Arg::default_values` needs `Into<OsStr>`,
+        // and without clap's `string` feature (not enabled in this workspace)
+        // `clap::builder::OsStr` can only be built from a `'static str`. These
+        // values live for the process anyway, so leaking them is the process's
+        // own allocation outliving nothing it didn't already own.
+        let values: Vec<&'static str> = values
+            .into_iter()
+            .map(|v| -> &'static str { Box::leak(v.into_boxed_str()) })
+            .collect();
+        // `required(false)` alongside the default: clap's own required check
+        // looks only at whether the value came from the command line or the
+        // environment (`ValueSource::is_explicit`), never at whether a
+        // default was set — so a required argument with nothing but a
+        // default still reports missing. Explicitly lifting the requirement
+        // is what lets a file-supplied value satisfy it.
+        cmd = cmd.mut_arg(id, move |a| a.default_values(values).required(false));
+    }
+    cmd
 }
 
 /// Re-point a clap error at the file that actually caused it.
@@ -279,7 +298,7 @@ fn blame_file(
 impl Config {
     /// This process's configuration, from the real argv and environment.
     pub fn load() -> Result<Self, clap::Error> {
-        todo!("2026-07-31-cli-config-design.md §5")
+        Self::try_load_from(std::env::args_os())
     }
 
     /// [`Config::load`] against a supplied argv, which is what makes the file
@@ -290,8 +309,15 @@ impl Config {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let _ = argv.into_iter();
-        todo!("2026-07-31-cli-config-design.md §5")
+        // Collected once: the pre-parse and the real parse must see the same
+        // arguments, and `I` is consumed by whichever runs first.
+        let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
+        let defaults = match config_path_from(argv.clone()) {
+            Some(p) => FileConfig::read(&p)?.as_defaults(),
+            None => std::collections::BTreeMap::new(),
+        };
+        let matches = command_with(defaults).try_get_matches_from(argv)?;
+        <Self as clap::FromArgMatches>::from_arg_matches(&matches)
     }
 
     pub fn auth_config(&self) -> AuthConfig {
@@ -753,5 +779,69 @@ mod tests {
             want,
             "--config <path>"
         );
+    }
+
+    fn load(args: &[&str]) -> Result<Config, clap::Error> {
+        Config::try_load_from(std::iter::once("sparql-pod").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn a_file_value_is_used_when_nothing_overrides_it() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://file.example/#me\"\n",
+            "listen = \"127.0.0.1:9999\"\n",
+        ));
+        let c = load(&["--config", p.to_str().unwrap()]).expect("loads");
+        assert_eq!(c.owner_webid.as_str(), "https://file.example/#me");
+        assert_eq!(c.listen.to_string(), "127.0.0.1:9999");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // §5.2: a file value satisfies a required argument, because clap sees an
+    // argument carrying a default and treats it as present.
+    #[test]
+    fn a_file_satisfies_the_required_owner_webid() {
+        let p = write_temp_toml("owner_webid = \"https://file.example/#me\"\n");
+        assert!(load(&["--config", p.to_str().unwrap()]).is_ok());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_flag_beats_the_file() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://file.example/#me\"\n",
+            "listen = \"127.0.0.1:9999\"\n",
+        ));
+        let c = load(&["--config", p.to_str().unwrap(), "--listen", "127.0.0.1:1234"])
+            .expect("loads");
+        assert_eq!(c.listen.to_string(), "127.0.0.1:1234");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_default_survives_a_file_that_says_nothing() {
+        let p = write_temp_toml("owner_webid = \"https://file.example/#me\"\n");
+        let c = load(&["--config", p.to_str().unwrap()]).expect("loads");
+        assert_eq!(c.rdf_store, "memory");
+        assert_eq!(c.max_body_bytes, 64 * 1024 * 1024);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_file_list_becomes_several_values() {
+        let p = write_temp_toml(concat!(
+            "owner_webid = \"https://file.example/#me\"\n",
+            "trusted_issuers = [\"https://one.example/\", \"https://two.example/\"]\n",
+        ));
+        let c = load(&["--config", p.to_str().unwrap()]).expect("loads");
+        assert_eq!(c.trusted_issuers.len(), 2);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn no_config_flag_loads_nothing() {
+        let c = load(&["--owner-webid", "https://a.example/#me"]).expect("loads");
+        assert_eq!(c.rdf_store, "memory");
+        assert!(c.config.is_none());
     }
 }
