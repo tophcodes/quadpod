@@ -1,7 +1,7 @@
 //! Why six of Plan 6's seven defect classes cannot recur, and what else the
 //! type system decides here.
 //!
-//! Five are gone at the type level and have no runtime test, because the
+//! Six are gone at the type level and have no runtime test, because the
 //! expression that would exercise them does not compile:
 //!
 //! * **Slug escalation.** The only struct literal that produces an `AuxUrl`
@@ -55,6 +55,16 @@
 //!   dropping a body instead of skolemizing it is a decision, not a broken
 //!   invariant, so `http.rs` tests what a `PUT` with a blank node actually
 //!   stores.
+//! * **An unvalidated owner WebID in the root ACL.** `provision_root_acl`
+//!   (`src/wac/provision.rs`) interpolates the owner's WebID into a Turtle
+//!   string, so an unvalidated one closes the IRI and continues as syntax —
+//!   the Plan-1 lesson. Its parameter is `&NamedNode`, and `NamedNode::new`
+//!   is the only way to make one, so the check happens where the value is
+//!   parsed: `Config::owner_webid` carries the type, not a `String`. The
+//!   runtime test that used to feed it `"not an iri> } ; DROP ALL ; #"` is
+//!   gone because that expression no longer compiles. What this does *not*
+//!   cover: the graph IRIs interpolated beside it come from `GraphName`,
+//!   which is sealed by its own rule in `docs/constraints.md`.
 //! * **Orphaned auxiliary.** `resource::delete_rdf` is bounded to
 //!   `impl DirectlyDeletable` (`src/resource.rs:141-144`), and
 //!   `DirectlyDeletable` is implemented only for `AuxUrl` (`src/space.rs:181`)
