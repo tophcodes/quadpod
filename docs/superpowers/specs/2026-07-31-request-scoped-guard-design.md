@@ -159,11 +159,20 @@ impl<'a> Guard<'a> {
     fn authorize_parent(&self, mode: Mode) -> Result<Option<Decision>, Response>;
     fn authorize_aux(&self, kind: AuxKind) -> Result<Option<Decision>, Response>;
 
+    fn target_exists(&self) -> bool;
     fn is_taken(&self) -> bool;
     fn deny(&self) -> Response;
     async fn materialize(self) -> Result<(), Response>;
 }
 ```
+
+The two presence readers answer two different **questions**, which is why they are two methods
+and not one — and why they are not the pair §3 rejects. `target_exists` is "is there a
+representation here", which a creating `PATCH` asks to tell a create from an update.
+`is_taken` is "may a freshly minted name land on this URL", which folds in the trailing-slash
+counterpart because Protocol §3.1 forbids the pair. The rejected shape was handing out the
+*components* of one question for a caller to reassemble; two callers with two questions is the
+guard doing its job.
 
 The lifetime ties a guard to the store reference it was probed with, so it cannot be stashed in
 anything that outlives the request's snapshot of the store. `authorize_parent` and
