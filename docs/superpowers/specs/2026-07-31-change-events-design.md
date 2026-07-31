@@ -24,7 +24,7 @@ Four properties are decided beyond "events exist":
 - **Nothing is computed for a topic nobody is listening to.** The `state` of an event is read
   only after the registry has confirmed a live channel for its topic. With no subscribers the
   write path does no extra I/O, with one exception it cannot: a `PUT` on an auxiliary pays one
-  `exists` probe that has to run before the write and therefore before the gate (§4.2).
+  `exists` probe that has to run before the write and therefore before the gate (§4.3).
 - **`state` is the ETag of the N-Quads representation at the held RDF version**, or the blob
   ETag for a binary resource, and it always describes the *topic* — never the `object`.
 - **Emission is synchronous with the request.** The state a notification reports must be the
@@ -139,17 +139,55 @@ to a URL that did not exist yet. That is legitimate and is the "tell me when thi
 | Request | Events |
 |---|---|
 | `PUT`/`PATCH` on an existing resource | `r` → `Update` |
-| `PUT`/`POST`/`PATCH` that creates | `r` → `Create`; parent `p` → `Update` and `Add`(object=`r`, target=`p`) |
-| containers materialized on the way | each `c` → `Create`; its parent → `Update` + `Add` |
+| `PUT`/`POST`/`PATCH` that creates | `r` → `Create`; parent `p` → `Add`(object=`r`, target=`p`) |
+| containers materialized on the way | each `c` → `Create`; its parent → `Add` |
 | `PUT` on an existing container | `c` → `Update` |
-| `DELETE` of a resource or container | `r` → `Delete`; parent `p` → `Update` and `Remove`(object=`r`, target=`p`) |
+| `DELETE` of a resource or container | `r` → `Delete`; parent `p` → `Remove`(object=`r`, target=`p`) |
 | the auxiliaries that delete took with it | each `a` → `Delete` on its own topic |
 | `PUT` on an auxiliary | `a` → `Create` or `Update`, no parent event |
 | `DELETE` of an auxiliary | `a` → `Delete`, no parent event |
 
 `PATCH` appears in the creating row because `create_by_patch` exists.
 
-### 4.1 An auxiliary has no containment to report
+A `PUT /a/b/c.ttl` onto an empty path is therefore six events: three `Create`, three `Add`.
+
+### 4.1 A containment change is `Add`/`Remove` alone, not `Update` beside it
+
+The issue's text gave the parent `as:Update` *plus* `as:Add`/`as:Remove`. That is one event too
+many. `Add` already says the container changed, the container's new `state` rides on that same
+event, and the Community Solid Server — the only Solid implementation whose behaviour can be
+read — sends only the one:
+
+```typescript
+private addContainerActivity(map: ChangeMap, id: ResourceIdentifier, add: boolean, object: ResourceIdentifier): void {
+  const metadata = new RepresentationMetadata({
+    [SOLID_AS.activity]: add ? AS.terms.Add : AS.terms.Remove,
+    [AS.object]: namedNode(object.path),
+  });
+  map.set(id, metadata);
+}
+```
+
+Its `ChangeMap` is keyed by identifier, so it *cannot* carry two activities for one resource.
+Every client written against CSS therefore already copes with `Add` alone, and none expects the
+pair. That also independently confirms §3.2: the parent's `AS.object` is the child.
+
+`Update` stays where a container's representation changes without containment changing — a `PUT`
+on an existing container.
+
+**One deliberate divergence.** A container that is created *and* gains a child in the same
+request sends both `Create` and `Add`, as two events. CSS collapses them only because a map
+keyed by identifier cannot hold two activities; that is an artifact of the data structure, not a
+decision. This bus is keyed by (topic, activity) and has no such limit, and the two facts are
+genuinely different — a "tell me when this appears" subscriber wants the `Create`.
+
+The same source confirms the fan-out itself. `DataAccessorBasedStore::createRecursiveContainers`
+accumulates every intermediate container it creates into the returned `ChangeMap`, and
+`MonitoringStore` emits one event per entry over `[ AS.terms.Add, AS.terms.Create,
+AS.terms.Delete, AS.terms.Remove, AS.terms.Update ]`. Reporting only the immediate parent would
+have been the deviation.
+
+### 4.2 An auxiliary has no containment to report
 
 Not an exception to remember — `delete_impl` already states the rule it follows from: "an
 auxiliary is never a container member […] so there is no containment to repair". No
@@ -160,7 +198,7 @@ deleted subject with it, so each of those is a `Delete` on its own topic. `delet
 probes `exists` for every `AuxKind` to authorize the cascade, so which auxiliaries were there is
 known without a further read.
 
-### 4.2 Telling `Create` from `Update`
+### 4.3 Telling `Create` from `Update`
 
 Requires knowing whether the target existed *before* the write. For a resource or a container
 `authorize_and_materialize` already computes it (`is_member = !exists(target)`) and can report
@@ -345,8 +383,8 @@ and `state`. Beyond those, four that can actually fail:
   content, with a sibling asserting that the same read *without* the `version` parameter returns
   a **different** tag. Without that pair the test passes trivially on a 1.1 resource, where the
   two are the same value, and the version half of §5.2 goes unchecked.
-- Fan-out: `PUT /a/b/c.ttl` onto an empty path; a subscriber on `/` receives `Update` and
-  `Add`(object=`/a/`) and **no** `Create` for `/a/b/`.
+- Fan-out: `PUT /a/b/c.ttl` onto an empty path; a subscriber on `/` receives exactly one event,
+  `Add`(object=`/a/`) — no `Update` beside it (§4.1) and no `Create` for `/a/b/` (§3.2).
 - No subscriber ⇒ no `state`: demonstrated with a query counter, not with "it did not crash". A
   test that cannot go red is the mistake `docs/constraints.md` opens by warning about.
 
