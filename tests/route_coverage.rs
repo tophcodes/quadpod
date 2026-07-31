@@ -1,7 +1,8 @@
-//! Every route, every verb, no credentials: the answer must always be a
-//! refusal. This is the structural safeguard for Plan 6's per-handler guard
-//! design — a handler added later without an `authorize` call fails here
-//! rather than silently exposing the store.
+//! Every route, every verb but OPTIONS, no credentials: the answer must
+//! always be a refusal. This is the structural safeguard for the per-handler
+//! guard design — a handler added later without an `authorize` call fails
+//! here rather than silently exposing the store. The `?validate` view is
+//! swept too, since it is a second handler reached through the same routes.
 
 use std::sync::Arc;
 
@@ -72,6 +73,10 @@ async fn no_route_serves_an_unauthenticated_request() {
     let paths = [
         "/", "/seeded", "/.aux/seeded.acl", "/.aux/.acl", "/box/", "/box/child",
         "/does-not-exist", "/a/b/c",
+        // The `?validate` view is a second handler (`validate_view`) reached
+        // through the same `GET` routes, with its own `Guard::probe` call —
+        // a query string on an otherwise-covered path is what exercises it.
+        "/seeded?validate", "/box/?validate",
     ];
     // HEAD is served by the same handler axum's `get()` route installs, so it
     // is guarded like GET — but this test exists to be structural, and a verb
@@ -85,7 +90,7 @@ async fn no_route_serves_an_unauthenticated_request() {
     // authorization, not from `classify`:
     // `the_unallocated_reserved_namespace_serves_nothing_either` below does
     // include OPTIONS, and holds it to the same 404.
-    let methods = ["GET", "HEAD", "PUT", "POST", "DELETE"];
+    let methods = ["GET", "HEAD", "PUT", "POST", "DELETE", "PATCH"];
 
     for path in paths {
         for method in methods {

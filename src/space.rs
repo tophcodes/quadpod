@@ -38,7 +38,7 @@ mod sealed {
 /// `graph_iri` is interpolated verbatim into SPARQL, so only types minted
 /// through `StorageSpace::resolve` (and its `root`/`parent`/`ancestors`/
 /// `as_container` derivatives) may implement it.
-pub trait GraphName: sealed::Sealed {
+pub trait GraphName: sealed::Sealed + Sync {
     fn graph_iri(&self) -> &str;
 }
 

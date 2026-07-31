@@ -60,7 +60,7 @@ pub enum Kind {
 }
 
 /// The system graph holding server-asserted facts about `g`.
-pub fn sys_graph_iri(g: &impl GraphName) -> String {
+pub fn sys_graph_iri<G: GraphName + ?Sized>(g: &G) -> String {
     format!("urn:quadpod:sys:{}", g.graph_iri())
 }
 
@@ -629,6 +629,45 @@ pub async fn get_rdf(
     Ok(Some(triples))
 }
 
+/// Which of `graphs` are present, as the set of their graph IRIs.
+///
+/// One query for the whole set. The ancestor chains an authorization walks are
+/// nested — the ACL candidates for `/a/b/` are a suffix of those for `/a/b/c` —
+/// so asking level by level re-asks what an earlier level already answered.
+/// See `2026-07-31-request-scoped-guard-design.md` §2, §4.
+///
+/// Lives here because the system graph holding the marker is this module's to
+/// name and nobody else's (`docs/constraints.md`, *"Only `resource` builds a
+/// system-graph IRI"*). [`exists`] is the one-element case, so the two cannot
+/// answer differently.
+pub async fn exists_many(
+    store: &dyn SparqlStore,
+    graphs: &[&dyn GraphName],
+) -> Result<std::collections::HashSet<String>, ResourceError> {
+    if graphs.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut values = String::new();
+    for g in graphs {
+        let iri = g.graph_iri();
+        let sys = sys_graph_iri(*g);
+        values.push_str(&format!("(<{sys}> <{iri}>) "));
+    }
+    let rows = store
+        .query_solutions(&format!(
+            "SELECT ?g WHERE {{ VALUES (?sys ?g) {{ {values} }} \
+             GRAPH ?sys {{ ?g <{SYS_PRESENT}> true }} }}"
+        ))
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| match row.get("g") {
+            Some(oxigraph::model::Term::NamedNode(n)) => Some(n.as_str().to_owned()),
+            _ => None,
+        })
+        .collect())
+}
+
 /// Whether `g` is present. Reads the stored marker in the system graph
 /// rather than counting triples, so an empty-but-present graph still
 /// reports `true` and unmarked content still reports `false`.
@@ -791,6 +830,49 @@ mod tests {
 
         assert!(!exists(&store, &absent).await.unwrap());
         assert_eq!(get_rdf(&store, &absent).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn exists_many_returns_only_the_present() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = StorageSpace::new("https://pod.toph.so/").unwrap();
+        let here = match sp.resolve("/here").unwrap() { Target::Resource(r) => r, _ => unreachable!() };
+        let gone = match sp.resolve("/gone").unwrap() { Target::Resource(r) => r, _ => unreachable!() };
+        put_rdf(&store, &here, &[]).await.unwrap();
+
+        let found = exists_many(&store, &[&here as &dyn GraphName, &gone]).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found.contains(here.graph_iri()));
+        assert!(!found.contains(gone.graph_iri()));
+    }
+
+    // An empty graph that is marked present is present — the same distinction
+    // `exists` draws, and the reason presence is a stored fact rather than a
+    // triple count.
+    #[tokio::test]
+    async fn exists_many_agrees_with_exists_on_every_input() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let sp = StorageSpace::new("https://pod.toph.so/").unwrap();
+        let empty = match sp.resolve("/empty").unwrap() { Target::Resource(r) => r, _ => unreachable!() };
+        let absent = match sp.resolve("/absent").unwrap() { Target::Resource(r) => r, _ => unreachable!() };
+        put_rdf(&store, &empty, &[]).await.unwrap();
+
+        let found = exists_many(&store, &[&empty as &dyn GraphName, &absent]).await.unwrap();
+        for g in [&empty, &absent] {
+            assert_eq!(
+                found.contains(g.graph_iri()),
+                exists(&store, g).await.unwrap(),
+                "exists_many disagreed with exists about {}", g.graph_iri()
+            );
+        }
+    }
+
+    // The degenerate input must not produce `VALUES { }`, which is a parse error
+    // rather than an empty answer.
+    #[tokio::test]
+    async fn exists_many_of_nothing_asks_nothing() {
+        let store = OxigraphStore::in_memory().unwrap();
+        assert!(exists_many(&store, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

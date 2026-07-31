@@ -308,3 +308,15 @@ The `version` media-type parameter is read in exactly one place.
     what this forbids. A looser pattern counted a test assertion as a
     violation.
     check: [ "$(rg -o 'eq_ignore_ascii_case\("version"\)|strip_prefix\("version="\)|starts_with\("version="\)' src | wc -l)" = 1 ]
+
+## WAC
+
+The guard names the store exactly twice: the field it holds and the probe that fills it.
+    → 2026-07-31-request-scoped-guard-design.md §5, §9. The decision methods are
+    synchronous and hold no store, so a second resolution of the same ACL — which
+    would repeat the ancestor walk and could straddle a concurrent write — is not
+    something a later edit has to remember not to write. Restoring a store parameter
+    to any of the three makes this three. Anchored on the declaration rather than on
+    a regex over one signature, so it cannot be satisfied by a method spelled
+    differently.
+    check: [ "$(rg -o 'dyn SparqlStore' src/wac/guard.rs | wc -l)" = 2 ]
