@@ -95,8 +95,20 @@ settles the name, then probes the child. The child's chain is the container's ch
 element, so the second probe is one more query, not another ladder. Two guards, still one chain.
 
 The child probe also absorbs `name_is_taken`: "is this name free" is the presence question the
-probe already answers, and reading it from the guard removes a store call rather than adding
+probe already answers, and reading it from the guard removes two store calls rather than adding
 one. A collision costs a third probe, which is what a collision is worth.
+
+That question is **one** method, `is_taken`, and not two accessors the caller composes. The
+answer turns on two probed facts — the URL itself, and the trailing-slash counterpart Protocol
+§3.1 forbids from coexisting with it — and a guard that handed both out separately would put the
+§3.1 rule in the handler, where `http.rs` would then carry a piece of LDP semantics that
+`name_is_taken` used to own. The guard answers questions; it does not publish facts for callers
+to reassemble into rules.
+
+The name is deliberately present-tense. An earlier draft called the own-existence half `existed`,
+past tense, to mark that it describes the store before the request wrote to it — but that is true
+of *every* answer this type gives, which is what consuming `self` in `materialize` enforces. A
+tense that belongs to the type reads as noise on one method and is missed on all the others.
 
 This is what makes a single probe complete rather than merely helpful. It is not an
 optimization that happens to work today: it is a consequence of LDP addressing one resource per
@@ -147,7 +159,7 @@ impl Guard {
     fn authorize_parent(&self, mode: Mode) -> Result<Decision, Response>;
     fn authorize_aux(&self, kind: AuxKind) -> Result<Decision, Response>;
 
-    fn existed(&self) -> bool;
+    fn is_taken(&self) -> bool;
     fn deny(&self) -> Response;
     async fn materialize(self) -> Result<(), Response>;
 }
@@ -236,9 +248,10 @@ substance:
   auxiliary subject — is produced after the corresponding `authorize` has returned `Ok`.
 - `Guard::probe` itself refuses nothing. Its only failure is a store error, which is a `500`
   regardless of what exists.
-- `existed()` refuses nothing on its own — it reports a probed fact, and every caller reads it
-  after `authorize` has returned `Ok`. That ordering is a discipline, exactly as it is today for
-  the lookup it replaces; what changes is that the fact is free, not that the rule is new.
+- `is_taken()` refuses nothing on its own — it answers from probed facts, and its one caller
+  reads it after `authorize` has returned `Ok`. That ordering is a discipline, exactly as it is
+  today for the `name_is_taken` lookup it replaces; what changes is that the answer is free, not
+  that the rule is new.
 
 The existing tests that pin this ordering (`materialization_is_authorized_at_every_level_it_writes`,
 the ACL-oracle tests in `http.rs`) are the regression check, and they must pass unchanged. Any
