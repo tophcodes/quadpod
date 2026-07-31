@@ -1199,6 +1199,8 @@ git commit -m "refactor(http): read paths and PATCH decide through the guard"
 - Consumes: `Guard::probe`, `authorize`, `authorize_parent`, `authorize_aux`, `existed`, `materialize`.
 - Produces: nothing new.
 
+**Correction to every `Guard::probe` snippet below.** They are written as `Err(res) => return res`. That is wrong and was fixed in Task 7 (`f8f986e`): the free `authorize` folded store errors and denials into one `Result` that each call site wrapped, so a bare return drops the aux `Link` headers on the backend-outage `500` — a response change in a task whose invariant is that no response changes. Write `Err(res) => return with_aux_links(res, &target)` instead, matching the neighbouring denial arm at each site (`&child` where the site is about the child).
+
 - [ ] **Step 1: Migrate `put_impl` (lines 1093, 1115) and drop its second read**
 
 Probe once at the top, authorize `Write`, and take the created/updated distinction from `materialize`:
