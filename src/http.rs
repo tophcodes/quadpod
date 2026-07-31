@@ -16,7 +16,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::Guard, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::{Guard, Materialized}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1091,18 +1091,45 @@ fn report_link(target: &Target, mut res: Response) -> Response {
     res
 }
 
+/// The single place a `PUT` reports what it changed.
+///
+/// A wrapper rather than an emit at each success site, because the write below
+/// has one successful early exit of its own (the blob arm) and design §6.2
+/// fixes exactly one emit call per handler: the two facts the emit needs are
+/// carried out of [`put_write`] as values instead of the emit being repeated
+/// wherever control leaves.
 async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
+    let (res, existence, materialized) = put_write(&st, agent, &target, headers, body).await;
+    crate::notify::emit_put(&st, &target, existence, &materialized, res.status()).await;
+    res
+}
+
+/// The write itself, reporting what the emit above cannot re-derive: whether
+/// the target was there beforehand, and what the ancestor walk materialized.
+///
+/// Every failing exit reports `Existence::Absent` and an empty `Materialized`;
+/// neither is ever read, because `emit_put` returns on a non-success status
+/// before it touches them.
+async fn put_write(
+    st: &AppState, agent: Agent, target: &Target, headers: HeaderMap, body: Bytes,
+) -> (Response, crate::notify::Existence, Materialized) {
     let store = st.store.as_ref();
+    let absent = crate::notify::Existence::Absent;
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &target),
+        Err(res) => return (with_aux_links(res, target), absent, Materialized::default()),
     };
     if let Err(res) = guard.authorize(Mode::Write) {
-        return with_aux_links(res, &target);
+        return (with_aux_links(res, target), absent, Materialized::default());
     }
-    let repr = match classify_body(&headers, &body, &target, st.store.rdf_version()) {
+    let existence = if guard.target_exists() {
+        crate::notify::Existence::Existed
+    } else {
+        crate::notify::Existence::Absent
+    };
+    let repr = match classify_body(&headers, &body, target, st.store.rdf_version()) {
         Ok(r) => r,
-        Err(res) => return *res,
+        Err(res) => return (*res, existence, Materialized::default()),
     };
     let (dataset, fmt, declared) = match repr {
         Repr::Rdf(d, f, v) => (d, f, v),
@@ -1112,33 +1139,38 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             // share the conditional-request block and the ancestor walk, so
             // it runs them itself rather than falling through to where the
             // RDF path runs them.
-            let Target::Resource(r) = &target else {
+            let Target::Resource(r) = target else {
                 unreachable!("classify_body refuses a blob for any other target")
             };
             if crate::blob::BlobKey::of(r).is_none() {
-                return StatusCode::URI_TOO_LONG.into_response();
+                return (StatusCode::URI_TOO_LONG.into_response(), existence, Materialized::default());
             }
-            if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
-                return res;
+            if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, target).await {
+                return (res, existence, Materialized::default());
             }
-            if let Err(res) = guard.materialize().await {
-                return with_aux_links(res, &target);
-            }
-            return match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
-                Ok(()) => created(&target),
+            let materialized = match guard.materialize().await {
+                Ok(m) => m,
+                Err(res) => return (with_aux_links(res, target), existence, Materialized::default()),
+            };
+            // Still an early exit, but no longer one that outruns the emit:
+            // what `emit_put` needs travels out with the response (§6.3).
+            return (match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
+                Ok(()) => created(target),
                 Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
                 Err(e) => (put_status(&e), e.to_string()).into_response(),
-            };
+            }, existence, materialized);
         }
     };
     // §3.2.2 — the skolem namespace is the server's.
     if dataset.uses_reserved_namespace() {
-        return (StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response();
+        return ((StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response(),
+            existence, Materialized::default());
     }
     // §3.4 — a container's graph carries containment; an auxiliary's rules
     // would be invisible to WAC inside a subgraph.
     if dataset.has_named_graphs() && !matches!(target, Target::Resource(_)) {
-        return (StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response();
+        return ((StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response(),
+            existence, Materialized::default());
     }
     // Containment is server-managed. Refused here, before the ancestor walk
     // below writes anything, so a rejected PUT cannot leave a containment
@@ -1146,7 +1178,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // dataset, not the default graph: otherwise the 409 is bypassed by
     // putting ldp:contains in a named graph.
     if matches!(target, Target::Container(_)) && container::body_sets_containment(&triples_of(&dataset)) {
-        return StatusCode::CONFLICT.into_response();
+        return (StatusCode::CONFLICT.into_response(), existence, Materialized::default());
     }
     // The version half of the same argument, and it applies to every format
     // rather than only the graph-shaped ones: a client that declared 1.1 was
@@ -1158,32 +1190,34 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // classifies as: declaring 1.2 and sending 1.1 content is a deliberate
     // replacement by a client that can see the whole resource, and refusing
     // that would make the higher version a trap rather than a capability.
-    if let Target::Resource(r) = &target {
+    if let Target::Resource(r) = target {
         let existing = match get_dataset(store, r).await {
             Ok(v) => v,
-            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+            Err(e) => return ((put_status(&e), e.to_string()).into_response(),
+                existence, Materialized::default()),
         };
         if let Some(existing) = existing {
             let held = existing.deskolemize().rdf_version();
             if declared < held {
-                return (StatusCode::CONFLICT, format!(
+                return ((StatusCode::CONFLICT, format!(
                     "this resource holds RDF {} terms that {} cannot carry; \
                      send Content-Type with version={}, or DELETE it first",
                     held.label(), declared.label(), held.label()
-                )).into_response();
+                )).into_response(), existence, Materialized::default());
             }
         }
     }
     // §6.2.1 — a graph-format write must not silently discard what a graph
     // format could not have shown the client in the first place.
-    if let Target::Resource(r) = &target {
+    if let Target::Resource(r) = target {
         if !fmt.carries_dataset() {
             // A store error is not "no named graphs": reading it that way lets
             // the overwrite this check exists to refuse proceed on exactly the
             // request the check could not evaluate.
             let existing = match get_dataset(store, r).await {
                 Ok(v) => v,
-                Err(e) => return (put_status(&e), e.to_string()).into_response(),
+                Err(e) => return ((put_status(&e), e.to_string()).into_response(),
+                    existence, Materialized::default()),
             };
             if let Some(existing) = existing {
                 // Over the stored quads, where every graph name is an IRI. A
@@ -1204,22 +1238,22 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
                         parts.push(format!("{blank_named} named by a blank node"));
                     }
                     let list = parts.join(", ");
-                    return (StatusCode::CONFLICT, format!(
+                    return ((StatusCode::CONFLICT, format!(
                         "this resource has named graphs ({list}) that {} cannot carry; \
                          write it as application/trig or application/ld+json, or DELETE it first",
                         fmt.media_type()
-                    )).into_response();
+                    )).into_response(), existence, Materialized::default());
                 }
             }
         }
     }
     let skolemized = Skolemized::skolemize(&dataset);
-    if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
-        return res;
+    if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, target).await {
+        return (res, existence, Materialized::default());
     }
-    let findings = match enforce_shape(&st, &target, &dataset).await {
+    let findings = match enforce_shape(st, target, &dataset).await {
         Ok(f) => f,
-        Err(res) => return res,
+        Err(res) => return (res, existence, Materialized::default()),
     };
     // Creating a resource materializes every missing ancestor container and
     // links it into the first one that already exists — real mutations of
@@ -1235,10 +1269,11 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // rule belongs to the same one traversal, because the set of URLs it
     // applies to is the set of URLs this call would create; there is no
     // separate check here that could drift from it.
-    if let Err(res) = guard.materialize().await {
-        return with_aux_links(res, &target);
-    }
-    let res = match &target {
+    let materialized = match guard.materialize().await {
+        Ok(m) => m,
+        Err(res) => return (with_aux_links(res, target), existence, Materialized::default()),
+    };
+    let res = match target {
         // An auxiliary exists only for an existing subject, and that rule is
         // inside `aux::put`'s update rather than a check here — a check and a
         // write are two round-trips, and an interleaved DELETE between them
@@ -1246,7 +1281,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Target::Aux(a) => {
             let triples = triples_of(&dataset.default_graph_only());
             match aux::put(store, a, &triples).await {
-                Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(&target)),
+                Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(target)),
                 Err(AuxError::SubjectMissing) =>
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
                 // Unreachable: `put` writes the auxiliary, so it never asks
@@ -1264,22 +1299,23 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             // per the plan's cross-graph-atomicity note.
             let existing = match get_rdf(store, c).await {
                 Ok(v) => v.unwrap_or_default(),
-                Err(e) => return (put_status(&e), e.to_string()).into_response(),
+                Err(e) => return ((put_status(&e), e.to_string()).into_response(),
+                    existence, materialized),
             };
             let mut merged = triples_of(&dataset.default_graph_only());
             merged.extend(
                 existing.into_iter().filter(|t| t.predicate.as_str() == container::LDP_CONTAINS),
             );
             if let Err(e) = put_rdf(store, c, &merged).await {
-                return (put_status(&e), e.to_string()).into_response();
+                return ((put_status(&e), e.to_string()).into_response(), existence, materialized);
             }
             if let Err(e) = container::ensure_container(store, c).await {
-                return (put_status(&e), e.to_string()).into_response();
+                return ((put_status(&e), e.to_string()).into_response(), existence, materialized);
             }
-            created(&target)
+            created(target)
         }
         Target::Resource(r) => match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
-            Ok(()) => created(&target),
+            Ok(()) => created(target),
             Err(e) => (put_status(&e), e.to_string()).into_response(),
         },
     };
@@ -1288,7 +1324,9 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // its `Ok` arm, so findings alone cannot gate the link: a body that only
     // warned, followed by a `put_dataset` failure, would otherwise still
     // advertise a report for a write that stored nothing.
-    if findings.is_some() && res.status().is_success() { report_link(&target, res) } else { res }
+    let res =
+        if findings.is_some() && res.status().is_success() { report_link(target, res) } else { res };
+    (res, existence, materialized)
 }
 
 async fn handle_post(
@@ -1980,6 +2018,7 @@ mod tests {
     use tower::ServiceExt;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::time::{timeout, Duration};
     use crate::{space::{ContainerUrl, StorageSpace}, store::OxigraphStore, auth::StaticJwksResolver};
     use crate::auth::testsupport::{TestClient, TestIdp};
     use crate::auth::StaticWebIdIssuers;
@@ -2020,6 +2059,7 @@ mod tests {
     /// directly.
     struct Fixture {
         app: axum::Router,
+        events: Arc<crate::notify::Bus>,
         store: Arc<dyn crate::store::SparqlStore>,
         blobs: Arc<dyn crate::blob::BlobStore>,
         space: StorageSpace,
@@ -2076,9 +2116,10 @@ mod tests {
         let mut issuers = StaticWebIdIssuers::new();
         issuers.allow(OWNER, ISSUER);
 
+        let events = Arc::new(crate::notify::Bus::new());
         let state = AppState {
             store: store.clone(),
-            events: Arc::new(crate::notify::Bus::new()),
+            events: events.clone(),
             blobs: blobs.clone(),
             space: space.clone(),
             resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
@@ -2087,8 +2128,8 @@ mod tests {
             max_body_bytes,
         };
         Fixture {
-            app: router(state), store, blobs, space, max_body_bytes, idp, client, _replay_guard,
-            _reentrancy: ReentrancyGuard,
+            app: router(state), events, store, blobs, space, max_body_bytes, idp, client,
+            _replay_guard, _reentrancy: ReentrancyGuard,
         }
     }
 
@@ -2185,7 +2226,10 @@ mod tests {
             issuers.allow(webid, ISSUER);
             router(AppState {
                 store: self.store.clone(),
-                events: Arc::new(crate::notify::Bus::new()),
+                // The same bus as `app`: this router serves the same data, so a
+                // test subscribed through `Fixture::events` must hear what a
+                // write through either router reports.
+                events: self.events.clone(),
                 blobs: self.blobs.clone(),
                 space: self.space.clone(),
                 resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
@@ -6882,5 +6926,149 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(body_string(res).await, BINARY_TARGET_MESSAGE,
             "the blob refusal must win over the shape one");
+    }
+
+    /// The next event on a topic, or a failure — never a hang. A
+    /// `broadcast::Receiver` whose sender is still alive blocks forever when
+    /// nothing is published, and libtest has no per-test timeout: an
+    /// unbounded `recv` turns "no event was emitted" into a suite that never
+    /// finishes rather than into a red test.
+    async fn next_event(rx: &mut crate::notify::Receiver) -> crate::notify::Event {
+        timeout(Duration::from_secs(5), rx.recv())
+            .await.expect("expected an event on this topic, none arrived within 5s").unwrap()
+    }
+
+    /// That a topic stays silent. The write is over before this is called, so
+    /// anything the topic was going to hear is already buffered: this waits on
+    /// a silence that has already been decided, not on one still being made.
+    async fn stays_silent(rx: &mut crate::notify::Receiver, why: &str) {
+        assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err(), "{why}");
+    }
+
+    /// A create is reported on the resource's own channel, and on its parent's
+    /// as `Add` — not as a second `Create` (§3.2).
+    #[tokio::test]
+    async fn a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent() {
+        let f = fixture().await;
+        // `/c/` is made to exist first, so this write's only containment
+        // change there is the `Add`; the container's own `Create` is the
+        // subject of the next test.
+        f.put_turtle("/c/other", "<#it> <http://schema.org/name> \"y\" .").await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Create);
+        assert_eq!(e.object, target.graph_iri());
+        assert_eq!(e.target, None);
+        assert!(e.state.is_some(), "a create reports the state it produced");
+
+        let p = next_event(&mut on_parent).await;
+        assert_eq!(p.activity, crate::notify::Activity::Add);
+        assert_eq!(p.object, target.graph_iri(), "the object of an Add is the child");
+        assert_eq!(p.target.as_deref(), Some(parent.graph_iri()));
+    }
+
+    /// `/c/` did not exist either, so the same write created it — and a
+    /// container's own creation is its own fact, reported beside the `Add`
+    /// that filled it.
+    #[tokio::test]
+    async fn a_put_that_materializes_a_container_emits_its_create_too() {
+        let f = fixture().await;
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"x\" .").await;
+
+        let first = next_event(&mut on_parent).await;
+        assert_eq!(first.activity, crate::notify::Activity::Create,
+            "the container came into existence, which the Add alone does not say");
+        assert_eq!(first.object, parent.graph_iri());
+        assert_eq!(first.target, None);
+        let second = next_event(&mut on_parent).await;
+        assert_eq!(second.activity, crate::notify::Activity::Add);
+        assert_eq!(second.target.as_deref(), Some(parent.graph_iri()));
+    }
+
+    /// An overwrite changes no containment, so the parent hears nothing at all.
+    #[tokio::test]
+    async fn a_put_that_overwrites_emits_update_and_nothing_on_the_parent() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let put = |body: &'static str| f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle").body(Body::from(body)).unwrap();
+        f.app.clone().oneshot(put("<#it> <http://schema.org/name> \"one\" .")).await.unwrap();
+
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+        f.app.clone().oneshot(put("<#it> <http://schema.org/name> \"two\" .")).await.unwrap();
+
+        assert_eq!(next_event(&mut on_target).await.activity, crate::notify::Activity::Update);
+        stays_silent(&mut on_parent, "containment did not change, so the parent is silent").await;
+    }
+
+    /// The regression test for the `Repr::Blob` arm's early return: a binary
+    /// write must not bypass the tail where emission happens.
+    #[tokio::test]
+    async fn a_binary_put_emits() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/photo.png").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/c/photo.png")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(Body::from(&b"\x89PNG\r\n\x1a\n"[..])).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Create);
+        assert_eq!(e.state.as_deref(), Some(blob_etag(b"\x89PNG\r\n\x1a\n").as_str()));
+    }
+
+    /// And the containment half of the same early return: the blob path walks
+    /// the same ancestors, so it reports the same `Add`.
+    #[tokio::test]
+    async fn a_binary_put_emits_the_add_on_its_parent() {
+        let f = fixture().await;
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        f.put_blob("/c/photo.png", "image/png", b"\x89PNG\r\n\x1a\n").await;
+
+        // `/c/` is created by this same write, so its own `Create` comes first;
+        // the `Add` is the fact under test.
+        assert_eq!(next_event(&mut on_parent).await.activity, crate::notify::Activity::Create);
+        let add = next_event(&mut on_parent).await;
+        assert_eq!(add.activity, crate::notify::Activity::Add,
+            "the blob path must report the containment it added");
+        assert_eq!(add.object, f.space.resolve("/c/photo.png").unwrap().graph_iri());
+        assert_eq!(add.target.as_deref(), Some(parent.graph_iri()));
+    }
+
+    /// A refused write emits nothing: the tail returns before touching the bus.
+    #[tokio::test]
+    async fn a_refused_put_emits_nothing() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("this is not turtle {{{")).unwrap()).await.unwrap();
+        assert!(!res.status().is_success(), "the fixture's premise: {}", res.status());
+        stays_silent(&mut on_target, "a refused write is not a change").await;
+        stays_silent(&mut on_parent, "a refused write materialized nothing to report either").await;
     }
 }

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use axum::http::StatusCode;
 use axum::response::Response;
 use tokio::sync::broadcast;
 
@@ -188,14 +189,82 @@ pub enum Existence {
 /// gained a child. `existence` comes from
 /// [`crate::wac::guard::Guard::target_exists`], read before the guard was
 /// consumed.
+///
+/// Takes the response's `status`, not the response: `axum::body::Body` is not
+/// `Sync`, so a `&Response` is not `Send`, and an `async fn` holds every
+/// argument for the whole of its body — one such parameter makes the calling
+/// handler's future `!Send` and unusable as an axum `Handler`. The status is
+/// all the emit reads.
 pub async fn emit_put(
-    _st: &AppState,
-    _target: &Target,
-    _existence: Existence,
-    _materialized: &Materialized,
-    _res: &Response,
+    st: &AppState,
+    target: &Target,
+    existence: Existence,
+    materialized: &Materialized,
+    status: StatusCode,
 ) {
-    todo!("skeleton")
+    if !status.is_success() {
+        return;
+    }
+    let activity = match existence {
+        Existence::Existed => Activity::Update,
+        Existence::Absent => Activity::Create,
+    };
+    publish_own(st, target, activity).await;
+    publish_containment(st, target.graph_iri(), materialized, Activity::Add).await;
+}
+
+/// `Create`, `Update` or `Delete` on the topic's own channel, where `object`
+/// is the topic itself and there is no `target`.
+async fn publish_own(st: &AppState, target: &Target, activity: Activity) {
+    let topic = Topic::from(target);
+    if st.events.live(std::slice::from_ref(&topic)).is_empty() {
+        return;
+    }
+    let state = match activity {
+        Activity::Delete => None,
+        _ => state_of(st, target).await,
+    };
+    let object = topic.as_str().to_owned();
+    st.events.publish(Event { topic, activity, object, target: None, state });
+}
+
+/// A `Create` for every container this write brought into existence, and one
+/// `Add` or `Remove` for every container whose membership changed.
+///
+/// No `Update` beside the `Add`: it says nothing the `Add` does not, and the
+/// container's new state rides on the same event (design §4.1). A container
+/// that was both created and gained a child gets both events — they are two
+/// facts, and this bus is keyed by (topic, activity).
+async fn publish_containment(
+    st: &AppState,
+    target_iri: &str,
+    materialized: &Materialized,
+    activity: Activity,
+) {
+    for created in &materialized.created {
+        if created.graph_iri() == target_iri {
+            continue; // the request's own target — `publish_own` already did it
+        }
+        let Some(container) = created.as_container() else {
+            continue; // only containers are materialized on the way down
+        };
+        publish_own(st, &Target::Container(container), Activity::Create).await;
+    }
+    for (container, child) in &materialized.linked {
+        let container_target = Target::Container(container.clone());
+        let topic = Topic::from(&container_target);
+        if st.events.live(std::slice::from_ref(&topic)).is_empty() {
+            continue;
+        }
+        let state = state_of(st, &container_target).await;
+        st.events.publish(Event {
+            topic,
+            activity,
+            object: child.clone(),
+            target: Some(container.graph_iri().to_owned()),
+            state,
+        });
+    }
 }
 
 /// `POST`: as [`emit_put`], on the allocated child rather than the request
