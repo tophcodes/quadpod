@@ -963,26 +963,52 @@ mod tests {
             "the walk must never touch the root");
     }
 
+    // Alice holds only `acl:default` at /box/ — enough to Append one level
+    // *below* /box/ by inheritance, but decide_from(1) evaluates /box/
+    // itself directly (offset 0, not inherited), which needs `acl:accessTo`
+    // and finds none: denied. That denial must win over the slash-pair
+    // check even though /box/sub (no trailing slash) already exists and
+    // /box/sub/ is exactly the target — if the check ran before the walk,
+    // it would answer 409 and reveal /box/sub's existence to an agent who
+    // is about to be refused for /box/ anyway. Asserting 403 is what makes
+    // this fixture fail loudly if that check is ever hoisted above the loop
+    // (see `materialize`'s doc comment): a hoist here would flip 403 to 409.
     #[tokio::test]
-    async fn a_guarded_write_refuses_the_other_half_of_a_slash_pair() {
+    async fn a_guarded_write_denied_on_an_ancestor_never_reaches_the_slash_pair_check() {
         let store = OxigraphStore::in_memory().unwrap();
-        seed_acl(&store, "/", &format!(
-            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
-             <{ACL_DEFAULT}> <https://pod.toph.so/> ; <{ACL_MODE}> <{ACL_WRITE}> ."
+        seed_acl(&store, "/box/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
+             <{ACL_MODE}> <{ACL_WRITE}> ."
         )).await;
-        crate::resource::put_rdf(&store, &resource("/box"), &[]).await.unwrap();
-        let g = guard_for(&store, alice(), "/box/").await;
-        assert_eq!(status(g.materialize().await), Some(StatusCode::CONFLICT));
+        crate::resource::put_rdf(&store, &resource("/box/sub"), &[]).await.unwrap();
+        let g = guard_for(&store, alice(), "/box/sub/").await;
+        assert_eq!(status(g.materialize().await), Some(StatusCode::FORBIDDEN),
+            "denied on /box/ (accessTo required, only default granted) must win over \
+             the 409 for /box/sub's slash counterpart, or the ordering leaks it");
     }
 
+    // Alice holds only `acl:accessTo` at the root — a direct grant that does
+    // not inherit. /box/ does not exist yet, so the walk does not break
+    // immediately (unlike the aux case where the nearest ancestor already
+    // exists and record_child is false); it reaches decide_from(1), which
+    // resolves against the root ACL from an inherited position (offset > 0)
+    // and needs `acl:default`, absent here: denied. That denial must win
+    // over the aux-subject-exists check even though /box/ghost does not
+    // exist either — if the check ran before the walk, it would answer 404
+    // and confirm the subject's absence to an agent who is about to be
+    // refused for /box/ anyway. Asserting 403 is what makes this fixture
+    // fail loudly if that check is ever hoisted above the loop: a hoist
+    // here would flip 403 to 404.
     #[tokio::test]
-    async fn a_guarded_aux_write_still_needs_its_subject_to_exist() {
+    async fn a_guarded_aux_write_denied_on_an_ancestor_never_reaches_the_subject_check() {
         let store = OxigraphStore::in_memory().unwrap();
         seed_acl(&store, "/", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
-             <{ACL_DEFAULT}> <https://pod.toph.so/> ; <{ACL_MODE}> <{ACL_CONTROL}> ."
+             <{ACL_MODE}> <{ACL_WRITE}> ."
         )).await;
-        let g = guard_for(&store, alice(), "/.aux/ghost.acl").await;
-        assert_eq!(status(g.materialize().await), Some(StatusCode::NOT_FOUND));
+        let g = guard_for(&store, alice(), "/.aux/box/ghost.acl").await;
+        assert_eq!(status(g.materialize().await), Some(StatusCode::FORBIDDEN),
+            "denied while walking to /box/ (root's accessTo grant doesn't inherit) must \
+             win over the 404 for ghost's own non-existence, or the ordering leaks it");
     }
 }
