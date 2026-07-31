@@ -115,4 +115,10 @@ async fn an_auxiliary_never_outlives_its_subject() {
         !resource::exists(&store, &doc.aux(AuxKind::Acl)).await.unwrap(),
         "the recreated resource must not pick up the deleted one's ACL"
     );
+    for ancestor in doc.ancestors() {
+        assert!(
+            !resource::exists(&store, &ancestor.as_resource().aux(AuxKind::Acl)).await.unwrap(),
+            "nor may an ancestor's ACL have been left governing it"
+        );
+    }
 }
