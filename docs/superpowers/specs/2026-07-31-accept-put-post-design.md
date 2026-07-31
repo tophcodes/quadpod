@@ -122,12 +122,17 @@ most — and `protocol/cors/enumerate-headers` requires the list to be enumerate
 
 `docs/constraints.md` gains one rule:
 
-> The write advertisement is derived from `Format`.
->     check: `! rg -q '"application/(trig|n-quads|ld\+json)"' src/http.rs`
+> The write advertisement is built from `Format::ALL`.
+>     check: `rg -q 'for f in Format::ALL' src/http.rs`
 
-It goes red against the violation it names: a hand-written media-type list in `http.rs` trips it
-on the first entry. `text/turtle` is excluded because `http.rs` legitimately names it — the LDP
-container default and the shape-graph parse both ask `Format::from_content_type("text/turtle")`.
+It goes red against the violation it names: a hand-written media-type list in place of the loop
+deletes the anchor, which was checked against a real edit before the rule was added.
+
+A literal-absence check was the first form considered — `! rg -q '"application/(trig|n-quads)"'
+src/http.rs` — and it is rejected: `http.rs` names `application/trig` and `application/ld+json`
+legitimately in §6.2's `rel="alternate"` links, and every format by name across its tests, so
+that form is red against a correct tree. Anchoring on the loop is the same shape as
+*"`space::GraphName` stays sealed"*, which pins a signature rather than an absence.
 
 The `Format::ALL` search in §2 is not separately checked. It is the definition of
 `from_content_type`, so it cannot drift without the parser drifting with it.

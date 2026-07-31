@@ -134,6 +134,18 @@ There is one content-negotiation path, one parser and one ETag.
     both answer, one answers wrong.
     check: ! rg -q 'fn (format_for_accept|format_for_content_type)\b' src
 
+The write advertisement is built from `Format::ALL`.
+    → 2026-07-31-accept-put-post-design.md §2, §6. `Accept-Put` and
+    `Accept-Post` name the media types `classify_body` admits, and a
+    hand-maintained second list is how the header comes to advertise a type
+    the parser refuses — a disagreement invisible from either side, because
+    both halves keep looking plausible on their own. `aux_links` builds from
+    `AuxKind::ALL` against the same failure. Anchored on the loop rather than
+    on the absence of literals: `http.rs` legitimately names
+    `application/trig` and `application/ld+json` in the `rel="alternate"`
+    links of §6.2, and every format by name across its tests.
+    check: rg -q 'for f in Format::ALL' src/http.rs
+
 `patch` never reaches the store.
     → 2026-07-30-n3-patch-design.md §3, §6. The argument that no client SPARQL
     exists rests on the patch document being parsed to terms in one place and

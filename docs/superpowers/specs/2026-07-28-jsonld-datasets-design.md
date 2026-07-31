@@ -524,9 +524,11 @@ the dataset formats; `*/*` admits everything and resolves per §6.4.
 image/png`), which is today's behaviour and unchanged.
 
 `application/trig` and `application/n-quads` are new, for reading and writing. Without them
-JSON-LD would be the only lossless text form. Both are undiscoverable: the pod emits no
-`Accept-Put`/`Accept-Post` and has no `OPTIONS` route. **Named follow-up (§11)**, and the
-reason the `Link: rel="alternate"` headers of §6.2 matter more than they otherwise would.
+JSON-LD would be the only lossless text form. Both were undiscoverable when this was written: the
+pod emitted no `Accept-Put`/`Accept-Post` and had no `OPTIONS` route — **named follow-up
+(§11)**, closed by [2026-07-31-accept-put-post-design.md](2026-07-31-accept-put-post-design.md)
+and by the conformance-headers slice before it. That is the reason the `Link: rel="alternate"`
+headers of §6.2 matter more than they otherwise would.
 
 `Vary: Accept` is emitted on every negotiated response, and the selected format participates
 in the ETag. Today neither is true: one strong validator is shared by every representation,
