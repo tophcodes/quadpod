@@ -324,14 +324,21 @@ The config file is never found, only named.
     uuid::Uuid::new_v4()))` and `.join("sparql-pod-does-not-exist.toml")`,
     both in `config.rs`'s test module — which is data a test writes, not a
     path the pod looks for, and it cost both fixtures a rewrite around the
-    check rather than the other way round. Requiring a `const` or `let` whose
-    literal value ends in `.toml` keeps the rule pointed at a name a lookup
-    would use while leaving a temp-file argument alone. Demonstrated red
-    against `const SEARCH_PATH: &str = "sparql-pod.toml";`, injected into and
-    then reverted out of `src/config.rs`; demonstrated to stay green against
-    the two fixture lines above, reintroduced the same way, on which the
-    untightened `\.toml"` alternative alone went red.
-    check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|(const|let)\s.*=\s*"[^"]*\.toml"' src
+    check rather than the other way round. Anchoring on the closing quote
+    catches a `.toml`-suffixed literal regardless of what expression it sits
+    in, so `Path::new`, `PathBuf::from`, a bare `.join(...)` argument, and a
+    `static` all count the same as a `const` or `let`. Demonstrated red,
+    each injected into and then reverted out of `src/config.rs` in turn,
+    against `let p = std::path::PathBuf::from("sparql-pod.toml");`, that same
+    call as a bare expression with no binding, `let p =
+    std::path::Path::new("sparql-pod.toml");`,
+    `std::env::current_dir().unwrap().join("sparql-pod.toml")`, `static
+    SEARCH_PATH: &str = "sparql-pod.toml";`, and a `dirs::config_dir()` /
+    `std::env::var("XDG_CONFIG_HOME")` / `home_dir()` lookup; demonstrated to
+    stay green on the unmodified tree, where the two fixture lines above
+    build their temp filename through `std::env::temp_dir().join(...)` and
+    `.with_extension("toml")` rather than a `.toml`-suffixed string literal.
+    check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|\.toml"' src
 
 Precedence is clap's, never hand-written.
     → 2026-07-31-cli-config-design.md §5, §5.1; `config.rs`'s module header,
