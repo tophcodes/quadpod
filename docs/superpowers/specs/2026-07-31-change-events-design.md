@@ -345,11 +345,17 @@ That is the cut `put_impl`'s tail already makes for the shape report
 Emitting at each success site instead would be fifteen places to forget, in a file of nearly
 seven thousand lines, where a future write path compiles silently without an event.
 
-### 6.3 The blob arm has to stop returning early
+### 6.3 Two successful early exits have to stop bypassing the tail
 
-`put_impl`'s `Repr::Blob` branch is a `return match put_blob(…)` — a *successful*
-early exit that bypasses the tail. It becomes a value flowing into `res`, or every binary write
-emits nothing. This is the only place #17 changes existing control flow.
+`put_impl`'s `Repr::Blob` branch is a `return match put_blob(…)` and `patch_impl`'s
+`Target::Aux(_)` arm returns its own response — both *successful* early exits past the tail. Each
+becomes a value flowing into the response the wrapper emits from, or a binary write and an
+auxiliary `PATCH` emit nothing while the same operations under `PUT` do. These are the only two
+places #17 changes existing control flow.
+
+The auxiliary one is the easier to miss, and its absence is not a silent degradation but a
+contradiction: a `PUT` on an auxiliary reaches `put_impl`'s tail and emits, so without this the
+two verbs disagree about the same topic.
 
 ## 7. Synchronous by design
 
