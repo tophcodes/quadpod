@@ -800,9 +800,14 @@ mod tests {
     async fn authorize_parent_decides_one_level_up_and_is_none_at_the_root() {
         let store = OxigraphStore::in_memory().unwrap();
         seed_container(&store, "/box/").await;
+        // Only acl:accessTo: decide_from(1, ...) reaches /box/ at offset 0
+        // (inherited = false), so this is the predicate a correct index needs.
+        // A wrongly-indexed decide_from(0, ...) would see /box/ at offset 1
+        // (inherited = true) and require acl:default, which is absent here —
+        // so only the correct index finds a match.
         seed_acl(&store, "/box/", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/> ; \
-             <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; <{ACL_MODE}> <{ACL_WRITE}> ."
+             <{ACL_MODE}> <{ACL_WRITE}> ."
         )).await;
         let g = guard_for(&store, alice(), "/box/item").await;
         assert!(g.authorize_parent(Mode::Write).unwrap().is_some());
@@ -824,15 +829,18 @@ mod tests {
     }
 
     // Control on the subject is what an ACL auxiliary requires — Write is not
-    // enough, or a narrowing ACL could be erased by someone holding merely Write.
+    // enough, or a narrowing ACL could be erased by someone holding merely
+    // Write. The auxiliary under test here is /box/doc's own .acl, which is
+    // also the ACL that governs /box/doc at chain[0] — so its own grant to
+    // Alice is what decide_from(0, ...) resolves against, deliberately Write
+    // only rather than empty, so the denial comes from the mode requirement.
     #[tokio::test]
     async fn authorize_aux_requires_control_over_the_subject() {
         let store = OxigraphStore::in_memory().unwrap();
-        seed_acl(&store, "/box/", &format!(
-            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/box/> ; \
+        seed_acl(&store, "/box/doc", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/doc> ; \
              <{ACL_MODE}> <{ACL_WRITE}> ."
         )).await;
-        seed_acl(&store, "/box/doc", "").await;
         let g = guard_for(&store, alice(), "/box/doc").await;
         assert_eq!(status(g.authorize_aux(AuxKind::Acl)), Some(StatusCode::FORBIDDEN));
     }
