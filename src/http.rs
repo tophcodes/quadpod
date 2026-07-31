@@ -1315,32 +1315,6 @@ async fn handle_post_root(
     }
 }
 
-/// Whether a name a `POST` would allocate is already spoken for — by a
-/// resource of its own, or by the other half of its trailing-slash pair,
-/// which Protocol §3.1 forbids it from coming to exist beside.
-///
-/// A `Slug` is a hint, so a taken name is answered by picking another rather
-/// than by the `409` a client-named `PUT` gets: the counterpart is exactly as
-/// unavailable as the name itself, and for the same reason. Store errors read
-/// as "not taken" here, as the direct existence check always has — the write
-/// that follows is what reports them.
-async fn name_is_taken(store: &dyn SparqlStore, child: &Target) -> bool {
-    if matches!(exists(store, child).await, Ok(true)) {
-        return true;
-    }
-    let subject = match child {
-        Target::Resource(r) => r,
-        // A `Link: rel="type"` can make the allocated child a container, and
-        // the pair rule reads the same from that side.
-        Target::Container(c) => c.as_resource(),
-        Target::Aux(_) => return false,
-    };
-    match subject.slash_counterpart() {
-        Some(counterpart) => matches!(exists(store, &counterpart).await, Ok(true)),
-        None => false,
-    }
-}
-
 async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
     let store = st.store.as_ref();
     // Authorize the target FIRST, even though Append on a non-container is a

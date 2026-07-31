@@ -205,11 +205,11 @@ Delegate `Control` the way you would hand over a key, not the way you would shar
   the response is 401/403 regardless of whether the resource exists — otherwise the
   status code is an existence oracle for the whole namespace.
 
-The exists-vs-new distinction for PUT requires one store lookup. It runs **after**
-`Write` on the target has been granted, so it can never be an oracle: only a caller who
-may already write the resource learns whether it exists. The parent's `Append` check
-then follows, and only in the create case — demanding it for plain updates would be
-stricter than WAC.
+The exists-vs-new distinction for PUT costs no lookup of its own — the request's probe already
+holds it (`2026-07-31-request-scoped-guard-design.md` §6). The ordering it protected is
+unchanged and restated there as §7: no refusal that reads a probed fact is produced before
+`authorize` has returned. The parent's `Append` check then follows, and only in the create
+case — demanding it for plain updates would be stricter than WAC.
 
 **PATCH** is absent from the matrix: N3-Patch does not exist yet. Whoever adds it must
 bring a guard; the route-coverage test (§6) fails if they forget.

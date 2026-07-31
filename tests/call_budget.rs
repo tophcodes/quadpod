@@ -154,7 +154,7 @@ async fn app() -> (axum::Router, Arc<CountingStore>) {
     (app, counting)
 }
 
-const GET_BUDGET: usize = 10;
+const GET_BUDGET: usize = 8;
 
 #[tokio::test]
 async fn a_get_stays_within_budget() {
@@ -179,7 +179,7 @@ async fn a_get_stays_within_budget() {
     assert!(c.total() <= GET_BUDGET, "GET /seeded cost {c:?}, budget {GET_BUDGET}");
 }
 
-const PUT_EXISTING_BUDGET: usize = 15;
+const PUT_EXISTING_BUDGET: usize = 11;
 
 #[tokio::test]
 async fn a_put_on_an_existing_resource_stays_within_budget() {
@@ -211,7 +211,7 @@ async fn a_put_on_an_existing_resource_stays_within_budget() {
     );
 }
 
-const PUT_DEEP_BUDGET: usize = 36;
+const PUT_DEEP_BUDGET: usize = 13;
 
 #[tokio::test]
 async fn a_put_creating_a_deep_resource_stays_within_budget() {
@@ -239,7 +239,7 @@ async fn a_put_creating_a_deep_resource_stays_within_budget() {
     );
 }
 
-const POST_BUDGET: usize = 20;
+const POST_BUDGET: usize = 9;
 
 #[tokio::test]
 async fn a_post_stays_within_budget() {
@@ -265,7 +265,7 @@ async fn a_post_stays_within_budget() {
     assert!(c.total() <= POST_BUDGET, "POST / cost {c:?}, budget {POST_BUDGET}");
 }
 
-const DELETE_BUDGET: usize = 12;
+const DELETE_BUDGET: usize = 6;
 
 #[tokio::test]
 async fn a_delete_stays_within_budget() {
@@ -289,7 +289,7 @@ async fn a_delete_stays_within_budget() {
     assert!(c.total() <= DELETE_BUDGET, "DELETE /seeded cost {c:?}, budget {DELETE_BUDGET}");
 }
 
-const PATCH_BUDGET: usize = 9;
+const PATCH_BUDGET: usize = 7;
 
 #[tokio::test]
 async fn a_patch_stays_within_budget() {

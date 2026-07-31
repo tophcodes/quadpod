@@ -104,25 +104,20 @@ pub async fn provision_root_acl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wac::pdp::{decide, ACL_AGENT_CLASS, FOAF_AGENT};
-    use crate::wac::Mode;
-    use crate::{
-        auth::Agent,
-        space::{ResourceUrl, Target},
-        store::OxigraphStore,
-        wac::prp::effective_acl,
-    };
+    use crate::wac::pdp::{ACL_AGENT_CLASS, FOAF_AGENT};
+    use crate::wac::{guard::Guard, Mode};
+    use crate::{auth::Agent, store::OxigraphStore};
 
     const OWNER: &str = "https://alice.example/card#me";
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
-    fn res(path: &str) -> ResourceUrl {
-        match sp().resolve(path).unwrap() {
-            Target::Resource(r) => r,
-            Target::Container(c) => c.as_resource().clone(),
-            Target::Aux(_) => panic!("not a resource path"),
-        }
+    /// Probe a guard for `path` as `agent`, panicking on a store failure —
+    /// these tests read `provision_root_acl`'s effect through the same
+    /// enforcement point a request would, rather than through the retired
+    /// `prp::effective_acl` walk.
+    async fn guard_for<'a>(store: &'a OxigraphStore, agent: Agent, path: &str) -> Guard<'a> {
+        Guard::probe(store, agent, sp().resolve(path).unwrap()).await.expect("probe")
     }
 
     #[tokio::test]
@@ -130,24 +125,22 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
 
-        let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("root acl");
-        let owner = Agent::WebId(OWNER.to_string());
-        let direct = decide(&acl.triples, &owner, &acl.governed_iri, acl.inherited);
-        assert!(direct.allows(Mode::Read));
-        assert!(direct.allows(Mode::Write));
-        assert!(direct.allows(Mode::Control));
+        let g = guard_for(&store, Agent::WebId(OWNER.to_string()), "/").await;
+        assert!(g.authorize(Mode::Read).is_ok());
+        assert!(g.authorize(Mode::Write).is_ok());
+        assert!(g.authorize(Mode::Control).is_ok());
     }
 
     // acl:default is what makes the root ACL the fallback for the whole pod.
+    // /a/b/c has no ACL of its own, so a grant there can only have arrived by
+    // inheritance.
     #[tokio::test]
     async fn provisioned_root_acl_is_inherited_by_descendants() {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
 
-        let acl = effective_acl(&store, &res("/a/b/c")).await.unwrap().expect("inherited");
-        assert!(acl.inherited);
-        let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, true);
-        assert!(m.allows(Mode::Write));
+        let g = guard_for(&store, Agent::WebId(OWNER.to_string()), "/a/b/c").await;
+        assert!(g.authorize(Mode::Write).is_ok());
     }
 
     #[tokio::test]
@@ -155,19 +148,18 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         provision_root_acl(&store, &sp(), OWNER, false).await.unwrap();
 
-        let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("inherited");
         let stranger = Agent::WebId("https://bob.example/card#me".to_string());
-        let stranger_decision = decide(&acl.triples, &stranger, &acl.governed_iri, true);
-        assert!(!stranger_decision.allows(Mode::Read));
-        assert!(!stranger_decision.allows(Mode::Write));
-        assert!(!stranger_decision.allows(Mode::Append));
-        assert!(!stranger_decision.allows(Mode::Control));
+        let g = guard_for(&store, stranger, "/foo").await;
+        assert!(g.authorize(Mode::Read).is_err());
+        assert!(g.authorize(Mode::Write).is_err());
+        assert!(g.authorize(Mode::Append).is_err());
+        assert!(g.authorize(Mode::Control).is_err());
 
-        let public_decision = decide(&acl.triples, &Agent::Public, &acl.governed_iri, true);
-        assert!(!public_decision.allows(Mode::Read));
-        assert!(!public_decision.allows(Mode::Write));
-        assert!(!public_decision.allows(Mode::Append));
-        assert!(!public_decision.allows(Mode::Control));
+        let g = guard_for(&store, Agent::Public, "/foo").await;
+        assert!(g.authorize(Mode::Read).is_err());
+        assert!(g.authorize(Mode::Write).is_err());
+        assert!(g.authorize(Mode::Append).is_err());
+        assert!(g.authorize(Mode::Control).is_err());
     }
 
     // Restarting the server must never roll back shares the owner made.
@@ -186,9 +178,8 @@ mod tests {
 
         provision_root_acl(&store, &sp(), OWNER, false).await.unwrap(); // restart
 
-        let acl = effective_acl(&store, &res("/foo")).await.unwrap().expect("acl");
-        assert!(decide(&acl.triples, &Agent::Public, &acl.governed_iri, true).allows(Mode::Read),
-            "the owner's edit must survive re-provisioning");
+        let g = guard_for(&store, Agent::Public, "/foo").await;
+        assert!(g.authorize(Mode::Read).is_ok(), "the owner's edit must survive re-provisioning");
     }
 
     // Finding 1b. The scenario the flag exists for: an emptied root ACL
@@ -211,17 +202,16 @@ mod tests {
         // flag exists to escape, pinned here so the counterweight below means
         // something.
         provision_root_acl(&store, &sp(), OWNER, false).await.unwrap(); // restart, no flag
-        let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("acl");
-        let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, acl.inherited);
-        assert!(!m.allows(Mode::Control), "an emptied ACL must stay empty without the flag");
+        let owner = Agent::WebId(OWNER.to_string());
+        let g = guard_for(&store, owner.clone(), "/").await;
+        assert!(g.authorize(Mode::Control).is_err(), "an emptied ACL must stay empty without the flag");
 
         provision_root_acl(&store, &sp(), OWNER, true).await.unwrap(); // restart --reset-root-acl
 
-        let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("acl");
-        let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, acl.inherited);
-        assert!(m.allows(Mode::Read), "the flag must restore the owner's Read");
-        assert!(m.allows(Mode::Write), "the flag must restore the owner's Write");
-        assert!(m.allows(Mode::Control), "the flag must restore the owner's Control");
+        let g = guard_for(&store, owner, "/").await;
+        assert!(g.authorize(Mode::Read).is_ok(), "the flag must restore the owner's Read");
+        assert!(g.authorize(Mode::Write).is_ok(), "the flag must restore the owner's Write");
+        assert!(g.authorize(Mode::Control).is_ok(), "the flag must restore the owner's Control");
     }
 
     // The existence guard is what makes ownership transfer and deliberate
@@ -246,11 +236,10 @@ mod tests {
 
         provision_root_acl(&store, &sp(), OWNER, false).await.unwrap(); // restart
 
-        let acl = effective_acl(&store, sp().root().as_resource()).await.unwrap().expect("acl");
-        let m = decide(&acl.triples, &Agent::WebId(OWNER.to_string()), &acl.governed_iri, acl.inherited);
-        assert!(!m.allows(Mode::Control), "a removed owner rule must not be re-provisioned");
-        assert!(!m.allows(Mode::Read));
-        assert!(!m.allows(Mode::Write));
+        let g = guard_for(&store, Agent::WebId(OWNER.to_string()), "/").await;
+        assert!(g.authorize(Mode::Control).is_err(), "a removed owner rule must not be re-provisioned");
+        assert!(g.authorize(Mode::Read).is_err());
+        assert!(g.authorize(Mode::Write).is_err());
     }
 
     // The WebID is interpolated into SPARQL; an unvalidated one would be an
@@ -260,6 +249,7 @@ mod tests {
         let store = OxigraphStore::in_memory().unwrap();
         let err = provision_root_acl(&store, &sp(), "not an iri> } ; DROP ALL ; #", false).await;
         assert!(matches!(err, Err(ResourceError::InvalidIri)));
-        assert!(effective_acl(&store, sp().root().as_resource()).await.unwrap().is_none());
+        let g = guard_for(&store, Agent::Public, "/").await;
+        assert!(g.authorize_aux(AuxKind::Acl).unwrap().is_none(), "no ACL should have been written");
     }
 }
