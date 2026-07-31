@@ -283,9 +283,12 @@ pub async fn emit_post(
     publish_containment(st, child.graph_iri(), materialized, Activity::Add).await;
 }
 
-/// `PATCH`: `Update`, or the `Create` shape when `create_by_patch` ran.
-/// `existence` comes from [`crate::wac::guard::Guard::target_exists`], read
-/// before the guard was consumed — `create_by_patch` takes it by value.
+/// `PATCH`: `Update`, or the `Create` shape when `create_by_patch` ran. For a
+/// resource or container, `existence` comes from
+/// [`crate::wac::guard::Guard::target_exists`], read before the guard was
+/// consumed — `create_by_patch` takes it by value. For an auxiliary it is
+/// always `Existed`: `aux::patch` refuses an absent one itself, so this point
+/// is never reached without one (design §4.3).
 pub async fn emit_patch(
     st: &AppState,
     target: &Target,

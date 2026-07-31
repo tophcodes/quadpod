@@ -643,52 +643,56 @@ async fn patch_impl(
     // takes its own branch here because the `target_exists` check below is not
     // the one it needs: §7's creation path is closed for an auxiliary as well, and
     // `aux::patch` refuses an absent one itself, with a body that says which
-    // of the two is missing.
-    let r = match &target {
-        Target::Resource(r) => r,
-        Target::Container(c) => c.as_resource(),
-        Target::Aux(a) => {
-            return match aux::patch(store, a, &patch).await {
-                Ok(result) => patch_response(result, &patch),
-                Err(AuxError::SubjectMissing) => {
-                    (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
-                }
-                Err(e @ AuxError::Missing) => {
-                    (StatusCode::NOT_FOUND, e.to_string()).into_response()
-                }
-                Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
+    // of the two is missing. That refusal also means this arm never creates —
+    // it is always an `Update` (§4.3), the same activity `put_write`'s `Aux`
+    // arm reports on the same topic.
+    let (res, existence, materialized) = if let Target::Aux(a) = &target {
+        let res = match aux::patch(store, a, &patch).await {
+            Ok(result) => patch_response(result, &patch),
+            Err(AuxError::SubjectMissing) => {
+                (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
             }
-        }
-    };
-    // Read before `materialize` consumes `guard` below (in either branch):
-    // it takes `self`, so this is the only chance to ask.
-    let existence = if guard.target_exists() {
-        crate::notify::Existence::Existed
-    } else {
-        crate::notify::Existence::Absent
-    };
-    let (res, materialized) = if matches!(existence, crate::notify::Existence::Absent) {
-        create_by_patch(&st, guard, &target, &patch).await
-    } else {
-        let res = match patch_dataset(store, r, &patch).await {
-            // A container's type triples are the server's, and a patch names
-            // its own triples — including them. Re-asserting them here is
-            // what `put_impl` does after writing a container body, and it is
-            // why a container patch is not refused outright: the client
-            // stays free to patch everything else the container's graph
-            // holds.
-            Ok(result) => match &target {
-                Target::Container(c) => match container::ensure_container(store, c).await {
-                    Ok(()) => patch_response(result, &patch),
-                    Err(e) => (put_status(&e), e.to_string()).into_response(),
-                },
-                _ => patch_response(result, &patch),
-            },
-            Err(e) => (put_status(&e), e.to_string()).into_response(),
+            Err(e @ AuxError::Missing) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+            Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
         };
-        // An update materializes nothing: the target already existed, so
-        // there is no ancestor to walk.
-        (res, Materialized::default())
+        (res, crate::notify::Existence::Existed, Materialized::default())
+    } else {
+        let r = match &target {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource(),
+            Target::Aux(_) => unreachable!("matched above"),
+        };
+        // Read before `materialize` consumes `guard` below (in either
+        // branch): it takes `self`, so this is the only chance to ask.
+        let existence = if guard.target_exists() {
+            crate::notify::Existence::Existed
+        } else {
+            crate::notify::Existence::Absent
+        };
+        let (res, materialized) = if matches!(existence, crate::notify::Existence::Absent) {
+            create_by_patch(&st, guard, &target, &patch).await
+        } else {
+            let res = match patch_dataset(store, r, &patch).await {
+                // A container's type triples are the server's, and a patch names
+                // its own triples — including them. Re-asserting them here is
+                // what `put_impl` does after writing a container body, and it is
+                // why a container patch is not refused outright: the client
+                // stays free to patch everything else the container's graph
+                // holds.
+                Ok(result) => match &target {
+                    Target::Container(c) => match container::ensure_container(store, c).await {
+                        Ok(()) => patch_response(result, &patch),
+                        Err(e) => (put_status(&e), e.to_string()).into_response(),
+                    },
+                    _ => patch_response(result, &patch),
+                },
+                Err(e) => (put_status(&e), e.to_string()).into_response(),
+            };
+            // An update materializes nothing: the target already existed, so
+            // there is no ancestor to walk.
+            (res, Materialized::default())
+        };
+        (res, existence, materialized)
     };
     crate::notify::emit_patch(&st, &target, existence, &materialized, res.status()).await;
     res
@@ -711,6 +715,10 @@ async fn patch_impl(
 ///
 /// Only a resource or a container reaches here. An auxiliary is answered by
 /// `aux::patch`, which refuses an absent one itself.
+///
+/// The second element of the pair is what the ancestor walk materialized —
+/// what `emit_patch` needs and cannot re-derive. A failing exit's is never
+/// read: `emit_patch` gates emission on `status` alone, before it looks at it.
 async fn create_by_patch(
     st: &AppState,
     guard: Guard<'_>,
@@ -7230,5 +7238,72 @@ mod tests {
         let p = next_event(&mut on_parent).await;
         assert_eq!(p.activity, crate::notify::Activity::Add);
         assert_eq!(p.object, target.graph_iri());
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state.
+        let container_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(p.state.as_deref(), Some(container_etag.as_str()),
+            "the Add's state must be the container's own validator, not the child's");
+    }
+
+    /// Design §4.3: an auxiliary `PATCH` never creates — `aux::patch` refuses
+    /// an absent one — so it is always an `Update`, reported on the
+    /// auxiliary's own topic. An auxiliary is never a container member, so
+    /// its parent's containment does not change either.
+    #[tokio::test]
+    async fn a_patch_on_an_auxiliary_emits_update() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+        let acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        assert_eq!(put_acl(&f, "/c/notes", &acl_body).await.status(), StatusCode::CREATED);
+
+        let aux = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_aux = f.events.subscribe(crate::notify::Topic::from(&aux));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        let res = patch_n3(&f, "/.aux/c/notes.acl",
+            "<> a solid:InsertDeletePatch ; solid:inserts \
+             { <#owner> <http://purl.org/dc/terms/title> \"updated\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_aux).await;
+        assert_eq!(e.activity, crate::notify::Activity::Update);
+        assert_eq!(e.object, aux.graph_iri());
+        assert_eq!(e.target, None);
+        // Independent of `state_of`: a GET on the auxiliary itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state.
+        let aux_etag = f.app.clone().oneshot(f.owner_request("GET", "/.aux/c/notes.acl")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(e.state.as_deref(), Some(aux_etag.as_str()));
+        stays_silent(&mut on_parent,
+            "an auxiliary is never a container member, so containment did not change").await;
+    }
+
+    /// Deleting `emit_patch`'s `!status.is_success()` guard would let this
+    /// through with a bogus `Update` — the tail is reached, patch or no.
+    #[tokio::test]
+    async fn a_refused_patch_emits_nothing() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        // `solid:deletes` names a triple that is not there — the simplest 409.
+        let res = patch_n3(&f, "/c/notes",
+            "<> a solid:InsertDeletePatch ; solid:deletes \
+             { <#it> <http://schema.org/name> \"absent\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT, "the fixture's premise");
+        stays_silent(&mut on_target, "a refused patch is not a change").await;
     }
 }
