@@ -629,6 +629,24 @@ pub async fn get_rdf(
     Ok(Some(triples))
 }
 
+/// Which of `graphs` are present, as the set of their graph IRIs.
+///
+/// One query for the whole set. The ancestor chains an authorization walks are
+/// nested — the ACL candidates for `/a/b/` are a suffix of those for `/a/b/c` —
+/// so asking level by level re-asks what an earlier level already answered.
+/// See `2026-07-31-request-scoped-guard-design.md` §2, §4.
+///
+/// Lives here because the system graph holding the marker is this module's to
+/// name and nobody else's (`docs/constraints.md`, *"Only `resource` builds a
+/// system-graph IRI"*). [`exists`] is the one-element case, so the two cannot
+/// answer differently.
+pub async fn exists_many(
+    store: &dyn SparqlStore,
+    graphs: &[&dyn GraphName],
+) -> Result<std::collections::HashSet<String>, ResourceError> {
+    todo!("design §4: one SELECT over a VALUES block of (system graph, own IRI) pairs")
+}
+
 /// Whether `g` is present. Reads the stored marker in the system graph
 /// rather than counting triples, so an empty-but-present graph still
 /// reports `true` and unmarked content still reports `false`.

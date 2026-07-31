@@ -12,7 +12,7 @@ the store, and the answer turns out to be quadratic in path depth.
 
 The LDP door's WAC enforcement point becomes a value. `wac::Guard` is constructed once per request from
 the store, the agent and the target; it resolves every existence fact the request needs in
-**one** store query and reads the governing ACL once; and `authorize` becomes a synchronous
+**one** store query and the chain's ACLs in one more; and `authorize` becomes a synchronous
 method on it that cannot reach the store at all.
 
 Four properties are decided beyond "it is faster":
@@ -156,14 +156,22 @@ and the ACL triples it loaded. Not `AppState`, not the blob store, not headers, 
 body. Without that line it becomes the place everything per-request accumulates, and an
 enforcement point that holds the request body is no longer an enforcement point.
 
-**ACL triples are fetched lazily, memoized by governed IRI.** The probe already says which ACLs
-exist; which one governs a given level is then a lookup, and its triples are one `CONSTRUCT` the
-first time that level is decided. Nested chains usually share one ACL, so the usual count is
-one — but a resource with its own ACL under a container with another is two, and the memo is
-what keeps it at two rather than one per level.
+**The chain's ACL triples are read eagerly, in one query.** `prp::load_chain_acls` takes the
+probe's presence set and fetches every ACL the chain actually has, keyed by the IRI it governs;
+choosing which one governs a given level is then a lookup in that map.
 
-Total for the authorization of a deep create: **one `SELECT` and one `CONSTRUCT`**, against
-roughly *d*²/2 today.
+Eager rather than lazy, and the skeleton is what settled it: a lazy per-level fetch needs an
+`await` at the moment a level is decided, and there is none left — `authorize` is synchronous,
+which is the property the whole design is for. Laziness and a store-free decision cannot both
+hold, and the decision is the one worth keeping.
+
+What eagerness costs is reading an ACL that no level ends up consulting. That is bounded by the
+chain, it is one query either way, and in the ordinary case the chain holds exactly one ACL
+document. It buys back the memo, the interior mutability a memo behind `&self` would need, and
+the ordering question of which level warms it.
+
+Total for the authorization of a deep create: **two queries** — the presence probe and the ACL
+read — against roughly *d*²/2 today.
 
 ## 6. Before and after the write
 
@@ -276,9 +284,6 @@ No existing rule changes. The `SparqlStore`-has-one-implementor check stays as i
   that means adding a shape to `SparqlStore`, which ADR-2 makes a load-bearing contract, and §5
   removes so many calls that the per-call parse cost is a different question afterwards than it
   is now. Revisit against measurements, not before.
-- **Batching the ACL `CONSTRUCT`s.** §5's memo makes the usual count one. A `SELECT` over
-  several ACL graphs at once would make the unusual count one as well, for a case that does not
-  yet appear in any measurement.
 - **The read path's remaining queries.** Content, shelves and conditional requests are work, not
   overhead. `get_rdf`'s duplicate existence check disappears as a consequence of §4, but the
   reads themselves stay.

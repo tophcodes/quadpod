@@ -292,6 +292,109 @@ pub async fn authorize_and_materialize(
     Ok(())
 }
 
+/// What a materialization found and made — the pre-write state, carried past
+/// the moment it stops being readable from the store.
+///
+/// `target_existed` is what chooses `201` over `204`, and it is the reason
+/// `put_impl` no longer reads the same snapshot twice: the probe knew it
+/// before anything was written. See `2026-07-31-request-scoped-guard-design.md` §6.
+pub struct Created {
+    pub target_existed: bool,
+}
+
+/// The LDP door's enforcement point, for one request.
+///
+/// Built once from the target, it resolves every existence fact the request
+/// needs in one query and reads the governing ACLs in one more. The three
+/// decision methods are then synchronous and hold no store parameter, so a
+/// second resolution of the same ACL — which would repeat the walk and could
+/// straddle a concurrent write — is not something a later edit has to
+/// remember not to write.
+///
+/// **Not** the enforcement point for the `/sparql` read proxy the root spec
+/// §11 keeps as a seam: that door asks a set-valued question ("which graphs
+/// may this agent read"), which no single-target API answers. The core root
+/// spec §8 shares across doors is `pdp::decide` and the ACL resolution below
+/// this type, both of which this uses rather than replaces.
+///
+/// The lifetime is deliberate: a guard borrows the store for the request it
+/// was probed in, so it cannot be stashed in anything that outlives the
+/// snapshot it describes.
+pub struct Guard<'a> {
+    store: &'a dyn SparqlStore,
+    agent: Agent,
+    target: Target,
+    /// The subject and every container above it, nearest first — the one
+    /// chain a request touches (design §3).
+    chain: Vec<ResourceUrl>,
+    /// Graph IRIs the probe found present.
+    present: std::collections::HashSet<String>,
+    /// ACL triples by governed IRI, for every ACL in the chain that exists.
+    acls: std::collections::HashMap<String, Vec<oxigraph::model::Triple>>,
+}
+
+impl<'a> Guard<'a> {
+    /// Resolve everything this request's authorization depends on.
+    ///
+    /// Refuses nothing: its only failure is a store error, which is a `500`
+    /// whatever exists. Every refusal that reads a probed fact is produced by
+    /// a method below, after the corresponding [`Guard::authorize`] returned
+    /// `Ok` — design §7's rule, which is about the ordering of *answers*, not
+    /// of queries.
+    pub async fn probe(
+        store: &'a dyn SparqlStore,
+        agent: Agent,
+        target: Target,
+    ) -> Result<Self, Response> {
+        todo!("design §4: chain + ACLs + slash counterparts in one exists_many, then load_chain_acls")
+    }
+
+    /// May this agent perform `mode` on the target?
+    ///
+    /// Takes no target: there is one per request and this owns it. An
+    /// auxiliary is decided against its subject and requires the mode its
+    /// [`AuxKind`] demands, exactly as the free function it replaces.
+    pub fn authorize(&self, mode: Mode) -> Result<Decision, Response> {
+        todo!("design §5: pick the governing ACL from `acls`, then pdp::decide")
+    }
+
+    /// The same question for the container above the target — `None` at the
+    /// root, which has none. `DELETE` needs it because removing a member
+    /// rewrites the parent's containment triples.
+    pub fn authorize_parent(&self, mode: Mode) -> Result<Option<Decision>, Response> {
+        todo!("design §5")
+    }
+
+    /// The same question for the target's auxiliary of `kind` — `None` when
+    /// no such auxiliary exists, so there is nothing to authorize.
+    ///
+    /// `DELETE` needs it for every kind: deleting a subject takes its
+    /// auxiliaries with it, and a narrowing ACL must not be removable by
+    /// someone holding merely `Write`.
+    pub fn authorize_aux(&self, kind: AuxKind) -> Result<Option<Decision>, Response> {
+        todo!("design §5")
+    }
+
+    /// Whether the target was present when this guard was probed.
+    ///
+    /// Refuses nothing on its own. Callers read it after [`Guard::authorize`]
+    /// returned `Ok`, which is the ordering the store lookup it replaces
+    /// already obeyed (design §7).
+    pub fn existed(&self) -> bool {
+        todo!("design §6")
+    }
+
+    /// Authorize and perform the container materialization this write implies,
+    /// then give up the guard.
+    ///
+    /// Takes `self` because the probe describes the store *before* these
+    /// writes: after this returns there is no guard left to read a stale
+    /// answer from, and what the request still needs travels in [`Created`].
+    pub async fn materialize(self) -> Result<Created, Response> {
+        todo!("design §6: the decide-then-write walk, now deciding from `present`")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

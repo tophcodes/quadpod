@@ -30,6 +30,26 @@ pub struct EffectiveAcl {
     pub inherited: bool,
 }
 
+/// The triples of every ACL in `chain` that exists, keyed by the IRI of the
+/// resource it governs.
+///
+/// `present` is the probe's answer (`resource::exists_many`), so this asks the
+/// store nothing about existence — it reads the set it was handed and fetches
+/// only the graphs already known to be there, in one query.
+///
+/// Eager rather than lazy, and that is forced: `Guard::authorize` is
+/// synchronous, so there is no `await` left at the point a level's ACL is
+/// chosen. Loading the whole chain's ACLs costs one query for a set bounded by
+/// the chain, and is usually one document — a lazy per-level fetch would cost
+/// the synchronous decision instead. See `2026-07-31-request-scoped-guard-design.md` §5.
+pub async fn load_chain_acls(
+    store: &dyn SparqlStore,
+    chain: &[ResourceUrl],
+    present: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashMap<String, Vec<Triple>>, ResourceError> {
+    todo!("design §5: one SELECT ?g ?s ?p ?o over the chain's existing ACL graphs")
+}
+
 /// Resolve the ACL governing `subject`, or `None` — which the guard turns
 /// into a denial, because WAC has no implicit grant.
 pub async fn effective_acl(
