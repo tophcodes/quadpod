@@ -179,16 +179,76 @@ fn allowed_methods(target: &Target) -> &'static str {
 
 /// The one patch format this pod accepts. Protocol §5.3 makes advertising it a
 /// MUST, and it travels with `Allow` because both answer "what may I do here?".
+///
+/// A constant rather than a lookup, unlike [`accept_write`]: `text/n3` is not
+/// a [`Format`] — nothing in `rdf.rs` parses it, `patch.rs` owns it end to end
+/// — so there is no list here for a second one to drift from.
 const ACCEPT_PATCH: &str = "text/n3";
 
+/// Which write method an advertisement describes. A two-arm enum rather than a
+/// `bool`, for the reason [`Shape`] is one: `accept_write(&target, true, v)`
+/// says nothing at the call site.
+#[derive(Debug, Clone, Copy)]
+enum Write {
+    Put,
+    Post,
+}
+
+/// What may be written here, as an `Accept-Put`/`Accept-Post` field value.
+///
+/// `None` where [`allowed_methods`] does not permit the method: `POST`
+/// addresses containers alone, and a header naming a method the same response
+/// refuses in `Allow` is worse than an absent one.
+///
+/// Every RDF format appears twice — bare, and with the store's own `version`
+/// label. Both are true: [`RdfVersion::from_media_type`] reads an *absent*
+/// parameter as `Rdf11`, so the two spellings are two acceptable
+/// representations. The versioned twin is dropped on an `Rdf11` store, where
+/// it would be a second spelling of the first entry. Only the store's maximum
+/// is named; a lower `version` is accepted — [`classify_body`] refuses only
+/// `declared > store_version` — and is what the bare entry already covers.
+///
+/// `*/*` is [LDP §4.5.2][ldp]'s "any media type", and it is [`classify_body`]'s
+/// blob arm read back out: a `POST`ed child and a `PUT` resource may be blobs;
+/// a container's own representation and an auxiliary may not.
+///
+/// [ldp]: https://www.w3.org/TR/ldp/#ldpc-post-acceptposthdr
+fn accept_write(target: &Target, method: Write, version: RdfVersion) -> Option<String> {
+    let blobs = match (target, method) {
+        (Target::Container(_), Write::Post) | (Target::Resource(_), Write::Put) => true,
+        (Target::Container(_) | Target::Aux(_), Write::Put) => false,
+        (Target::Resource(_) | Target::Aux(_), Write::Post) => return None,
+    };
+    let mut types = Vec::new();
+    for f in Format::ALL {
+        types.push(f.media_type().to_string());
+        if version > RdfVersion::Rdf11 {
+            types.push(format!("{};version={}", f.media_type(), version.label()));
+        }
+    }
+    if blobs {
+        types.push("*/*".to_string());
+    }
+    Some(types.join(", "))
+}
+
 /// Attach [`allowed_methods`] to a read that succeeded — Protocol §4.1 makes
-/// it a MUST on `GET`/`HEAD` — alongside `Accept-Patch`.
-fn with_allow(mut res: Response, target: &Target) -> Response {
+/// it a MUST on `GET`/`HEAD` — alongside the three `Accept-*` headers §5.3
+/// makes a MUST beside it.
+fn with_allow(mut res: Response, target: &Target, version: RdfVersion) -> Response {
     res.headers_mut().insert(
         header::ALLOW,
         allowed_methods(target).parse().expect("method list is header-safe"),
     );
     res.headers_mut().insert("accept-patch", HeaderValue::from_static(ACCEPT_PATCH));
+    for (name, method) in [("accept-put", Write::Put), ("accept-post", Write::Post)] {
+        if let Some(value) = accept_write(target, method, version) {
+            res.headers_mut().insert(
+                name,
+                value.parse().expect("media types and version labels are header-safe"),
+            );
+        }
+    }
     res
 }
 
@@ -221,8 +281,10 @@ fn wac_allow_value(decision: &Decision) -> String {
 ///
 /// One helper rather than three nested calls at four sites, so a read path
 /// added later cannot pick up two of the three and still look right.
-fn with_read_headers(res: Response, target: &Target, decision: &Decision) -> Response {
-    let mut res = with_allow(with_aux_links(res, target), target);
+fn with_read_headers(
+    res: Response, target: &Target, decision: &Decision, version: RdfVersion,
+) -> Response {
+    let mut res = with_allow(with_aux_links(res, target), target, version);
     res.headers_mut().insert(
         "wac-allow",
         wac_allow_value(decision).parse().expect("mode names are header-safe"),
@@ -1423,18 +1485,25 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
 /// [`allowed_methods`] takes a [`Target`] and never reaches the store — so it
 /// discloses nothing about what exists. That is the line `post_impl` already
 /// draws when it answers `409` from the path shape rather than let `POST`
-/// become an existence oracle.
+/// become an existence oracle. The [`RdfVersion`] this also takes is a
+/// deployment constant ([`SparqlStore::rdf_version`]) rather than a lookup, so
+/// that argument survives it intact.
 ///
 /// `Access-Control-Allow-Headers` mirrors what was asked for rather than
 /// naming a fixed set: `protocol/cors/accept-acah` sends two otherwise
 /// identical preflights and requires `Accept` to be absent from the answer to
 /// the one that did not request it.
-fn options_impl(target: &Target, headers: &HeaderMap) -> Response {
+fn options_impl(target: &Target, headers: &HeaderMap, version: RdfVersion) -> Response {
     let mut out = HeaderMap::new();
     let methods = allowed_methods(target);
     out.insert(header::ALLOW, HeaderValue::from_static(methods));
     out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static(methods));
     out.insert("accept-patch", HeaderValue::from_static(ACCEPT_PATCH));
+    for (name, method) in [("accept-put", Write::Put), ("accept-post", Write::Post)] {
+        if let Some(value) = accept_write(target, method, version) {
+            out.insert(name, value.parse().expect("media types and version labels are header-safe"));
+        }
+    }
     if let Some(requested) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
         out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
     }
@@ -1445,14 +1514,14 @@ async fn handle_options(
     State(st): State<AppState>, Path(path): Path<String>, headers: HeaderMap,
 ) -> Response {
     match classify(&st.space, &format!("/{path}")) {
-        Ok(target) => options_impl(&target, &headers),
+        Ok(target) => options_impl(&target, &headers, st.store.rdf_version()),
         Err(status) => status.into_response(),
     }
 }
 
 async fn handle_options_root(State(st): State<AppState>, headers: HeaderMap) -> Response {
     match classify(&st.space, "/") {
-        Ok(target) => options_impl(&target, &headers),
+        Ok(target) => options_impl(&target, &headers, st.store.rdf_version()),
         Err(status) => status.into_response(),
     }
 }
@@ -1607,12 +1676,14 @@ async fn blob_read(st: AppState, target: Target, headers: HeaderMap, mt: MediaTy
     out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
     out.insert(header::VARY, "Accept".parse().expect("static"));
     if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
-        return with_allow(with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target), &target);
+        return with_allow(
+            with_aux_links((StatusCode::NOT_MODIFIED, out).into_response(), &target),
+            &target, st.store.rdf_version());
     }
     // `MediaType` carries the `HeaderValue` its constructor validated, so
     // there is nothing here to assert.
     out.insert(header::CONTENT_TYPE, mt.header_value());
-    with_allow(with_aux_links((out, bytes).into_response(), &target), &target)
+    with_allow(with_aux_links((out, bytes).into_response(), &target), &target, st.store.rdf_version())
 }
 
 async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap) -> Response {
@@ -1675,7 +1746,8 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
         out.insert(header::VARY, "Accept".parse().expect("static"));
         return with_read_headers(
-            (StatusCode::NOT_MODIFIED, out).into_response(), &target, &decision);
+            (StatusCode::NOT_MODIFIED, out).into_response(), &target, &decision,
+            store.rdf_version());
     }
     // §6.2: a graph format gets the default graph, and is told what it missed.
     let served = if fmt.carries_dataset() { visible.clone() } else { visible.default_graph_only() };
@@ -1741,7 +1813,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             ).parse().expect("static"));
         }
     }
-    with_read_headers((out, bytes).into_response(), &target, &decision)
+    with_read_headers((out, bytes).into_response(), &target, &decision, store.rdf_version())
 }
 
 /// The pre-dataset read path: containers and auxiliaries, whose graph never
@@ -1776,6 +1848,7 @@ async fn legacy_graph_read(
                 out.insert(header::VARY, "Accept".parse().expect("static"));
                 return with_read_headers(
                     (StatusCode::NOT_MODIFIED, out).into_response(), &target, decision,
+                    store.rdf_version(),
                 );
             }
             match fmt.serialize(&visible.project_to(served_version)) {
@@ -1798,7 +1871,8 @@ async fn legacy_graph_read(
                             target.graph_iri(), fmt.media_type(), held.label()
                         ).parse().expect("media type and version label are token-safe"));
                     }
-                    with_read_headers((headers, bytes).into_response(), &target, decision)
+                    with_read_headers(
+                        (headers, bytes).into_response(), &target, decision, store.rdf_version())
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
@@ -2221,6 +2295,72 @@ mod tests {
             assert!(acam.contains("PATCH"), "OPTIONS {path} ACAM: {acam}");
             assert_eq!(opt.headers()["accept-patch"].to_str().unwrap(), "text/n3");
         }
+    }
+
+    /// Protocol §5.3: the three `Accept-*` headers are one MUST, and the two
+    /// new ones are checked on every target shape for the reason the test
+    /// above gives — `allowed_methods` has three arms.
+    #[tokio::test]
+    async fn accept_put_advertises_every_writable_format_and_version() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        for path in ["/c/thing", "/c/", "/"] {
+            let get = f.app.clone().oneshot(f.owner_request("GET", path)
+                .header(header::ACCEPT, "text/turtle")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(get.status(), StatusCode::OK, "GET {path}");
+            let put = get.headers()["accept-put"].to_str().unwrap().to_string();
+
+            let opt = f.app.clone().oneshot(Request::builder()
+                .method("OPTIONS").uri(path).body(Body::empty()).unwrap()).await.unwrap();
+            let opt_put = opt.headers()["accept-put"].to_str().unwrap().to_string();
+            assert_eq!(put, opt_put, "GET and OPTIONS must advertise the same thing at {path}");
+
+            for fmt in Format::ALL {
+                let mt = fmt.media_type();
+                assert!(put.contains(mt), "{path} Accept-Put lacks {mt}: {put}");
+                // Both halves are true: an absent `version` parameter *is*
+                // 1.1 (`RdfVersion::from_media_type`), so the bare type and
+                // the versioned type are two acceptable representations.
+                assert!(
+                    put.contains(&format!("{mt};version=1.2")),
+                    "{path} Accept-Put lacks {mt};version=1.2: {put}"
+                );
+            }
+        }
+    }
+
+    /// Each header reaches exactly as far as `Allow` does, and `*/*` appears
+    /// exactly where `classify_body` admits a blob. A container's own
+    /// representation must be RDF; an auxiliary's must be too.
+    #[tokio::test]
+    async fn the_write_advertisement_is_scoped_to_what_the_target_allows() {
+        let f = fixture().await;
+        f.put_turtle("/c/thing", "<#a> <http://example.org/b> \"c\" .").await;
+
+        let container = f.app.clone().oneshot(Request::builder()
+            .method("OPTIONS").uri("/c/").body(Body::empty()).unwrap()).await.unwrap();
+        let post = container.headers()["accept-post"].to_str().unwrap();
+        assert!(post.contains("*/*"), "a POSTed child may be a blob: {post}");
+        assert!(post.contains("text/turtle"), "{post}");
+        let put = container.headers()["accept-put"].to_str().unwrap();
+        assert!(!put.contains("*/*"), "a container's own representation must be RDF: {put}");
+
+        let resource = f.app.clone().oneshot(Request::builder()
+            .method("OPTIONS").uri("/c/thing").body(Body::empty()).unwrap()).await.unwrap();
+        assert!(resource.headers()["accept-put"].to_str().unwrap().contains("*/*"));
+        assert!(
+            resource.headers().get("accept-post").is_none(),
+            "POST is not in a resource's Allow, so it must not be advertised"
+        );
+
+        let aux = f.app.clone().oneshot(Request::builder()
+            .method("OPTIONS").uri("/.aux/thing.acl").body(Body::empty()).unwrap()).await.unwrap();
+        let aux_put = aux.headers()["accept-put"].to_str().unwrap();
+        assert!(aux_put.contains("text/turtle"), "{aux_put}");
+        assert!(!aux_put.contains("*/*"), "an auxiliary is a policy document, never a blob: {aux_put}");
+        assert!(aux.headers().get("accept-post").is_none());
     }
 
     #[tokio::test]
