@@ -7293,6 +7293,54 @@ mod tests {
             "the Add's state must be the container's own validator, not the child's");
     }
 
+    /// §6.3: a `PUT` on an auxiliary reaches `put_impl`'s tail and emits, and
+    /// that is the whole argument for the aux `PATCH` fix — the two verbs must
+    /// agree about the same topic. First write creates it, the second updates
+    /// it, and its subject's container hears neither: an auxiliary is never a
+    /// member (§4.2).
+    #[tokio::test]
+    async fn a_put_on_an_auxiliary_emits_create_then_update() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+        let aux = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let mut on_aux = f.events.subscribe(crate::notify::Topic::from(&aux));
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+
+        // Control on every write, or the second `PUT` would be refused by the
+        // policy the first one installed.
+        let acl = |title: &str| format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ; \
+             <http://purl.org/dc/terms/title> \"{title}\" ."
+        );
+        assert_eq!(put_acl(&f, "/c/notes", &acl("first")).await.status(), StatusCode::CREATED);
+
+        let created = next_event(&mut on_aux).await;
+        assert_eq!(created.activity, crate::notify::Activity::Create);
+        assert_eq!(created.object, aux.graph_iri());
+        assert_eq!(created.target, None);
+
+        let second = put_acl(&f, "/c/notes", &acl("second")).await;
+        assert!(second.status().is_success(), "overwriting the acl: {}", second.status());
+
+        let updated = next_event(&mut on_aux).await;
+        assert_eq!(updated.activity, crate::notify::Activity::Update,
+            "the auxiliary was there, so the second write is not another Create");
+        // Independent of `state_of`: a GET on the auxiliary itself, at the
+        // media type and version §5.1 fixes, is the validator the pod would
+        // hand a client for the same state.
+        let aux_etag = f.app.clone().oneshot(f.owner_request("GET", "/.aux/c/notes.acl")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(updated.state.as_deref(), Some(aux_etag.as_str()));
+
+        stays_silent(&mut on_parent,
+            "an auxiliary is never a container member, so containment did not change").await;
+    }
+
     /// Design §4.3: an auxiliary `PATCH` never creates — `aux::patch` refuses
     /// an absent one — so it is always an `Update`, reported on the
     /// auxiliary's own topic. An auxiliary is never a container member, so
@@ -7459,6 +7507,28 @@ mod tests {
             "an auxiliary is not a member, so nothing about containment changed").await;
     }
 
+    /// `delete_impl` collects only the auxiliaries `authorize_aux` reported
+    /// present. One it found absent must not reach `emit_delete`, or a
+    /// `DELETE` would announce the removal of an auxiliary that never was —
+    /// on the topic of every kind in `AuxKind::ALL`, as each new kind is added.
+    #[tokio::test]
+    async fn a_delete_says_nothing_about_an_auxiliary_that_was_not_there() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"x\" .").await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let acl = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_acl = f.events.subscribe(crate::notify::Topic::from(&acl));
+
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/c/notes").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        assert_eq!(next_event(&mut on_target).await.activity, crate::notify::Activity::Delete);
+        stays_silent(&mut on_acl,
+            "the resource had no acl, so the cascade took none with it").await;
+    }
+
     /// A refused delete emits nothing: the tail returns before touching the bus.
     #[tokio::test]
     async fn a_refused_delete_emits_nothing() {
@@ -7471,6 +7541,38 @@ mod tests {
             .await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "the fixture's premise");
         stays_silent(&mut on_target, "a refused delete is not a change").await;
+    }
+
+    /// §9's first mandated test, on the wire: `state` is byte-identical to the
+    /// `ETag` of an immediately following `GET` at the media type and version
+    /// §5.1 fixes. Against a resource that actually holds RDF 1.2, with the
+    /// unversioned read of the same state asserted to differ — on a 1.1
+    /// fixture the two reads return the same tag and the version half of §5.2
+    /// goes unchecked.
+    #[tokio::test]
+    async fn the_state_is_the_versioned_n_quads_etag_of_a_1_2_resource() {
+        let f = fixture().await;
+        let target = f.space.resolve("/foo").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        assert_eq!(
+            put_versioned(&f, "/foo", "text/turtle;version=1.2", TRIPLE_TERM_TTL).await.status(),
+            StatusCode::CREATED,
+            "the fixture's premise: the stored state holds a triple term",
+        );
+        let e = next_event(&mut on_target).await;
+
+        let versioned = get_accepting(&f, "/foo", "application/n-quads;version=1.2").await;
+        assert_eq!(versioned.status(), StatusCode::OK);
+        let versioned_etag = versioned.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let unversioned = get_accepting(&f, "/foo", "application/n-quads").await;
+        assert_eq!(unversioned.status(), StatusCode::OK);
+        let unversioned_etag = unversioned.headers()[header::ETAG].to_str().unwrap().to_owned();
+
+        assert_ne!(versioned_etag, unversioned_etag,
+            "the two reads must differ, or this test cannot tell the versions apart");
+        assert_eq!(e.state.as_deref(), Some(versioned_etag.as_str()),
+            "state is the validator of the state as held, not of its 1.1 projection");
     }
 
     /// A deep create is six events, and the root hears exactly one of them:
