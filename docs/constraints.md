@@ -309,6 +309,64 @@ The `version` media-type parameter is read in exactly one place.
     violation.
     check: [ "$(rg -o 'eq_ignore_ascii_case\("version"\)|strip_prefix\("version="\)|starts_with\("version="\)' src | wc -l)" = 1 ]
 
+## Configuration
+
+The config file is never found, only named.
+    → 2026-07-31-cli-config-design.md §4. A pod must not be able to start
+    against a file that is invisible to whoever reads the command line, so
+    `--config`/`POD_CONFIG` is the only route in and there is no search path.
+    The rule is cheap to break by accident: adding a "just look in the working
+    directory too" convenience is one line, reads as helpful, and silently
+    makes two pods with identical invocations behave differently depending on
+    where they were started. The `.toml"` alternative is deliberately blunt:
+    it matches *any* string literal ending in `.toml`, whatever expression it
+    sits in, so `Path::new`, `PathBuf::from`, a bare `.join(...)` argument and
+    a `static` all count the same as a `const` or `let`. A narrower pattern
+    anchored on `const`/`let` was tried and abandoned — `PathBuf::from` and
+    `Path::new` are how a path actually gets written in Rust, so it missed the
+    likeliest shape of the very convenience the rule exists to stop.
+    **This over-matches, and that is the accepted trade.** A legitimate
+    `.toml`-suffixed literal in a test fixture trips it too; twice during
+    implementation it did, and both fixtures were rewritten around the check.
+    If you hit it and your literal is data a test writes rather than a path
+    the pod looks for, build the name with `.with_extension("toml")` — as
+    `config.rs`'s `write_temp_toml` does — rather than loosening this rule.
+    A false positive here argues with you out loud; a false negative would
+    let a search path in without a word. Demonstrated red,
+    each injected into and then reverted out of `src/config.rs` in turn,
+    against `let p = std::path::PathBuf::from("sparql-pod.toml");`, that same
+    call as a bare expression with no binding, `let p =
+    std::path::Path::new("sparql-pod.toml");`,
+    `std::env::current_dir().unwrap().join("sparql-pod.toml")`, `static
+    SEARCH_PATH: &str = "sparql-pod.toml";`, and a `dirs::config_dir()` /
+    `std::env::var("XDG_CONFIG_HOME")` / `home_dir()` lookup; demonstrated to
+    stay green on the unmodified tree, where the two fixture lines above
+    build their temp filename through `std::env::temp_dir().join(...)` and
+    `.with_extension("toml")` rather than a `.toml`-suffixed string literal.
+    **What it does not catch:** a search path built by joining a non-literal
+    base — `std::env::current_dir().unwrap().join("sparql-pod").with_extension("toml")`,
+    the very idiom this rule's own prose recommends above for a test
+    fixture's filename — produces no matching string literal and passes
+    unseen, and a search path whose filename does not end in `.toml` at all
+    is invisible to a check anchored on that suffix, even though `--config`
+    itself accepts any path. Both were verified to pass unseen against the
+    unmodified tree.
+    check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|\.toml"' src
+
+Precedence is clap's, never hand-written.
+    → 2026-07-31-cli-config-design.md §5, §5.1; `config.rs`'s module header,
+    which states the property this pins. File values reach clap as defaults,
+    so flag > env > file > default falls out of clap's own resolution with no
+    merge logic anywhere. The alternative — reading `ArgMatches::value_source`
+    and overwriting whatever came from a default — needs one arm per field,
+    and a field whose arm is forgotten silently ignores the file. Nothing but
+    a missing test would catch that, which is what makes it worth a rule.
+    Scoped to all of `src`, not just `config.rs`: `Config::load()`'s result is
+    actually consumed in `main.rs`, so a merge helper placed there instead
+    would be the same hand-written precedence and a check confined to
+    `config.rs` would not see it. Demonstrated red against a
+    `value_source("listen")` merge helper injected into `main.rs`.
+    check: ! rg -q 'value_source' src
 ## WAC
 
 The guard names the store exactly twice: the field it holds and the probe that fills it.
