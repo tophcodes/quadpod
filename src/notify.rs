@@ -488,6 +488,23 @@ mod tests {
         drop(keep);
     }
 
+    /// The other half of §2.2: `live` reclaims a channel whose readers are
+    /// all gone, so the map does not grow without bound over client-chosen
+    /// paths. `Drop` covers the ordinary route out and cannot produce the
+    /// state under test, so the sender is put in the map directly.
+    #[test]
+    fn live_evicts_a_channel_that_has_no_reader_left() {
+        let bus = Arc::new(Bus::new());
+        let topic = Topic::from(&target("/notes"));
+        let (tx, rx) = broadcast::channel(CAPACITY);
+        drop(rx);
+        bus.channels.write().unwrap().insert(topic.clone(), tx);
+
+        assert!(bus.live(&[topic]).is_empty(), "a channel nobody reads is not live");
+        assert_eq!(bus.channels.read().unwrap().len(), 0,
+            "live must reclaim the entry, not merely report it as not live");
+    }
+
     #[tokio::test]
     async fn publish_reaches_the_receiver_of_that_topic() {
         let bus = Arc::new(Bus::new());
