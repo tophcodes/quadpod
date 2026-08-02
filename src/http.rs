@@ -7200,6 +7200,34 @@ mod tests {
             "the Add's state must be the container's own validator, not the child's");
     }
 
+    /// Every other refusal in `post_impl` returns before the tail, so a
+    /// storage failure is the only way a non-2xx reaches `emit_post` — and its
+    /// success guard is all that stands between that and a `Create` for a
+    /// child that was never written, plus an `Add` naming it.
+    ///
+    /// The blob backend is what fails, not the store: `Guard::materialize`
+    /// runs before the write and takes its own `500` out of `post_impl` past
+    /// the tail, so a failing `SparqlStore` never gets a request as far as the
+    /// emit.
+    #[tokio::test]
+    async fn a_post_whose_write_fails_emits_nothing() {
+        let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;
+        let container = f.space.resolve("/c/").unwrap();
+        let child = f.space.resolve("/c/photo.png").unwrap();
+        let mut on_container = f.events.subscribe(crate::notify::Topic::from(&container));
+        let mut on_child = f.events.subscribe(crate::notify::Topic::from(&child));
+
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/c/")
+            .header(header::CONTENT_TYPE, "image/png")
+            .header("slug", "photo.png")
+            .body(Body::from(&b"\x89PNG\r\n\x1a\n"[..])).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR, "the fixture's premise");
+
+        stays_silent(&mut on_child, "no bytes were stored, so no child was created").await;
+        stays_silent(&mut on_container, "and nothing is there for an Add to name").await;
+    }
+
     /// The ordinary patch: the resource was there, so it is an `Update`.
     #[tokio::test]
     async fn a_patch_on_an_existing_resource_emits_update() {

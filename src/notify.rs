@@ -634,7 +634,6 @@ mod tests {
     /// would put a plausible validator of nothing on the event.
     #[tokio::test]
     async fn state_of_a_binary_whose_kind_cannot_be_read_is_none() {
-        use crate::store::SparqlStore as _;
         let (st, target) = binary_fixture("/photo.png", b"\x89PNG\r\n\x1a\n").await;
         let Target::Resource(r) = &target else { unreachable!() };
         // §3.1's invariant broken — a binary with no stored media type — which
