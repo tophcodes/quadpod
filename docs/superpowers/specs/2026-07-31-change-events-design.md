@@ -395,6 +395,12 @@ the one-ETag constraint exists against, and there is no measurement asking for i
 - The container `PUT` path writes `put_rdf` and `ensure_container` as two operations; if the
   second fails there is a partial write and no event. That is the non-atomicity already
   documented in `put_impl`'s `Target::Container` arm, not something introduced here.
+- The same gap is wider than that one arm, and this feature is what makes it observable. A
+  write that fails *after* `Guard::materialize` has run — on the resource path, the blob path,
+  or in `create_by_patch` — leaves containers created and containment added that no subscriber
+  hears about, because the status gate suppresses the whole request's events. Two such requests
+  occur in the test suite today. Accepted: reporting a partial write would mean emitting events
+  for a request the client is told failed, which is worse than reporting nothing.
 
 ## 9. Tests
 
