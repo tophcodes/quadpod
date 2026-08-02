@@ -7136,10 +7136,22 @@ mod tests {
         assert_eq!(add.target.as_deref(), Some(parent.graph_iri()));
     }
 
-    /// A refused write emits nothing: the tail returns before touching the bus.
+    /// A refused write emits nothing: the tail returns before touching the
+    /// bus. The unparseable body is refused at `classify_body`, before
+    /// `Guard::materialize` ever runs, so `materialized` is empty and the
+    /// parent assertion below is vacuous on its own — it would pass whether
+    /// or not `emit_put`'s status gate exists (issue #41).
+    ///
+    /// The second half is the case that discriminates: `/d/` does not exist
+    /// yet, so `PUT`ting a blob under it really materializes the container
+    /// and really links it into its parent before the blob write — the only
+    /// step that can still fail — fails. `FailingBlobs`, not `FailingStore`:
+    /// a failing `SparqlStore` takes its `500` inside `materialize` itself
+    /// and never reaches the tail (see `a_post_whose_write_fails_emits_nothing`).
     #[tokio::test]
     async fn a_refused_put_emits_nothing() {
-        let f = fixture().await;
+        let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;
+
         let target = f.space.resolve("/c/notes").unwrap();
         let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
         let mut on_parent = f.events.subscribe(
@@ -7151,6 +7163,28 @@ mod tests {
         assert!(!res.status().is_success(), "the fixture's premise: {}", res.status());
         stays_silent(&mut on_target, "a refused write is not a change").await;
         stays_silent(&mut on_parent, "a refused write materialized nothing to report either").await;
+
+        let child = f.space.resolve("/d/photo.png").unwrap();
+        let container = f.space.resolve("/d/").unwrap();
+        let mut on_child = f.events.subscribe(crate::notify::Topic::from(&child));
+        let mut on_container = f.events.subscribe(crate::notify::Topic::from(&container));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/d/photo.png")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(Body::from(&b"\x89PNG\r\n\x1a\n"[..])).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR, "the fixture's premise");
+
+        // `/d/` was really materialized: `Guard::materialize` commits its
+        // container and containment writes to the real store before
+        // `put_blob` ever runs, so the 500 above leaves it behind.
+        let d = f.app.clone().oneshot(f.owner_request("GET", "/d/")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(d.status(), StatusCode::OK,
+            "materialize must have created /d/ before put_blob failed");
+
+        stays_silent(&mut on_child, "no bytes were stored, so no child was created").await;
+        stays_silent(&mut on_container,
+            "the container was materialized, but the write still failed").await;
     }
 
     /// The allocated child is always new, so `POST` is always a `Create` — and
