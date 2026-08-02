@@ -220,6 +220,8 @@ async fn publish_own(st: &AppState, target: &Target, activity: Activity) {
         return;
     }
     let state = match activity {
+        // Skips a store read that would come back `None` anyway: the target
+        // is already gone by the time a `Delete` publishes.
         Activity::Delete => None,
         _ => state_of(st, target).await,
     };

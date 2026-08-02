@@ -7389,8 +7389,11 @@ mod tests {
         assert_eq!(e.activity, crate::notify::Activity::Delete);
     }
 
-    /// An auxiliary is never a container member, so its removal is not a
-    /// containment change and the parent hears nothing (design §4.2).
+    /// A direct auxiliary `DELETE` reaches the tail's single `emit_delete`
+    /// rather than returning early past it, so it is reported on the
+    /// auxiliary's own topic. An auxiliary is never a container member, so
+    /// its removal is not a containment change and the parent hears nothing
+    /// (design §4.2).
     #[tokio::test]
     async fn deleting_an_auxiliary_emits_no_parent_event() {
         let f = fixture().await;
@@ -7408,12 +7411,21 @@ mod tests {
                  <http://www.w3.org/ns/auth/acl#Control> ."))).unwrap())
             .await.unwrap();
 
+        let acl = f.space.resolve("/.aux/c/notes.acl").unwrap();
         let mut on_parent = f.events.subscribe(
             crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+        let mut on_acl = f.events.subscribe(crate::notify::Topic::from(&acl));
         let res = f.app.clone().oneshot(
             f.owner_request("DELETE", "/.aux/c/notes.acl").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_acl).await;
+        assert_eq!(e.activity, crate::notify::Activity::Delete);
+        assert_eq!(e.object, acl.graph_iri());
+        assert_eq!(e.target, None);
+        assert_eq!(e.state, None);
+        stays_silent(&mut on_acl, "the aux arm reaches the tail's one emit, not two").await;
 
         stays_silent(&mut on_parent,
             "an auxiliary is not a member, so nothing about containment changed").await;
