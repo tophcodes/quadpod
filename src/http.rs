@@ -16,7 +16,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::Guard, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::{Guard, Materialized}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -500,7 +500,7 @@ fn etag_candidates(stored: &Skolemized) -> Vec<String> {
 /// always ground — §3.4 and skolemization at the write path guarantee both)
 /// into the same [`Skolemized`] type a resource's dataset is held as, so the
 /// two paths share one `etag`/`deskolemize` implementation.
-fn ground_dataset(triples: Vec<Triple>) -> Skolemized {
+pub(crate) fn ground_dataset(triples: Vec<Triple>) -> Skolemized {
     let quads: Vec<Quad> = triples.into_iter()
         .map(|t| Quad::new(t.subject, t.predicate, t.object, oxigraph::model::GraphName::DefaultGraph))
         .collect();
@@ -643,41 +643,59 @@ async fn patch_impl(
     // takes its own branch here because the `target_exists` check below is not
     // the one it needs: §7's creation path is closed for an auxiliary as well, and
     // `aux::patch` refuses an absent one itself, with a body that says which
-    // of the two is missing.
-    let r = match &target {
-        Target::Resource(r) => r,
-        Target::Container(c) => c.as_resource(),
-        Target::Aux(a) => {
-            return match aux::patch(store, a, &patch).await {
-                Ok(result) => patch_response(result, &patch),
-                Err(AuxError::SubjectMissing) => {
-                    (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
-                }
-                Err(e @ AuxError::Missing) => {
-                    (StatusCode::NOT_FOUND, e.to_string()).into_response()
-                }
-                Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
+    // of the two is missing. That refusal also means this arm never creates —
+    // it is always an `Update` (§4.3), the same activity `put_write`'s `Aux`
+    // arm reports on the same topic.
+    let (res, existence, materialized) = if let Target::Aux(a) = &target {
+        let res = match aux::patch(store, a, &patch).await {
+            Ok(result) => patch_response(result, &patch),
+            Err(AuxError::SubjectMissing) => {
+                (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
             }
-        }
-    };
-    if !guard.target_exists() {
-        return create_by_patch(&st, guard, &target, &patch).await;
-    }
-    match patch_dataset(store, r, &patch).await {
-        // A container's type triples are the server's, and a patch names its
-        // own triples — including them. Re-asserting them here is what
-        // `put_impl` does after writing a container body, and it is why a
-        // container patch is not refused outright: the client stays free to
-        // patch everything else the container's graph holds.
-        Ok(result) => match &target {
-            Target::Container(c) => match container::ensure_container(store, c).await {
-                Ok(()) => patch_response(result, &patch),
+            Err(e @ AuxError::Missing) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+            Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
+        };
+        (res, crate::notify::Existence::Existed, Materialized::default())
+    } else {
+        let r = match &target {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource(),
+            Target::Aux(_) => unreachable!("matched above"),
+        };
+        // Read before `materialize` consumes `guard` below (in either
+        // branch): it takes `self`, so this is the only chance to ask.
+        let existence = if guard.target_exists() {
+            crate::notify::Existence::Existed
+        } else {
+            crate::notify::Existence::Absent
+        };
+        let (res, materialized) = if matches!(existence, crate::notify::Existence::Absent) {
+            create_by_patch(&st, guard, &target, &patch).await
+        } else {
+            let res = match patch_dataset(store, r, &patch).await {
+                // A container's type triples are the server's, and a patch names
+                // its own triples — including them. Re-asserting them here is
+                // what `put_impl` does after writing a container body, and it is
+                // why a container patch is not refused outright: the client
+                // stays free to patch everything else the container's graph
+                // holds.
+                Ok(result) => match &target {
+                    Target::Container(c) => match container::ensure_container(store, c).await {
+                        Ok(()) => patch_response(result, &patch),
+                        Err(e) => (put_status(&e), e.to_string()).into_response(),
+                    },
+                    _ => patch_response(result, &patch),
+                },
                 Err(e) => (put_status(&e), e.to_string()).into_response(),
-            },
-            _ => patch_response(result, &patch),
-        },
-        Err(e) => (put_status(&e), e.to_string()).into_response(),
-    }
+            };
+            // An update materializes nothing: the target already existed, so
+            // there is no ancestor to walk.
+            (res, Materialized::default())
+        };
+        (res, existence, materialized)
+    };
+    crate::notify::emit_patch(&st, &target, existence, &materialized, res.status()).await;
+    res
 }
 
 /// §7: a target that does not exist is patched against an empty RDF dataset,
@@ -697,22 +715,27 @@ async fn patch_impl(
 ///
 /// Only a resource or a container reaches here. An auxiliary is answered by
 /// `aux::patch`, which refuses an absent one itself.
+///
+/// The second element of the pair is what the ancestor walk materialized —
+/// what `emit_patch` needs and cannot re-derive. A failing exit's is never
+/// read: `emit_patch` gates emission on `status` alone, before it looks at it.
 async fn create_by_patch(
     st: &AppState,
     guard: Guard<'_>,
     target: &Target,
     patch: &crate::patch::Patch,
-) -> Response {
+) -> (Response, Materialized) {
     let store = st.store.as_ref();
     let Some(triples) = patch.ground_insertions() else {
-        return patch_response(PatchResult::NoMapping, patch);
+        return (patch_response(PatchResult::NoMapping, patch), Materialized::default());
     };
     if !patch.deletions().is_empty() {
-        return patch_response(PatchResult::DeletionMissing, patch);
+        return (patch_response(PatchResult::DeletionMissing, patch), Materialized::default());
     }
-    if let Err(res) = guard.materialize().await {
-        return with_aux_links(res, target);
-    }
+    let materialized = match guard.materialize().await {
+        Ok(m) => m,
+        Err(res) => return (with_aux_links(res, target), Materialized::default()),
+    };
     let written = match target {
         Target::Resource(r) => {
             let turtle =
@@ -730,8 +753,8 @@ async fn create_by_patch(
         Target::Aux(_) => unreachable!("an auxiliary never reaches the creation branch"),
     };
     match written {
-        Ok(()) => created(target),
-        Err(e) => (put_status(&e), e.to_string()).into_response(),
+        Ok(()) => (created(target), materialized),
+        Err(e) => ((put_status(&e), e.to_string()).into_response(), Materialized::default()),
     }
 }
 
@@ -1091,18 +1114,44 @@ fn report_link(target: &Target, mut res: Response) -> Response {
     res
 }
 
+/// The single place a `PUT` reports what it changed.
+///
+/// A wrapper rather than an emit at each success site, because the write below
+/// has one successful early exit of its own (the blob arm) and design §6.2
+/// fixes exactly one emit call per handler: the two facts the emit needs are
+/// carried out of [`put_write`] as values instead of the emit being repeated
+/// wherever control leaves.
 async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap, body: Bytes) -> Response {
+    let (res, existence, materialized) = put_write(&st, agent, &target, headers, body).await;
+    crate::notify::emit_put(&st, &target, existence, &materialized, res.status()).await;
+    res
+}
+
+/// The write itself, reporting what the emit above cannot re-derive: whether
+/// the target was there beforehand, and what the ancestor walk materialized.
+///
+/// A failing exit's `existence` and `materialized` are never read: `emit_put`
+/// gates emission on `status` alone, before it looks at either value.
+async fn put_write(
+    st: &AppState, agent: Agent, target: &Target, headers: HeaderMap, body: Bytes,
+) -> (Response, crate::notify::Existence, Materialized) {
     let store = st.store.as_ref();
+    let absent = crate::notify::Existence::Absent;
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &target),
+        Err(res) => return (with_aux_links(res, target), absent, Materialized::default()),
     };
     if let Err(res) = guard.authorize(Mode::Write) {
-        return with_aux_links(res, &target);
+        return (with_aux_links(res, target), absent, Materialized::default());
     }
-    let repr = match classify_body(&headers, &body, &target, st.store.rdf_version()) {
+    let existence = if guard.target_exists() {
+        crate::notify::Existence::Existed
+    } else {
+        crate::notify::Existence::Absent
+    };
+    let repr = match classify_body(&headers, &body, target, st.store.rdf_version()) {
         Ok(r) => r,
-        Err(res) => return *res,
+        Err(res) => return (*res, existence, Materialized::default()),
     };
     let (dataset, fmt, declared) = match repr {
         Repr::Rdf(d, f, v) => (d, f, v),
@@ -1112,33 +1161,38 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             // share the conditional-request block and the ancestor walk, so
             // it runs them itself rather than falling through to where the
             // RDF path runs them.
-            let Target::Resource(r) = &target else {
+            let Target::Resource(r) = target else {
                 unreachable!("classify_body refuses a blob for any other target")
             };
             if crate::blob::BlobKey::of(r).is_none() {
-                return StatusCode::URI_TOO_LONG.into_response();
+                return (StatusCode::URI_TOO_LONG.into_response(), existence, Materialized::default());
             }
-            if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
-                return res;
+            if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, target).await {
+                return (res, existence, Materialized::default());
             }
-            if let Err(res) = guard.materialize().await {
-                return with_aux_links(res, &target);
-            }
-            return match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
-                Ok(()) => created(&target),
+            let materialized = match guard.materialize().await {
+                Ok(m) => m,
+                Err(res) => return (with_aux_links(res, target), existence, Materialized::default()),
+            };
+            // An early exit that carries what `emit_put` needs out alongside
+            // the response (§6.3).
+            return (match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
+                Ok(()) => created(target),
                 Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
                 Err(e) => (put_status(&e), e.to_string()).into_response(),
-            };
+            }, existence, materialized);
         }
     };
     // §3.2.2 — the skolem namespace is the server's.
     if dataset.uses_reserved_namespace() {
-        return (StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response();
+        return ((StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response(),
+            existence, Materialized::default());
     }
     // §3.4 — a container's graph carries containment; an auxiliary's rules
     // would be invisible to WAC inside a subgraph.
     if dataset.has_named_graphs() && !matches!(target, Target::Resource(_)) {
-        return (StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response();
+        return ((StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response(),
+            existence, Materialized::default());
     }
     // Containment is server-managed. Refused here, before the ancestor walk
     // below writes anything, so a rejected PUT cannot leave a containment
@@ -1146,7 +1200,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // dataset, not the default graph: otherwise the 409 is bypassed by
     // putting ldp:contains in a named graph.
     if matches!(target, Target::Container(_)) && container::body_sets_containment(&triples_of(&dataset)) {
-        return StatusCode::CONFLICT.into_response();
+        return (StatusCode::CONFLICT.into_response(), existence, Materialized::default());
     }
     // The version half of the same argument, and it applies to every format
     // rather than only the graph-shaped ones: a client that declared 1.1 was
@@ -1158,32 +1212,34 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // classifies as: declaring 1.2 and sending 1.1 content is a deliberate
     // replacement by a client that can see the whole resource, and refusing
     // that would make the higher version a trap rather than a capability.
-    if let Target::Resource(r) = &target {
+    if let Target::Resource(r) = target {
         let existing = match get_dataset(store, r).await {
             Ok(v) => v,
-            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+            Err(e) => return ((put_status(&e), e.to_string()).into_response(),
+                existence, Materialized::default()),
         };
         if let Some(existing) = existing {
             let held = existing.deskolemize().rdf_version();
             if declared < held {
-                return (StatusCode::CONFLICT, format!(
+                return ((StatusCode::CONFLICT, format!(
                     "this resource holds RDF {} terms that {} cannot carry; \
                      send Content-Type with version={}, or DELETE it first",
                     held.label(), declared.label(), held.label()
-                )).into_response();
+                )).into_response(), existence, Materialized::default());
             }
         }
     }
     // §6.2.1 — a graph-format write must not silently discard what a graph
     // format could not have shown the client in the first place.
-    if let Target::Resource(r) = &target {
+    if let Target::Resource(r) = target {
         if !fmt.carries_dataset() {
             // A store error is not "no named graphs": reading it that way lets
             // the overwrite this check exists to refuse proceed on exactly the
             // request the check could not evaluate.
             let existing = match get_dataset(store, r).await {
                 Ok(v) => v,
-                Err(e) => return (put_status(&e), e.to_string()).into_response(),
+                Err(e) => return ((put_status(&e), e.to_string()).into_response(),
+                    existence, Materialized::default()),
             };
             if let Some(existing) = existing {
                 // Over the stored quads, where every graph name is an IRI. A
@@ -1204,22 +1260,22 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
                         parts.push(format!("{blank_named} named by a blank node"));
                     }
                     let list = parts.join(", ");
-                    return (StatusCode::CONFLICT, format!(
+                    return ((StatusCode::CONFLICT, format!(
                         "this resource has named graphs ({list}) that {} cannot carry; \
                          write it as application/trig or application/ld+json, or DELETE it first",
                         fmt.media_type()
-                    )).into_response();
+                    )).into_response(), existence, Materialized::default());
                 }
             }
         }
     }
     let skolemized = Skolemized::skolemize(&dataset);
-    if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
-        return res;
+    if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, target).await {
+        return (res, existence, Materialized::default());
     }
-    let findings = match enforce_shape(&st, &target, &dataset).await {
+    let findings = match enforce_shape(st, target, &dataset).await {
         Ok(f) => f,
-        Err(res) => return res,
+        Err(res) => return (res, existence, Materialized::default()),
     };
     // Creating a resource materializes every missing ancestor container and
     // links it into the first one that already exists — real mutations of
@@ -1235,10 +1291,11 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // rule belongs to the same one traversal, because the set of URLs it
     // applies to is the set of URLs this call would create; there is no
     // separate check here that could drift from it.
-    if let Err(res) = guard.materialize().await {
-        return with_aux_links(res, &target);
-    }
-    let res = match &target {
+    let materialized = match guard.materialize().await {
+        Ok(m) => m,
+        Err(res) => return (with_aux_links(res, target), existence, Materialized::default()),
+    };
+    let res = match target {
         // An auxiliary exists only for an existing subject, and that rule is
         // inside `aux::put`'s update rather than a check here — a check and a
         // write are two round-trips, and an interleaved DELETE between them
@@ -1246,7 +1303,7 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Target::Aux(a) => {
             let triples = triples_of(&dataset.default_graph_only());
             match aux::put(store, a, &triples).await {
-                Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(&target)),
+                Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(target)),
                 Err(AuxError::SubjectMissing) =>
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
                 // Unreachable: `put` writes the auxiliary, so it never asks
@@ -1264,22 +1321,23 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             // per the plan's cross-graph-atomicity note.
             let existing = match get_rdf(store, c).await {
                 Ok(v) => v.unwrap_or_default(),
-                Err(e) => return (put_status(&e), e.to_string()).into_response(),
+                Err(e) => return ((put_status(&e), e.to_string()).into_response(),
+                    existence, materialized),
             };
             let mut merged = triples_of(&dataset.default_graph_only());
             merged.extend(
                 existing.into_iter().filter(|t| t.predicate.as_str() == container::LDP_CONTAINS),
             );
             if let Err(e) = put_rdf(store, c, &merged).await {
-                return (put_status(&e), e.to_string()).into_response();
+                return ((put_status(&e), e.to_string()).into_response(), existence, materialized);
             }
             if let Err(e) = container::ensure_container(store, c).await {
-                return (put_status(&e), e.to_string()).into_response();
+                return ((put_status(&e), e.to_string()).into_response(), existence, materialized);
             }
-            created(&target)
+            created(target)
         }
         Target::Resource(r) => match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
-            Ok(()) => created(&target),
+            Ok(()) => created(target),
             Err(e) => (put_status(&e), e.to_string()).into_response(),
         },
     };
@@ -1288,7 +1346,9 @@ async fn put_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // its `Ok` arm, so findings alone cannot gate the link: a body that only
     // warned, followed by a `put_dataset` failure, would otherwise still
     // advertise a report for a write that stored nothing.
-    if findings.is_some() && res.status().is_success() { report_link(&target, res) } else { res }
+    let res =
+        if findings.is_some() && res.status().is_success() { report_link(target, res) } else { res };
+    (res, existence, materialized)
 }
 
 async fn handle_post(
@@ -1424,9 +1484,10 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // POSTing into a container that does not exist yet materializes it and
     // its missing ancestors, so those need authorizing too — the same single
     // traversal `put_impl` uses.
-    if let Err(res) = child_guard.materialize().await {
-        return with_aux_links(res, &child);
-    }
+    let materialized = match child_guard.materialize().await {
+        Ok(m) => m,
+        Err(res) => return with_aux_links(res, &child),
+    };
     let res = match &child {
         Target::Resource(r) => match repr {
             Repr::Blob(bytes, mt) => match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
@@ -1466,7 +1527,9 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // Mirrors `put_impl`'s tail: findings alone cannot gate the link, or a
     // body that only warned, followed by a storage failure, would advertise a
     // report for a child that was never created.
-    if findings.is_some() && res.status().is_success() { report_link(&child, res) } else { res }
+    let res = if findings.is_some() && res.status().is_success() { report_link(&child, res) } else { res };
+    crate::notify::emit_post(&st, &child, &materialized, res.status()).await;
+    res
 }
 
 /// Answer a CORS preflight — and a bare `OPTIONS`, which the suite also sends
@@ -1636,7 +1699,7 @@ async fn validate_view(
 /// and it changes under a backend migration although the content did not. This
 /// is the same rule and the same shape as
 /// [`Skolemized::etag`](crate::dataset::Skolemized::etag).
-fn blob_etag(bytes: &[u8]) -> String {
+pub(crate) fn blob_etag(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
@@ -1913,63 +1976,79 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     if let Err(res) = guard.authorize(Mode::Write) {
         return with_aux_links(res, &target);
     }
-    let subject = match &target {
+    // The auxiliary arm's response carries no `present_auxes` of its own — an
+    // auxiliary cascades no others — so both arms reach the single emit below
+    // through the same pair.
+    let (res, present_auxes): (Response, Vec<AuxUrl>) = if let Target::Aux(a) = &target {
         // Removing an auxiliary is a complete operation on its own: the path
         // falls back to inherited policy, which is exactly what its absence
         // means. Nothing else refers to it — an auxiliary is never a
         // container member — so there is no containment to repair.
-        Target::Aux(a) => {
-            return match delete_rdf(store, a).await {
-                Ok(true) => StatusCode::NO_CONTENT.into_response(),
-                Ok(false) => StatusCode::NOT_FOUND.into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            };
-        }
-        Target::Resource(r) => r,
-        Target::Container(c) => c.as_resource(),
-    };
-    // Removing a member rewrites the parent's containment triples.
-    if let Err(res) = guard.authorize_parent(Mode::Write) {
-        return with_aux_links(res, &target);
-    }
-    // Deleting a subject takes every auxiliary it has with it (that cascade
-    // is `aux::delete_subject`'s definition, not a step remembered here), so
-    // the caller must be allowed to remove each one that exists. Without
-    // this, a narrowing ACL — WAC's only mechanism for revoking what an
-    // ancestor hands down through `acl:default` — could be erased by someone
-    // holding merely Write: delete the resource, recreate it, and the wider
-    // ancestor grant applies again. The residual signal ("this resource has
-    // an auxiliary of kind k") is only ever observable to a caller who
-    // already holds Write on it.
-    for kind in AuxKind::ALL {
-        if let Err(res) = guard.authorize_aux(*kind) {
+        let res = match delete_rdf(store, a).await {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        (res, Vec::new())
+    } else {
+        let subject = match &target {
+            Target::Resource(r) => r,
+            Target::Container(c) => c.as_resource(),
+            Target::Aux(_) => unreachable!("matched above"),
+        };
+        // Removing a member rewrites the parent's containment triples.
+        if let Err(res) = guard.authorize_parent(Mode::Write) {
             return with_aux_links(res, &target);
         }
-    }
-    if let Target::Container(c) = &target {
-        if subject.parent().is_none() {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        match container::container_is_empty(store, c).await {
-            Ok(false) => return StatusCode::CONFLICT.into_response(),
-            Ok(true) => {}
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    }
-    match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
-        Ok(true) => {
-            if let Some(parent) = subject.parent() {
-                if let Err(e) =
-                    container::remove_containment(store, &parent, subject.graph_iri()).await
-                {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
+        // Deleting a subject takes every auxiliary it has with it (that cascade
+        // is `aux::delete_subject`'s definition, not a step remembered here), so
+        // the caller must be allowed to remove each one that exists. Without
+        // this, a narrowing ACL — WAC's only mechanism for revoking what an
+        // ancestor hands down through `acl:default` — could be erased by someone
+        // holding merely Write: delete the resource, recreate it, and the wider
+        // ancestor grant applies again. The residual signal ("this resource has
+        // an auxiliary of kind k") is only ever observable to a caller who
+        // already holds Write on it.
+        //
+        // `authorize_aux` answers `Ok(Some(_))` exactly for a kind the probe
+        // found present, so that same call collects `present_auxes` — the set
+        // `emit_delete` reports — without a second probe.
+        let mut present_auxes: Vec<AuxUrl> = Vec::new();
+        for kind in AuxKind::ALL {
+            match guard.authorize_aux(*kind) {
+                Err(res) => return with_aux_links(res, &target),
+                Ok(Some(_)) => present_auxes.push(subject.aux(*kind)),
+                Ok(None) => {}
             }
-            StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+        if let Target::Container(c) = &target {
+            if subject.parent().is_none() {
+                return StatusCode::METHOD_NOT_ALLOWED.into_response();
+            }
+            match container::container_is_empty(store, c).await {
+                Ok(false) => return StatusCode::CONFLICT.into_response(),
+                Ok(true) => {}
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        let res = match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
+            Ok(true) => {
+                if let Some(parent) = subject.parent() {
+                    if let Err(e) =
+                        container::remove_containment(store, &parent, subject.graph_iri()).await
+                    {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    }
+                }
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(false) => with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        (res, present_auxes)
+    };
+    crate::notify::emit_delete(&st, &target, &present_auxes, res.status()).await;
+    res
 }
 
 #[cfg(test)]
@@ -1980,6 +2059,7 @@ mod tests {
     use tower::ServiceExt;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::time::{timeout, Duration};
     use crate::{space::{ContainerUrl, StorageSpace}, store::OxigraphStore, auth::StaticJwksResolver};
     use crate::auth::testsupport::{TestClient, TestIdp};
     use crate::auth::StaticWebIdIssuers;
@@ -2020,6 +2100,7 @@ mod tests {
     /// directly.
     struct Fixture {
         app: axum::Router,
+        events: Arc<crate::notify::Bus>,
         store: Arc<dyn crate::store::SparqlStore>,
         blobs: Arc<dyn crate::blob::BlobStore>,
         space: StorageSpace,
@@ -2078,9 +2159,10 @@ mod tests {
         let mut issuers = StaticWebIdIssuers::new();
         issuers.allow(OWNER, ISSUER);
 
+        let events = Arc::new(crate::notify::Bus::new());
         let state = AppState {
             store: store.clone(),
-            events: Arc::new(crate::notify::Bus::new()),
+            events: events.clone(),
             blobs: blobs.clone(),
             space: space.clone(),
             resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
@@ -2089,8 +2171,8 @@ mod tests {
             max_body_bytes,
         };
         Fixture {
-            app: router(state), store, blobs, space, max_body_bytes, idp, client, _replay_guard,
-            _reentrancy: ReentrancyGuard,
+            app: router(state), events, store, blobs, space, max_body_bytes, idp, client,
+            _replay_guard, _reentrancy: ReentrancyGuard,
         }
     }
 
@@ -2187,7 +2269,10 @@ mod tests {
             issuers.allow(webid, ISSUER);
             router(AppState {
                 store: self.store.clone(),
-                events: Arc::new(crate::notify::Bus::new()),
+                // The same bus as `app`: this router serves the same data, so a
+                // test subscribed through `Fixture::events` must hear what a
+                // write through either router reports.
+                events: self.events.clone(),
                 blobs: self.blobs.clone(),
                 space: self.space.clone(),
                 resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
@@ -6884,5 +6969,636 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(body_string(res).await, BINARY_TARGET_MESSAGE,
             "the blob refusal must win over the shape one");
+    }
+
+    /// The next event on a topic, or a failure — never a hang. A
+    /// `broadcast::Receiver` whose sender is still alive blocks forever when
+    /// nothing is published, and libtest has no per-test timeout: an
+    /// unbounded `recv` turns "no event was emitted" into a suite that never
+    /// finishes rather than into a red test.
+    async fn next_event(rx: &mut crate::notify::Receiver) -> crate::notify::Event {
+        timeout(Duration::from_secs(5), rx.recv())
+            .await.expect("expected an event on this topic, none arrived within 5s").unwrap()
+    }
+
+    /// That a topic stays silent. The write is over before this is called, so
+    /// anything the topic was going to hear is already buffered: this waits on
+    /// a silence that has already been decided, not on one still being made.
+    async fn stays_silent(rx: &mut crate::notify::Receiver, why: &str) {
+        assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err(), "{why}");
+    }
+
+    /// A create is reported on the resource's own channel, and on its parent's
+    /// as `Add` — not as a second `Create` (§3.2).
+    #[tokio::test]
+    async fn a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent() {
+        let f = fixture().await;
+        // `/c/` is made to exist first, so this write's only containment
+        // change there is the `Add`; the container's own `Create` is the
+        // subject of the next test.
+        f.put_turtle("/c/other", "<#it> <http://schema.org/name> \"y\" .").await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Create);
+        assert_eq!(e.object, target.graph_iri());
+        assert_eq!(e.target, None);
+        assert!(e.state.is_some(), "a create reports the state it produced");
+
+        let p = next_event(&mut on_parent).await;
+        assert_eq!(p.activity, crate::notify::Activity::Add);
+        assert_eq!(p.object, target.graph_iri(), "the object of an Add is the child");
+        assert_eq!(p.target.as_deref(), Some(parent.graph_iri()));
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state. Catches an Add reporting
+        // back the child's state instead of the topic's — the one place the
+        // "state describes the topic, not the object" rule can break.
+        let container_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(p.state.as_deref(), Some(container_etag.as_str()),
+            "the Add's state must be the container's own validator, not the child's");
+    }
+
+    /// `/c/` did not exist either, so the same write created it — and a
+    /// container's own creation is its own fact, reported beside the `Add`
+    /// that filled it.
+    #[tokio::test]
+    async fn a_put_that_materializes_a_container_emits_its_create_too() {
+        let f = fixture().await;
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"x\" .").await;
+
+        let first = next_event(&mut on_parent).await;
+        assert_eq!(first.activity, crate::notify::Activity::Create,
+            "the container came into existence, which the Add alone does not say");
+        assert_eq!(first.object, parent.graph_iri());
+        assert_eq!(first.target, None);
+        let second = next_event(&mut on_parent).await;
+        assert_eq!(second.activity, crate::notify::Activity::Add);
+        assert_eq!(second.target.as_deref(), Some(parent.graph_iri()));
+    }
+
+    /// `Materialized::created` always includes the request's own target, and
+    /// for a container target `as_container` does not screen it back out —
+    /// so a fresh container's own channel must hear its `Create` exactly
+    /// once, not once from `publish_own` and again from `publish_containment`.
+    #[tokio::test]
+    async fn a_put_that_creates_a_container_emits_exactly_one_create_on_its_own_topic() {
+        let f = fixture().await;
+        let target = f.space.resolve("/fresh/").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/fresh/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Create);
+        assert_eq!(e.object, target.graph_iri());
+        assert_eq!(e.target, None);
+        stays_silent(&mut on_target,
+            "the container's own topic must hear one Create, not a second one for the same target").await;
+    }
+
+    /// An overwrite changes no containment, so the parent hears nothing at all.
+    #[tokio::test]
+    async fn a_put_that_overwrites_emits_update_and_nothing_on_the_parent() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let put = |body: &'static str| f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle").body(Body::from(body)).unwrap();
+        f.app.clone().oneshot(put("<#it> <http://schema.org/name> \"one\" .")).await.unwrap();
+
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+        f.app.clone().oneshot(put("<#it> <http://schema.org/name> \"two\" .")).await.unwrap();
+
+        assert_eq!(next_event(&mut on_target).await.activity, crate::notify::Activity::Update);
+        stays_silent(&mut on_parent, "containment did not change, so the parent is silent").await;
+    }
+
+    /// The blob arm's early return carries `existence` and `materialized` out
+    /// alongside the response (§6.3), so a binary `PUT` emits every field a
+    /// graph `PUT` does.
+    #[tokio::test]
+    async fn a_binary_put_emits() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/photo.png").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/c/photo.png")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(Body::from(&b"\x89PNG\r\n\x1a\n"[..])).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Create);
+        assert_eq!(e.object, target.graph_iri());
+        assert_eq!(e.target, None);
+        assert_eq!(e.state.as_deref(), Some(blob_etag(b"\x89PNG\r\n\x1a\n").as_str()));
+    }
+
+    /// And the containment half of the same early return: the blob path walks
+    /// the same ancestors, so it reports the same `Add`.
+    #[tokio::test]
+    async fn a_binary_put_emits_the_add_on_its_parent() {
+        let f = fixture().await;
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        f.put_blob("/c/photo.png", "image/png", b"\x89PNG\r\n\x1a\n").await;
+
+        // `/c/` is created by this same write, so its own `Create` comes first;
+        // the `Add` is the fact under test.
+        assert_eq!(next_event(&mut on_parent).await.activity, crate::notify::Activity::Create);
+        let add = next_event(&mut on_parent).await;
+        assert_eq!(add.activity, crate::notify::Activity::Add,
+            "the blob path must report the containment it added");
+        assert_eq!(add.object, f.space.resolve("/c/photo.png").unwrap().graph_iri());
+        assert_eq!(add.target.as_deref(), Some(parent.graph_iri()));
+    }
+
+    /// A refused write emits nothing: the tail returns before touching the bus.
+    #[tokio::test]
+    async fn a_refused_put_emits_nothing() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("this is not turtle {{{")).unwrap()).await.unwrap();
+        assert!(!res.status().is_success(), "the fixture's premise: {}", res.status());
+        stays_silent(&mut on_target, "a refused write is not a change").await;
+        stays_silent(&mut on_parent, "a refused write materialized nothing to report either").await;
+    }
+
+    /// The allocated child is always new, so `POST` is always a `Create` — and
+    /// the container that received it hears `Add`, with the child as
+    /// `object`. `/c/` is made to exist first (as
+    /// `a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent`
+    /// does), so this write's only containment change there is the `Add`.
+    #[tokio::test]
+    async fn a_post_emits_create_on_the_child_and_add_on_the_container() {
+        let f = fixture().await;
+        f.put_turtle("/c/other", "<#it> <http://schema.org/name> \"y\" .").await;
+        let container = f.space.resolve("/c/").unwrap();
+        let child = f.space.resolve("/c/child").unwrap();
+        let mut on_container = f.events.subscribe(crate::notify::Topic::from(&container));
+        // Subscribed up front, alongside the container: a broken `emit_post`
+        // that only ran `publish_containment` and never `publish_own` on the
+        // child would still satisfy an assertion made solely on the
+        // container's channel, so the child's own `Create` is checked too.
+        let mut on_child = f.events.subscribe(crate::notify::Topic::from(&child));
+
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/c/")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header("slug", "child")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let location = res.headers()[header::LOCATION].to_str().unwrap().to_owned();
+        assert_eq!(location, child.graph_iri(), "the fixture's premise: no slug collision");
+
+        let created = next_event(&mut on_child).await;
+        assert_eq!(created.activity, crate::notify::Activity::Create);
+        assert_eq!(created.object, child.graph_iri());
+        assert_eq!(created.target, None);
+        assert!(created.state.is_some(), "a create reports the state it produced");
+
+        let e = next_event(&mut on_container).await;
+        assert_eq!(e.activity, crate::notify::Activity::Add);
+        assert_eq!(e.object, location, "the object of an Add is the allocated child");
+        assert_eq!(e.target.as_deref(), Some(container.graph_iri()));
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state. Catches an Add reporting
+        // back the child's state instead of the topic's.
+        let container_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(e.state.as_deref(), Some(container_etag.as_str()),
+            "the Add's state must be the container's own validator, not the child's");
+    }
+
+    /// Every other refusal in `post_impl` returns before the tail, so a
+    /// storage failure is the only way a non-2xx reaches `emit_post` — and its
+    /// success guard is all that stands between that and a `Create` for a
+    /// child that was never written, plus an `Add` naming it.
+    ///
+    /// The blob backend is what fails, not the store: `Guard::materialize`
+    /// runs before the write and takes its own `500` out of `post_impl` past
+    /// the tail, so a failing `SparqlStore` never gets a request as far as the
+    /// emit.
+    #[tokio::test]
+    async fn a_post_whose_write_fails_emits_nothing() {
+        let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;
+        let container = f.space.resolve("/c/").unwrap();
+        let child = f.space.resolve("/c/photo.png").unwrap();
+        let mut on_container = f.events.subscribe(crate::notify::Topic::from(&container));
+        let mut on_child = f.events.subscribe(crate::notify::Topic::from(&child));
+
+        let res = f.app.clone().oneshot(f.owner_request("POST", "/c/")
+            .header(header::CONTENT_TYPE, "image/png")
+            .header("slug", "photo.png")
+            .body(Body::from(&b"\x89PNG\r\n\x1a\n"[..])).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR, "the fixture's premise");
+
+        stays_silent(&mut on_child, "no bytes were stored, so no child was created").await;
+        stays_silent(&mut on_container, "and nothing is there for an Add to name").await;
+    }
+
+    /// The ordinary patch: the resource was there, so it is an `Update`.
+    #[tokio::test]
+    async fn a_patch_on_an_existing_resource_emits_update() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let res = f.app.clone().oneshot(f.owner_request("PATCH", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(
+                "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+                 <> a solid:InsertDeletePatch ; solid:inserts \
+                 { <#it> <http://schema.org/keywords> \"k\" . } .\n")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Update);
+        // Independent of `state_of`: a GET at the same media type and version
+        // §5.1 fixes is the validator the pod would hand a client for the
+        // post-patch state. A bare `is_some()` would pass a read-back of the
+        // wrong resource; this pins the exact value.
+        let etag = f.app.clone().oneshot(f.owner_request("GET", "/c/notes")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(e.state.as_deref(), Some(etag.as_str()));
+    }
+
+    /// `create_by_patch`: a patch on an absent resource creates it, so it is a
+    /// `Create` and its parent hears `Add`.
+    #[tokio::test]
+    async fn a_patch_that_creates_emits_create_and_add() {
+        let f = fixture().await;
+        f.put_turtle("/c/other", "<#it> <http://schema.org/name> \"y\" .").await;
+        let target = f.space.resolve("/c/fresh").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        let res = f.app.clone().oneshot(f.owner_request("PATCH", "/c/fresh")
+            .header(header::CONTENT_TYPE, "text/n3")
+            .body(Body::from(
+                "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+                 <> a solid:InsertDeletePatch ; solid:inserts \
+                 { <#it> <http://schema.org/name> \"x\" . } .\n")).unwrap())
+            .await.unwrap();
+        assert!(res.status().is_success(), "create-by-patch: {}", res.status());
+
+        assert_eq!(next_event(&mut on_target).await.activity, crate::notify::Activity::Create);
+        let p = next_event(&mut on_parent).await;
+        assert_eq!(p.activity, crate::notify::Activity::Add);
+        assert_eq!(p.object, target.graph_iri());
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state.
+        let container_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(p.state.as_deref(), Some(container_etag.as_str()),
+            "the Add's state must be the container's own validator, not the child's");
+    }
+
+    /// §6.3: a `PUT` on an auxiliary reaches `put_impl`'s tail and emits, and
+    /// that is the whole argument for the aux `PATCH` fix — the two verbs must
+    /// agree about the same topic. First write creates it, the second updates
+    /// it, and its subject's container hears neither: an auxiliary is never a
+    /// member (§4.2).
+    #[tokio::test]
+    async fn a_put_on_an_auxiliary_emits_create_then_update() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+        let aux = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let mut on_aux = f.events.subscribe(crate::notify::Topic::from(&aux));
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+
+        // Control on every write, or the second `PUT` would be refused by the
+        // policy the first one installed.
+        let acl = |title: &str| format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ; \
+             <http://purl.org/dc/terms/title> \"{title}\" ."
+        );
+        assert_eq!(put_acl(&f, "/c/notes", &acl("first")).await.status(), StatusCode::CREATED);
+
+        let created = next_event(&mut on_aux).await;
+        assert_eq!(created.activity, crate::notify::Activity::Create);
+        assert_eq!(created.object, aux.graph_iri());
+        assert_eq!(created.target, None);
+
+        let second = put_acl(&f, "/c/notes", &acl("second")).await;
+        assert!(second.status().is_success(), "overwriting the acl: {}", second.status());
+
+        let updated = next_event(&mut on_aux).await;
+        assert_eq!(updated.activity, crate::notify::Activity::Update,
+            "the auxiliary was there, so the second write is not another Create");
+        // Independent of `state_of`: a GET on the auxiliary itself, at the
+        // media type and version §5.1 fixes, is the validator the pod would
+        // hand a client for the same state.
+        let aux_etag = f.app.clone().oneshot(f.owner_request("GET", "/.aux/c/notes.acl")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(updated.state.as_deref(), Some(aux_etag.as_str()));
+
+        stays_silent(&mut on_parent,
+            "an auxiliary is never a container member, so containment did not change").await;
+    }
+
+    /// Design §4.3: an auxiliary `PATCH` never creates — `aux::patch` refuses
+    /// an absent one — so it is always an `Update`, reported on the
+    /// auxiliary's own topic. An auxiliary is never a container member, so
+    /// its parent's containment does not change either.
+    #[tokio::test]
+    async fn a_patch_on_an_auxiliary_emits_update() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+        let acl_body = format!(
+            "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+             <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+             <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Control> ."
+        );
+        assert_eq!(put_acl(&f, "/c/notes", &acl_body).await.status(), StatusCode::CREATED);
+
+        let aux = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        let mut on_aux = f.events.subscribe(crate::notify::Topic::from(&aux));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+
+        let res = patch_n3(&f, "/.aux/c/notes.acl",
+            "<> a solid:InsertDeletePatch ; solid:inserts \
+             { <#owner> <http://purl.org/dc/terms/title> \"updated\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_aux).await;
+        assert_eq!(e.activity, crate::notify::Activity::Update);
+        assert_eq!(e.object, aux.graph_iri());
+        assert_eq!(e.target, None);
+        // Independent of `state_of`: a GET on the auxiliary itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state.
+        let aux_etag = f.app.clone().oneshot(f.owner_request("GET", "/.aux/c/notes.acl")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(e.state.as_deref(), Some(aux_etag.as_str()));
+        stays_silent(&mut on_parent,
+            "an auxiliary is never a container member, so containment did not change").await;
+    }
+
+    /// Deleting `emit_patch`'s `!status.is_success()` guard would let this
+    /// through with a bogus `Update` — the tail is reached, patch or no.
+    #[tokio::test]
+    async fn a_refused_patch_emits_nothing() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"one\" .").await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        // `solid:deletes` names a triple that is not there — the simplest 409.
+        let res = patch_n3(&f, "/c/notes",
+            "<> a solid:InsertDeletePatch ; solid:deletes \
+             { <#it> <http://schema.org/name> \"absent\" . } .\n").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT, "the fixture's premise");
+        stays_silent(&mut on_target, "a refused patch is not a change").await;
+    }
+
+    /// The resource, and its parent losing a member. `Remove` carries the child
+    /// as `object`, exactly as `Add` does.
+    #[tokio::test]
+    async fn a_delete_emits_delete_on_the_target_and_remove_on_the_parent() {
+        let f = fixture().await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let parent = f.space.resolve("/c/").unwrap();
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_parent = f.events.subscribe(crate::notify::Topic::from(&parent));
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/c/notes").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_target).await;
+        assert_eq!(e.activity, crate::notify::Activity::Delete);
+        assert_eq!(e.state, None, "a deleted resource has no state to report");
+
+        let p = next_event(&mut on_parent).await;
+        assert_eq!(p.activity, crate::notify::Activity::Remove);
+        assert_eq!(p.object, target.graph_iri());
+        assert_eq!(p.target.as_deref(), Some(parent.graph_iri()));
+        // Independent of `state_of`: a GET on the container itself, at the
+        // same media type and version §5.1 fixes, is the validator the pod
+        // would hand a client for the same state. Catches a Remove reporting
+        // back the child's (nonexistent) state instead of the parent's.
+        let parent_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
+            .header(header::ACCEPT, "application/n-quads")
+            .body(Body::empty()).unwrap()).await.unwrap()
+            .headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+        assert_eq!(p.state.as_deref(), Some(parent_etag.as_str()),
+            "the parent still exists and reports its new state");
+    }
+
+    /// `aux::delete_subject` takes the ACL with the subject, and its own topic
+    /// hears about it.
+    #[tokio::test]
+    async fn deleting_a_subject_emits_delete_for_the_auxiliaries_it_cascades() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        f.app.clone().oneshot(f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> \
+                 <http://www.w3.org/ns/auth/acl#Read>, <http://www.w3.org/ns/auth/acl#Write>, \
+                 <http://www.w3.org/ns/auth/acl#Control> ."))).unwrap())
+            .await.unwrap();
+
+        let acl = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let mut on_acl = f.events.subscribe(crate::notify::Topic::from(&acl));
+        f.app.clone().oneshot(
+            f.owner_request("DELETE", "/c/notes").body(Body::empty()).unwrap()).await.unwrap();
+
+        let e = next_event(&mut on_acl).await;
+        assert_eq!(e.activity, crate::notify::Activity::Delete);
+    }
+
+    /// A direct auxiliary `DELETE` reaches the tail's single `emit_delete`
+    /// rather than returning early past it, so it is reported on the
+    /// auxiliary's own topic. An auxiliary is never a container member, so
+    /// its removal is not a containment change and the parent hears nothing
+    /// (design §4.2).
+    #[tokio::test]
+    async fn deleting_an_auxiliary_emits_no_parent_event() {
+        let f = fixture().await;
+        f.app.clone().oneshot(f.owner_request("PUT", "/c/notes")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        f.app.clone().oneshot(f.owner_request("PUT", "/.aux/c/notes.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(format!(
+                "<#o> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
+                 <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/c/notes> ; \
+                 <http://www.w3.org/ns/auth/acl#mode> \
+                 <http://www.w3.org/ns/auth/acl#Read>, <http://www.w3.org/ns/auth/acl#Write>, \
+                 <http://www.w3.org/ns/auth/acl#Control> ."))).unwrap())
+            .await.unwrap();
+
+        let acl = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let mut on_parent = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/c/").unwrap()));
+        let mut on_acl = f.events.subscribe(crate::notify::Topic::from(&acl));
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/.aux/c/notes.acl").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let e = next_event(&mut on_acl).await;
+        assert_eq!(e.activity, crate::notify::Activity::Delete);
+        assert_eq!(e.object, acl.graph_iri());
+        assert_eq!(e.target, None);
+        assert_eq!(e.state, None);
+        stays_silent(&mut on_acl, "the aux arm reaches the tail's one emit, not two").await;
+
+        stays_silent(&mut on_parent,
+            "an auxiliary is not a member, so nothing about containment changed").await;
+    }
+
+    /// `delete_impl` collects only the auxiliaries `authorize_aux` reported
+    /// present. One it found absent must not reach `emit_delete`, or a
+    /// `DELETE` would announce the removal of an auxiliary that never was —
+    /// on the topic of every kind in `AuxKind::ALL`, as each new kind is added.
+    #[tokio::test]
+    async fn a_delete_says_nothing_about_an_auxiliary_that_was_not_there() {
+        let f = fixture().await;
+        f.put_turtle("/c/notes", "<#it> <http://schema.org/name> \"x\" .").await;
+        let target = f.space.resolve("/c/notes").unwrap();
+        let acl = f.space.resolve("/.aux/c/notes.acl").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+        let mut on_acl = f.events.subscribe(crate::notify::Topic::from(&acl));
+
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/c/notes").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        assert_eq!(next_event(&mut on_target).await.activity, crate::notify::Activity::Delete);
+        stays_silent(&mut on_acl,
+            "the resource had no acl, so the cascade took none with it").await;
+    }
+
+    /// A refused delete emits nothing: the tail returns before touching the bus.
+    #[tokio::test]
+    async fn a_refused_delete_emits_nothing() {
+        let f = fixture().await;
+        let mut on_target = f.events.subscribe(
+            crate::notify::Topic::from(&f.space.resolve("/never-existed").unwrap()));
+
+        let res = f.app.clone().oneshot(
+            f.owner_request("DELETE", "/never-existed").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "the fixture's premise");
+        stays_silent(&mut on_target, "a refused delete is not a change").await;
+    }
+
+    /// §9's first mandated test, on the wire: `state` is byte-identical to the
+    /// `ETag` of an immediately following `GET` at the media type and version
+    /// §5.1 fixes. Against a resource that actually holds RDF 1.2, with the
+    /// unversioned read of the same state asserted to differ — on a 1.1
+    /// fixture the two reads return the same tag and the version half of §5.2
+    /// goes unchecked.
+    #[tokio::test]
+    async fn the_state_is_the_versioned_n_quads_etag_of_a_1_2_resource() {
+        let f = fixture().await;
+        let target = f.space.resolve("/foo").unwrap();
+        let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
+
+        assert_eq!(
+            put_versioned(&f, "/foo", "text/turtle;version=1.2", TRIPLE_TERM_TTL).await.status(),
+            StatusCode::CREATED,
+            "the fixture's premise: the stored state holds a triple term",
+        );
+        let e = next_event(&mut on_target).await;
+
+        let versioned = get_accepting(&f, "/foo", "application/n-quads;version=1.2").await;
+        assert_eq!(versioned.status(), StatusCode::OK);
+        let versioned_etag = versioned.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let unversioned = get_accepting(&f, "/foo", "application/n-quads").await;
+        assert_eq!(unversioned.status(), StatusCode::OK);
+        let unversioned_etag = unversioned.headers()[header::ETAG].to_str().unwrap().to_owned();
+
+        assert_ne!(versioned_etag, unversioned_etag,
+            "the two reads must differ, or this test cannot tell the versions apart");
+        assert_eq!(e.state.as_deref(), Some(versioned_etag.as_str()),
+            "state is the validator of the state as held, not of its 1.1 projection");
+    }
+
+    /// A deep create is six events, and the root hears exactly one of them:
+    /// `Add` naming the container directly beneath it. Not `Create` for the
+    /// grandchild — `as:Create` only ever runs on the new resource's own
+    /// channel (design §3.2).
+    #[tokio::test]
+    async fn a_deep_create_tells_the_root_only_about_its_own_child() {
+        let f = fixture().await;
+        let root = f.space.resolve("/").unwrap();
+        let a = f.space.resolve("/a/").unwrap();
+        let mut on_root = f.events.subscribe(crate::notify::Topic::from(&root));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/a/b/c.ttl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_root).await;
+        assert_eq!(e.activity, crate::notify::Activity::Add);
+        assert_eq!(e.object, a.graph_iri(), "the root's own child, not the grandchild");
+        assert_eq!(e.target.as_deref(), Some(root.graph_iri()));
+
+        stays_silent(&mut on_root, "one event on the root, not one per level below it").await;
     }
 }

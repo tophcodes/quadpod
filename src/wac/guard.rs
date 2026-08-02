@@ -327,6 +327,8 @@ impl<'a> Guard<'a> {
             }
         }
 
+        let created: Vec<ResourceUrl> = creations.into_iter().cloned().collect();
+        let mut linked: Vec<(ContainerUrl, String)> = Vec::new();
         for (ancestor, child_iri) in plan {
             container::ensure_container(self.store, &ancestor)
                 .await
@@ -335,10 +337,10 @@ impl<'a> Guard<'a> {
                 container::add_containment(self.store, &ancestor, &child_iri)
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+                linked.push((ancestor, child_iri));
             }
         }
-        // skeleton: the two lists this method already built, not yet handed back.
-        Ok(Materialized::default())
+        Ok(Materialized { created, linked })
     }
 }
 
@@ -720,5 +722,51 @@ mod tests {
         assert_eq!(status(g.materialize().await), Some(StatusCode::FORBIDDEN),
             "denied while walking to /box/ (root's accessTo grant doesn't inherit) must \
              win over the 404 for ghost's own non-existence, or the ordering leaks it");
+    }
+
+    /// A deep create reports every container it made and every link it added,
+    /// so the change events can be derived from one walk rather than a second.
+    #[tokio::test]
+    async fn materialize_reports_the_containers_it_created_and_the_links_it_added() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
+             <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
+             <{ACL_MODE}> <{ACL_READ}>, <{ACL_WRITE}>, <{ACL_APPEND}> ."
+        )).await;
+        let m = guard_for(&store, alice(), "/a/b/c.ttl").await.materialize().await.unwrap();
+
+        let created: Vec<&str> = m.created.iter().map(|r| r.graph_iri()).collect();
+        assert_eq!(created, vec![
+            "https://pod.toph.so/a/b/c.ttl",
+            "https://pod.toph.so/a/b/",
+            "https://pod.toph.so/a/",
+        ], "nearest first, and the target itself is among them");
+
+        let linked: Vec<(&str, &str)> = m.linked.iter()
+            .map(|(c, child)| (c.graph_iri(), child.as_str())).collect();
+        assert_eq!(linked, vec![
+            ("https://pod.toph.so/a/b/", "https://pod.toph.so/a/b/c.ttl"),
+            ("https://pod.toph.so/a/", "https://pod.toph.so/a/b/"),
+            ("https://pod.toph.so/", "https://pod.toph.so/a/"),
+        ]);
+    }
+
+    /// An overwrite creates nothing and links nothing: the parent already
+    /// records this child, so re-inserting the triple changes no state.
+    #[tokio::test]
+    async fn materialize_reports_nothing_for_an_overwrite() {
+        let store = OxigraphStore::in_memory().unwrap();
+        seed_acl(&store, "/", &format!(
+            "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_DEFAULT}> <https://pod.toph.so/> ; \
+             <{ACL_ACCESS_TO}> <https://pod.toph.so/> ; \
+             <{ACL_MODE}> <{ACL_READ}>, <{ACL_WRITE}>, <{ACL_APPEND}> ."
+        )).await;
+        guard_for(&store, alice(), "/a.ttl").await.materialize().await.unwrap();
+        crate::resource::put_rdf(&store, &resource("/a.ttl"), &[]).await.unwrap();
+
+        let m = guard_for(&store, alice(), "/a.ttl").await.materialize().await.unwrap();
+        assert!(m.created.is_empty(), "nothing was created: {:?}", m.created);
+        assert!(m.linked.is_empty(), "nothing was linked: {:?}", m.linked);
     }
 }

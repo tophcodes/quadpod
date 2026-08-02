@@ -345,11 +345,18 @@ That is the cut `put_impl`'s tail already makes for the shape report
 Emitting at each success site instead would be fifteen places to forget, in a file of nearly
 seven thousand lines, where a future write path compiles silently without an event.
 
-### 6.3 The blob arm has to stop returning early
+### 6.3 Three successful early exits have to stop bypassing the tail
 
-`put_impl`'s `Repr::Blob` branch is a `return match put_blob(…)` — a *successful*
-early exit that bypasses the tail. It becomes a value flowing into `res`, or every binary write
-emits nothing. This is the only place #17 changes existing control flow.
+`put_impl`'s `Repr::Blob` branch is a `return match put_blob(…)`, and `patch_impl`'s and
+`delete_impl`'s `Target::Aux(_)` arms each return their own response — three *successful* early
+exits past the tail. Each becomes a value flowing into the response the wrapper emits from, or a
+binary write and both auxiliary operations emit nothing. These are the only three places #17
+changes existing control flow.
+
+The two auxiliary ones are the easier to miss, and their absence is not a silent degradation but
+a contradiction: a `PUT` on an auxiliary reaches `put_impl`'s tail and emits, so without them the
+verbs disagree about the same topic. All three were found one at a time, each by the review of
+the task that touched it — which is the argument for the count being stated here at all.
 
 ## 7. Synchronous by design
 
@@ -388,6 +395,12 @@ the one-ETag constraint exists against, and there is no measurement asking for i
 - The container `PUT` path writes `put_rdf` and `ensure_container` as two operations; if the
   second fails there is a partial write and no event. That is the non-atomicity already
   documented in `put_impl`'s `Target::Container` arm, not something introduced here.
+- The same gap is wider than that one arm, and this feature is what makes it observable. A
+  write that fails *after* `Guard::materialize` has run — on the resource path, the blob path,
+  or in `create_by_patch` — leaves containers created and containment added that no subscriber
+  hears about, because the status gate suppresses the whole request's events. Two such requests
+  occur in the test suite today. Accepted: reporting a partial write would mean emitting events
+  for a request the client is told failed, which is worse than reporting nothing.
 
 ## 9. Tests
 

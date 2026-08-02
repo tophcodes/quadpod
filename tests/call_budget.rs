@@ -99,7 +99,7 @@ const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
 /// store-call counts are identical either way — `pdp::decide` is pure, and the
 /// one branch that differs for an anonymous agent (reusing the user decision
 /// as the public one) touches nothing stored.
-async fn app() -> (axum::Router, Arc<CountingStore>) {
+async fn app() -> (axum::Router, Arc<CountingStore>, Arc<sparql_pod::notify::Bus>) {
     let counting = Arc::new(CountingStore::new(OxigraphStore::in_memory().unwrap()));
     let store: Arc<dyn SparqlStore> = counting.clone();
     let space = StorageSpace::new("https://pod.toph.so/").unwrap();
@@ -142,9 +142,10 @@ async fn app() -> (axum::Router, Arc<CountingStore>) {
         .quads().iter().cloned().map(Triple::from).collect();
     sparql_pod::resource::put_rdf(store.as_ref(), &seeded, &content).await.unwrap();
 
+    let events = Arc::new(sparql_pod::notify::Bus::new());
     let app = router(AppState {
         store,
-        events: Arc::new(sparql_pod::notify::Bus::new()),
+        events: events.clone(),
         blobs: Arc::new(sparql_pod::blob::ObjectStoreBlobs::in_memory()),
         space,
         resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
@@ -152,14 +153,25 @@ async fn app() -> (axum::Router, Arc<CountingStore>) {
         auth_config: Arc::new(AuthConfig::default()),
         max_body_bytes: 64 * 1024 * 1024,
     });
-    (app, counting)
+    (app, counting, events)
+}
+
+/// A `PUT` of one triple at `path`, whose object distinguishes one call from
+/// the next so that repeated writes are not no-ops.
+fn put_request(path: &str, object: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .body(Body::from(format!("<#it> <http://schema.org/name> {object} .")))
+        .unwrap()
 }
 
 const GET_BUDGET: usize = 8;
 
 #[tokio::test]
 async fn a_get_stays_within_budget() {
-    let (app, counts) = app().await;
+    let (app, counts, _events) = app().await;
     counts.take(); // discard the fixture's own writes
 
     let res = app
@@ -184,20 +196,10 @@ const PUT_EXISTING_BUDGET: usize = 11;
 
 #[tokio::test]
 async fn a_put_on_an_existing_resource_stays_within_budget() {
-    let (app, counts) = app().await;
+    let (app, counts, _events) = app().await;
     counts.take();
 
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/seeded")
-                .header(header::CONTENT_TYPE, "text/turtle")
-                .body(Body::from("<#it> <http://schema.org/name> \"two\" ."))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let res = app.oneshot(put_request("/seeded", "\"two\"")).await.unwrap();
     // Every successful PUT to a resource answers `201 Created` regardless of
     // whether the resource previously existed (`src/http.rs`'s `put_impl`
     // returns `created(&target)` unconditionally) — matched here rather than
@@ -216,20 +218,10 @@ const PUT_DEEP_BUDGET: usize = 13;
 
 #[tokio::test]
 async fn a_put_creating_a_deep_resource_stays_within_budget() {
-    let (app, counts) = app().await;
+    let (app, counts, _events) = app().await;
     counts.take();
 
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/a/b/c")
-                .header(header::CONTENT_TYPE, "text/turtle")
-                .body(Body::from("<#it> <http://schema.org/name> \"two\" ."))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let res = app.oneshot(put_request("/a/b/c", "\"two\"")).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
 
     let c = counts.take();
@@ -244,7 +236,7 @@ const POST_BUDGET: usize = 9;
 
 #[tokio::test]
 async fn a_post_stays_within_budget() {
-    let (app, counts) = app().await;
+    let (app, counts, _events) = app().await;
     counts.take();
 
     let res = app
@@ -270,7 +262,7 @@ const DELETE_BUDGET: usize = 6;
 
 #[tokio::test]
 async fn a_delete_stays_within_budget() {
-    let (app, counts) = app().await;
+    let (app, counts, _events) = app().await;
     counts.take();
 
     let res = app
@@ -294,7 +286,7 @@ const PATCH_BUDGET: usize = 6;
 
 #[tokio::test]
 async fn a_patch_stays_within_budget() {
-    let (app, counts) = app().await;
+    let (app, counts, _events) = app().await;
     counts.take();
 
     let body = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
@@ -317,4 +309,56 @@ async fn a_patch_stays_within_budget() {
     let c = counts.take();
     println!("PATCH /seeded: {c:?} total={}", c.total());
     assert!(c.total() <= PATCH_BUDGET, "PATCH /seeded cost {c:?}, budget {PATCH_BUDGET}");
+}
+
+/// The gate is a gate: with a subscriber on the topic, the same request costs
+/// strictly more, because `state` is read back. Asserted as an inequality
+/// rather than a number, so it survives an unrelated change to the write path.
+#[tokio::test]
+async fn a_subscriber_makes_a_put_cost_more_than_it_does_without_one() {
+    let (app, counts, events) = app().await;
+
+    counts.take();
+    app.clone().oneshot(put_request("/seeded", "\"one\"")).await.unwrap();
+    let without = counts.take().total();
+
+    let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+    let _rx = events.subscribe(sparql_pod::notify::Topic::from(&space.resolve("/seeded").unwrap()));
+    app.oneshot(put_request("/seeded", "\"two\"")).await.unwrap();
+    let with = counts.take().total();
+
+    assert!(with > without, "a watched topic reads its state back: {without} without, {with} with");
+}
+
+/// A `Delete` is the one activity that publishes no `state`, so a subscriber on
+/// the deleted target costs nothing. Only the store-call count can say so: the
+/// event carries `state: None` whether the read-back was skipped or run and
+/// discarded, because `state_of` on a target that is already gone answers
+/// `None` either way.
+///
+/// Two apps rather than two requests: the second `DELETE /seeded` would be a
+/// `404` and would emit nothing at all.
+#[tokio::test]
+async fn a_subscriber_makes_a_delete_cost_no_more_than_it_does_without_one() {
+    let space = StorageSpace::new("https://pod.toph.so/").unwrap();
+    let seeded = space.resolve("/seeded").unwrap();
+    let delete = || {
+        Request::builder().method("DELETE").uri("/seeded").body(Body::empty()).unwrap()
+    };
+
+    let (unwatched, counts, _events) = app().await;
+    counts.take();
+    let res = unwatched.oneshot(delete()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let without = counts.take().total();
+
+    let (watched, counts, events) = app().await;
+    let _rx = events.subscribe(sparql_pod::notify::Topic::from(&seeded));
+    counts.take();
+    let res = watched.oneshot(delete()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let with = counts.take().total();
+
+    assert_eq!(with, without,
+        "a Delete skips the read-back, so watching the target is free: {without} without, {with} with");
 }
