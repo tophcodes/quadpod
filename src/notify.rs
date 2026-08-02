@@ -131,7 +131,7 @@ impl Bus {
         let tx = channels
             .entry(topic.clone())
             .or_insert_with(|| broadcast::channel(CAPACITY).0);
-        Receiver { rx: tx.subscribe(), bus: Arc::clone(self), topic }
+        Receiver { rx: Some(tx.subscribe()), bus: Arc::clone(self), topic }
     }
 }
 
@@ -153,21 +153,27 @@ impl Default for Bus {
 pub struct Receiver {
     bus: Arc<Bus>,
     topic: Topic,
-    rx: broadcast::Receiver<Event>,
+    /// An `Option` so [`Drop`] can release it before taking the lock. `Some`
+    /// for the whole of this value's observable life.
+    rx: Option<broadcast::Receiver<Event>>,
 }
 
 impl Receiver {
     pub async fn recv(&mut self) -> Result<Event, broadcast::error::RecvError> {
-        self.rx.recv().await
+        self.rx.as_mut().expect("only Drop takes the inner receiver").recv().await
     }
 }
 
 impl Drop for Receiver {
     fn drop(&mut self) {
+        // Dropped *before* the lock, so `receiver_count()` below counts only
+        // the readers that remain and `0` is exact. Deciding while this one is
+        // still alive is not decisive: two readers of one topic dropping
+        // concurrently would both see two, both decline, and leave a channel
+        // behind that no later `Drop` can reclaim.
+        drop(self.rx.take());
         let mut channels = self.bus.channels.write().expect("the bus lock is never held across a panic");
-        // `self.rx` is still alive here, so the count includes it: 1 means this
-        // was the last reader.
-        if channels.get(&self.topic).is_some_and(|tx| tx.receiver_count() <= 1) {
+        if channels.get(&self.topic).is_some_and(|tx| tx.receiver_count() == 0) {
             channels.remove(&self.topic);
         }
     }
@@ -439,6 +445,33 @@ mod tests {
         drop(bus.subscribe(topic.clone()));
         assert_eq!(bus.channels.read().unwrap().len(), 0,
             "the last receiver's Drop must remove the entry, without help from live()");
+    }
+
+    /// Two readers of one topic dropping at once. Each `Drop` decides from
+    /// the count of the readers that *remain*, so exactly one of them sees
+    /// zero and evicts. A `Drop` that counted itself would have both see two,
+    /// both decline, and leave an entry with no readers behind — reclaimable
+    /// only by a `live` call, which happens only when that topic is written
+    /// to again, so a topic nobody writes to leaks for the process's life
+    /// (design §2.2).
+    #[test]
+    fn concurrent_drops_of_one_topic_leave_no_dead_channel() {
+        let bus = Arc::new(Bus::new());
+        for i in 0..20_000 {
+            let topic = Topic::from(&target(&format!("/notes{i}")));
+            let first = bus.subscribe(topic.clone());
+            let second = bus.subscribe(topic);
+            let a = std::thread::spawn(move || drop(first));
+            let b = std::thread::spawn(move || drop(second));
+            a.join().unwrap();
+            b.join().unwrap();
+        }
+        let dead: Vec<String> = bus.channels.read().unwrap().iter()
+            .filter(|(_, tx)| tx.receiver_count() == 0)
+            .map(|(t, _)| t.as_str().to_owned())
+            .collect();
+        assert!(dead.is_empty(),
+            "{} channels outlived every reader of theirs: {dead:?}", dead.len());
     }
 
     /// And only the *last* one: an unconditional eviction would cut off every
