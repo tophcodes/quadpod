@@ -368,9 +368,16 @@ pub async fn emit_delete(
 async fn state_of(st: &AppState, target: &Target) -> Option<String> {
     let store = st.store.as_ref();
     if let Target::Resource(r) = target {
-        if let Ok(Some(crate::resource::Kind::Binary(_))) = crate::resource::kind_of(store, r).await {
-            let key = crate::blob::BlobKey::of(r)?;
-            return st.blobs.get(&key).await.ok().flatten().map(|b| crate::http::blob_etag(&b));
+        match crate::resource::kind_of(store, r).await {
+            Ok(Some(crate::resource::Kind::Binary(_))) => {
+                let key = crate::blob::BlobKey::of(r)?;
+                return st.blobs.get(&key).await.ok().flatten().map(|b| crate::http::blob_etag(&b));
+            }
+            // A read that failed reports no state at all. Falling through
+            // would reach `get_dataset`, which answers `Some(<empty dataset>)`
+            // for a binary and would hand the event a validator of nothing.
+            Err(_) => return None,
+            Ok(_) => {}
         }
         let stored = crate::resource::get_dataset(store, r).await.ok().flatten()?;
         return Some(etag_of(&stored));
@@ -619,6 +626,30 @@ mod tests {
             state_of(&st, &target).await.as_deref(),
             Some(crate::http::blob_etag(b"\x89PNG\r\n\x1a\n").as_str()),
         );
+    }
+
+    /// §8: a failed read-back reports `state: None`. A `kind_of` that fails
+    /// must not fall through to `get_dataset`, which for a binary answers
+    /// `Some(<empty dataset>)` — its presence marker is in the store — and
+    /// would put a plausible validator of nothing on the event.
+    #[tokio::test]
+    async fn state_of_a_binary_whose_kind_cannot_be_read_is_none() {
+        use crate::store::SparqlStore as _;
+        let (st, target) = binary_fixture("/photo.png", b"\x89PNG\r\n\x1a\n").await;
+        let Target::Resource(r) = &target else { unreachable!() };
+        // §3.1's invariant broken — a binary with no stored media type — which
+        // is the state `kind_of` fails closed on.
+        let sys = crate::resource::sys_graph_iri(r);
+        st.store.update(&format!(
+            "DELETE WHERE {{ GRAPH <{sys}> {{ <{}> <{}> ?m }} }}",
+            r.graph_iri(), crate::shelf::SYS_MEDIA_TYPE,
+        )).await.unwrap();
+        assert!(crate::resource::kind_of(st.store.as_ref(), r).await.is_err(),
+            "the fixture's premise: the kind is unreadable");
+        assert!(crate::resource::get_dataset(st.store.as_ref(), r).await.unwrap().is_some(),
+            "the fixture's premise: the fall-through would find something to hash");
+
+        assert_eq!(state_of(&st, &target).await, None);
     }
 
     /// An absent target has no state, which is what a `Delete` reports.
