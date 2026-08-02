@@ -7444,4 +7444,29 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "the fixture's premise");
         stays_silent(&mut on_target, "a refused delete is not a change").await;
     }
+
+    /// A deep create is six events, and the root hears exactly one of them:
+    /// `Add` naming the container directly beneath it. Not `Create` for the
+    /// grandchild — `as:Create` only ever runs on the new resource's own
+    /// channel (design §3.2).
+    #[tokio::test]
+    async fn a_deep_create_tells_the_root_only_about_its_own_child() {
+        let f = fixture().await;
+        let root = f.space.resolve("/").unwrap();
+        let a = f.space.resolve("/a/").unwrap();
+        let mut on_root = f.events.subscribe(crate::notify::Topic::from(&root));
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/a/b/c.ttl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let e = next_event(&mut on_root).await;
+        assert_eq!(e.activity, crate::notify::Activity::Add);
+        assert_eq!(e.object, a.graph_iri(), "the root's own child, not the grandchild");
+        assert_eq!(e.target.as_deref(), Some(root.graph_iri()));
+
+        stays_silent(&mut on_root, "one event on the root, not one per level below it").await;
+    }
 }

@@ -320,3 +320,40 @@ The guard names the store exactly twice: the field it holds and the probe that f
     a regex over one signature, so it cannot be satisfied by a method spelled
     differently.
     check: [ "$(rg -o 'dyn SparqlStore' src/wac/guard.rs | wc -l)" = 2 ]
+
+## Notifications
+
+Every write handler emits exactly once.
+    → 2026-07-31-change-events-design.md §6.2. Emission at each success site
+    instead would be fifteen places to forget in `http.rs`, where a new write
+    path compiles silently without an event and no test names the omission.
+    Counts calls rather than the functions' existence: a handler that stops
+    calling its emit keeps compiling.
+    check: [ "$(rg -o 'crate::notify::emit_(put|post|patch|delete)\(' src/http.rs | wc -l)" = 4 ]
+
+Only `notify` fixes a format for `state`.
+    → 2026-07-31-change-events-design.md §5.1, §5.2. `state` is the N-Quads
+    validator at the held version; a second site choosing a format is a second
+    answer to "which of this resource's ETags is its state", and the two would
+    drift silently because both would keep producing a plausible tag.
+    Anchored on the *fixed* format rather than on the media type: `rdf.rs`
+    names `application/n-quads` in `Format::media_type` and `http.rs` in
+    `SERVABLE`, both legitimately, so a literal-based check is red on arrival.
+    What distinguishes this call is that every other `.etag(` site passes a
+    negotiated format — `etag_candidates`, `get_impl` and `legacy_graph_read`
+    all pass a variable — and only `state` pins one. Narrower than its
+    sentence: it catches the copy-paste, not a second site that re-derives
+    N-Quads under another name.
+    check: ! rg -q 'etag\(nquads\(\)' src --glob '!src/notify.rs'
+
+`Topic` is built only from a `Target`.
+    → 2026-07-31-change-events-design.md §2.1. The registry is where #18
+    authorizes subscriptions, so a key that did not pass
+    `StorageSpace::resolve` is a subscription to a path the space never
+    admitted. The private tuple field makes `From<&Target>` the only
+    constructor today, and the compiler holds that only while the field stays
+    private — widening it to `pub(crate)` opens the constructor to the whole
+    crate, which is the shape the violation actually takes. Narrower than its
+    sentence: it catches a topic minted anywhere but `notify.rs`, not a second
+    `From` impl added beside the first one there.
+    check: ! rg -q 'Topic\(' src --glob '!src/notify.rs'
