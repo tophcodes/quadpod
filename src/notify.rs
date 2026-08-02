@@ -97,17 +97,39 @@ impl Bus {
     ///
     /// Evicts any sender whose receiver count has fallen to zero, which is
     /// what keeps the map from growing without bound over client-chosen paths.
+    ///
+    /// The lookup is a read; the write lock is asked for only when there is
+    /// something to evict. Every write in the pod passes through here, and on
+    /// a topic nobody watches there is nothing to reclaim, so writers that
+    /// touch unrelated topics do not exclude each other (design §7).
     pub fn live(&self, topics: &[Topic]) -> Vec<Topic> {
-        let mut channels = self.channels.write().expect("the bus lock is never held across a panic");
-        topics.iter().filter(|t| {
-            match channels.get(*t) {
-                // A sender whose last receiver went away is evicted here rather
-                // than left to accumulate: the key space is client-chosen.
-                Some(tx) if tx.receiver_count() == 0 => { channels.remove(*t); false }
-                Some(_) => true,
-                None => false,
+        let mut live = Vec::new();
+        // A sender whose last receiver went away is reclaimed rather than left
+        // to accumulate: the key space is client-chosen.
+        let mut dead = Vec::new();
+        {
+            let channels = self.channels.read().expect("the bus lock is never held across a panic");
+            for topic in topics {
+                match channels.get(topic) {
+                    Some(tx) if tx.receiver_count() == 0 => dead.push(topic.clone()),
+                    Some(_) => live.push(topic.clone()),
+                    None => {}
+                }
             }
-        }).cloned().collect()
+        }
+        if !dead.is_empty() {
+            let mut channels = self.channels.write().expect("the bus lock is never held across a panic");
+            for topic in &dead {
+                // Re-counted under this lock: `subscribe` revives an existing
+                // sender in place, so a topic that had no reader a moment ago
+                // may have one now, and evicting it would cut that reader off
+                // from every later publish.
+                if channels.get(topic).is_some_and(|tx| tx.receiver_count() == 0) {
+                    channels.remove(topic);
+                }
+            }
+        }
+        live
     }
 
     /// Deliver `event` to `event.topic`'s channel, if it still has one.
@@ -215,7 +237,7 @@ pub async fn emit_put(
         Existence::Absent => Activity::Create,
     };
     publish_own(st, target, activity).await;
-    publish_containment(st, target.graph_iri(), materialized, Activity::Add).await;
+    publish_containment(st, target.graph_iri(), materialized).await;
 }
 
 /// `Create`, `Update` or `Delete` on the topic's own channel, where `object`
@@ -235,25 +257,31 @@ async fn publish_own(st: &AppState, target: &Target, activity: Activity) {
     st.events.publish(Event { topic, activity, object, target: None, state });
 }
 
-/// A `Create` for every container this write brought into existence, and one
-/// `Add` or `Remove` for every container whose membership changed.
+/// A `Create` for every container this write brought into existence, and an
+/// `Add` for every container whose membership changed.
+///
+/// `Add` only: the writes that walk a [`Materialized`] all put a resource
+/// *into* its containers. The one `Remove` the pod emits is a `DELETE`'s, and
+/// [`emit_delete`] computes it directly.
 ///
 /// No `Update` beside the `Add`: it says nothing the `Add` does not, and the
 /// container's new state rides on the same event (design §4.1). A container
 /// that was both created and gained a child gets both events — they are two
 /// facts, and this bus is keyed by (topic, activity).
-async fn publish_containment(
-    st: &AppState,
-    target_iri: &str,
-    materialized: &Materialized,
-    activity: Activity,
-) {
+async fn publish_containment(st: &AppState, target_iri: &str, materialized: &Materialized) {
     for created in &materialized.created {
         if created.graph_iri() == target_iri {
             continue; // the request's own target — `publish_own` already did it
         }
         let Some(container) = created.as_container() else {
-            continue; // only containers are materialized on the way down
+            // Unreachable rather than merely unexercised: everything
+            // `Guard::materialize` records as created is an ancestor container,
+            // except the request's own target, which the skip above has already
+            // taken out. A skip rather than an `expect`, because `created` is a
+            // `Vec<ResourceUrl>` and nothing in the type says so — and a write
+            // that already committed must not be turned into a panic by the
+            // notification it triggers.
+            continue;
         };
         publish_own(st, &Target::Container(container), Activity::Create).await;
     }
@@ -266,7 +294,7 @@ async fn publish_containment(
         let state = state_of(st, &container_target).await;
         st.events.publish(Event {
             topic,
-            activity,
+            activity: Activity::Add,
             object: child.clone(),
             target: Some(container.graph_iri().to_owned()),
             state,
@@ -288,7 +316,7 @@ pub async fn emit_post(
     // No `Existence` parameter: `post_impl` allocates an unused name, so the
     // child is new by construction.
     publish_own(st, child, Activity::Create).await;
-    publish_containment(st, child.graph_iri(), materialized, Activity::Add).await;
+    publish_containment(st, child.graph_iri(), materialized).await;
 }
 
 /// `PATCH`: `Update`, or the `Create` shape when `create_by_patch` ran. For a
@@ -312,7 +340,7 @@ pub async fn emit_patch(
         Existence::Absent => Activity::Create,
     };
     publish_own(st, target, activity).await;
-    publish_containment(st, target.graph_iri(), materialized, Activity::Add).await;
+    publish_containment(st, target.graph_iri(), materialized).await;
 }
 
 /// `DELETE`: `Delete` on the target, `Remove` on its parent, and a `Delete` on
@@ -510,6 +538,49 @@ mod tests {
         assert!(bus.live(&[topic]).is_empty(), "a channel nobody reads is not live");
         assert_eq!(bus.channels.read().unwrap().len(), 0,
             "live must reclaim the entry, not merely report it as not live");
+    }
+
+    /// §7: the gate's common path takes a read lock. Every write in the pod
+    /// passes through `live`, so a write lock there would serialize writers
+    /// that touch unrelated topics on a map that is usually empty.
+    ///
+    /// Asserted by holding a read guard elsewhere: a `live` that asked for the
+    /// write lock would queue behind it and never answer. The call runs on its
+    /// own thread so that failure is a timeout rather than a hung test.
+    #[test]
+    fn live_does_not_exclude_a_concurrent_reader_of_the_registry() {
+        let bus = Arc::new(Bus::new());
+        let watched = Topic::from(&target("/notes"));
+        let _rx = bus.subscribe(watched.clone());
+
+        let (holding, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let bus = Arc::clone(&bus);
+            std::thread::spawn(move || {
+                let guard = bus.channels.read().unwrap();
+                holding.send(()).unwrap();
+                released.recv().unwrap();
+                drop(guard);
+            })
+        };
+        held.recv().unwrap();
+
+        let (answered, answer) = std::sync::mpsc::channel();
+        {
+            let bus = Arc::clone(&bus);
+            let watched = watched.clone();
+            std::thread::spawn(move || {
+                let _ = answered.send(bus.live(std::slice::from_ref(&watched)));
+            });
+        }
+        let got = answer
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("live must answer while another reader holds the map: its lookup is a read");
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(got, vec![watched]);
     }
 
     #[tokio::test]

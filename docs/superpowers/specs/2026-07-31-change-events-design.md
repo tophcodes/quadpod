@@ -71,9 +71,17 @@ impl Bus { pub fn live(&self, topics: &[Topic]) -> Vec<Topic> }
 ```
 
 The emit path asks which of the topics a request touched have a live channel, and computes
-`state` only for those. A `Sender` whose `receiver_count()` has fallen to zero is evicted
-during that lookup; the `Receiver` `Bus::subscribe` hands out also removes its own entry when
-the last one drops. Without the eviction the map grows without bound over client-chosen paths.
+`state` only for those. It asks per topic, as it reaches each one: the signature is a filter
+rather than a predicate over a single topic so that the gate stays one expression, and each
+call costs one hash lookup under a shared read lock.
+
+The lookup is a read. A `Sender` whose `receiver_count()` has fallen to zero is reclaimed under
+a write lock taken only when that read found one — so a write to a topic nobody watches, which
+is every write in an unsubscribed pod, never asks for exclusive access. The count is re-taken
+under that lock before the entry goes, because `subscribe` revives an existing sender in place
+and a topic that had no reader a moment ago may have one. The `Receiver` `Bus::subscribe` hands
+out also removes its own entry when the last one drops. Without the eviction the map grows
+without bound over client-chosen paths.
 
 `Receiver` is a reader of one topic's channel and nothing else. The Solid *notification channel*
 — a channel type, a `receiveFrom` or `sendTo`, an `accept`, the optional
@@ -362,8 +370,9 @@ the task that touched it — which is the argument for the count being stated he
 
 `broadcast::Sender::send` is not an `async fn`: it writes into a ring buffer and wakes receivers
 without yielding, and overwrites the oldest entry when full rather than applying backpressure. A
-slow subscriber cannot stall the write path. The registry lookup takes an uncontended read lock
-for nanoseconds and nothing is held across an await.
+slow subscriber cannot stall the write path. The registry lookup takes a read lock for
+nanoseconds — writers to unrelated topics do not exclude each other, and the write lock is
+reached only to reclaim a dead channel (§2.2) — and nothing is held across an await.
 
 The one real cost is the `state` read-back, and it is not moved off the request path. Under two
 rapid writes to one resource, two spawned emit tasks would both read after the second write and
