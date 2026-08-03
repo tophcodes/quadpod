@@ -150,8 +150,14 @@ Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     dyn dispatch exists precisely so a backend can be swapped, but the
     `;`-sequence atomicity every write path rests on is a property of
     `OxigraphStore` rather than of SPARQL. A second implementor must reopen that
-    decision, and today nothing would make anyone do it.
-    check: [ "$(rg -o 'impl SparqlStore for [A-Za-z]+' src | wc -l)" = 1 ]
+    decision, and today nothing would make anyone do it. Matched in every
+    spelling that names the trait, because the path is the loophole: the check
+    read `impl SparqlStore for` alone while `src/http/tests/fixture.rs` writes
+    `impl crate::store::SparqlStore for FailingStore` and passed unseen. That
+    `#[cfg(test)]` double is a backend outage the HTTP handlers have to answer,
+    not a second backend, so it is carved out by file and pinned to one there in
+    turn — a real second implementor goes red wherever it lands.
+    check: [ "$(rg -o 'impl (crate::)?(store::)?SparqlStore for [A-Za-z]+' src --glob '!src/http/tests/fixture.rs' | wc -l)" = 1 ] && [ "$(rg -o 'impl (crate::)?(store::)?SparqlStore for [A-Za-z]+' src/http/tests/fixture.rs | wc -l)" = 1 ]
 
 `ResourceUrl::ancestors` is the only multi-hop walk up the container chain.
     → tests/unrepresentable.rs's header; Plan 6 finding F2. Plan 6 had two
