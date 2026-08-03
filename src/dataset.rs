@@ -34,7 +34,7 @@ pub struct Dataset(Vec<Quad>);
 ///
 /// The one recogniser of the reserved namespace, so a caller holding terms
 /// rather than a [`Dataset`] — an N3 Patch document, whose IRIs must be checked
-/// before any binding is substituted (`2026-07-30-n3-patch-design.md` §6.3) —
+/// before any binding is substituted —
 /// asks here instead of matching the prefix itself.
 ///
 /// `urn:quadpod:` — scheme and NID are case-insensitive (RFC 8141), the rest of

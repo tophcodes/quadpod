@@ -85,11 +85,10 @@ fn required_mode_for_aux(kind: AuxKind) -> Mode {
 /// straddle a concurrent write — is not something a later edit has to
 /// remember not to write.
 ///
-/// **Not** the enforcement point for the `/sparql` read proxy the root spec
-/// §11 keeps as a seam: that door asks a set-valued question ("which graphs
-/// may this agent read"), which no single-target API answers. The core root
-/// spec §8 shares across doors is `pdp::decide` and the ACL resolution below
-/// this type, both of which this uses rather than replaces.
+/// **Not** an answer to a set-valued question. A query interface would ask
+/// "which graphs may this agent read", which no single-target API answers.
+/// What such a door would share with this one is `pdp::decide` and the ACL
+/// resolution below this type, both of which this uses rather than replaces.
 ///
 /// The lifetime is deliberate: a guard borrows the store for the request it
 /// was probed in, so it cannot be stashed in anything that outlives the
@@ -345,7 +344,7 @@ impl<'a> Guard<'a> {
 }
 
 /// What a [`Guard::materialize`] call brought about, for the change events the
-/// write path emits (`docs/superpowers/specs/2026-07-31-change-events-design.md`).
+/// write path emits (`docs/architecture.md`, Change events).
 ///
 /// Owned rather than borrowed: `materialize` consumes the guard the URLs came
 /// from, so nothing is left to borrow out of.

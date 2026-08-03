@@ -95,7 +95,7 @@ pub struct Config {
 
     /// Where the RDF lives. `memory` keeps it in this process, so every restart
     /// is a fresh pod. `rocksdb:<dir>` holds it in `<dir>`, which exactly one
-    /// process may open at a time — root spec §16 ADR-7.
+    /// process may open at a time (`docs/decisions.md`, ADR-7).
     #[arg(long, env = "POD_RDF_STORE", default_value = "memory")]
     pub rdf_store: String,
 

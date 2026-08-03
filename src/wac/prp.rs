@@ -29,7 +29,7 @@ use crate::{
 /// synchronous, so there is no `await` left at the point a level's ACL is
 /// chosen. Loading the whole chain's ACLs costs one query for a set bounded by
 /// the chain, and is usually one document — a lazy per-level fetch would cost
-/// the synchronous decision instead. See `2026-07-31-request-scoped-guard-design.md` §5.
+/// the synchronous decision instead.
 pub async fn load_chain_acls(
     store: &dyn SparqlStore,
     chain: &[ResourceUrl],

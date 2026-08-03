@@ -628,8 +628,7 @@ async fn handle_put_root(
     }
 }
 
-/// `PATCH` (`2026-07-30-n3-patch-design.md`). The sequence, which the plan fills
-/// in this order and no other:
+/// `PATCH`. The sequence runs in this order and no other:
 ///
 /// 1. `authorize(…, Mode::Append)` — before anything is parsed, so an
 ///    unauthorized caller learns nothing, and the returned `Decision` carries
