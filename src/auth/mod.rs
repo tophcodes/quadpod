@@ -22,7 +22,7 @@ pub use access_token::{peek_untrusted_issuer, verify_access_token, AccessClaims}
 pub use agent::Agent;
 pub use authenticate::{authenticate, AuthDeps};
 pub use config::AuthConfig;
-pub use dpop::verify_dpop;
+pub use dpop::{verify_dpop, InMemoryJtiReplayStore, JtiReplayStore};
 pub use http_jwks::HttpJwksResolver;
 pub use jwks::{Jwks, JwksResolver, StaticJwksResolver};
 pub use middleware::auth_layer;

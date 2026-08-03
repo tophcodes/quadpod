@@ -2,22 +2,24 @@
 
 use super::access_token::{peek_untrusted_issuer, verify_access_token};
 use super::config::AuthConfig;
-use super::dpop::verify_dpop;
+use super::dpop::{verify_dpop, JtiReplayStore};
 use super::jwks::JwksResolver;
 use super::webid_issuer::{issuer_matches, WebIdIssuerVerifier};
 use super::{Agent, AuthError};
 
-/// The trust-configuration collaborators [`authenticate`] verifies a
-/// request's credentials against: the issuer's published keys, the
-/// WebID-issuer trust binding, and the (optional) issuer allowlist / audience
-/// config. Bundled into one struct (rather than three separate parameters)
-/// to keep `authenticate`'s argument count sane — these three are always
-/// supplied together by the caller (`AppState` in `http.rs`), unlike the
-/// per-request data (`auth_header`, `dpop_header`, `htm`, `htu`, `now_unix`).
+/// The collaborators [`authenticate`] verifies a request's credentials
+/// against: the issuer's published keys, the WebID-issuer trust binding, the
+/// (optional) issuer allowlist / audience config, and the replay set the
+/// accepted proof's `jti` is recorded in. Bundled into one struct (rather
+/// than four separate parameters) to keep `authenticate`'s argument count
+/// sane — these are always supplied together by the caller (`AppState` in
+/// `http.rs`), unlike the per-request data (`auth_header`, `dpop_header`,
+/// `htm`, `htu`, `now_unix`).
 pub struct AuthDeps<'a> {
     pub resolver: &'a dyn JwksResolver,
     pub webid_verifier: &'a dyn WebIdIssuerVerifier,
     pub config: &'a AuthConfig,
+    pub replay: &'a dyn JtiReplayStore,
 }
 
 /// Authenticate a request from its `Authorization` and `DPoP` headers.
@@ -96,7 +98,7 @@ pub async fn authenticate(
         return Err(AuthError::IssuerNotAuthorized);
     }
 
-    verify_dpop(proof, htu, htm, &claims.jkt, now_unix).await?;
+    verify_dpop(proof, htu, htm, &claims.jkt, now_unix, deps.replay).await?;
 
     Ok(Agent::WebId(claims.webid))
 }
@@ -122,6 +124,7 @@ mod tests {
     use super::*;
     use crate::auth::{
         config::AuthConfig,
+        dpop::InMemoryJtiReplayStore,
         jwks::StaticJwksResolver,
         testsupport::{TestClient, TestIdp},
         webid_issuer::StaticWebIdIssuers,
@@ -134,7 +137,10 @@ mod tests {
         let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
         let webids = StaticWebIdIssuers::new();
         let cfg = AuthConfig::default();
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let agent = authenticate(None, None, "GET", "https://pod.toph.so/foo", deps, 1_000)
             .await
             .unwrap();
@@ -155,7 +161,10 @@ mod tests {
             9_999_999_999,
         );
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-x");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let agent = authenticate(
             Some(&format!("DPoP {at}")),
             Some(&proof),
@@ -181,7 +190,10 @@ mod tests {
             &client.jkt(),
             9_999_999_999,
         );
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         assert!(authenticate(
             Some(&format!("DPoP {at}")),
             None,
@@ -211,7 +223,10 @@ mod tests {
         let cfg = AuthConfig::default();
         let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-imp");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await;
         assert!(matches!(r, Err(crate::auth::AuthError::IssuerNotAuthorized)));
@@ -227,7 +242,10 @@ mod tests {
         let cfg = AuthConfig::default();
         let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-ok2");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await.unwrap();
         assert_eq!(agent, crate::auth::Agent::WebId("https://alice.example/card#me".into()));
@@ -246,7 +264,10 @@ mod tests {
         };
         let at = idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-allow");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await;
         assert!(matches!(r, Err(crate::auth::AuthError::UntrustedIssuer)));
@@ -274,7 +295,10 @@ mod tests {
             9_999_999_999,
         );
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-slash");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await;
         assert!(
@@ -301,7 +325,10 @@ mod tests {
             &["solid", "https://pod.toph.so/"],
         );
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-aud-ok");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await.unwrap();
         assert_eq!(agent, Agent::WebId("https://alice.example/card#me".into()));
@@ -325,7 +352,10 @@ mod tests {
             &["https://other-rs.example/"],
         );
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-aud-bad");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let r = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await;
         assert!(matches!(r, Err(AuthError::WrongAudience)));
@@ -346,7 +376,10 @@ mod tests {
             &["https://some-other-rs.example/"],
         );
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-aud-none");
-        let deps = AuthDeps { resolver: &resolver, webid_verifier: &webids, config: &cfg };
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
         let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
             "https://pod.toph.so/foo", deps, 1_010).await.unwrap();
         assert_eq!(agent, Agent::WebId("https://alice.example/card#me".into()));

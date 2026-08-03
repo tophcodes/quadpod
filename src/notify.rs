@@ -722,6 +722,7 @@ mod tests {
             resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
             webid_verifier: Arc::new(StaticWebIdIssuers::new()),
             auth_config: Arc::new(AuthConfig::default()),
+            replay: Arc::new(crate::auth::InMemoryJtiReplayStore::new()),
             max_body_bytes: 64 * 1024 * 1024,
         }
     }

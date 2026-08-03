@@ -32,13 +32,15 @@
 //! passed — is shared. No property is re-implemented per algorithm.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use dpop_verifier::uri::{normalize_htu, normalize_method};
-use dpop_verifier::{DpopError, DpopVerifier, ReplayContext, ReplayStore, VerifiedDpop};
+use dpop_verifier::{
+    DpopError, DpopVerifier, ReplayContext, ReplayStore as DpopVerifierReplayStore, VerifiedDpop,
+};
 use josekit::jwk::Jwk;
 use josekit::jws::RS256;
 use serde_json::Value;
@@ -60,12 +62,12 @@ const MAX_AGE_SECONDS: i64 = 300;
 const FUTURE_SKEW_SECONDS: i64 = 5;
 
 /// How far `now_unix` must move, in either direction, before
-/// [`record_jti_or_reject_replay`] runs another eviction sweep.
+/// [`InMemoryJtiReplayStore`] runs another eviction sweep.
 ///
 /// The sweep is O(n) over the whole set, and n scales with throughput —
 /// every accepted request records a `jti` that lives for the freshness
 /// window, so n ≈ requests-per-second × `MAX_AGE_SECONDS`. Sweeping on
-/// every call therefore puts an O(n) scan inside the process-wide mutex on
+/// every call therefore puts an O(n) scan inside the store's mutex on
 /// a tokio worker thread, and the serialized cost per request grows with
 /// the very throughput it is trying to serve: the sustainable rate
 /// collapses to `sqrt(1 / (per-entry cost × window))`, a few hundred
@@ -82,22 +84,69 @@ const FUTURE_SKEW_SECONDS: i64 = 5;
 /// `throughput × (MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS + this)`.
 const EVICTION_INTERVAL_SECONDS: i64 = 60;
 
-/// Replay-detection storage backing the `jti` check, shared across all
-/// calls to `verify_dpop` in this process.
+/// Where this pod remembers the `jti` of every proof it has accepted, so a
+/// second sighting of the same one is refused.
 ///
-/// This is process-lifetime, in-memory storage: a `jti` is only rejected as
-/// a replay within the single running process that first saw it (restarts
-/// or multiple replicas don't share this state) — a shared/persistent
-/// (e.g. Redis) store is still needed for multi-replica deployments; this
-/// remains single-instance only. Each entry is keyed by the `jti` hash and
-/// stores the `now_unix` at which it was recorded, so stale entries can be
-/// evicted (see `record_jti_or_reject_replay`) and the set stays bounded
-/// instead of growing for the process's lifetime.
-static REPLAY_JTIS: OnceLock<Mutex<ReplaySet>> = OnceLock::new();
+/// **Not** `dpop_verifier::ReplayStore`, imported into this module as
+/// `DpopVerifierReplayStore`: that one is the crate's own interface,
+/// consulted from inside `DpopVerifier::verify` — i.e. *before* this
+/// module's freshness and `cnf.jkt` checks have run — and is deliberately
+/// given a store that records nothing ([`NoopReplayStore`]). This trait is
+/// the pod's replay set, consulted by [`verify_dpop`] only once every other
+/// check has passed.
+///
+/// It is injected through [`AppState`](crate::http::AppState) beside the
+/// store, the blobs, the JWKS resolver and the WebID verifier, so a pod's
+/// replay set belongs to that pod, and a shared/persistent (e.g. Redis)
+/// store for multi-replica deployments is a second implementor rather than
+/// a change to this module.
+#[async_trait]
+pub trait JtiReplayStore: Send + Sync {
+    /// Record `jti` as seen at `now_unix`, or reject it as a replay because
+    /// this store is already holding it.
+    ///
+    /// [`verify_dpop`] calls this only after every other check (signature,
+    /// htu/htm, freshness, `cnf.jkt` binding) has passed, so a proof
+    /// rejected by any of those never consumes its `jti` and only a
+    /// fully-valid proof does. A *second* submission of that same valid
+    /// proof is then rejected here.
+    ///
+    /// An implementor may forget an entry once it is older than the
+    /// freshness window (`MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS`) from
+    /// `now_unix`: a `jti` can never be legitimately replayed *within* that
+    /// window, because this method rejects it, and *outside* the window
+    /// [`verify_dpop`]'s own `iat` freshness check has already rejected the
+    /// proof before the store is ever consulted. So nothing that still needs
+    /// replay protection is droppable.
+    async fn record_or_reject(&self, jti: &str, now_unix: i64) -> Result<(), AuthError>;
+}
+
+/// The [`JtiReplayStore`] a pod uses unless it is given another: an
+/// in-memory map for the lifetime of this value.
+///
+/// A `jti` is therefore only rejected as a replay by the very store that
+/// first saw it — a restart, or a second replica, starts empty. That is the
+/// single-instance limitation a shared/persistent (e.g. Redis) implementor
+/// would lift.
+///
+/// Each entry is keyed by the `jti` hash and holds the `now_unix` at which
+/// it was recorded, which is what lets stale entries be evicted so the set
+/// stays bounded instead of growing for as long as the pod runs.
+#[derive(Default)]
+pub struct InMemoryJtiReplayStore {
+    replay: Mutex<ReplaySet>,
+}
+
+impl InMemoryJtiReplayStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// The replay set together with the bookkeeping its amortized eviction
 /// needs. `last_eviction` lives under the same lock as `jtis` because the
 /// two are only ever read and written together, in one critical section.
+#[derive(Default)]
 struct ReplaySet {
     /// `jti` hash -> the `now_unix` at which that `jti` was recorded.
     jtis: HashMap<[u8; 32], i64>,
@@ -105,35 +154,43 @@ struct ReplaySet {
     last_eviction: i64,
 }
 
-fn replay_jtis() -> &'static Mutex<ReplaySet> {
-    REPLAY_JTIS.get_or_init(|| {
-        Mutex::new(ReplaySet {
-            jtis: HashMap::new(),
-            last_eviction: 0,
-        })
-    })
-}
+#[async_trait]
+impl JtiReplayStore for InMemoryJtiReplayStore {
+    /// The eviction sweep is deliberately NOT run on every call: it runs
+    /// only once `now_unix` has moved `EVICTION_INTERVAL_SECONDS` away from
+    /// the last one, which is what keeps this O(1) per request instead of
+    /// O(set size). See that constant for the throughput argument and for
+    /// why the resulting slightly-longer entry lifetime is safe.
+    ///
+    /// The interval is compared in absolute value, so a `now_unix` that
+    /// moves *backwards* — a stepped wall clock, or a caller simulating one
+    /// — also forces a sweep instead of suppressing eviction until the clock
+    /// catches up.
+    ///
+    /// The whole critical section is that O(1) amortized bookkeeping plus a
+    /// hash insert, with no `.await` inside it, so the lock is a plain
+    /// `std::sync::Mutex` and is released before this future can yield.
+    async fn record_or_reject(&self, jti: &str, now_unix: i64) -> Result<(), AuthError> {
+        let mut replay = self.replay.lock().unwrap();
 
-/// Serializes tests that record a `jti` into the process-wide
-/// [`REPLAY_JTIS`] store. `cargo test` runs tests in parallel by default,
-/// and the tests that touch this store use wildly different `now_unix`
-/// values — this module's own use simulated times near `1_000` (and one far
-/// in the future, to exercise eviction), while `http`'s handler tests go
-/// through `auth_layer`, which uses the real wall clock. A large `now_unix`
-/// in one test evicts another concurrently-running test's just-inserted,
-/// still-fresh entry out from under it (see
-/// `record_jti_or_reject_replay`), so any test that both records a `jti`
-/// and depends on it staying recorded must hold this lock.
-///
-/// Uses `tokio::sync::Mutex`, not `std::sync::Mutex`, because the guard is
-/// held across `.await` points in those tests (clippy's
-/// `await_holding_lock` correctly flags a std lock there).
-#[cfg(test)]
-static TEST_REPLAY_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        if now_unix
+            .saturating_sub(replay.last_eviction)
+            .saturating_abs()
+            >= EVICTION_INTERVAL_SECONDS
+        {
+            let cutoff = now_unix.saturating_sub(MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS);
+            replay.jtis.retain(|_, recorded_at| *recorded_at >= cutoff);
+            replay.last_eviction = now_unix;
+        }
 
-#[cfg(test)]
-pub fn test_replay_lock() -> &'static tokio::sync::Mutex<()> {
-    TEST_REPLAY_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        let hash = hash_jti(jti);
+        if let std::collections::hash_map::Entry::Vacant(entry) = replay.jtis.entry(hash) {
+            entry.insert(now_unix);
+            Ok(())
+        } else {
+            Err(AuthError::DpopInvalid("dpop proof replayed".to_string()))
+        }
+    }
 }
 
 /// Hash a `jti` the same way `dpop-verifier` does internally (the SHA-256
@@ -143,76 +200,22 @@ fn hash_jti(jti: &str) -> [u8; 32] {
     Sha256::digest(jti.as_bytes()).into()
 }
 
-/// Record `jti` as seen in the process-lifetime replay set.
-///
-/// Deliberately called by `verify_dpop` only after every other check
-/// (signature, htu/htm, freshness, `cnf.jkt` binding) has already passed —
-/// so a proof rejected by any of those checks never consumes its `jti`, and
-/// only a fully-valid proof does. A *second* submission of that same valid
-/// proof is then rejected here as a replay.
-///
-/// Entries recorded further back than the freshness window
-/// (`MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS`) from `now_unix` are evicted,
-/// which is what keeps the set bounded rather than growing for the
-/// process's lifetime. Dropping them is safe because a `jti` can never be
-/// legitimately replayed *within* that window (this function rejects it),
-/// and *outside* the window `verify_dpop`'s own freshness check already
-/// rejects the proof on `iat` staleness before we ever get here — so
-/// nothing that still needs replay protection is ever evicted.
-///
-/// The sweep is deliberately NOT run on every call: it runs only once
-/// `now_unix` has moved `EVICTION_INTERVAL_SECONDS` away from the last
-/// one, which is what keeps this function's cost O(1) per request instead
-/// of O(set size). See that constant for the throughput argument and for
-/// why the resulting slightly-longer entry lifetime is safe.
-///
-/// The interval is compared in absolute value, so a `now_unix` that moves
-/// *backwards* — a stepped wall clock in production, or the widely
-/// different simulated clocks the tests use against this one shared set —
-/// also forces a sweep instead of suppressing eviction until the clock
-/// catches up.
-///
-/// Note: this is still an in-process, single-instance store (see
-/// `REPLAY_JTIS`); a shared/persistent store (e.g. Redis) is required for
-/// multi-replica deployments, which is out of scope here.
-fn record_jti_or_reject_replay(jti: &str, now_unix: i64) -> Result<(), AuthError> {
-    let mut replay = replay_jtis().lock().unwrap();
-
-    if now_unix
-        .saturating_sub(replay.last_eviction)
-        .saturating_abs()
-        >= EVICTION_INTERVAL_SECONDS
-    {
-        let cutoff = now_unix.saturating_sub(MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS);
-        replay.jtis.retain(|_, recorded_at| *recorded_at >= cutoff);
-        replay.last_eviction = now_unix;
-    }
-
-    let hash = hash_jti(jti);
-    if let std::collections::hash_map::Entry::Vacant(entry) = replay.jtis.entry(hash) {
-        entry.insert(now_unix);
-        Ok(())
-    } else {
-        Err(AuthError::DpopInvalid("dpop proof replayed".to_string()))
-    }
-}
-
-/// A `ReplayStore` that never records or rejects on replay, passed to
-/// `dpop-verifier`'s own `verify()` in place of the real replay store.
+/// A `dpop_verifier::ReplayStore` that never records or rejects on replay,
+/// passed to `dpop-verifier`'s own `verify()` in place of a real one.
 ///
 /// `dpop-verifier` checks replay *before* returning control to this module,
 /// i.e. before our own freshness (Fix 1) and `cnf.jkt` binding checks run.
-/// If those were given the real store directly, a proof that fails one of
-/// *our* later checks would still have permanently burned its `jti` inside
+/// If it were given a recording store, a proof that fails one of *our* later
+/// checks would still have permanently burned its `jti` inside
 /// `dpop-verifier` — letting an attacker who merely observes (or replays
 /// with a wrong key) a proof deny that `jti` to the legitimate client
 /// forever. Using this no-op store here means `dpop-verifier` never
-/// consumes a `jti`; the real, process-wide replay check happens in
-/// `record_jti_or_reject_replay`, called only once every check has passed.
+/// consumes a `jti`; the real replay check is the injected
+/// [`JtiReplayStore`], consulted only once every check has passed.
 struct NoopReplayStore;
 
 #[async_trait]
-impl ReplayStore for NoopReplayStore {
+impl DpopVerifierReplayStore for NoopReplayStore {
     async fn insert_once(
         &mut self,
         _jti_hash: [u8; 32],
@@ -356,8 +359,8 @@ const RS256_ALG: &str = "RS256";
 
 /// `dpop-verifier`'s own `JTI_MAX_LENGTH`, which its ES256 path applies to
 /// every proof it accepts. Restated here so the RS256 path bounds the `jti`
-/// it hands to [`record_jti_or_reject_replay`] identically — an unbounded
-/// `jti` is an unbounded key into the process-wide replay map.
+/// it hands to the [`JtiReplayStore`] identically — an unbounded `jti` is an
+/// unbounded key into the replay map.
 const JTI_MAX_LENGTH: usize = 512;
 
 /// Decode one base64url segment of a compact JWS as JSON.
@@ -578,6 +581,7 @@ pub async fn verify_dpop(
     htm: &str,
     expected_jkt: &str,
     now_unix: i64,
+    replay: &dyn JtiReplayStore,
 ) -> Result<(), AuthError> {
     // Only RS256 — the one algorithm `dpop-verifier` cannot reach — is
     // verified here; everything else, `none` and `HS*` included, still goes
@@ -637,8 +641,8 @@ pub async fn verify_dpop(
 
     // Every check above has passed: only now do we consume the jti, so a
     // proof rejected by any earlier check leaves its jti reusable (see
-    // `NoopReplayStore` and `record_jti_or_reject_replay`).
-    record_jti_or_reject_replay(&verified.jti, now_unix)?;
+    // `NoopReplayStore` and `JtiReplayStore`).
+    replay.record_or_reject(&verified.jti, now_unix).await?;
 
     Ok(())
 }
@@ -648,19 +652,9 @@ mod tests {
     use super::*;
     use crate::auth::testsupport::TestClient;
 
-    /// Serializes tests that actually record a `jti` into the process-wide
-    /// `REPLAY_JTIS` store (i.e. reach a fully-valid `verify_dpop` call) —
-    /// see [`super::test_replay_lock`], which `http`'s handler tests share.
-    /// Tests that never reach `record_jti_or_reject_replay` (rejected
-    /// earlier by htu/htm, freshness, or jkt binding) don't touch the shared
-    /// store and don't need this lock.
-    fn test_lock() -> &'static tokio::sync::Mutex<()> {
-        super::test_replay_lock()
-    }
-
     #[tokio::test]
     async fn valid_proof_matching_jkt_passes() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-a");
         assert!(verify_dpop(
@@ -668,7 +662,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_ok());
@@ -695,6 +690,7 @@ mod tests {
     /// dangerous.
     #[tokio::test]
     async fn trailing_slash_difference_is_rejected_in_both_directions() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let resource = client.mint_dpop("https://pod.toph.so/foo", "PUT", 1_000, "jti-slash-1");
         assert!(verify_dpop(
@@ -702,7 +698,8 @@ mod tests {
             "https://pod.toph.so/foo/",
             "PUT",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -713,7 +710,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "PUT",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -725,7 +723,8 @@ mod tests {
             "https://pod.toph.so/.aux/foo.acl/",
             "PUT",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -737,7 +736,7 @@ mod tests {
     /// working when the proof names them exactly.
     #[tokio::test]
     async fn exact_htu_still_passes_for_resource_container_and_auxiliary() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         for (i, htu) in [
             "https://pod.toph.so/foo",
@@ -752,7 +751,7 @@ mod tests {
             let jti = format!("jti-exact-{i}");
             let proof = client.mint_dpop(htu, "GET", 1_000, &jti);
             assert!(
-                verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010)
+                verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010, &replay)
                     .await
                     .is_ok(),
                 "exact htu {htu} must still verify"
@@ -770,7 +769,7 @@ mod tests {
     /// against a `derive_htu` that had already decoded it to `A`.
     #[tokio::test]
     async fn a_percent_encoded_path_verifies_for_the_request_it_was_signed_for() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         for (i, htu) in [
             "https://pod.toph.so/caf%C3%A9",
@@ -784,7 +783,7 @@ mod tests {
             let jti = format!("jti-pct-{i}");
             let proof = client.mint_dpop(htu, "GET", 1_000, &jti);
             assert!(
-                verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010)
+                verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010, &replay)
                     .await
                     .is_ok(),
                 "wire-form htu {htu} must verify for its own request"
@@ -808,6 +807,7 @@ mod tests {
     /// `http::tests::a_proof_for_one_acl_cannot_be_redirected_by_a_double_escape`.
     #[tokio::test]
     async fn a_percent_encoded_proof_cannot_be_redirected_through_a_double_escape() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let plain = client.mint_dpop("https://pod.toph.so/a%41", "PUT", 1_000, "jti-pct25-1");
         assert!(verify_dpop(
@@ -815,7 +815,8 @@ mod tests {
             "https://pod.toph.so/a%2541",
             "PUT",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -826,7 +827,8 @@ mod tests {
             "https://pod.toph.so/a%41",
             "PUT",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -844,7 +846,8 @@ mod tests {
             "https://pod.toph.so/.aux/a%2541.acl",
             "PUT",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -859,7 +862,7 @@ mod tests {
     /// treats the two as identical.
     #[tokio::test]
     async fn explicit_default_port_in_proof_htu_still_verifies() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so:443/foo", "GET", 1_000, "jti-port");
         assert!(verify_dpop(
@@ -867,7 +870,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_ok());
@@ -878,7 +882,7 @@ mod tests {
     /// must still verify. Comparing the whole URL would have rejected this.
     #[tokio::test]
     async fn differently_cased_host_in_proof_htu_still_verifies() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let proof = client.mint_dpop("https://POD.TOPH.SO/foo", "GET", 1_000, "jti-case");
         assert!(verify_dpop(
@@ -886,7 +890,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_ok());
@@ -894,6 +899,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_htu_is_rejected() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-b");
         assert!(verify_dpop(
@@ -901,7 +907,8 @@ mod tests {
             "https://pod.toph.so/OTHER",
             "GET",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -909,6 +916,7 @@ mod tests {
 
     #[tokio::test]
     async fn jkt_mismatch_is_binding_error() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let other = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-c");
@@ -918,7 +926,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &other.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -926,6 +935,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_proof_is_rejected() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-stale");
         // now far beyond MAX_AGE after iat
@@ -934,7 +944,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &client.jkt(),
-            9_999_999
+            9_999_999,
+            &replay
         )
         .await
         .is_err());
@@ -942,6 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn future_proof_is_rejected() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 5_000_000, "jti-future");
         assert!(verify_dpop(
@@ -949,7 +961,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &client.jkt(),
-            1_000
+            1_000,
+            &replay
         )
         .await
         .is_err());
@@ -957,6 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn extreme_iat_does_not_panic_and_is_rejected() {
+        let replay = InMemoryJtiReplayStore::new();
         // `TestClient::mint_dpop` goes through `josekit`'s registered-claim
         // validation, which rejects *any* negative `iat` at mint time (not
         // specific to this module) -- so an extreme-negative `iat` can't be
@@ -974,7 +988,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &client.jkt(),
-            i64::MAX
+            i64::MAX,
+            &replay
         )
         .await
         .is_err());
@@ -982,26 +997,26 @@ mod tests {
 
     #[tokio::test]
     async fn replay_of_valid_proof_is_rejected_but_rejected_proof_does_not_burn_jti() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new();
         // a proof that will FAIL the jkt binding (wrong expected_jkt) must NOT burn its jti
         let other = TestClient::new();
         let p_reject = client.mint_dpop("https://pod.toph.so/x", "GET", 1_000, "jti-shared");
         assert!(
-            verify_dpop(&p_reject, "https://pod.toph.so/x", "GET", &other.jkt(), 1_010)
+            verify_dpop(&p_reject, "https://pod.toph.so/x", "GET", &other.jkt(), 1_010, &replay)
                 .await
                 .is_err()
         );
         // same jti now used by a VALID proof -> must SUCCEED (jti not burned by the rejected attempt)
         let p_ok = client.mint_dpop("https://pod.toph.so/y", "GET", 1_000, "jti-shared");
         assert!(
-            verify_dpop(&p_ok, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+            verify_dpop(&p_ok, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010, &replay)
                 .await
                 .is_ok()
         );
         // replay the SAME valid proof/jti -> must be rejected
         assert!(
-            verify_dpop(&p_ok, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+            verify_dpop(&p_ok, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010, &replay)
                 .await
                 .is_err()
         );
@@ -1035,7 +1050,7 @@ mod tests {
     /// is that key's RFC 7638 thumbprint, must now verify end to end.
     #[tokio::test]
     async fn an_rs256_proof_with_a_matching_rsa_jkt_verifies() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new_rsa();
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-rsa-ok");
         assert!(verify_dpop(
@@ -1043,7 +1058,8 @@ mod tests {
             "https://pod.toph.so/foo",
             "GET",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_ok());
@@ -1062,7 +1078,7 @@ mod tests {
     /// broken binding announces itself.
     #[tokio::test]
     async fn the_rsa_jkt_binding_is_load_bearing() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new_rsa();
         let other = TestClient::new_rsa();
 
@@ -1070,7 +1086,7 @@ mod tests {
         // RSA thumbprint is computed wrongly.
         let ok = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-rsa-bind-1");
         assert!(
-            verify_dpop(&ok, "https://pod.toph.so/foo", "GET", &client.jkt(), 1_010)
+            verify_dpop(&ok, "https://pod.toph.so/foo", "GET", &client.jkt(), 1_010, &replay)
                 .await
                 .is_ok(),
             "an RSA proof must verify against its own key's RFC 7638 thumbprint"
@@ -1080,7 +1096,7 @@ mod tests {
         // key must not satisfy this token's binding.
         let wrong = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-rsa-bind-2");
         assert!(
-            verify_dpop(&wrong, "https://pod.toph.so/foo", "GET", &other.jkt(), 1_010)
+            verify_dpop(&wrong, "https://pod.toph.so/foo", "GET", &other.jkt(), 1_010, &replay)
                 .await
                 .is_err(),
             "an RSA proof must not verify against another key's cnf.jkt"
@@ -1101,6 +1117,7 @@ mod tests {
     /// strictly before it ever inspects the signature bytes.
     #[tokio::test]
     async fn rs256_proof_with_a_1024_bit_key_is_rejected() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new_rsa_with_bits(1024);
         let proof = client.mint_dpop_with_dummy_signature(
             "https://pod.toph.so/foo",
@@ -1114,6 +1131,7 @@ mod tests {
             "GET",
             &client.jkt(),
             1_010,
+            &replay,
         )
         .await
         .expect_err("a 1024-bit RSA key must be rejected");
@@ -1135,6 +1153,7 @@ mod tests {
     /// close a server-side hole, which is why coverage of it was missing.
     #[tokio::test]
     async fn rs256_proof_with_embedded_private_key_is_rejected() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new_rsa();
         let proof = client.mint_dpop_with_private_jwk_in_header(
             "https://pod.toph.so/foo",
@@ -1148,6 +1167,7 @@ mod tests {
             "GET",
             &client.jkt(),
             1_010,
+            &replay,
         )
         .await
         .expect_err("a jwk carrying private key material must be rejected");
@@ -1167,6 +1187,7 @@ mod tests {
     /// still be refused.
     #[tokio::test]
     async fn rs256_proof_with_a_513_character_jti_is_rejected() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new_rsa();
         let jti = "a".repeat(513);
         let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, &jti);
@@ -1176,6 +1197,7 @@ mod tests {
             "GET",
             &client.jkt(),
             1_010,
+            &replay,
         )
         .await
         .expect_err("a 513-character jti must be rejected");
@@ -1205,6 +1227,7 @@ mod tests {
     /// path.
     #[tokio::test]
     async fn rs256_header_over_an_okp_key_is_refused_by_the_pods_own_kty_check() {
+        let replay = InMemoryJtiReplayStore::new();
         use josekit::jwk::alg::ed::EdCurve;
 
         let ed_private = Jwk::generate_ed_key(EdCurve::Ed25519).expect("generate Ed25519 key");
@@ -1229,7 +1252,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode([0u8; 32])
         );
 
-        let err = verify_dpop(&proof, "https://pod.toph.so/foo", "GET", "irrelevant-jkt", 1_010)
+        let err = verify_dpop(&proof, "https://pod.toph.so/foo", "GET", "irrelevant-jkt", 1_010, &replay)
             .await
             .expect_err("an RS256 header over an OKP jwk must be refused");
         match err {
@@ -1249,6 +1272,7 @@ mod tests {
     /// can be talked into it.
     #[tokio::test]
     async fn alg_none_and_symmetric_algs_are_refused() {
+        let replay = InMemoryJtiReplayStore::new();
         let ec = TestClient::new();
         let rsa = TestClient::new_rsa();
         for (i, client) in [&ec, &rsa].iter().enumerate() {
@@ -1262,7 +1286,8 @@ mod tests {
                         "https://pod.toph.so/foo",
                         "GET",
                         &client.jkt(),
-                        1_010
+                        1_010,
+                        &replay
                     )
                     .await
                     .is_err(),
@@ -1285,6 +1310,7 @@ mod tests {
     /// it because its `Jwk` type has no RSA variant to deserialize into.
     #[tokio::test]
     async fn alg_confusion_is_refused_in_both_directions() {
+        let replay = InMemoryJtiReplayStore::new();
         let ec = TestClient::new();
         let rs256_over_ec_key = ec.mint_dpop_claiming_alg(
             "RS256",
@@ -1299,7 +1325,8 @@ mod tests {
                 "https://pod.toph.so/foo",
                 "GET",
                 &ec.jkt(),
-                1_010
+                1_010,
+                &replay
             )
             .await
             .is_err(),
@@ -1320,7 +1347,8 @@ mod tests {
                 "https://pod.toph.so/foo",
                 "GET",
                 &rsa.jkt(),
-                1_010
+                1_010,
+                &replay
             )
             .await
             .is_err(),
@@ -1337,6 +1365,7 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn an_rs256_proof_is_held_to_the_exact_htu_comparison_too() {
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new_rsa();
         let proof =
             client.mint_dpop("https://pod.toph.so/foo", "PUT", 1_000, "jti-rsa-slash");
@@ -1345,7 +1374,8 @@ mod tests {
             "https://pod.toph.so/foo/",
             "PUT",
             &client.jkt(),
-            1_010
+            1_010,
+            &replay
         )
         .await
         .is_err());
@@ -1357,14 +1387,14 @@ mod tests {
     /// available to the honest client, and only a fully-valid one burns it.
     #[tokio::test]
     async fn a_rejected_rs256_proof_does_not_burn_its_jti() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = TestClient::new_rsa();
         let other = TestClient::new_rsa();
 
         // Fails the jkt binding, the last check before the jti is recorded.
         let rejected = client.mint_dpop("https://pod.toph.so/x", "GET", 1_000, "jti-rsa-shared");
         assert!(
-            verify_dpop(&rejected, "https://pod.toph.so/x", "GET", &other.jkt(), 1_010)
+            verify_dpop(&rejected, "https://pod.toph.so/x", "GET", &other.jkt(), 1_010, &replay)
                 .await
                 .is_err()
         );
@@ -1372,14 +1402,14 @@ mod tests {
         // The same jti, now on a valid proof: must still be available.
         let accepted = client.mint_dpop("https://pod.toph.so/y", "GET", 1_000, "jti-rsa-shared");
         assert!(
-            verify_dpop(&accepted, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+            verify_dpop(&accepted, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010, &replay)
                 .await
                 .is_ok()
         );
 
         // And now it is burned: replaying the valid proof is rejected.
         assert!(
-            verify_dpop(&accepted, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010)
+            verify_dpop(&accepted, "https://pod.toph.so/y", "GET", &client.jkt(), 1_010, &replay)
                 .await
                 .is_err()
         );
@@ -1387,20 +1417,20 @@ mod tests {
 
     #[tokio::test]
     async fn replayed_jti_outside_window_is_allowed_again_and_set_stays_bounded() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
         let client = crate::auth::testsupport::TestClient::new();
         // first use at t=1000
         let p1 = client.mint_dpop("https://pod.toph.so/a", "GET", 1_000, "jti-ttl");
-        assert!(verify_dpop(&p1, "https://pod.toph.so/a", "GET", &client.jkt(), 1_010)
+        assert!(verify_dpop(&p1, "https://pod.toph.so/a", "GET", &client.jkt(), 1_010, &replay)
             .await
             .is_ok());
         // immediate replay (same jti, within window) → rejected
-        assert!(verify_dpop(&p1, "https://pod.toph.so/a", "GET", &client.jkt(), 1_010)
+        assert!(verify_dpop(&p1, "https://pod.toph.so/a", "GET", &client.jkt(), 1_010, &replay)
             .await
             .is_err());
         // a NEW proof with the SAME jti but far in the future (past the eviction window) → allowed
         let p2 = client.mint_dpop("https://pod.toph.so/a", "GET", 1_000_000, "jti-ttl");
-        assert!(verify_dpop(&p2, "https://pod.toph.so/a", "GET", &client.jkt(), 1_000_010)
+        assert!(verify_dpop(&p2, "https://pod.toph.so/a", "GET", &client.jkt(), 1_000_010, &replay)
             .await
             .is_ok());
     }
@@ -1416,33 +1446,104 @@ mod tests {
     /// sweep there, the entry recorded at `0` is gone and its `jti` is
     /// accepted again.
     ///
-    /// This calls `record_jti_or_reject_replay` directly rather than going
-    /// through `verify_dpop`: the timings it needs are ones no proof could
-    /// reach through the public path, where an `iat` that old is rejected
-    /// for staleness long before the replay set is consulted.
+    /// This calls the store directly rather than going through
+    /// `verify_dpop`: the timings it needs are ones no proof could reach
+    /// through the public path, where an `iat` that old is rejected for
+    /// staleness long before the replay set is consulted.
     #[tokio::test]
     async fn the_eviction_sweep_is_amortized_rather_than_run_per_call() {
-        let _guard = test_lock().lock().await;
+        let replay = InMemoryJtiReplayStore::new();
 
-        assert!(record_jti_or_reject_replay("jti-amort", 0).is_ok());
+        assert!(replay.record_or_reject("jti-amort", 0).await.is_ok());
         // Each of these is a full interval on from the one before, so each
         // sweeps; the last leaves the sweep clock at 300.
         for t in [60, 120, 180, 240, 300] {
-            assert!(record_jti_or_reject_replay(&format!("jti-amort-{t}"), t).is_ok());
+            assert!(replay.record_or_reject(&format!("jti-amort-{t}"), t).await.is_ok());
         }
 
         // 310 is past the freshness window for the entry recorded at 0
         // (300 + 5 = 305), but only 10 seconds on from the last sweep — so
         // no sweep runs and the entry is still there to catch the replay.
         assert!(
-            record_jti_or_reject_replay("jti-amort", 310).is_err(),
+            replay.record_or_reject("jti-amort", 310).await.is_err(),
             "no sweep is due at 310, so the entry recorded at 0 must still be held"
         );
 
         // 360 is a full interval on from that sweep, so this one does sweep.
         assert!(
-            record_jti_or_reject_replay("jti-amort", 360).is_ok(),
+            replay.record_or_reject("jti-amort", 360).await.is_ok(),
             "the sweep due at 360 must evict the entry recorded at 0"
+        );
+    }
+
+    /// Two [`InMemoryJtiReplayStore`]s hold two replay sets, not one — which
+    /// is the whole point of the store being a collaborator rather than
+    /// something `verify_dpop` reaches for.
+    ///
+    /// Both halves are asserted, because each pins a different way the
+    /// separation can fail:
+    ///
+    /// - a `jti` burned in one store must still be available in the other,
+    ///   or two pods in one process share a replay set neither asked for;
+    /// - a `now_unix` far enough ahead to force an eviction sweep in one
+    ///   store must not evict the other's still-fresh entry. That is the
+    ///   exact interference a shared set produced between concurrently
+    ///   running tests, and it is invisible to the first half alone: a
+    ///   shared set would answer the second `record` here identically
+    ///   whether or not the sweep reached across.
+    #[tokio::test]
+    async fn two_replay_stores_do_not_see_each_others_jtis() {
+        let one = InMemoryJtiReplayStore::new();
+        let two = InMemoryJtiReplayStore::new();
+
+        assert!(
+            one.record_or_reject("jti-per-store", 1_010).await.is_ok(),
+            "the first store has not seen this jti"
+        );
+        assert!(
+            one.record_or_reject("jti-per-store", 1_010).await.is_err(),
+            "the first store must reject its own second sighting"
+        );
+        assert!(
+            two.record_or_reject("jti-per-store", 1_010).await.is_ok(),
+            "the second store has never seen this jti and must accept it"
+        );
+
+        // A clock far enough ahead to sweep in `two` must not reach into
+        // `one`, whose entry is still inside its freshness window.
+        assert!(
+            two.record_or_reject("jti-elsewhere", 1_000_000).await.is_ok(),
+            "an unrelated jti at a swept clock is recorded, not rejected"
+        );
+        assert!(
+            one.record_or_reject("jti-per-store", 1_010).await.is_err(),
+            "the first store's still-fresh entry must survive the second store's sweep"
+        );
+
+        // And the same separation through the public path, so what
+        // `verify_dpop` consults is the store it was handed.
+        let client = TestClient::new();
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-per-store");
+        let htu = "https://pod.toph.so/foo";
+        let first = InMemoryJtiReplayStore::new();
+        let second = InMemoryJtiReplayStore::new();
+        assert!(
+            verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010, &first)
+                .await
+                .is_ok(),
+            "a store that has seen nothing accepts the proof"
+        );
+        assert!(
+            verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010, &first)
+                .await
+                .is_err(),
+            "the same store rejects the replay"
+        );
+        assert!(
+            verify_dpop(&proof, htu, "GET", &client.jkt(), 1_010, &second)
+                .await
+                .is_ok(),
+            "a different store never saw that proof and must accept it"
         );
     }
 }

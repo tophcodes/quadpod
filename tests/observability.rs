@@ -26,7 +26,7 @@ use axum::http::{Request, StatusCode};
 use oxigraph::model::Triple;
 use oxigraph::sparql::QuerySolution;
 use sparql_pod::{
-    auth::{AuthConfig, Jwks, StaticJwksResolver, StaticWebIdIssuers},
+    auth::{AuthConfig, InMemoryJtiReplayStore, Jwks, StaticJwksResolver, StaticWebIdIssuers},
     container,
     http::{router, AppState},
     rdf::RdfVersion,
@@ -146,6 +146,7 @@ async fn app() -> (axum::Router, Arc<FailingStore>) {
         resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
         webid_verifier: Arc::new(StaticWebIdIssuers::new()),
         auth_config: Arc::new(AuthConfig::default()),
+        replay: Arc::new(InMemoryJtiReplayStore::new()),
         max_body_bytes: 64 * 1024 * 1024,
     });
     (app, failing)
