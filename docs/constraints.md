@@ -71,8 +71,13 @@ A SPARQL literal is never interpolated by hand.
     erroring. `src/http.rs` and `src/dataset.rs` are excluded: their `\"{`
     matches build an HTTP `Link` header, a `Warning` header and an `ETag`
     (`blob_etag`) in `src/http.rs`, and an `ETag` (`Skolemized::etag`) in
-    `src/dataset.rs` — all quoted per their own RFC, never SPARQL.
-    check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs' --glob '!src/dataset.rs'
+    `src/dataset.rs` — all quoted per their own RFC, never SPARQL. Two of the
+    HTTP tests are excluded for the same reason, by name rather than as a
+    subtree: `src/http/tests/acl.rs` asserts on that `Warning` header and
+    `src/http/tests/events.rs` interpolates a Turtle request body, while their
+    sibling files really do hand-build SPARQL against the store and stay
+    covered.
+    check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs' --glob '!src/http/tests/acl.rs' --glob '!src/http/tests/events.rs' --glob '!src/dataset.rs'
 
 Only `blob::BlobKey` builds an object key.
     → 2026-07-29-non-rdf-resources-design.md §3.2. The key is the resource's
@@ -239,23 +244,23 @@ Only `shapes` reads the constraint binding.
     `LDP_CONTAINS`'s value, or angle-bracketed inside a SPARQL string, as
     every other metadata read in this crate does); or it can skip the spelling
     entirely by importing `LDP_CONSTRAINED_BY` and comparing against that.
-    `src/http.rs` is excluded from the first conjunct rather than cleared
-    outright: its `#[cfg(test)]` fixtures `PUT` a Turtle body to set a binding
-    up, which is data, not a read, but it is still the IRI in text — so the
-    second conjunct pins today's count instead, and a new occurrence anywhere
-    in the file, reader or fixture, goes red. The count includes one
-    non-fixture occurrence: the `422` refusal's own `Link:
+    `src/http.rs` and `src/http/tests/shapes.rs` are excluded from the first
+    conjunct rather than cleared outright: the shape tests `PUT` a Turtle body
+    to set a binding up, which is data, not a read, but it is still the IRI in
+    text — so the second conjunct pins today's count across the two instead,
+    and a new occurrence in either, reader or fixture, goes red. The count
+    includes one non-fixture occurrence: the `422` refusal's own `Link:
     rel="…ldp#constrainedBy"` header (§3.1) — the response naming the shape
     that refused it is not a second *read* of the binding, since it is built
     from the `Shape` `shapes::load` already returned, but it is one more
-    place this file spells the IRI, so it counts here rather than being
+    place the HTTP layer spells the IRI, so it counts here rather than being
     carved out like the fixtures are. The third conjunct is what stops the
     import: `LDP_CONSTRAINED_BY` stays private, so nothing outside
     `shapes.rs` can name it to compare against — and any restricted-visibility
     modifier (`pub(crate)`, `pub(super)`, `pub(in path)`) counts as exported
     for this purpose, since `shapes` is a top-level module and `pub(super)`
     is exactly `pub(crate)` here, so the pattern below matches all of them.
-    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs | wc -l)" = 7 ] && ! rg -q 'pub(\([^)]*\))? const LDP_CONSTRAINED_BY' src/shapes.rs
+    check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' --glob '!src/http/tests/shapes.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs src/http/tests/shapes.rs | wc -l)" = 7 ] && ! rg -q 'pub(\([^)]*\))? const LDP_CONSTRAINED_BY' src/shapes.rs
 
 The query string is read in exactly one place.
     → §6. `?validate` is the only query parameter this pod gives meaning to,
