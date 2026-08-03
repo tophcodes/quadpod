@@ -36,13 +36,38 @@ pub fn router(state: AppState) -> Router {
     //
     // `Router::layer` wraps everything built so far, so the LAST call is the
     // outermost: `cors_layer` sees the `401` that `auth_layer` produces, which
-    // is where the CORS fields are required.
+    // is where the CORS fields are required, and the trace layer outside both
+    // sees every response this pod emits — including the ones no handler ever
+    // ran for.
     Router::new()
         .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).patch(handle_patch_root).options(handle_options_root))
         .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).patch(handle_patch).options(handle_options))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
         .layer(axum::middleware::from_fn(cors_layer))
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::extract::Request| {
+                    // The id is minted here rather than read off a header: an
+                    // inbound `X-Request-Id` is client-controlled, so trusting
+                    // it lets one caller file its requests under another's id.
+                    // Every event a request produces — the `error!` at each
+                    // `500` included — inherits this span, so a log line always
+                    // says which request it belongs to.
+                    tracing::info_span!(
+                        "request",
+                        id = %uuid::Uuid::new_v4(),
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                    )
+                })
+                // At `INFO`, because the access log is the record of what the
+                // pod did and a default-level subscriber must see it. The
+                // status and the latency are `DefaultOnResponse`'s own fields.
+                .on_response(
+                    tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
+                ),
+        )
         .with_state(state)
 }
 
@@ -419,6 +444,35 @@ fn put_status(e: &ResourceError) -> StatusCode {
     }
 }
 
+/// The body every `500` carries, whatever failed underneath.
+///
+/// A store or blob failure names this pod's internals — an Oxigraph message, a
+/// bucket, a path — and none of that is something the client can act on. The
+/// detail is not lost, it is moved: [`internal_error`] logs the cause with the
+/// request's own span around it. A `4xx` keeps its text, because there the text
+/// describes what the caller sent.
+const INTERNAL_ERROR_BODY: &str = "internal server error";
+
+/// The `500` for a failure the client did not cause: logged with its cause,
+/// answered with [`INTERNAL_ERROR_BODY`].
+///
+/// Every `500` this crate builds goes through here, so a failure that reaches a
+/// client is a failure the operator can read about.
+pub(crate) fn internal_error(cause: &dyn std::fmt::Display) -> Response {
+    tracing::error!(error = %cause, "request failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_BODY).into_response()
+}
+
+/// The response a write-path [`ResourceError`] earns: [`put_status`]'s status,
+/// with the cause going to whichever of the two audiences it belongs to.
+fn put_error(e: &ResourceError) -> Response {
+    let status = put_status(e);
+    if status.is_server_error() {
+        return internal_error(e);
+    }
+    (status, e.to_string()).into_response()
+}
+
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> &str {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
@@ -613,7 +667,7 @@ async fn patch_impl(
                 return (StatusCode::CONFLICT, BINARY_TARGET_MESSAGE).into_response()
             }
             Ok(_) => {}
-            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+            Err(e) => return put_error(&e),
         }
     }
     // A shape-constrained container refuses every PATCH outright — see
@@ -653,7 +707,7 @@ async fn patch_impl(
                 (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
             }
             Err(e @ AuxError::Missing) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
-            Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
+            Err(AuxError::Resource(e)) => put_error(&e),
         };
         (res, crate::notify::Existence::Existed, Materialized::default())
     } else {
@@ -682,11 +736,11 @@ async fn patch_impl(
                 Ok(result) => match &target {
                     Target::Container(c) => match container::ensure_container(store, c).await {
                         Ok(()) => patch_response(result, &patch),
-                        Err(e) => (put_status(&e), e.to_string()).into_response(),
+                        Err(e) => put_error(&e),
                     },
                     _ => patch_response(result, &patch),
                 },
-                Err(e) => (put_status(&e), e.to_string()).into_response(),
+                Err(e) => put_error(&e),
             };
             // An update materializes nothing: the target already existed, so
             // there is no ancestor to walk.
@@ -754,7 +808,7 @@ async fn create_by_patch(
     };
     match written {
         Ok(()) => (created(target), materialized),
-        Err(e) => ((put_status(&e), e.to_string()).into_response(), Materialized::default()),
+        Err(e) => (put_error(&e), Materialized::default()),
     }
 }
 
@@ -965,7 +1019,7 @@ async fn check_conditionals(
     }
     let current_tags = match current_tags(store, blobs, target).await {
         Ok(t) => t,
-        Err(e) => return Err((put_status(&e), e.to_string()).into_response()),
+        Err(e) => return Err(put_error(&e)),
     };
     if let Some(im) = headers.get(IF_MATCH).and_then(|v| v.to_str().ok()) {
         // RFC 9110 §13.1.1: `If-Match` matches *any* current representation,
@@ -1081,7 +1135,6 @@ async fn patch_shape_conflict(st: &AppState, target: &Target) -> Result<(), Resp
 /// output, is a `500`. One function, so the two cannot drift apart.
 fn shape_status(e: crate::shapes::ShapeError) -> Response {
     use crate::shapes::ShapeError;
-    let message = e.to_string();
     let status = match &e {
         ShapeError::Resource(r) => put_status(r),
         ShapeError::Engine(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1089,7 +1142,10 @@ fn shape_status(e: crate::shapes::ShapeError) -> Response {
             StatusCode::CONFLICT
         }
     };
-    (status, message).into_response()
+    if status.is_server_error() {
+        return internal_error(&e);
+    }
+    (status, e.to_string()).into_response()
 }
 
 /// A dataset as Turtle, for an error body. Not negotiated: `Accept` describes
@@ -1179,7 +1235,7 @@ async fn put_write(
             return (match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
                 Ok(()) => created(target),
                 Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
-                Err(e) => (put_status(&e), e.to_string()).into_response(),
+                Err(e) => put_error(&e),
             }, existence, materialized);
         }
     };
@@ -1215,8 +1271,7 @@ async fn put_write(
     if let Target::Resource(r) = target {
         let existing = match get_dataset(store, r).await {
             Ok(v) => v,
-            Err(e) => return ((put_status(&e), e.to_string()).into_response(),
-                existence, Materialized::default()),
+            Err(e) => return (put_error(&e), existence, Materialized::default()),
         };
         if let Some(existing) = existing {
             let held = existing.deskolemize().rdf_version();
@@ -1238,8 +1293,7 @@ async fn put_write(
             // request the check could not evaluate.
             let existing = match get_dataset(store, r).await {
                 Ok(v) => v,
-                Err(e) => return ((put_status(&e), e.to_string()).into_response(),
-                    existence, Materialized::default()),
+                Err(e) => return (put_error(&e), existence, Materialized::default()),
             };
             if let Some(existing) = existing {
                 // Over the stored quads, where every graph name is an IRI. A
@@ -1308,8 +1362,8 @@ async fn put_write(
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
                 // Unreachable: `put` writes the auxiliary, so it never asks
                 // for one that is already there.
-                Err(AuxError::Missing) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
+                Err(e @ AuxError::Missing) => internal_error(&e),
+                Err(AuxError::Resource(e)) => put_error(&e),
             }
         }
         Target::Container(c) => {
@@ -1321,24 +1375,23 @@ async fn put_write(
             // per the plan's cross-graph-atomicity note.
             let existing = match get_rdf(store, c).await {
                 Ok(v) => v.unwrap_or_default(),
-                Err(e) => return ((put_status(&e), e.to_string()).into_response(),
-                    existence, materialized),
+                Err(e) => return (put_error(&e), existence, materialized),
             };
             let mut merged = triples_of(&dataset.default_graph_only());
             merged.extend(
                 existing.into_iter().filter(|t| t.predicate.as_str() == container::LDP_CONTAINS),
             );
             if let Err(e) = put_rdf(store, c, &merged).await {
-                return ((put_status(&e), e.to_string()).into_response(), existence, materialized);
+                return (put_error(&e), existence, materialized);
             }
             if let Err(e) = container::ensure_container(store, c).await {
-                return ((put_status(&e), e.to_string()).into_response(), existence, materialized);
+                return (put_error(&e), existence, materialized);
             }
             created(target)
         }
         Target::Resource(r) => match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
             Ok(()) => created(target),
-            Err(e) => (put_status(&e), e.to_string()).into_response(),
+            Err(e) => put_error(&e),
         },
     };
     // The link describes the stored representation. `Target::Resource`'s
@@ -1493,13 +1546,13 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
             Repr::Blob(bytes, mt) => match put_blob(store, st.blobs.as_ref(), r, bytes, &mt).await {
                 Ok(()) => created(&child),
                 Err(ResourceError::KeyTooLong) => StatusCode::URI_TOO_LONG.into_response(),
-                Err(e) => (put_status(&e), e.to_string()).into_response(),
+                Err(e) => put_error(&e),
             },
             Repr::Rdf(_, fmt, _) => {
                 let skolemized = skolemized.expect("Repr::Rdf produced a skolemized dataset above");
                 match put_dataset(store, st.blobs.as_ref(), r, &skolemized, fmt).await {
                     Ok(()) => created(&child),
-                    Err(e) => (put_status(&e), e.to_string()).into_response(),
+                    Err(e) => put_error(&e),
                 }
             }
         },
@@ -1514,15 +1567,15 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
             match put_rdf(store, c, &triples).await {
                 Ok(()) => match container::ensure_container(store, c).await {
                     Ok(()) => created(&child),
-                    Err(e) => (put_status(&e), e.to_string()).into_response(),
+                    Err(e) => put_error(&e),
                 },
-                Err(e) => (put_status(&e), e.to_string()).into_response(),
+                Err(e) => put_error(&e),
             }
         }
         // Unreachable: a `Slug` can never name an auxiliary (see above), and
         // the only other shape `classify` can return for a child path is the
         // container the `Link` header asks for.
-        Target::Aux(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Target::Aux(_) => internal_error(&"a POST allocated a child path that names an auxiliary"),
     };
     // Mirrors `put_impl`'s tail: findings alone cannot gate the link, or a
     // body that only warned, followed by a storage failure, would advertise a
@@ -1654,7 +1707,7 @@ async fn validate_view(
         Target::Resource(r) => match get_dataset(store, r).await {
             Ok(Some(d)) => d.deskolemize(),
             Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
-            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+            Err(e) => return put_error(&e),
         },
         Target::Container(c) => match get_rdf(store, c).await {
             // Minus what this pod adds on write — `ldp:contains` and the
@@ -1668,7 +1721,7 @@ async fn validate_view(
             Ok(Some(t)) =>
                 ground_dataset(container::without_server_managed(t, c.graph_iri())).deskolemize(),
             Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
-            Err(e) => return (put_status(&e), e.to_string()).into_response(),
+            Err(e) => return put_error(&e),
         },
         Target::Aux(_) => unreachable!("an auxiliary already returned above"),
     };
@@ -1689,7 +1742,7 @@ async fn validate_view(
             out.insert(header::VARY, "Accept".parse().expect("static"));
             (out, bytes).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(&e),
     }
 }
 
@@ -1729,7 +1782,7 @@ async fn blob_read(st: AppState, target: Target, headers: HeaderMap, mt: MediaTy
             }
             return with_aux_links((StatusCode::NOT_FOUND, out).into_response(), &target);
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(&e),
     };
     let tag = blob_etag(&bytes);
     let mut out = HeaderMap::new();
@@ -1769,7 +1822,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Ok(Some(Kind::Rdf)) => {}
         Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
         Err(ResourceError::InvalidIri) => return StatusCode::BAD_REQUEST.into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(&e),
     }
     // §6.1: read everything first — the ETag covers the resource, not the
     // body, so the shelves are read even when only the default graph will be
@@ -1780,7 +1833,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         // learns where its ACL goes from the 404 it got when it looked.
         Ok(None) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
         Err(ResourceError::InvalidIri) => return StatusCode::BAD_REQUEST.into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(&e),
     };
     let visible = stored.deskolemize();
     // What is withheld is decided on the **stored** quads, where every graph
@@ -1818,7 +1871,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     let served = served.project_to(served_version);
     let bytes = match fmt.serialize(&served) {
         Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(&e),
     };
     let mut out = HeaderMap::new();
     // §5: the response states the version it carries — but only where a
@@ -1938,14 +1991,14 @@ async fn legacy_graph_read(
                     with_read_headers(
                         (headers, bytes).into_response(), &target, decision, store.rdf_version())
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Err(e) => internal_error(&e),
             }
         }
         // The advertisement matters most here: a client creating a resource
         // learns where its ACL goes from the 404 it got when it looked.
         Ok(None) => with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
         Err(ResourceError::InvalidIri) => StatusCode::BAD_REQUEST.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(&e),
     }
 }
 
@@ -1987,7 +2040,7 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
         let res = match delete_rdf(store, a).await {
             Ok(true) => StatusCode::NO_CONTENT.into_response(),
             Ok(false) => StatusCode::NOT_FOUND.into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => internal_error(&e),
         };
         (res, Vec::new())
     } else {
@@ -2028,7 +2081,7 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
             match container::container_is_empty(store, c).await {
                 Ok(false) => return StatusCode::CONFLICT.into_response(),
                 Ok(true) => {}
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Err(e) => return internal_error(&e),
             }
         }
         let res = match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
@@ -2037,13 +2090,13 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
                     if let Err(e) =
                         container::remove_containment(store, &parent, subject.graph_iri()).await
                     {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                        return internal_error(&e);
                     }
                 }
                 StatusCode::NO_CONTENT.into_response()
             }
             Ok(false) => with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => internal_error(&e),
         };
         (res, present_auxes)
     };
@@ -5782,6 +5835,21 @@ mod tests {
             .body(Body::from(&b"x"[..])).unwrap()).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The backend's own words are for the log, not for the client: the body
+    /// says the same thing whatever failed underneath. `tests/observability.rs`
+    /// holds the other half — that the words really are in the log.
+    #[tokio::test]
+    async fn a_500_says_nothing_about_the_backend_that_failed() {
+        let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;
+
+        let res = f.app.clone().oneshot(f.owner_request("PUT", "/photo.png")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(Body::from(&b"x"[..])).unwrap()).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_string(res).await, INTERNAL_ERROR_BODY);
     }
 
     #[tokio::test]

@@ -144,10 +144,10 @@ impl<'a> Guard<'a> {
 
         let present = resource::exists_many(store, &candidates)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+            .map_err(|e| crate::http::internal_error(&e))?;
         let acls = prp::load_chain_acls(store, &chain, &present)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+            .map_err(|e| crate::http::internal_error(&e))?;
 
         Ok(Self { store, agent, target, chain, present, acls })
     }
@@ -332,11 +332,11 @@ impl<'a> Guard<'a> {
         for (ancestor, child_iri) in plan {
             container::ensure_container(self.store, &ancestor)
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+                .map_err(|e| crate::http::internal_error(&e))?;
             if let Some(child_iri) = child_iri {
                 container::add_containment(self.store, &ancestor, &child_iri)
                     .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+                    .map_err(|e| crate::http::internal_error(&e))?;
                 linked.push((ancestor, child_iri));
             }
         }
