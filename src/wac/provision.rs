@@ -97,6 +97,9 @@ pub async fn provision_root_acl(
         // Unreachable by construction: `put` writes the auxiliary, so it never
         // asks for one that is already there.
         Err(AuxError::Missing) => unreachable!("put does not require an existing auxiliary"),
+        // Unreachable: the ACL written above is one authorization of seven
+        // triples, two orders of magnitude under `aux::MAX_AUX_TRIPLES`.
+        Err(AuxError::TooLarge(n)) => unreachable!("the root ACL is {n} triples"),
     }
 }
 

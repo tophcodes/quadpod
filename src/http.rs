@@ -653,6 +653,9 @@ async fn patch_impl(
                 (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
             }
             Err(e @ AuxError::Missing) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+            // Unreachable: the triple cap is counted over a whole document,
+            // which only `aux::put` is given.
+            Err(AuxError::TooLarge(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             Err(AuxError::Resource(e)) => (put_status(&e), e.to_string()).into_response(),
         };
         (res, crate::notify::Existence::Existed, Materialized::default())
@@ -1306,6 +1309,15 @@ async fn put_write(
                 Ok(()) => warn_if_acl_grants_nothing(&st.space, a, &triples, created(target)),
                 Err(AuxError::SubjectMissing) =>
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
+                // RFC 9110 §15.5.14: the content is larger than this server is
+                // willing to process. The document is well-formed RDF and its
+                // meaning is understood — nothing about it is a client
+                // mistake a `400` would describe — so what is refused is its
+                // size, which is also what tells the caller a smaller
+                // document would be accepted. Same answer the configured
+                // `max_body_bytes` gives one layer out, for the same reason.
+                Err(e @ AuxError::TooLarge(_)) =>
+                    (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
                 // Unreachable: `put` writes the auxiliary, so it never asks
                 // for one that is already there.
                 Err(AuxError::Missing) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -4327,6 +4339,35 @@ mod tests {
 
         let del_acl = f.owner_request("DELETE", "/.aux/box/doc.acl").body(Body::empty()).unwrap();
         assert_eq!(f.app.oneshot(del_acl).await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+
+    // An ACL over `aux::MAX_AUX_TRIPLES` is refused with a `413`, and refused
+    // whole: nothing of it is stored, so the resource keeps being governed by
+    // whatever governed it before. The body here is tens of kilobytes against
+    // a 64 MiB limit, so the status can only have come from the triple cap —
+    // axum's own limit never sees a body this small.
+    #[tokio::test]
+    async fn an_acl_over_the_triple_cap_is_refused_with_413() {
+        let f = fixture().await;
+        f.put_turtle("/box/doc", "<#it> <http://schema.org/name> \"doc\" .").await;
+
+        let mut body = String::new();
+        for i in 0..=crate::aux::MAX_AUX_TRIPLES {
+            body.push_str(&format!(
+                "<#a{i}> <http://www.w3.org/ns/auth/acl#agent> <https://webid.example/{i}> .\n"
+            ));
+        }
+        let put_acl = f.owner_request("PUT", "/.aux/box/doc.acl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(body)).unwrap();
+        let res = f.app.clone().oneshot(put_acl).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(body_string(res).await.contains("at most"));
+
+        assert!(
+            f.stored("/.aux/box/doc.acl").await.is_none(),
+            "the refused ACL must not have been stored"
+        );
     }
 
     // ACL-of-an-ACL. A document that governs itself is permanent: whoever

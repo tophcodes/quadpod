@@ -26,9 +26,39 @@ pub enum AuxError {
     /// require an existing auxiliary report this — [`put`] writes one instead.
     #[error("the auxiliary resource does not exist")]
     Missing,
+    /// The document offered to [`put`] holds more triples than
+    /// [`MAX_AUX_TRIPLES`]. Carries the count, so the refusal can say how far
+    /// over the caller was rather than only that they were.
+    #[error("an auxiliary resource may hold at most {MAX_AUX_TRIPLES} triples, and this one has {0}")]
+    TooLarge(usize),
     #[error(transparent)]
     Resource(#[from] ResourceError),
 }
+
+/// The largest auxiliary document [`put`] accepts, in triples.
+///
+/// The only auxiliary kind today is the ACL, and an ACL is read on the request
+/// path, not just written: the WAC guard re-reads the applicable one and
+/// decides on it per level of the ancestor chain, for every request in the
+/// subtree it governs. So the size of a stored ACL is a tax on later reads,
+/// which is what makes a bound belong on the write rather than on the reader
+/// alone. Nothing else bounds it — an auxiliary is an ordinary RDF resource
+/// written through `PUT`, so without this its size is whatever
+/// `Config::max_body_bytes` admits, and a body of that size is hundreds of
+/// thousands of triples.
+///
+/// A thousand is chosen to sit far from both edges. A real ACL is a handful of
+/// authorizations of half a dozen triples each — the root ACL this pod
+/// provisions is seven — so legitimate use is two orders of magnitude below
+/// this, and a WebID-per-authorization document naming a hundred and forty
+/// distinct agents would still be admitted. On the other
+/// side, the decision itself is linear in the document (`wac::pdp` groups it
+/// by subject once), so a thousand triples is a decision measured in
+/// microseconds even repeated per ancestor — and it stays that way
+/// for any pass over the ACL that is quadratic by accident, since a thousand
+/// squared is a million comparisons, not the 10¹⁰ that an uncapped body
+/// permits.
+pub const MAX_AUX_TRIPLES: usize = 1_000;
 
 /// The `404` body for an auxiliary write refused for [`AuxError::SubjectMissing`].
 ///
@@ -104,11 +134,18 @@ fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
 /// would believe the path is protected while nearest-ACL-wins quietly hands
 /// it the ancestor's rules. Claiming success for an unwritten policy
 /// document is the dangerous direction.
+///
+/// A document over [`MAX_AUX_TRIPLES`] is refused before the update is built,
+/// so an oversized ACL never reaches the store and therefore never reaches the
+/// guard that re-reads it on every later request in the subtree.
 pub async fn put(
     store: &dyn SparqlStore,
     aux: &AuxUrl,
     triples: &[Triple],
 ) -> Result<(), AuxError> {
+    if triples.len() > MAX_AUX_TRIPLES {
+        return Err(AuxError::TooLarge(triples.len()));
+    }
     store
         .update(&conditional_put_update(aux, triples))
         .await
@@ -302,6 +339,83 @@ mod tests {
             matches!(&from_blank.subject, oxigraph::model::NamedOrBlankNode::NamedNode(_)),
             "a blank node must never reach the store as a blank node"
         );
+    }
+
+    /// `count` authorizations, each one triple, on distinct subjects — the
+    /// cheapest way to reach a given triple count, and the shape that costs a
+    /// reader the most: every subject distinct is what makes a per-subject
+    /// rescan quadratic.
+    fn authorizations(aux: &AuxUrl, count: usize) -> Vec<Triple> {
+        let mut turtle = String::new();
+        for i in 0..count {
+            turtle.push_str(&format!(
+                "<#a{i}> <http://www.w3.org/ns/auth/acl#agent> <https://webid.example/{i}> .\n"
+            ));
+        }
+        let t = triples(&turtle, aux.graph_iri());
+        assert_eq!(t.len(), count, "the fixture must hold exactly the asked-for count");
+        t
+    }
+
+    // The cap is a refusal, not a truncation: nothing of an oversized document
+    // reaches the store, so the auxiliary stays absent rather than half
+    // written. One triple over is enough — the boundary itself is what the
+    // test below pins.
+    #[tokio::test]
+    async fn an_auxiliary_over_the_triple_cap_is_refused_and_stores_nothing() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+
+        let oversized = authorizations(&acl, MAX_AUX_TRIPLES + 1);
+        assert!(matches!(
+            put(&store, &acl, &oversized).await,
+            Err(AuxError::TooLarge(n)) if n == MAX_AUX_TRIPLES + 1
+        ));
+
+        assert!(!exists(&store, &acl).await.unwrap());
+        assert!(
+            graph_contents(&store, acl.graph_iri()).await.is_empty(),
+            "an oversized auxiliary must not be stored, whole or in part"
+        );
+        assert!(
+            graph_contents(&store, &sys_graph_iri(&acl)).await.is_empty(),
+            "the presence marker was written for a refused document"
+        );
+    }
+
+    // The counterweight, and what makes the cap a boundary rather than a
+    // direction: a document of exactly `MAX_AUX_TRIPLES` is still written. An
+    // off-by-one in the comparison fails here or above, never in both.
+    #[tokio::test]
+    async fn an_auxiliary_at_the_triple_cap_is_still_written() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+
+        put(&store, &acl, &authorizations(&acl, MAX_AUX_TRIPLES)).await.unwrap();
+        assert!(exists(&store, &acl).await.unwrap());
+        assert_eq!(graph_contents(&store, acl.graph_iri()).await.len(), MAX_AUX_TRIPLES);
+    }
+
+    // A refused write must not destroy what is already there — the same rule
+    // the suppressed-subject write follows. The refusal happens before the
+    // update is built, so the existing policy document is untouched and the
+    // resource stays governed by it.
+    #[tokio::test]
+    async fn an_oversized_write_leaves_the_existing_auxiliary_alone() {
+        let store = OxigraphStore::in_memory().unwrap();
+        let foo = res("/foo");
+        let acl = foo.aux(AuxKind::Acl);
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        put(&store, &acl, &grant(&acl)).await.unwrap();
+
+        let oversized = authorizations(&acl, MAX_AUX_TRIPLES + 1);
+        assert!(matches!(put(&store, &acl, &oversized).await, Err(AuxError::TooLarge(_))));
+
+        assert_eq!(graph_contents(&store, acl.graph_iri()).await, grant(&acl));
     }
 
     // `put` replaces, it does not accumulate: an ACL is the whole policy for
