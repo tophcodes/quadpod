@@ -258,7 +258,14 @@ async fn a_post_stays_within_budget() {
     assert!(c.total() <= POST_BUDGET, "POST / cost {c:?}, budget {POST_BUDGET}");
 }
 
-const DELETE_BUDGET: usize = 6;
+/// Five, and what they are: the guard's presence probe over the target and its
+/// ancestor chain, the one read of the ACL documents that probe found,
+/// `exists` on the subject, the shelf-registry read, and the single update
+/// that drops the subject's graphs and takes it out of its parent's
+/// containment. The unlink shares that update because it must — see
+/// `aux::delete_subject` and `tests/delete_atomicity.rs` — so a delete that
+/// costs two updates is both slower and wrong.
+const DELETE_BUDGET: usize = 5;
 
 #[tokio::test]
 async fn a_delete_stays_within_budget() {

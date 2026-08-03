@@ -2096,17 +2096,11 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
                 Err(e) => return internal_error(&e),
             }
         }
+        // The parent's containment triple goes with the subject, inside
+        // `delete_subject`'s own update — this handler cannot leave the two
+        // half-applied because it never holds them apart.
         let res = match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
-            Ok(true) => {
-                if let Some(parent) = subject.parent() {
-                    if let Err(e) =
-                        container::remove_containment(store, &parent, subject.graph_iri()).await
-                    {
-                        return internal_error(&e);
-                    }
-                }
-                StatusCode::NO_CONTENT.into_response()
-            }
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
             Ok(false) => with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
             Err(e) => internal_error(&e),
         };
@@ -3536,7 +3530,7 @@ mod tests {
 
     // This test used to assert a 400 with the reasoning that an empty body
     // left the container linking a child that did not exist — the child 404d
-    // forever and a later DELETE never reached `remove_containment`. Existence
+    // forever and a later DELETE never reached the containment removal. Existence
     // is a stored fact now, so the created child exists, is listed, is
     // readable and is deletable; the dangling-link hazard the 400 defended
     // against is gone, and what remains is a resource with no triples, which
@@ -4640,8 +4634,9 @@ mod tests {
             "DROP SILENT GRAPH <{}>; DROP SILENT GRAPH <{}>",
             doc.graph_iri(), crate::resource::sys_graph_iri(&doc),
         )).await.unwrap();
-        container::remove_containment(f.store.as_ref(), &f.container("/box/"), doc.graph_iri())
-            .await.unwrap();
+        f.store.update(
+            &container::containment_removal(&f.container("/box/"), doc.graph_iri()).unwrap(),
+        ).await.unwrap();
 
         // The owner tidies up, which revokes Bob's delegation by cascading
         // /box/'s own ACL. /box/doc's ACL is a different subject's auxiliary,

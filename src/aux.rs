@@ -196,16 +196,19 @@ pub async fn patch(
     Ok(result)
 }
 
-/// Delete a subject resource together with every auxiliary it may have and
-/// every shelf its dataset registered, in a single store update. Returns
-/// whether the subject existed.
+/// Delete a subject resource together with every auxiliary it may have, every
+/// shelf its dataset registered, and its membership triple in its parent
+/// container, in a single store update. Returns whether the subject existed.
 ///
 /// The drops run unconditionally — they are `DROP SILENT`, a no-op on an
 /// absent graph — and the existence check only decides the returned boolean.
 /// An early return on `!exists` would leave an already-orphaned auxiliary in
 /// place and unreported, and since this is the only cascade path that orphan
 /// would be permanent: recreating the subject would resurrect its grants.
-/// Same reasoning as [`crate::resource::delete_rdf`].
+/// Same reasoning as [`crate::resource::delete_rdf`]. The unlink is
+/// unconditional for the same reason and heals the same way: a parent left
+/// pointing at a subject that is already gone loses the triple on the next
+/// `DELETE` of that path, which is otherwise a `404` that repairs nothing.
 ///
 /// The shelf registry is read before any drop, and its drops are ordered
 /// before the system graph's: the registry lives in the very graph this
@@ -214,29 +217,42 @@ pub async fn patch(
 /// (design spec §7). A container's registry is simply empty, so the same
 /// cascade is correct for it without a branch.
 ///
-/// This is the one delete cascade (§7): callers remain responsible for
-/// containment — the subject's membership triple in its parent, and for a
-/// container subject its children, are `container`'s business, not this
-/// function's — but everything else a subject can hold, including a blob it
-/// stored bytes as, goes with it here.
+/// The unlink rides in that same sequence rather than in a call of its own
+/// because [`SparqlStore`]'s atomicity obligation stops at one `update`: as
+/// two, a failure between them leaves the parent listing a member whose
+/// graphs are gone, and nothing can repair it — containment is server-managed,
+/// so no client may write the triple away. The parent is derived here from the
+/// subject rather than passed in, so no caller can delete a subject and forget
+/// to unlink it; the root has no parent and is simply not unlinked. Where the
+/// triple's shape lives is unchanged — [`crate::container::containment_removal`]
+/// builds it, next to the `add_containment` that writes it.
+///
+/// This is the one delete cascade (§7). A container subject's *children*
+/// remain the caller's business — `http::delete_impl` refuses a non-empty
+/// container before it gets here — but everything else a subject can hold,
+/// including a blob it stored bytes as and the link its parent holds to it,
+/// goes with it here.
 pub async fn delete_subject(
     store: &dyn SparqlStore,
     blobs: &dyn crate::blob::BlobStore,
     subject: &ResourceUrl,
 ) -> Result<bool, ResourceError> {
     let existed = exists(store, subject).await?;
-    let mut drops: Vec<String> = registered_shelves(store, subject).await?
+    let mut ops: Vec<String> = registered_shelves(store, subject).await?
         .into_iter()
         .map(|key| format!("DROP SILENT GRAPH <{}>", key.graph_iri()))
         .collect();
-    drops.push(format!("DROP SILENT GRAPH <{}>", subject.graph_iri()));
-    drops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(subject)));
+    ops.push(format!("DROP SILENT GRAPH <{}>", subject.graph_iri()));
+    ops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(subject)));
     for kind in AuxKind::ALL {
         let aux = subject.aux(*kind);
-        drops.push(format!("DROP SILENT GRAPH <{}>", aux.graph_iri()));
-        drops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(&aux)));
+        ops.push(format!("DROP SILENT GRAPH <{}>", aux.graph_iri()));
+        ops.push(format!("DROP SILENT GRAPH <{}>", sys_graph_iri(&aux)));
     }
-    store.update(&drops.join("; ")).await?;
+    if let Some(parent) = subject.parent() {
+        ops.push(crate::container::containment_removal(&parent, subject.graph_iri())?);
+    }
+    store.update(&ops.join("; ")).await?;
     // §7: graphs and marker first, then the object. An interrupted second half
     // leaves an object no marker points at, which the next write to the same
     // URL overwrites; the reverse order would leave a resource that exists and
@@ -689,6 +705,45 @@ mod tests {
         assert!(
             graph_contents(&store, &sys_graph_iri(&acl)).await.is_empty(),
             "orphan kept its presence marker"
+        );
+    }
+
+    // The unlink is part of the cascade, not a follow-up the caller owes:
+    // the parent stops listing the subject in the very update that drops it,
+    // which is the whole of the atomicity property (`tests/delete_atomicity.rs`
+    // pins the failure side, where only a decorated store can see it).
+    //
+    // Second half: it runs even for a subject that is already gone. A parent
+    // pointing at nothing is otherwise permanent — containment is
+    // server-managed, so the client's only lever is a `DELETE` that answers
+    // `404` — and this is the call that repairs it.
+    #[tokio::test]
+    async fn deleting_a_subject_takes_its_parents_containment_triple_with_it() {
+        use crate::container::{add_containment, container_is_empty, ensure_container};
+
+        let store = OxigraphStore::in_memory().unwrap();
+        let blobs = crate::blob::ObjectStoreBlobs::in_memory();
+        let foo = res("/foo");
+        let root = foo.parent().expect("a resource below the root has one");
+        ensure_container(&store, &root).await.unwrap();
+        put_rdf(&store, &foo, &[]).await.unwrap();
+        add_containment(&store, &root, foo.graph_iri()).await.unwrap();
+        assert!(!container_is_empty(&store, &root).await.unwrap(), "premise: it is listed");
+
+        assert!(delete_subject(&store, &blobs, &foo).await.unwrap());
+        assert!(
+            container_is_empty(&store, &root).await.unwrap(),
+            "the parent must not be left listing a member whose graphs are gone"
+        );
+
+        add_containment(&store, &root, foo.graph_iri()).await.unwrap();
+        assert!(
+            !delete_subject(&store, &blobs, &foo).await.unwrap(),
+            "the subject was already absent, so the answer is false"
+        );
+        assert!(
+            container_is_empty(&store, &root).await.unwrap(),
+            "and the dangling triple goes anyway, or nothing can ever remove it"
         );
     }
 

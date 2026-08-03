@@ -94,15 +94,20 @@ pub async fn add_containment(
     insert_marked(store, parent, &quads).await
 }
 
-pub async fn remove_containment(
-    store: &dyn SparqlStore, parent: &ContainerUrl, child_iri: &str,
-) -> Result<(), ResourceError> {
+/// The update that takes `child_iri` out of `parent`'s containment triples.
+///
+/// A fragment rather than a call, because removing a member and removing the
+/// member's own graphs must not be able to come apart: [`SparqlStore`]'s
+/// atomicity obligation covers one `;`-separated update, so the two halves
+/// have to reach the store as one. [`crate::aux::delete_subject`] is what
+/// joins them; this function keeps the shape of the containment triple here,
+/// where [`add_containment`] writes it.
+pub(crate) fn containment_removal(
+    parent: &ContainerUrl, child_iri: &str,
+) -> Result<String, ResourceError> {
     let p = parent.graph_iri();
     let c = node(child_iri)?;
-    store.update(&format!(
-        "DELETE DATA {{ GRAPH <{p}> {{ <{p}> <{LDP_CONTAINS}> {c} }} }}",
-    )).await?;
-    Ok(())
+    Ok(format!("DELETE DATA {{ GRAPH <{p}> {{ <{p}> <{LDP_CONTAINS}> {c} }} }}"))
 }
 
 pub async fn container_is_empty(
@@ -212,7 +217,7 @@ mod tests {
         assert!(container_is_empty(&store, &c).await.unwrap());
         add_containment(&store, &c, &iri("/c/x")).await.unwrap();
         assert!(!container_is_empty(&store, &c).await.unwrap());
-        remove_containment(&store, &c, &iri("/c/x")).await.unwrap();
+        store.update(&containment_removal(&c, &iri("/c/x")).unwrap()).await.unwrap();
         assert!(container_is_empty(&store, &c).await.unwrap());
     }
 
