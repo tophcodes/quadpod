@@ -16,7 +16,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
-    wac::{guard::{Guard, Materialized}, pdp, AccessModes, Decision, Mode}};
+    wac::{guard::{Denial, Guard, Materialized}, pdp, AccessModes, Decision, Mode}};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -463,6 +463,50 @@ pub(crate) fn internal_error(cause: &dyn std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_BODY).into_response()
 }
 
+/// The challenge sent with a 401, telling a client which credential the pod
+/// accepts. `Bearer` is deliberately absent: Plan 4 verifies DPoP-bound
+/// tokens only.
+///
+/// `algs` is RFC 9449 §5.1's space-delimited list of the JWS algorithms the
+/// pod will verify a proof under, and it must stay an accurate description of
+/// [`crate::auth::dpop::verify_dpop`]: a client that reads this header picks
+/// its proof algorithm from it, so advertising one the pod rejects sends
+/// honest clients into a 401 loop, and omitting one it accepts turns away
+/// clients that could have authenticated. ES256 comes from `dpop-verifier`,
+/// RS256 from the pod's own path; EdDSA is absent because `dpop-verifier`'s
+/// `eddsa` feature is not enabled here.
+const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256 RS256\"";
+
+/// The `409` body a create is refused with when it would produce the other
+/// half of a trailing-slash pair.
+const SLASH_PAIR_MESSAGE: &str =
+    "another resource already exists whose URI differs from this one only in the trailing slash";
+
+/// What each refusal the guard reaches costs a client.
+///
+/// The guard decides *that* a request is refused and on which ground; the
+/// status codes, the bodies and the challenge header are this layer's, and
+/// this is the only place they are chosen. A store failure keeps the road
+/// every other `500` takes — [`internal_error`], which logs the cause and
+/// answers [`INTERNAL_ERROR_BODY`] — so the detail the guard carried out
+/// reaches the operator and nothing of it reaches the client.
+impl IntoResponse for Denial {
+    fn into_response(self) -> Response {
+        match self {
+            Denial::Unauthenticated => {
+                (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, DPOP_CHALLENGE)])
+                    .into_response()
+            }
+            Denial::Forbidden => StatusCode::FORBIDDEN.into_response(),
+            Denial::AuxSubjectMissing => {
+                (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response()
+            }
+            Denial::SlashPair => (StatusCode::CONFLICT, SLASH_PAIR_MESSAGE).into_response(),
+            Denial::Store(e) => internal_error(&e),
+        }
+    }
+}
+
 /// The response a write-path [`ResourceError`] earns: [`put_status`]'s status,
 /// with the cause going to whichever of the two audiences it belongs to.
 fn put_error(e: &ResourceError) -> Response {
@@ -615,15 +659,15 @@ async fn patch_impl(
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent.clone(), target.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &target),
+        Err(d) => return with_aux_links(d.into_response(), &target),
     };
     // Append is the weakest mode any patch §5.1 admits can need, and
     // `AccessModes::allows` makes Write subsume it — so this refuses exactly
     // those callers who could do nothing anyway, and it runs before the body
     // is looked at so an unauthorized caller learns nothing.
     let decision = match guard.authorize(Mode::Append) {
-        Ok(d) => d,
-        Err(res) => return with_aux_links(res, &target),
+        Ok(dec) => dec,
+        Err(d) => return with_aux_links(d.into_response(), &target),
     };
 
     let ct = header_str(&headers, header::CONTENT_TYPE).trim();
@@ -656,7 +700,7 @@ async fn patch_impl(
     // from the patch's parts would demand `Read` or `Write` on top of
     // `Control` — refusing an ACL patch from an agent WAC says may make it.
     if !matches!(target, Target::Aux(_)) && !patch.required_modes().satisfied_by(decision.user) {
-        return with_aux_links(guard.deny(), &target);
+        return with_aux_links(guard.deny().into_response(), &target);
     }
 
     // §8: `text/n3` is a perfectly good request body, so the conflict is with
@@ -791,7 +835,7 @@ async fn create_by_patch(
     }
     let materialized = match guard.materialize().await {
         Ok(m) => m,
-        Err(res) => return (with_aux_links(res, target), Materialized::default()),
+        Err(d) => return (with_aux_links(d.into_response(), target), Materialized::default()),
     };
     let written = match target {
         Target::Resource(r) => {
@@ -1198,10 +1242,10 @@ async fn put_write(
     let absent = crate::notify::Existence::Absent;
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return (with_aux_links(res, target), absent, Materialized::default()),
+        Err(d) => return (with_aux_links(d.into_response(), target), absent, Materialized::default()),
     };
-    if let Err(res) = guard.authorize(Mode::Write) {
-        return (with_aux_links(res, target), absent, Materialized::default());
+    if let Err(d) = guard.authorize(Mode::Write) {
+        return (with_aux_links(d.into_response(), target), absent, Materialized::default());
     }
     let existence = if guard.target_exists() {
         crate::notify::Existence::Existed
@@ -1231,7 +1275,7 @@ async fn put_write(
             }
             let materialized = match guard.materialize().await {
                 Ok(m) => m,
-                Err(res) => return (with_aux_links(res, target), existence, Materialized::default()),
+                Err(d) => return (with_aux_links(d.into_response(), target), existence, Materialized::default()),
             };
             // An early exit that carries what `emit_put` needs out alongside
             // the response (§6.3).
@@ -1350,7 +1394,7 @@ async fn put_write(
     // separate check here that could drift from it.
     let materialized = match guard.materialize().await {
         Ok(m) => m,
-        Err(res) => return (with_aux_links(res, target), existence, Materialized::default()),
+        Err(d) => return (with_aux_links(d.into_response(), target), existence, Materialized::default()),
     };
     let res = match target {
         // An auxiliary exists only for an existing subject, and that rule is
@@ -1445,10 +1489,10 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // try to create one, and it is refused as "not a container".
     let parent_guard = match Guard::probe(store, agent.clone(), target.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &target),
+        Err(d) => return with_aux_links(d.into_response(), &target),
     };
-    if let Err(res) = parent_guard.authorize(Mode::Append) {
-        return with_aux_links(res, &target);
+    if let Err(d) = parent_guard.authorize(Mode::Append) {
+        return with_aux_links(d.into_response(), &target);
     }
     let Target::Container(parent) = &target else {
         return StatusCode::CONFLICT.into_response(); // POST target must be a container
@@ -1478,7 +1522,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // single-user v1.
     let mut child_guard = match Guard::probe(store, agent.clone(), child.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &child),
+        Err(d) => return with_aux_links(d.into_response(), &child),
     };
     if child_guard.is_taken() {
         let unique = format!("{name}-{}{suffix}", uuid::Uuid::new_v4());
@@ -1488,7 +1532,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         };
         child_guard = match Guard::probe(store, agent.clone(), child.clone()).await {
             Ok(g) => g,
-            Err(res) => return with_aux_links(res, &child),
+            Err(d) => return with_aux_links(d.into_response(), &child),
         };
     }
     // The container's Append is not enough to authorize the CHILD: it may
@@ -1497,8 +1541,8 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // check above, or the append-only inbox pattern this design targets would
     // break — every legitimate append-only POST would suddenly need Write on
     // the child it creates.
-    if let Err(res) = child_guard.authorize(Mode::Append) {
-        return with_aux_links(res, &child);
+    if let Err(d) = child_guard.authorize(Mode::Append) {
+        return with_aux_links(d.into_response(), &child);
     }
     let repr = match classify_body(&headers, &body, &child, st.store.rdf_version()) {
         Ok(r) => r,
@@ -1551,7 +1595,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // traversal `put_impl` uses.
     let materialized = match child_guard.materialize().await {
         Ok(m) => m,
-        Err(res) => return with_aux_links(res, &child),
+        Err(d) => return with_aux_links(d.into_response(), &child),
     };
     let res = match &child {
         Target::Resource(r) => match repr {
@@ -1689,10 +1733,10 @@ async fn validate_view(
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &target),
+        Err(d) => return with_aux_links(d.into_response(), &target),
     };
-    if let Err(res) = guard.authorize(Mode::Read) {
-        return with_aux_links(res, &target);
+    if let Err(d) = guard.authorize(Mode::Read) {
+        return with_aux_links(d.into_response(), &target);
     }
     // The container whose `ldp:constrainedBy` binds a shape to `target` —
     // its parent, the same lookup a write validates against (§3.2).
@@ -1815,11 +1859,11 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &target),
+        Err(d) => return with_aux_links(d.into_response(), &target),
     };
     let decision = match guard.authorize(Mode::Read) {
-        Ok(d) => d,
-        Err(res) => return with_aux_links(res, &target),
+        Ok(dec) => dec,
+        Err(d) => return with_aux_links(d.into_response(), &target),
     };
     let Target::Resource(r) = &target else {
         return legacy_graph_read(st, &decision, target, headers).await; // containers, auxiliaries
@@ -2036,10 +2080,10 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     let store = st.store.as_ref();
     let guard = match Guard::probe(store, agent, target.clone()).await {
         Ok(g) => g,
-        Err(res) => return with_aux_links(res, &target),
+        Err(d) => return with_aux_links(d.into_response(), &target),
     };
-    if let Err(res) = guard.authorize(Mode::Write) {
-        return with_aux_links(res, &target);
+    if let Err(d) = guard.authorize(Mode::Write) {
+        return with_aux_links(d.into_response(), &target);
     }
     // The auxiliary arm's response carries no `present_auxes` of its own — an
     // auxiliary cascades no others — so both arms reach the single emit below
@@ -2062,8 +2106,8 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
             Target::Aux(_) => unreachable!("matched above"),
         };
         // Removing a member rewrites the parent's containment triples.
-        if let Err(res) = guard.authorize_parent(Mode::Write) {
-            return with_aux_links(res, &target);
+        if let Err(d) = guard.authorize_parent(Mode::Write) {
+            return with_aux_links(d.into_response(), &target);
         }
         // Deleting a subject takes every auxiliary it has with it (that cascade
         // is `aux::delete_subject`'s definition, not a step remembered here), so
@@ -2081,7 +2125,7 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
         let mut present_auxes: Vec<AuxUrl> = Vec::new();
         for kind in AuxKind::ALL {
             match guard.authorize_aux(*kind) {
-                Err(res) => return with_aux_links(res, &target),
+                Err(d) => return with_aux_links(d.into_response(), &target),
                 Ok(Some(_)) => present_auxes.push(subject.aux(*kind)),
                 Ok(None) => {}
             }
@@ -3598,6 +3642,44 @@ mod tests {
         let body = body_string(res).await;
         assert!(body.contains("https://pod.toph.so/box/doc"));  // containment preserved
         assert!(body.contains("Box"));                           // user triple stored
+    }
+
+    // The whole mapping in one table: the guard decides a kind and this layer
+    // decides what it costs, so no test on the decision side can see a wrong
+    // status, a missing challenge or a body that leaks. Every [`Denial`] there
+    // is today is listed here; what makes a *new* one impossible to forget is
+    // `impl IntoResponse for Denial`'s exhaustive match, not this list.
+    #[tokio::test]
+    async fn every_denial_renders_as_the_answer_its_kind_earns() {
+        let store_failed =
+            ResourceError::Store(crate::store::StoreError::Backend("oxigraph exploded".into()));
+        let cases = [
+            (Denial::Unauthenticated, StatusCode::UNAUTHORIZED, "", true),
+            (Denial::Forbidden, StatusCode::FORBIDDEN, "", false),
+            (
+                Denial::AuxSubjectMissing,
+                StatusCode::NOT_FOUND,
+                AUX_SUBJECT_MISSING_MESSAGE,
+                false,
+            ),
+            (Denial::SlashPair, StatusCode::CONFLICT, SLASH_PAIR_MESSAGE, false),
+            // The literal, not the constant: what a client is told when the
+            // store fails is the contract `tests/observability.rs` pins from
+            // the outside, and it must not name the cause.
+            (Denial::Store(store_failed), StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error", false),
+        ];
+        for (denial, status, body, challenge) in cases {
+            let what = format!("{denial:?}");
+            let res = denial.into_response();
+            assert_eq!(res.status(), status, "{what}");
+            assert_eq!(
+                res.headers().get(header::WWW_AUTHENTICATE).map(|v| v.to_str().unwrap()),
+                challenge.then_some(DPOP_CHALLENGE),
+                "only an unauthenticated caller is told which credential would help: {what}"
+            );
+            assert_eq!(body_string(res).await, body, "{what}");
+        }
     }
 
     #[tokio::test]

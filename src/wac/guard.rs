@@ -7,62 +7,63 @@
 //! unroutable path all deny. The only path to `Ok(())` is an ACL that
 //! explicitly grants the requested mode to this agent.
 
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
-
 use crate::{
     auth::Agent,
-    aux::AUX_SUBJECT_MISSING_MESSAGE,
     container,
-    resource,
+    resource::{self, ResourceError},
     space::{AuxKind, ContainerUrl, GraphName, ResourceUrl, Target},
     store::SparqlStore,
 };
 
 use super::{pdp, prp, Decision, Mode};
 
-/// The challenge sent with a 401, telling a client which credential the pod
-/// accepts. `Bearer` is deliberately absent: Plan 4 verifies DPoP-bound
-/// tokens only.
+/// Why the guard refused, in the terms the guard reasons in. What each one
+/// costs a client — status, body, challenge header — is decided where HTTP
+/// lives, by `impl IntoResponse for Denial` in `src/http.rs`; the variants are
+/// what a caller matches on and what this module's tests assert.
 ///
-/// `algs` is RFC 9449 §5.1's space-delimited list of the JWS algorithms the
-/// pod will verify a proof under, and it must stay an accurate description of
-/// [`crate::auth::dpop::verify_dpop`]: a client that reads this header picks
-/// its proof algorithm from it, so advertising one the pod rejects sends
-/// honest clients into a 401 loop, and omitting one it accepts turns away
-/// clients that could have authenticated. ES256 comes from `dpop-verifier`,
-/// RS256 from the pod's own path; EdDSA is absent because `dpop-verifier`'s
-/// `eddsa` feature is not enabled here.
-const DPOP_CHALLENGE: &str = "DPoP algs=\"ES256 RS256\"";
-
-/// Deny in the way that tells the caller the truth without leaking anything:
-/// an anonymous caller learns that credentials would help (401), a verified
-/// one that theirs are insufficient (403). Neither learns whether the
-/// resource exists: no refusal that reads a probed existence fact is
-/// produced before the corresponding [`Guard::authorize`] has returned `Ok`
-/// — knowing early, which [`Guard::probe`] does for the whole chain, is fine;
-/// answering early from what it knows is not (design §7).
-///
-/// Public to the crate for the one refusal this module cannot make itself:
-/// a patch's required modes are known only after the body is parsed, and
-/// re-running [`Guard::authorize`] to say no would resolve the ACL a second time.
-/// It stays the single place the `401`/`403` split and [`DPOP_CHALLENGE`] are
-/// decided, which is what a handler-side refusal would break.
-pub(crate) fn deny(agent: &Agent) -> Response {
-    match agent {
-        Agent::Public => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, DPOP_CHALLENGE)],
-        )
-            .into_response(),
-        Agent::WebId(_) => StatusCode::FORBIDDEN.into_response(),
-    }
+/// Every variant is one refusal a method below actually produces, and no two
+/// of them are answered alike.
+#[derive(Debug)]
+pub enum Denial {
+    /// The caller presented no credentials and the governing ACL grants the
+    /// requested mode to nobody anonymous: credentials might help.
+    Unauthenticated,
+    /// The caller is a known agent and the governing ACL does not grant it
+    /// what it asked for: credentials would not help.
+    Forbidden,
+    /// An auxiliary was written for a subject that does not exist. Reported
+    /// only once every ancestor is authorized, so it tells no one about a
+    /// path they may not touch.
+    AuxSubjectMissing,
+    /// The write would create a URL whose trailing-slash counterpart already
+    /// exists, which Solid Protocol §3.1 forbids from coexisting with it.
+    SlashPair,
+    /// The store failed, so no decision was reached at all. Carries the cause
+    /// for the operator's log; a client learns nothing from it.
+    Store(ResourceError),
 }
 
-/// The `409` body a create is refused with when it would produce the other
-/// half of a trailing-slash pair.
-const SLASH_PAIR_MESSAGE: &str =
-    "another resource already exists whose URI differs from this one only in the trailing slash";
+/// Deny in the way that tells the caller the truth without leaking anything:
+/// an anonymous caller learns that credentials would help
+/// ([`Denial::Unauthenticated`]), a verified one that theirs are insufficient
+/// ([`Denial::Forbidden`]). Neither learns whether the resource exists: no
+/// refusal that reads a probed existence fact is produced before the
+/// corresponding [`Guard::authorize`] has returned `Ok` — knowing early, which
+/// [`Guard::probe`] does for the whole chain, is fine; answering early from
+/// what it knows is not (design §7).
+///
+/// The single place that split is decided, which is what a handler-side
+/// refusal would break: [`Guard::deny`] is how the one refusal this module
+/// cannot make itself — a patch's required modes, known only after the body is
+/// parsed — reaches it without re-running [`Guard::authorize`] and resolving
+/// the ACL a second time.
+fn deny(agent: &Agent) -> Denial {
+    match agent {
+        Agent::Public => Denial::Unauthenticated,
+        Agent::WebId(_) => Denial::Forbidden,
+    }
+}
 
 /// The mode required to access an auxiliary of this kind, whatever `mode` the
 /// handler asked for. Exhaustive over [`AuxKind`]: a new kind is a compile
@@ -118,7 +119,7 @@ impl<'a> Guard<'a> {
         store: &'a dyn SparqlStore,
         agent: Agent,
         target: Target,
-    ) -> Result<Self, Response> {
+    ) -> Result<Self, Denial> {
         let subject: ResourceUrl = match &target {
             Target::Resource(r) => r.clone(),
             Target::Container(c) => c.as_resource().clone(),
@@ -144,10 +145,10 @@ impl<'a> Guard<'a> {
 
         let present = resource::exists_many(store, &candidates)
             .await
-            .map_err(|e| crate::http::internal_error(&e))?;
+            .map_err(Denial::Store)?;
         let acls = prp::load_chain_acls(store, &chain, &present)
             .await
-            .map_err(|e| crate::http::internal_error(&e))?;
+            .map_err(Denial::Store)?;
 
         Ok(Self { store, agent, target, chain, present, acls })
     }
@@ -158,7 +159,7 @@ impl<'a> Guard<'a> {
     /// merging would make revoking access on a subtree impossible. `inherited`
     /// is true for anything above `start`, which is what makes `acl:default`
     /// apply rather than `acl:accessTo`.
-    fn decide_from(&self, start: usize, required: Mode) -> Result<Decision, Response> {
+    fn decide_from(&self, start: usize, required: Mode) -> Result<Decision, Denial> {
         let found = self.chain[start..]
             .iter()
             .enumerate()
@@ -186,7 +187,7 @@ impl<'a> Guard<'a> {
     /// Takes no target: there is one per request and this owns it. An
     /// auxiliary is decided against its subject and requires the mode its
     /// [`AuxKind`] demands, exactly as the free function it replaces.
-    pub fn authorize(&self, mode: Mode) -> Result<Decision, Response> {
+    pub fn authorize(&self, mode: Mode) -> Result<Decision, Denial> {
         let required = match &self.target {
             Target::Aux(a) => required_mode_for_aux(a.kind()),
             _ => mode,
@@ -197,7 +198,7 @@ impl<'a> Guard<'a> {
     /// The same question for the container above the target — `None` at the
     /// root, which has none. `DELETE` needs it because removing a member
     /// rewrites the parent's containment triples.
-    pub fn authorize_parent(&self, mode: Mode) -> Result<Option<Decision>, Response> {
+    pub fn authorize_parent(&self, mode: Mode) -> Result<Option<Decision>, Denial> {
         // chain[0] is the subject, so chain[1] is its parent — absent only at
         // the root, whose `ancestors()` is empty.
         if self.chain.len() < 2 {
@@ -212,7 +213,7 @@ impl<'a> Guard<'a> {
     /// `DELETE` needs it for every kind: deleting a subject takes its
     /// auxiliaries with it, and a narrowing ACL must not be removable by
     /// someone holding merely `Write`.
-    pub fn authorize_aux(&self, kind: AuxKind) -> Result<Option<Decision>, Response> {
+    pub fn authorize_aux(&self, kind: AuxKind) -> Result<Option<Decision>, Denial> {
         let aux = self.chain[0].aux(kind);
         if !self.present.contains(aux.graph_iri()) {
             return Ok(None); // nothing there to authorize
@@ -222,14 +223,15 @@ impl<'a> Guard<'a> {
     }
 
     /// Refuse, in the way that tells this agent the truth without leaking
-    /// anything — the `401`/`403` split of the free [`deny`].
+    /// anything — the free [`deny`]'s split between
+    /// [`Denial::Unauthenticated`] and [`Denial::Forbidden`].
     ///
     /// For the one refusal the decision methods cannot make: a patch's
     /// required modes are known only after its body is parsed, and re-running
     /// [`Guard::authorize`] to say no would decide against a mode the handler
     /// has already established is the wrong one. The guard owns the agent, so
-    /// this is where that refusal now comes from.
-    pub fn deny(&self) -> Response {
+    /// this is where that refusal comes from.
+    pub fn deny(&self) -> Denial {
         deny(&self.agent)
     }
 
@@ -274,7 +276,7 @@ impl<'a> Guard<'a> {
     /// writes: after this returns there is no guard left to read a stale
     /// answer from. A pre-write fact a caller still wants is read from
     /// [`Guard::is_taken`] beforehand, which the borrow checker orders for it.
-    pub async fn materialize(self) -> Result<Materialized, Response> {
+    pub async fn materialize(self) -> Result<Materialized, Denial> {
         let subject = &self.chain[0];
         // Target-existence only, never the counterpart: materializing a target
         // whose counterpart merely exists is not "already there" — it is the
@@ -313,7 +315,7 @@ impl<'a> Guard<'a> {
         // be reported — before the plan below materializes anything for a write
         // that could never succeed.
         if matches!(self.target, Target::Aux(_)) && !self.present.contains(subject.graph_iri()) {
-            return Err((StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response());
+            return Err(Denial::AuxSubjectMissing);
         }
 
         // Protocol §3.1, over everything this write would create. Deliberately
@@ -322,7 +324,7 @@ impl<'a> Guard<'a> {
         for created in &creations {
             if let Some(counterpart) = created.slash_counterpart() {
                 if self.present.contains(counterpart.graph_iri()) {
-                    return Err((StatusCode::CONFLICT, SLASH_PAIR_MESSAGE).into_response());
+                    return Err(Denial::SlashPair);
                 }
             }
         }
@@ -330,13 +332,11 @@ impl<'a> Guard<'a> {
         let created: Vec<ResourceUrl> = creations.into_iter().cloned().collect();
         let mut linked: Vec<(ContainerUrl, String)> = Vec::new();
         for (ancestor, child_iri) in plan {
-            container::ensure_container(self.store, &ancestor)
-                .await
-                .map_err(|e| crate::http::internal_error(&e))?;
+            container::ensure_container(self.store, &ancestor).await.map_err(Denial::Store)?;
             if let Some(child_iri) = child_iri {
                 container::add_containment(self.store, &ancestor, &child_iri)
                     .await
-                    .map_err(|e| crate::http::internal_error(&e))?;
+                    .map_err(Denial::Store)?;
                 linked.push((ancestor, child_iri));
             }
         }
@@ -421,8 +421,8 @@ mod tests {
     /// Generic in the success type because it never looks at one: every
     /// caller below asks a [`Guard`] decision method the same question, and
     /// only its refusal is under test.
-    fn status<T>(r: Result<T, Response>) -> Option<StatusCode> {
-        r.err().map(|res| res.status())
+    fn refusal<T>(r: Result<T, Denial>) -> Option<Denial> {
+        r.err()
     }
 
     /// Whether `parent`'s containment graph records `child_iri` as a member —
@@ -453,7 +453,7 @@ mod tests {
         )).await;
         let g = guard_for(&store, alice(), "/foo").await;
         assert!(g.authorize(Mode::Read).is_ok());
-        assert_eq!(status(g.authorize(Mode::Write)), Some(StatusCode::FORBIDDEN));
+        assert!(matches!(refusal(g.authorize(Mode::Write)), Some(Denial::Forbidden)));
     }
 
     #[tokio::test]
@@ -464,11 +464,11 @@ mod tests {
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
         let g = guard_for(&store, Agent::Public, "/foo").await;
-        let res = g.authorize(Mode::Read).expect_err("denied");
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_some());
+        let d = g.authorize(Mode::Read).expect_err("denied");
+        assert!(matches!(d, Denial::Unauthenticated),
+            "an anonymous caller is told credentials would help, not refused outright: {d:?}");
         // `deny` is the same refusal, for the caller that has to make it itself.
-        assert_eq!(g.deny().status(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(g.deny(), Denial::Unauthenticated));
     }
 
     #[tokio::test]
@@ -494,7 +494,7 @@ mod tests {
         )).await;
         seed_acl(&store, "/foo", "").await;
         let g = guard_for(&store, alice(), "/foo").await;
-        assert_eq!(status(g.authorize(Mode::Read)), Some(StatusCode::FORBIDDEN));
+        assert!(matches!(refusal(g.authorize(Mode::Read)), Some(Denial::Forbidden)));
     }
 
     // An auxiliary is decided against its subject and requires Control, whatever
@@ -507,7 +507,7 @@ mod tests {
              <{ACL_MODE}> <{ACL_READ}> ."
         )).await;
         let g = guard_for(&store, alice(), "/.aux/foo.acl").await;
-        assert_eq!(status(g.authorize(Mode::Read)), Some(StatusCode::FORBIDDEN));
+        assert!(matches!(refusal(g.authorize(Mode::Read)), Some(Denial::Forbidden)));
     }
 
     // A target that is itself present is taken, regardless of its counterpart.
@@ -564,7 +564,7 @@ mod tests {
     async fn no_acl_anywhere_denies() {
         let store = OxigraphStore::in_memory().unwrap();
         let g = guard_for(&store, alice(), "/foo").await;
-        assert_eq!(status(g.authorize(Mode::Read)), Some(StatusCode::FORBIDDEN));
+        assert!(matches!(refusal(g.authorize(Mode::Read)), Some(Denial::Forbidden)));
     }
 
     #[tokio::test]
@@ -613,7 +613,7 @@ mod tests {
              <{ACL_MODE}> <{ACL_WRITE}> ."
         )).await;
         let g = guard_for(&store, alice(), "/box/doc").await;
-        assert_eq!(status(g.authorize_aux(AuxKind::Acl)), Some(StatusCode::FORBIDDEN));
+        assert!(matches!(refusal(g.authorize_aux(AuxKind::Acl)), Some(Denial::Forbidden)));
     }
 
     // An existing target gains no containment triple — its parent already records
@@ -681,10 +681,11 @@ mod tests {
     // and finds none: denied. That denial must win over the slash-pair
     // check even though /box/sub (no trailing slash) already exists and
     // /box/sub/ is exactly the target — if the check ran before the walk,
-    // it would answer 409 and reveal /box/sub's existence to an agent who
-    // is about to be refused for /box/ anyway. Asserting 403 is what makes
-    // this fixture fail loudly if that check is ever hoisted above the loop
-    // (see `materialize`'s doc comment): a hoist here would flip 403 to 409.
+    // it would answer `SlashPair` and reveal /box/sub's existence to an agent
+    // who is about to be refused for /box/ anyway. Asserting `Forbidden` is
+    // what makes this fixture fail loudly if that check is ever hoisted above
+    // the loop (see `materialize`'s doc comment): a hoist here would flip
+    // `Forbidden` to `SlashPair`.
     #[tokio::test]
     async fn a_guarded_write_denied_on_an_ancestor_never_reaches_the_slash_pair_check() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -694,9 +695,9 @@ mod tests {
         )).await;
         crate::resource::put_rdf(&store, &resource("/box/sub"), &[]).await.unwrap();
         let g = guard_for(&store, alice(), "/box/sub/").await;
-        assert_eq!(status(g.materialize().await), Some(StatusCode::FORBIDDEN),
+        assert!(matches!(refusal(g.materialize().await), Some(Denial::Forbidden)),
             "denied on /box/ (accessTo required, only default granted) must win over \
-             the 409 for /box/sub's slash counterpart, or the ordering leaks it");
+             the slash-pair refusal for /box/sub's counterpart, or the ordering leaks it");
     }
 
     // Alice holds only `acl:accessTo` at the root — a direct grant that does
@@ -706,11 +707,11 @@ mod tests {
     // resolves against the root ACL from an inherited position (offset > 0)
     // and needs `acl:default`, absent here: denied. That denial must win
     // over the aux-subject-exists check even though /box/ghost does not
-    // exist either — if the check ran before the walk, it would answer 404
-    // and confirm the subject's absence to an agent who is about to be
-    // refused for /box/ anyway. Asserting 403 is what makes this fixture
-    // fail loudly if that check is ever hoisted above the loop: a hoist
-    // here would flip 403 to 404.
+    // exist either — if the check ran before the walk, it would answer
+    // `AuxSubjectMissing` and confirm the subject's absence to an agent who is
+    // about to be refused for /box/ anyway. Asserting `Forbidden` is what
+    // makes this fixture fail loudly if that check is ever hoisted above the
+    // loop: a hoist here would flip `Forbidden` to `AuxSubjectMissing`.
     #[tokio::test]
     async fn a_guarded_aux_write_denied_on_an_ancestor_never_reaches_the_subject_check() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -719,9 +720,9 @@ mod tests {
              <{ACL_MODE}> <{ACL_WRITE}> ."
         )).await;
         let g = guard_for(&store, alice(), "/.aux/box/ghost.acl").await;
-        assert_eq!(status(g.materialize().await), Some(StatusCode::FORBIDDEN),
+        assert!(matches!(refusal(g.materialize().await), Some(Denial::Forbidden)),
             "denied while walking to /box/ (root's accessTo grant doesn't inherit) must \
-             win over the 404 for ghost's own non-existence, or the ordering leaks it");
+             win over the refusal for ghost's own non-existence, or the ordering leaks it");
     }
 
     /// A deep create reports every container it made and every link it added,
