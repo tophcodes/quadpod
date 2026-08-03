@@ -797,11 +797,27 @@ and the answer — closed by the editor as "consensus is deemed to be captured i
 Editor's Draft" — is that step 3 of the walk inherits *only* rules marked `acl:default`,
 "therefore no rules grant access, therefore all access is denied".
 
-CSS diverges, and the bundled suite follows CSS. `ParentContainerReader` translates a
-`create` on the target into an `append` on the parent — `if
-(modes.has(AccessMode.create)) { containerModes.add(AccessMode.append); }` — so the check
-lands on the container itself, in `accessTo` scope. WAC has no `create` mode for this to
-map onto; CSS mints one internally.
+CSS diverges, and the bundled suite follows CSS. Measured against a fresh CSS 7.2.0
+(`@css:config/file-root.json`, root open, everything anonymous through `acl:agentClass
+foaf:Agent` — no WebID involved), with the container's ACL carrying exactly one
+Authorization:
+
+| The container's only Authorization | CSS `POST` | this pod |
+|---|---|---|
+| `acl:accessTo`, mode `acl:Append` | **201** | `401` |
+| `acl:default`, mode `acl:Append` | **401** | `401` |
+| both | 201 | 201 |
+
+Both columns are measured the same way — anonymous, one Authorization, nothing else in the
+hierarchy — so the rows compare like for like. (`401` rather than `403` in both servers
+because the agent is unauthenticated; the suite's six failures are the same shape with an
+authenticated agent.)
+
+CSS therefore requires precisely the predicate the inheritance rule does not use, and
+refuses the one it does. This pod requires both, which is why
+`append_only_agent_can_still_post_into_its_inbox` (`src/http/tests/wac.rs:534`) writes both and says
+so. The three shapes disagree pairwise, so an ACL that authorizes a `POST` on one server
+does not on the other unless it carries both predicates.
 
 **Reclassified from Bucket 3 (defect) on 2026-08-03.** The sentence that filed it there —
 "no document records this as intended" — was false: the specification's own text and
