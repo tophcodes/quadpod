@@ -379,6 +379,37 @@ The guard names the store exactly twice: the field it holds and the probe that f
     differently.
     check: [ "$(rg -o 'dyn SparqlStore' src/wac/guard.rs | wc -l)" = 2 ]
 
+`wac` names no HTTP type and calls nothing in `http`.
+    → issue #46; the doc comment on `wac::guard::Denial`. `pdp` is pure and
+    `prp` owns the I/O, which is what makes the decision table-testable;
+    `guard` undid half of that by answering every refusal as an
+    `axum::response::Response` and calling `crate::http::internal_error` for a
+    store failure. A refusal built inside the decision layer is a status code
+    and a body chosen where neither belongs, it makes the guard's tests assert
+    renderings instead of decisions, and it costs a `clippy::result_large_err`
+    on four hot signatures. `Denial` is the seam: the guard says which refusal,
+    `impl IntoResponse for Denial` in `src/http.rs` says what it costs.
+    Nothing but this rule holds the direction — the dependency compiles either
+    way, and one `crate::http::` call is all it takes to go back.
+    Anchored on both halves, because they are two different ways in: `axum`
+    catches a type named directly (`Response`, `StatusCode`, a `header::`
+    constant), `http::` catches both a reach back into this crate's own
+    `http` module and a `use http::StatusCode` from the same `http` crate
+    axum re-exports, which is a direct dependency here and would otherwise
+    slip past a check spelled `axum` alone. `http::` does not match the
+    `https://` and `http://` IRIs this subtree's fixtures are full of, and
+    `crate::http` without a trailing `::` — a rustdoc link, not a call — is
+    deliberately still allowed. Demonstrated red, each injected into and then
+    reverted out of `src/wac/guard.rs` in turn, against `use
+    axum::response::Response;`, a bare `axum::http::StatusCode::OK` expression,
+    `crate::http::internal_error(&e)`, and `use http::StatusCode;`;
+    demonstrated green on the tree as it stands.
+    **What it does not catch:** HTTP smuggled in without either spelling — a
+    `Denial` variant named after a status code, a bare `404` handed back for a
+    caller to trust, or a response type re-exported from a third module under
+    another name. It pins the import, not the layering.
+    check: ! rg -q 'axum|http::' src/wac
+
 ## Notifications
 
 Every write handler emits exactly once.
