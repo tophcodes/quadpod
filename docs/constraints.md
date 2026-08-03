@@ -385,9 +385,21 @@ Every write handler emits exactly once.
     → 2026-07-31-change-events-design.md §6.2. Emission at each success site
     instead would be fifteen places to forget in `http.rs`, where a new write
     path compiles silently without an event and no test names the omission.
-    Counts calls rather than the functions' existence: a handler that stops
-    calling its emit keeps compiling.
-    check: [ "$(rg -o 'crate::notify::emit_(put|post|patch|delete)\(' src/http.rs | wc -l)" = 4 ]
+    Anchored on the router's method table rather than on a call count: the
+    check reads the handlers registered under `put`/`post`/`patch`/`delete` in
+    `router`, follows each to the `*_impl` it delegates to, and requires
+    exactly one `crate::notify::emit_` in each of those and none anywhere else
+    in the file. A fifth write route is therefore red the moment it is
+    registered without an event, and a handler that stops calling its emit is
+    red while it still compiles. `get` and `options` sit on the same table and
+    are not counted: they register under no write method.
+    Narrower than its sentence in three ways. It is textual, so an emit behind
+    a branch that some success path misses still counts as one. It sees only
+    what `router` registers, so a write path mounted through a nested `Router`
+    or a tower service is invisible to it. And it expects the call in the
+    `*_impl` itself, so a handler that emits from a helper it calls reads as a
+    handler that never emits.
+    check: awk '/\.route\(/ { s = $0; while (match(s, /(put|post|patch|delete)\([a-z_0-9]+\)/)) { h = substr(s, RSTART, RLENGTH); sub(/^[a-z]+\(/, "", h); sub(/\)$/, "", h); want[h] = 1; s = substr(s, RSTART + RLENGTH) } } /^[ \t]*(pub[a-z()]* )?(async )?fn [a-z_0-9]+/ { fn = $0; sub(/^.*fn /, "", fn); sub(/[^a-z_0-9].*/, "", fn) } match($0, /[a-z_0-9]+_impl\(/) { c = substr($0, RSTART, RLENGTH); sub(/\($/, "", c); if (index(" " callee[fn] " ", " " c " ") == 0) callee[fn] = callee[fn] " " c } /crate::notify::emit_/ { emits[fn]++ } END { for (h in want) { if (callee[h] == "") exit 1; k = split(callee[h], a, " "); for (j = 1; j <= k; j++) w[a[j]] = 1 } n = 0; for (i in w) { if (emits[i] != 1) exit 1; n += emits[i] } t = 0; for (f in emits) t += emits[f]; exit (t != n) }' src/http.rs
 
 Only `notify` fixes a format for `state`.
     → 2026-07-31-change-events-design.md §5.1, §5.2. `state` is the N-Quads
