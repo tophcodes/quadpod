@@ -6,6 +6,8 @@
 //! table-testable, and it keeps the choice of decision engine local to this
 //! file.
 
+use std::collections::HashMap;
+
 use oxigraph::model::{NamedOrBlankNode, Term, Triple};
 
 use crate::auth::Agent;
@@ -51,18 +53,22 @@ fn recognized_mode(mode_iri: &str) -> Option<Mode> {
 /// container grants through `acl:default`, one found directly on the resource
 /// through `acl:accessTo`. The two never cross over — otherwise a container's
 /// own `accessTo` rules would silently apply to every child.
+///
+/// Every question is asked of one authorization's own triples, found once
+/// through [`by_subject`] — see there for why the whole document is never
+/// rescanned per subject.
 pub fn decide(acl: &[Triple], agent: &Agent, governed_iri: &str, inherited: bool) -> AccessModes {
     let scope_predicate = if inherited { ACL_DEFAULT } else { ACL_ACCESS_TO };
     let mut granted = AccessModes::default();
 
-    for subject in authorization_subjects(acl) {
-        if !has_object(acl, &subject, scope_predicate, governed_iri) {
+    for authorization in by_subject(acl).values() {
+        if !has_object(authorization, scope_predicate, governed_iri) {
             continue;
         }
-        if !matches_agent(acl, &subject, agent) {
+        if !matches_agent(authorization, agent) {
             continue;
         }
-        for t in acl.iter().filter(|t| t.subject == subject && t.predicate.as_str() == ACL_MODE) {
+        for t in authorization.iter().filter(|t| t.predicate.as_str() == ACL_MODE) {
             if let Term::NamedNode(m) = &t.object {
                 match recognized_mode(m.as_str()) {
                     Some(Mode::Read) => granted.read = true,
@@ -105,51 +111,55 @@ pub fn decide(acl: &[Triple], agent: &Agent, governed_iri: &str, inherited: bool
 /// subject, since an authorization is subject-scoped and a scope triple on
 /// one must not be paired with a mode on another.
 ///
-/// This replaced probing [`decide`] once per candidate agent — `Public`, a
-/// synthetic authenticated-agent probe, and every `acl:agent` object in the
-/// document, undeduplicated — under both scopes. That was a denial of
-/// service waiting to happen: an ACL is attacker-supplied (anyone holding
-/// `Control` on a resource can `PUT` its ACL), so a ~2 MB document — axum's
-/// default body limit — of `acl:agent` triples with distinct subjects and no
-/// `acl:mode` made `.any()` probe every one of them, each probe itself
-/// `O(subjects × triples)`, for on the order of 10¹³ comparisons in a
-/// synchronous loop with no `await` — a hang triggered by the exact feature
-/// meant to warn about a self-denying ACL. Asking the question directly is
-/// one pass over the subjects instead: `O(subjects × triples)` total, the
-/// same order as a single `decide` call, with no multiplication by how many
-/// agents the document happens to mention.
+/// Asked directly rather than by probing [`decide`] once per candidate agent
+/// — `Public`, a synthetic authenticated-agent probe, and every `acl:agent`
+/// object in the document, undeduplicated — under both scopes. An ACL is
+/// attacker-supplied: anyone holding `Control` on a resource can `PUT` its
+/// ACL, sized on the wire by the `max_body_bytes` knob and in triples by
+/// [`crate::aux::MAX_AUX_TRIPLES`]. Probing multiplies the document by every
+/// agent it happens to mention, and a document of `acl:agent` triples with
+/// distinct subjects and no `acl:mode` is the case that never lets `.any()`
+/// short-circuit — a synchronous loop with no `await` in it, hanging the
+/// worker on the exact feature meant to warn about a self-denying ACL. One
+/// pass over [`by_subject`] answers the question in time linear in the
+/// document instead, the same order as a single [`decide`] call.
 pub fn grants_anything(acl: &[Triple], governed_iri: &str) -> bool {
-    authorization_subjects(acl).into_iter().any(|subject| {
-        (has_object(acl, &subject, ACL_ACCESS_TO, governed_iri)
-            || has_object(acl, &subject, ACL_DEFAULT, governed_iri))
-            && names_someone(acl, &subject)
-            && has_recognized_mode(acl, &subject)
+    by_subject(acl).values().any(|authorization| {
+        (has_object(authorization, ACL_ACCESS_TO, governed_iri)
+            || has_object(authorization, ACL_DEFAULT, governed_iri))
+            && names_someone(authorization)
+            && has_recognized_mode(authorization)
     })
 }
 
-/// Every distinct subject in the ACL graph. We do not require an explicit
-/// `a acl:Authorization` type triple — WAC treats the scope/agent/mode
-/// predicates themselves as what makes an authorization, and many real ACLs
-/// omit the type.
+/// The ACL grouped by subject: each distinct subject with the triples that
+/// carry it. We do not require an explicit `a acl:Authorization` type triple —
+/// WAC treats the scope/agent/mode predicates themselves as what makes an
+/// authorization, and many real ACLs omit the type.
 ///
-/// Dedupes with a `HashSet` rather than `Vec::contains`: the ACL is
-/// attacker-supplied (see [`grants_anything`]'s doc comment), so a document
-/// with thousands of distinct subjects must not make this quadratic.
-fn authorization_subjects(acl: &[Triple]) -> Vec<NamedOrBlankNode> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<NamedOrBlankNode> = Vec::new();
+/// Every question this module asks — scope, agent, mode — is subject-scoped,
+/// so asking it of the whole slice means rescanning the document once per
+/// subject, which for a document whose subjects are all distinct is the
+/// document multiplied by itself. The ACL is attacker-supplied (see
+/// [`grants_anything`]), and the cost recurs: the guard re-reads the
+/// applicable ACL and decides per level of the ancestor chain on every
+/// request, so one accepted write would tax every later request in that
+/// subtree. Grouping once up front is what keeps a decision linear in the
+/// document — and it subsumes deduplication, since a repeated subject is one
+/// entry with more triples in it.
+fn by_subject(acl: &[Triple]) -> HashMap<&NamedOrBlankNode, Vec<&Triple>> {
+    let mut index: HashMap<&NamedOrBlankNode, Vec<&Triple>> = HashMap::new();
     for t in acl {
-        if seen.insert(t.subject.clone()) {
-            out.push(t.subject.clone());
-        }
+        index.entry(&t.subject).or_default().push(t);
     }
-    out
+    index
 }
 
-fn has_object(acl: &[Triple], subject: &NamedOrBlankNode, predicate: &str, object_iri: &str) -> bool {
-    acl.iter().any(|t| {
-        t.subject == *subject
-            && t.predicate.as_str() == predicate
+/// Whether one authorization — the triples [`by_subject`] grouped under a
+/// single subject — has `predicate` pointing at `object_iri`.
+fn has_object(authorization: &[&Triple], predicate: &str, object_iri: &str) -> bool {
+    authorization.iter().any(|t| {
+        t.predicate.as_str() == predicate
             && matches!(&t.object, Term::NamedNode(n) if n.as_str() == object_iri)
     })
 }
@@ -165,20 +175,20 @@ fn has_object(acl: &[Triple], subject: &NamedOrBlankNode, predicate: &str, objec
 /// the only authority), but it makes `grants_anything` report "grants
 /// nothing" for an ACL that does grant, i.e. a spurious warning on a write
 /// that was in fact effective.
-fn matches_agent(acl: &[Triple], subject: &NamedOrBlankNode, agent: &Agent) -> bool {
-    if has_object(acl, subject, ACL_AGENT_CLASS, FOAF_AGENT) {
+fn matches_agent(authorization: &[&Triple], agent: &Agent) -> bool {
+    if has_object(authorization, ACL_AGENT_CLASS, FOAF_AGENT) {
         return true;
     }
     match agent {
         Agent::Public => false,
         Agent::WebId(webid) => {
-            has_object(acl, subject, ACL_AGENT_CLASS, ACL_AUTHENTICATED_AGENT)
-                || has_object(acl, subject, ACL_AGENT, webid)
+            has_object(authorization, ACL_AGENT_CLASS, ACL_AUTHENTICATED_AGENT)
+                || has_object(authorization, ACL_AGENT, webid)
         }
     }
 }
 
-/// Whether `subject`'s agent clauses would match **some** agent, existentially
+/// Whether this authorization's agent clauses would match **some** agent, existentially
 /// — what [`grants_anything`] needs, as opposed to [`matches_agent`]'s "does
 /// this ONE agent match", which [`decide`] needs. The same three predicates,
 /// read the same way: `acl:agentClass foaf:Agent` and `acl:agentClass
@@ -186,23 +196,20 @@ fn matches_agent(acl: &[Triple], subject: &NamedOrBlankNode, agent: &Agent) -> b
 /// authenticated WebID), and an `acl:agent` triple matches whatever WebID its
 /// object names — so the mere existence of one such triple, whatever its
 /// object, is exactly the existential form of `matches_agent`'s third case.
-fn names_someone(acl: &[Triple], subject: &NamedOrBlankNode) -> bool {
-    has_object(acl, subject, ACL_AGENT_CLASS, FOAF_AGENT)
-        || has_object(acl, subject, ACL_AGENT_CLASS, ACL_AUTHENTICATED_AGENT)
-        || acl.iter().any(|t| {
-            t.subject == *subject
-                && t.predicate.as_str() == ACL_AGENT
-                && matches!(t.object, Term::NamedNode(_))
+fn names_someone(authorization: &[&Triple]) -> bool {
+    has_object(authorization, ACL_AGENT_CLASS, FOAF_AGENT)
+        || has_object(authorization, ACL_AGENT_CLASS, ACL_AUTHENTICATED_AGENT)
+        || authorization.iter().any(|t| {
+            t.predicate.as_str() == ACL_AGENT && matches!(t.object, Term::NamedNode(_))
         })
 }
 
-/// Whether `subject` has at least one `acl:mode` triple whose object is a
+/// Whether this authorization has at least one `acl:mode` triple whose object is a
 /// [`recognized_mode`] — the same notion [`decide`] uses to decide WHICH mode
 /// a triple grants, here only asked THAT one is granted.
-fn has_recognized_mode(acl: &[Triple], subject: &NamedOrBlankNode) -> bool {
-    acl.iter().any(|t| {
-        t.subject == *subject
-            && t.predicate.as_str() == ACL_MODE
+fn has_recognized_mode(authorization: &[&Triple]) -> bool {
+    authorization.iter().any(|t| {
+        t.predicate.as_str() == ACL_MODE
             && matches!(&t.object, Term::NamedNode(m) if recognized_mode(m.as_str()).is_some())
     })
 }
@@ -473,6 +480,146 @@ mod tests {
             false
         )
         .allows(Mode::Read));
+    }
+
+    /// `decide`'s question answered without an index: every clause rescans
+    /// the whole document, filtering on the subject as it goes. The literal
+    /// reading of "an authorization is a subject with a scope, an agent and
+    /// modes", written so it shares nothing with [`decide`] but
+    /// [`recognized_mode`] — so where the two agree, the grouping changed
+    /// only what the answer costs.
+    fn decide_by_rescan(
+        acl: &[Triple],
+        agent: &Agent,
+        governed_iri: &str,
+        inherited: bool,
+    ) -> AccessModes {
+        let scope = if inherited { ACL_DEFAULT } else { ACL_ACCESS_TO };
+        let object = |subject: &NamedOrBlankNode, predicate: &str, object_iri: &str| {
+            acl.iter().any(|t| {
+                t.subject == *subject
+                    && t.predicate.as_str() == predicate
+                    && matches!(&t.object, Term::NamedNode(n) if n.as_str() == object_iri)
+            })
+        };
+        let mut granted = AccessModes::default();
+        for subject in acl.iter().map(|t| t.subject.clone()) {
+            if !object(&subject, scope, governed_iri) {
+                continue;
+            }
+            let agent_matches = object(&subject, ACL_AGENT_CLASS, FOAF_AGENT)
+                || match agent {
+                    Agent::Public => false,
+                    Agent::WebId(webid) => {
+                        object(&subject, ACL_AGENT_CLASS, ACL_AUTHENTICATED_AGENT)
+                            || object(&subject, ACL_AGENT, webid)
+                    }
+                };
+            if !agent_matches {
+                continue;
+            }
+            for t in acl.iter().filter(|t| t.subject == subject && t.predicate.as_str() == ACL_MODE)
+            {
+                if let Term::NamedNode(m) = &t.object {
+                    match recognized_mode(m.as_str()) {
+                        Some(Mode::Read) => granted.read = true,
+                        Some(Mode::Write) => granted.write = true,
+                        Some(Mode::Append) => granted.append = true,
+                        Some(Mode::Control) => granted.control = true,
+                        None => {}
+                    }
+                }
+            }
+        }
+        granted
+    }
+
+    // The truth table above is exhaustive per rule, one authorization at a
+    // time; this pins the same decision on a document where the rules
+    // interact — subjects repeated across statements, a blank-node subject, a
+    // subject whose scope names another resource, a subject scoped under the
+    // other predicate, an unrecognized mode IRI and a mode object that is not
+    // an IRI at all — against the definition read straight off the slice. Both
+    // scopes, and an agent of every kind: named in the document, named nowhere
+    // in it, and the public.
+    #[test]
+    fn grouping_by_subject_decides_exactly_what_rescanning_the_acl_does() {
+        let a = acl(&format!(
+            "<#a> <{ACL_AGENT}> <{ALICE}>, <{BOB}> ; <{ACL_ACCESS_TO}> <{FOO}> ; \
+               <{ACL_MODE}> <{ACL_READ}> .\n\
+             <#a> <{ACL_MODE}> <{ACL_APPEND}>, <http://example.org/Fly> ; \
+               <{ACL_DEFAULT}> <{FOO}> .\n\
+             <#b> <{ACL_AGENT_CLASS}> <{ACL_AUTHENTICATED_AGENT}> ; <{ACL_ACCESS_TO}> <{FOO}> ; \
+               <{ACL_MODE}> <{ACL_WRITE}> .\n\
+             <#c> <{ACL_AGENT_CLASS}> <{FOAF_AGENT}> ; <{ACL_DEFAULT}> <{FOO}> ; \
+               <{ACL_MODE}> <{ACL_READ}> .\n\
+             <#d> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/other> ; \
+               <{ACL_MODE}> <{ACL_CONTROL}> .\n\
+             <#e> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <{FOO}> ; \
+               <{ACL_MODE}> \"Control\" .\n\
+             [] <{ACL_AGENT}> <{BOB}> ; <{ACL_ACCESS_TO}> <{FOO}> ; \
+               <{ACL_MODE}> <{ACL_CONTROL}> .\n\
+             <#f> <http://schema.org/name> \"not an authorization\" ."
+        ));
+
+        // Agreement is only worth something if there is something to agree
+        // about: two implementations that both grant nothing agree trivially.
+        assert_eq!(
+            decide(&a, &alice(), FOO, false),
+            AccessModes { read: true, write: true, append: true, control: false },
+            "Alice reads and appends through <#a> and writes through <#b>; the \
+             `Control` in <#d> is scoped elsewhere and the one in <#e> is a literal"
+        );
+        assert_eq!(
+            decide(&a, &Agent::Public, FOO, true),
+            AccessModes { read: true, write: false, append: false, control: false },
+            "the public inherits only <#c>'s Read"
+        );
+
+        for agent in [
+            alice(),
+            Agent::WebId(BOB.to_string()),
+            Agent::WebId("https://carol.example/card#me".to_string()),
+            Agent::Public,
+        ] {
+            for inherited in [false, true] {
+                assert_eq!(
+                    decide(&a, &agent, FOO, inherited),
+                    decide_by_rescan(&a, &agent, FOO, inherited),
+                    "{agent:?}, inherited={inherited}"
+                );
+            }
+        }
+    }
+
+    // What the grouping is for. Every subject here is distinct and none of
+    // them names a mode, so nothing short-circuits and a `decide` that
+    // rescanned the slice per subject would do 10¹⁰ term comparisons — the
+    // shape issue #45 describes. Grouped, it is one pass. The size is well
+    // past what `aux::MAX_AUX_TRIPLES` lets anyone store, deliberately:
+    // `decide` is pure and takes a slice, so this pins the function rather
+    // than the write path that feeds it.
+    //
+    // **This check fails by not finishing, which is the honest description of
+    // it**: there is no assertion that separates linear from quadratic, only
+    // the wall clock of the suite, exactly as
+    // `grants_anything_stays_fast_on_a_large_ungranted_acl` above. It is built
+    // through the model rather than parsed from Turtle so the ACL, not the
+    // parser, is what the time is spent on.
+    #[test]
+    fn decide_stays_linear_on_an_acl_of_distinct_subjects() {
+        use oxigraph::model::NamedNode;
+        let agent = NamedNode::new(ACL_AGENT).unwrap();
+        let a: Vec<Triple> = (0..100_000)
+            .map(|i| {
+                Triple::new(
+                    NamedNode::new(format!("https://pod.toph.so/foo.acl#s{i}")).unwrap(),
+                    agent.clone(),
+                    NamedNode::new(format!("https://webid.example/{i}")).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(decide(&a, &alice(), FOO, false), AccessModes::default());
     }
 
     // The scope check is subject-scoped too: a matching agent's own
