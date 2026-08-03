@@ -583,6 +583,97 @@ mod tests {
         assert_eq!(got, vec![watched]);
     }
 
+    /// The recheck under `live`'s write lock, pinned directly: a `subscribe`
+    /// that revives a dead sender between `live`'s read phase and its write
+    /// phase must leave that sender in the map, and a later `publish` must
+    /// still reach the receiver `subscribe` handed back — a surviving map
+    /// entry that drops the event is exactly as broken as an evicted one.
+    ///
+    /// Both `live`'s write-lock attempt and `subscribe`'s only lock are queued
+    /// behind one held read guard and released together, so which of the two
+    /// reaches the write lock first is up to the scheduler, not this test.
+    /// Only the ordering where `subscribe` gets there first exercises the
+    /// recheck, so the race runs `ITERATIONS` times rather than once.
+    #[test]
+    fn live_does_not_evict_a_channel_revived_during_its_write_phase() {
+        const ITERATIONS: usize = 500;
+        for _ in 0..ITERATIONS {
+            let bus = Arc::new(Bus::new());
+            let topic = Topic::from(&target("/notes"));
+
+            // A dead sender, seeded directly rather than through `subscribe` +
+            // `Drop`, as in `live_evicts_a_channel_that_has_no_reader_left`.
+            let (tx, rx) = broadcast::channel(CAPACITY);
+            drop(rx);
+            bus.channels.write().unwrap().insert(topic.clone(), tx);
+
+            let (holding, held) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let bus = Arc::clone(&bus);
+                std::thread::spawn(move || {
+                    let guard = bus.channels.read().unwrap();
+                    holding.send(()).unwrap();
+                    released.recv().unwrap();
+                    drop(guard);
+                })
+            };
+            held.recv().unwrap();
+
+            // `live`'s read phase runs freely — readers coexist with the
+            // holder's guard — and finds the topic dead. Its write phase then
+            // queues behind the holder, alongside `subscribe`'s only lock.
+            let (live_ready, live_started) = std::sync::mpsc::channel::<()>();
+            let live_thread = {
+                let bus = Arc::clone(&bus);
+                let topic = topic.clone();
+                std::thread::spawn(move || {
+                    let _ = live_ready.send(());
+                    bus.live(std::slice::from_ref(&topic))
+                })
+            };
+            let (sub_ready, sub_started) = std::sync::mpsc::channel::<()>();
+            let subscribe_thread = {
+                let bus = Arc::clone(&bus);
+                let topic = topic.clone();
+                std::thread::spawn(move || {
+                    let _ = sub_ready.send(());
+                    bus.subscribe(topic)
+                })
+            };
+            live_started.recv().unwrap();
+            sub_started.recv().unwrap();
+            // Both signals above fire before their thread's blocking lock
+            // call, not during it; this gives each thread a moment to reach
+            // that call and queue behind the holder before it is released.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            live_thread.join().unwrap();
+            let mut rx = subscribe_thread.join().unwrap();
+
+            assert_eq!(bus.channels.read().unwrap().len(), 1,
+                "a subscriber that registered during live's write phase must not be evicted");
+
+            bus.publish(Event {
+                topic: topic.clone(),
+                activity: Activity::Update,
+                object: topic.as_str().to_owned(),
+                target: None,
+                state: Some("\"abc\"".to_owned()),
+            });
+            // `try_recv` on the inner receiver directly: `publish` above is
+            // synchronous and precedes this call, so the event is already
+            // buffered and a blocking wait is not needed to observe it.
+            assert_eq!(
+                rx.rx.as_mut().unwrap().try_recv().map(|e| e.activity),
+                Ok(Activity::Update),
+                "the entry survived but the event sent to it was lost",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn publish_reaches_the_receiver_of_that_topic() {
         let bus = Arc::new(Bus::new());
