@@ -569,6 +569,73 @@ this one rather than contradicted by it.
 
 The 20 residual failures are unchanged and are the same ones reconciled below.
 
+## Eighth run — regression check on six unmeasured slices
+
+| | |
+|---|---|
+| **Date** | 2026-08-03 |
+| **Pod commit** | `247d24f` |
+
+| | Features | Scenarios | Passed | Failed |
+|---|---|---|---|---|
+| karate (everything that ran) | 41 | 652 | 632 | 20 |
+| harness's MUST-linked subset | 38 | 649 | 621 | 20 |
+
+**Identical to the seventh run, and that is the result being reported.** Six feature slices
+landed on `main` between `35ee057` and this commit without the suite being run once:
+[shape validation](superpowers/specs/2026-07-30-shape-validation-design.md),
+[`Accept-Put`/`Accept-Post`](superpowers/specs/2026-07-31-accept-put-post-design.md),
+[auth caching](superpowers/specs/2026-07-31-auth-caching-design.md),
+[CLI config and the persistent store](superpowers/specs/2026-07-31-cli-config-design.md),
+[the request-scoped guard](superpowers/specs/2026-07-31-request-scoped-guard-design.md), and
+[change events](superpowers/specs/2026-07-31-change-events-design.md). This run asks one
+question — did any of them reach a scenario that was passing before — and the answer is no.
+Nothing moved in either direction.
+
+**Shape validation was the named risk, and it is the one worth stating the evidence for.** It
+is the only slice of the six that can *refuse* a write, and the suite writes fixtures
+constantly. A refusal inside a feature's `Background` does not fail one scenario; it aborts
+the whole feature before any assertion runs — the mechanism that took out 540 scenarios at the
+`text/plain` fixture through the first two runs. That did not happen: `harness.log` reports
+`features: 41 | skipped: 0` and `scenarios: 652`, the same 41 and 652 as every run since the
+first, so every feature reached its assertions. No feature aborted, and none was skipped.
+
+The 20 failures are **line-identical to the sixth and seventh runs, not merely equal in
+count** — every `ERROR` line in `harness.log` carries the same feature and scenario line
+number as before:
+
+| Feature | Scenario lines | Scenarios | Cause |
+|---|---|---|---|
+| `writing-resource/post-target-not-found` | `:13`, `:27`, `:41`, `:55` | 4 | ancestor materialization (Bucket 2) |
+| `wac/protected-operation/write-access-{agent,bob,public}` | `:62`, `:62`, `:47`, ×2 each | 6 | `POST` into an `accessTo`-only container (Bucket 3) |
+| `wac/protected-operation/write-access-{agent,bob,public}` | `:128`, `:127`, `:100`, ×2 each | 6 | `DELETE` via inherited-only access (3 Bucket 3, 3 Bucket 2) |
+| `cors/preflight` | `:28` | 1 | `@http-redirect`, needs `https` (Bucket 1) |
+| `cors/preflight-requests` | `:51` | 1 | same |
+| `writing-resource/containment` | `:122` | 1 | trailing-slash pair (Bucket 2) |
+| `writing-resource/containment` | `:38` | 1 | `application/sparql-update` (Bucket 1) |
+| **Total** | | **20** | |
+
+`4 + 6 + 6 + 1 + 1 + 1 + 1 = 20`. The response lines are unchanged too, quoted from this run's
+own log rather than carried over: `post-target-not-found:13` → `status code was: 201,
+expected: 404`; `containment:122` → `status code was: 409, expected: 404 … another resource
+already exists whose URI differs from this one only in the trailing slash`; both
+`@http-redirect` rows → `[301,308]` does not contain `204`; `containment:38` → `did not
+evaluate to 'true': responseStatus >= 200 && responseStatus < 300`, still with no response
+line, for the reason Bucket 1 names.
+
+The per-feature counts behind those failures are unchanged as well —
+`write-access-{agent,bob}` at `80/84` each and `write-access-public` at `49/53`, read out of
+this run's `karate-summary-json.txt`. **34 of 41 features pass every scenario, 7 have at least
+one failure**, the same 34 and 7 as the sixth and seventh runs.
+
+One deviation in method, the same one the sixth run declared: this run's `karate-reports/`
+directory holds only the summary pages, no per-feature HTML. The claims above come from
+`harness.log`'s `ERROR` lines and its per-feature `failed:` banners, and from
+`conformance/reports/report.html` for per-scenario detail.
+
+The buckets below are untouched by this run: same 20 scenarios, same classification, and
+Bucket 4 stays empty.
+
 ## Bucket 1 — Expected gap (3 scenarios, as of the sixth run)
 
 Features this pod deliberately does not have, or environment limits the harness cannot
