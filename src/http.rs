@@ -13,7 +13,7 @@ use crate::{aux::{self, AuxError, AUX_SUBJECT_MISSING_MESSAGE}, container,
     dataset::{triples_of, Dataset, Skolemized},
     resource::{put_rdf, get_rdf, delete_rdf, patch_dataset, put_dataset, put_blob, get_dataset, stored_media_type, kind_of, Kind, PatchResult, ResourceError},
     rdf::{Format, MediaType, RdfVersion, Shape, negotiate, accept_allows},
-    auth::{Agent, AuthConfig, JwksResolver, WebIdIssuerVerifier, auth_layer},
+    auth::{Agent, AuthConfig, JtiReplayStore, JwksResolver, WebIdIssuerVerifier, auth_layer},
     space::{AuxKind, AuxUrl, ContainerUrl, GraphName, SpaceError, StorageSpace, Target},
     store::SparqlStore,
     wac::{guard::{Denial, Guard, Materialized}, pdp, AccessModes, Decision, Mode}};
@@ -27,6 +27,10 @@ pub struct AppState {
     pub resolver: Arc<dyn JwksResolver>,
     pub webid_verifier: Arc<dyn WebIdIssuerVerifier>,
     pub auth_config: Arc<AuthConfig>,
+    /// The `jti`s of the DPoP proofs this pod has accepted, so a second
+    /// sighting of one is refused. Per pod, like every other collaborator
+    /// here: two pods in one process each reject their own replays.
+    pub replay: Arc<dyn JtiReplayStore>,
     pub max_body_bytes: usize,
 }
 
@@ -2170,55 +2174,21 @@ mod tests {
     const OWNER: &str = "https://alice.example/card#me";
     const ISSUER: &str = "https://idp.example/";
 
-    // True while this thread's test is holding a live `Fixture`.
-    //
-    // The replay lock a `Fixture` takes is process-wide and NOT reentrant, so
-    // a second `fixture()` call inside one test would await a guard its own
-    // caller still holds — a silent hang rather than a failure. A bare
-    // `try_lock` cannot detect that: `cargo test` runs these tests in
-    // parallel, so the lock is legitimately contended almost all the time and
-    // `try_lock` fails for the innocent reason far more often than the guilty
-    // one. Re-entrancy is therefore tracked per test thread, where the two
-    // cases are distinguishable, and the mistake panics at once.
-    thread_local! {
-        static FIXTURE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    /// Clears [`FIXTURE_HELD`] when the fixture goes away. A field rather than
-    /// a `Drop` impl on `Fixture` itself, because tests move `f.app` out of
-    /// the fixture and that partial move is only legal while `Fixture` has no
-    /// `Drop` of its own.
-    struct ReentrancyGuard;
-
-    impl Drop for ReentrancyGuard {
-        fn drop(&mut self) {
-            FIXTURE_HELD.with(|f| f.set(false));
-        }
-    }
-
     /// An app whose root ACL grants OWNER full control, plus the IdP and
-    /// client needed to mint credentials for them. The store and space are
-    /// kept so a second app can be built over the SAME data (see
-    /// [`Fixture::app_also_trusting`]) and so tests can inspect the store
-    /// directly.
+    /// client needed to mint credentials for them. The store, space and
+    /// replay set are kept so a second app can be built over the SAME pod
+    /// (see [`Fixture::app_also_trusting`]) and so tests can inspect the
+    /// store directly.
     struct Fixture {
         app: axum::Router,
         events: Arc<crate::notify::Bus>,
         store: Arc<dyn crate::store::SparqlStore>,
         blobs: Arc<dyn crate::blob::BlobStore>,
         space: StorageSpace,
+        replay: Arc<dyn crate::auth::JtiReplayStore>,
         max_body_bytes: usize,
         idp: TestIdp,
         client: TestClient,
-        /// Held for the test's whole lifetime: these tests authenticate
-        /// through `auth_layer`, which records DPoP `jti`s into the
-        /// process-wide replay store using the REAL wall clock. That would
-        /// otherwise evict the still-fresh entries of `auth::dpop`'s
-        /// concurrently-running replay tests, which simulate `now_unix`
-        /// near the epoch (see `auth::dpop::test_replay_lock`).
-        _replay_guard: tokio::sync::MutexGuard<'static, ()>,
-        /// Releases this thread's re-entrancy flag (see [`FIXTURE_HELD`]).
-        _reentrancy: ReentrancyGuard,
     }
 
     async fn fixture() -> Fixture {
@@ -2245,12 +2215,6 @@ mod tests {
         blobs: Arc<dyn crate::blob::BlobStore>,
         max_body_bytes: usize,
     ) -> Fixture {
-        assert!(
-            !FIXTURE_HELD.with(|f| f.replace(true)),
-            "call fixture() once per test: it holds the process-wide DPoP replay lock \
-             for the fixture's lifetime, so a second call would deadlock"
-        );
-        let _replay_guard = crate::auth::dpop::test_replay_lock().lock().await;
         let space = StorageSpace::new("https://pod.toph.so/").unwrap();
         crate::container::provision_root(store.as_ref(), &space.root()).await.unwrap();
         crate::wac::provision::provision_root_acl(
@@ -2263,6 +2227,8 @@ mod tests {
         issuers.allow(OWNER, ISSUER);
 
         let events = Arc::new(crate::notify::Bus::new());
+        let replay: Arc<dyn crate::auth::JtiReplayStore> =
+            Arc::new(crate::auth::InMemoryJtiReplayStore::new());
         let state = AppState {
             store: store.clone(),
             events: events.clone(),
@@ -2271,11 +2237,11 @@ mod tests {
             resolver: Arc::new(StaticJwksResolver::new(ISSUER, idp.jwks())),
             webid_verifier: Arc::new(issuers),
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
+            replay: replay.clone(),
             max_body_bytes,
         };
         Fixture {
-            app: router(state), events, store, blobs, space, max_body_bytes, idp, client,
-            _replay_guard, _reentrancy: ReentrancyGuard,
+            app: router(state), events, store, blobs, space, replay, max_body_bytes, idp, client,
         }
     }
 
@@ -2381,6 +2347,10 @@ mod tests {
                 resolver: Arc::new(StaticJwksResolver::new(ISSUER, self.idp.jwks())),
                 webid_verifier: Arc::new(issuers),
                 auth_config: Arc::new(crate::auth::AuthConfig::default()),
+                // The same replay set as `app`: this is the same pod behind
+                // a second router, so a proof spent through one must not be
+                // spendable again through the other.
+                replay: self.replay.clone(),
                 max_body_bytes: self.max_body_bytes,
             })
         }
@@ -2389,17 +2359,6 @@ mod tests {
     async fn body_string(res: axum::response::Response) -> String {
         let b = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
         String::from_utf8_lossy(&b).into_owned()
-    }
-
-    // The failure mode the re-entrancy flag exists to prevent: before it, a
-    // second fixture() in one test awaited the process-wide replay lock its
-    // own caller was still holding and wedged CI with no output at all. The
-    // panic must arrive BEFORE that await, which is what this pins.
-    #[tokio::test]
-    #[should_panic(expected = "call fixture() once per test")]
-    async fn calling_fixture_twice_panics_instead_of_hanging() {
-        let _first = fixture().await;
-        let _second = fixture().await;
     }
 
     #[tokio::test]

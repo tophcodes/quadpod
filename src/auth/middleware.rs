@@ -63,8 +63,9 @@ fn derive_htu(space: &StorageSpace, raw_path: &str) -> String {
 /// request's socket scheme/host — the pod may sit behind a reverse proxy that
 /// rewrites those, so trusting them would let an attacker mint proofs against
 /// a URL the pod never actually serves under. `now_unix` uses the real wall
-/// clock; see `auth::dpop`'s doc comment for the matching process-lifetime
-/// replay-store limitation, and `auth::http_jwks` for the JWKS-TTL one.
+/// clock; see `auth::dpop::InMemoryJtiReplayStore` for the matching
+/// single-instance replay-store limitation, and `auth::http_jwks` for the
+/// JWKS-TTL one.
 ///
 /// Fails closed: any error from `authenticate` (malformed, expired, bad
 /// signature, wrong `htu`/`htm`, `cnf.jkt` mismatch, replay, ...) is a
@@ -92,6 +93,7 @@ pub async fn auth_layer(State(st): State<AppState>, mut req: Request, next: Next
         resolver: st.resolver.as_ref(),
         webid_verifier: st.webid_verifier.as_ref(),
         config: st.auth_config.as_ref(),
+        replay: st.replay.as_ref(),
     };
     match authenticate(
         auth_header.as_deref(),
@@ -190,6 +192,7 @@ mod tests {
             resolver,
             webid_verifier: Arc::new(crate::auth::webid_issuer::StaticWebIdIssuers::new()),
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
+            replay: Arc::new(crate::auth::InMemoryJtiReplayStore::new()),
             max_body_bytes: 64 * 1024 * 1024,
         };
         Router::new().route("/{*path}", get(whoami))

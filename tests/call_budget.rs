@@ -151,6 +151,7 @@ async fn app() -> (axum::Router, Arc<CountingStore>, Arc<sparql_pod::notify::Bus
         resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
         webid_verifier: Arc::new(StaticWebIdIssuers::new()),
         auth_config: Arc::new(AuthConfig::default()),
+        replay: Arc::new(sparql_pod::auth::InMemoryJtiReplayStore::new()),
         max_body_bytes: 64 * 1024 * 1024,
     });
     (app, counting, events)

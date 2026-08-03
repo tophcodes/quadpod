@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use sparql_pod::{auth::{GuardedClient, HttpJwksResolver, HttpWebIdIssuers}, config::Config,
-    http::{AppState, router}};
+use sparql_pod::{auth::{GuardedClient, HttpJwksResolver, HttpWebIdIssuers, InMemoryJtiReplayStore},
+    config::Config, http::{AppState, router}};
 
 #[tokio::main]
 async fn main() {
@@ -70,6 +70,7 @@ async fn main() {
         )),
         webid_verifier: Arc::new(HttpWebIdIssuers::new(guarded_client, fetch_policy)),
         auth_config: Arc::new(cfg.auth_config()),
+        replay: Arc::new(InMemoryJtiReplayStore::new()),
         max_body_bytes: cfg.max_body_bytes,
     };
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
