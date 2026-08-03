@@ -410,6 +410,39 @@ The guard names the store exactly twice: the field it holds and the probe that f
     another name. It pins the import, not the layering.
     check: ! rg -q 'axum|http::' src/wac
 
+## Failure reporting
+
+Only `internal_error` builds a `500`.
+    → issue #43; the doc comment on `http::internal_error`, which claims every
+    `500` this crate builds goes through it. That claim is what makes the
+    fixed `INTERNAL_ERROR_BODY` safe: the detail is dropped from the response
+    only because the same call put it in the log. A second site that builds a
+    `500` breaks both halves at once, and it breaks them in the direction that
+    is invisible — the client still gets a plausible answer, the operator gets
+    nothing, and no test fails. Before this rule the crate had thirty-odd such
+    sites, each answering with the backend's own error text.
+    Anchored on the two ways a `500` response is actually written rather than
+    on the status name: `StatusCode::INTERNAL_SERVER_ERROR` appears
+    legitimately in `put_status` and `shape_status`, which return a *status*
+    that `put_error`/`shape_status` then route through `internal_error`, in
+    two auth test handlers that mock a failing upstream, and in every test that
+    asserts one — none of those build a response, and none of them match.
+    Demonstrated red, each injected into and then reverted out of
+    `src/http.rs` in turn, against
+    `StatusCode::INTERNAL_SERVER_ERROR.into_response()` and
+    `(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()` — the
+    second being the exact shape the issue was filed about; demonstrated green
+    on the tree as it stands, where the single match is `internal_error`'s own
+    body.
+    **What it does not catch:** a `500` spelled some other way —
+    `Response::builder().status(500)`, a `StatusCode::from_u16(500)`, or a
+    handler returning a bare `StatusCode` that axum renders itself. It also
+    says nothing about `4xx`, which deliberately keep their own text. And it
+    pins the construction, not the logging: deleting the `tracing::error!`
+    from `internal_error` leaves this rule green — `tests/observability.rs` is
+    what fails then.
+    check: [ "$(rg -o 'INTERNAL_SERVER_ERROR[,)]?\.into_response\(\)|\(StatusCode::INTERNAL_SERVER_ERROR,' src | wc -l)" = 1 ]
+
 ## Notifications
 
 Every write handler emits exactly once.
