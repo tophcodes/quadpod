@@ -31,8 +31,7 @@ pub trait SparqlStore: Send + Sync {
     async fn ask(&self, sparql: &str) -> Result<bool, StoreError>;
 
 
-    /// The richest [`RdfVersion`] this backend can hold — the amended §13 of
-    /// the root spec, which now names capabilities rather than a product
+    /// The richest [`RdfVersion`] this backend can hold — a capability, not a product
     /// class. The write path refuses a representation above it with `415`.
     ///
     /// Neither `async` nor fallible: an implementor either knows this from
@@ -51,7 +50,7 @@ pub trait SparqlStore: Send + Sync {
     ///
     /// The third read shape, beside a graph and a boolean. It exists because
     /// N3 Patch must distinguish *no* variable mapping from *one* from *several*
-    /// (`2026-07-30-n3-patch-design.md` §6), and neither a `CONSTRUCT` nor an
+    ///, and neither a `CONSTRUCT` nor an
     /// `ASK` answers that question without encoding a `SELECT` into one of them
     /// and decoding it again.
     ///
@@ -77,7 +76,7 @@ impl OxigraphStore {
     /// Only one process may hold a directory at a time — `Store::open` takes an
     /// exclusive lock, so a second pod aimed at the same path fails here rather
     /// than sharing it. That bound is the whole of the single-writer constraint
-    /// (root spec §16 ADR-7): it is about processes, not about the tasks inside
+    /// (`docs/decisions.md`, ADR-7): it is about processes, not about the tasks inside
     /// this one, which write concurrently as before.
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
         Store::open(dir)

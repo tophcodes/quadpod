@@ -49,7 +49,7 @@ pub const SYS_PRESENT: &str = "urn:quadpod:sys#present";
 /// Stored rather than inferred from the media type: inferring it would make
 /// every blob stored under a type `Format` later learns re-interpret as an
 /// empty RDF resource, and `application/rdf+xml` is already on the follow-up
-/// list (`2026-07-28-jsonld-datasets-design.md` §11).
+/// list.
 pub const SYS_BINARY_RESOURCE: &str = "urn:quadpod:sys#BinaryResource";
 
 /// What a resource's representation is made of.
@@ -355,7 +355,7 @@ fn ground_term(
     render_bound(bound)
 }
 
-/// Apply a patch to an **existing** RDF resource (`2026-07-30-n3-patch-design.md` §6).
+/// Apply a patch to an **existing** RDF resource.
 ///
 /// At most a `SELECT`, an `ASK`, and one `UPDATE` — never more. The `SELECT`
 /// runs only when the patch has conditions, with `LIMIT 2` and scoped to this
@@ -634,7 +634,6 @@ pub async fn get_rdf(
 /// One query for the whole set. The ancestor chains an authorization walks are
 /// nested — the ACL candidates for `/a/b/` are a suffix of those for `/a/b/c` —
 /// so asking level by level re-asks what an earlier level already answered.
-/// See `2026-07-31-request-scoped-guard-design.md` §2, §4.
 ///
 /// Lives here because the system graph holding the marker is this module's to
 /// name and nobody else's (`docs/constraints.md`, *"Only `resource` builds a

@@ -1,7 +1,7 @@
 //! N3 Patch: the document a `PATCH` body carries, and nothing about applying it.
 //!
-//! The design of `2026-07-30-n3-patch-design.md`. This module parses, validates
-//! the shape §5.1 fixes, and answers which access modes the patch needs. It
+//! This module parses the document, validates its shape, and answers which
+//! access modes the patch needs. It
 //! reaches no store and builds no SPARQL, which is what keeps the question
 //! "is this document acceptable?" separable from "what does it do to this
 //! resource?".
@@ -40,11 +40,11 @@ pub enum PatchError {
     /// language-tagged string is an ordinary `Literal`, so a refusal that
     /// matches on `N3Term::Triple` alone lets it through into the store —
     /// which is exactly the half-check `Format::parse` used to have
-    /// (`2026-07-30-rdf12-design.md` §2).
+    /// (`docs/decisions.md`, ADR-6).
     ///
     /// A patch is always read at RDF 1.1. `text/n3` is not one of the five
-    /// negotiated formats and carries no `version` parameter here, and §4
-    /// reads silence as 1.1. Writing RDF 1.2 through a patch is therefore not
+    /// negotiated formats and carries no `version` parameter here, and silence
+    /// means RDF 1.1 (`docs/decisions.md`, ADR-6). Writing RDF 1.2 through a patch is therefore not
     /// possible today; it needs a version parameter on `text/n3` first.
     #[error("RDF 1.2 terms are not accepted in a patch; a patch is read as RDF 1.1")]
     Rdf12Term,

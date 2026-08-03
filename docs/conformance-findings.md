@@ -359,7 +359,7 @@ and unrelated to this fix.
 | | |
 |---|---|
 | **Date** | 2026-07-30 |
-| **Pod commit** | `d485135976795d0f5a6029a8f69029462b1993dd` (the fifth run's tree plus the N3 Patch work, [design](../superpowers/specs/2026-07-30-n3-patch-design.md)), **re-measured at `83f270e`** |
+| **Pod commit** | `d485135976795d0f5a6029a8f69029462b1993dd` (the fifth run's tree plus the N3 Patch work), **re-measured at `83f270e`** |
 
 | | Features | Scenarios | Passed | Failed |
 |---|---|---|---|---|
@@ -553,7 +553,7 @@ unimplemented feature on the list at all.
 question this run answers is whether any of it reached a scenario that was passing before.
 None did — same 632 / 20, same seven failing features.
 
-That outcome is designed rather than lucky. `2026-07-30-rdf12-design.md` §5 emits the `version`
+That outcome is designed rather than lucky. the pod emits the `version`
 parameter **only** on resources that classify above RDF 1.1, and no conformance scenario creates
 one, so every response the harness sees is byte-identical to the sixth run's — a strict
 `Content-Type: text/turtle` comparison never meets a parameter it did not expect. The design's
@@ -583,12 +583,8 @@ The 20 residual failures are unchanged and are the same ones reconciled below.
 
 **Identical to the seventh run, and that is the result being reported.** Six feature slices
 landed on `main` between `35ee057` and this commit without the suite being run once:
-[shape validation](superpowers/specs/2026-07-30-shape-validation-design.md),
-[`Accept-Put`/`Accept-Post`](superpowers/specs/2026-07-31-accept-put-post-design.md),
-[auth caching](superpowers/specs/2026-07-31-auth-caching-design.md),
-[CLI config and the persistent store](superpowers/specs/2026-07-31-cli-config-design.md),
-[the request-scoped guard](superpowers/specs/2026-07-31-request-scoped-guard-design.md), and
-[change events](superpowers/specs/2026-07-31-change-events-design.md). This run asks one
+shape validation, `Accept-Put`/`Accept-Post`, auth caching, CLI config and the
+persistent store, the request-scoped guard, and change events. This run asks one
 question — did any of them reach a scenario that was passing before — and the answer is no.
 Nothing moved in either direction.
 
@@ -643,8 +639,7 @@ clear.
 
 ### Non-RDF resources — RESOLVED (Plan 10, `feat/non-rdf-resources`)
 
-`PUT`/`POST` with a non-RDF `Content-Type` stores the body as a blob (parent spec §5,
-`docs/superpowers/specs/2026-07-29-non-rdf-resources-design.md` §3–§8) instead of
+`PUT`/`POST` with a non-RDF `Content-Type` stores the body as a blob (`docs/architecture.md`, Storage model) instead of
 answering `415`. Every feature this used to abort now runs to completion.
 
 <details>
@@ -712,8 +707,7 @@ green (see Bucket 3 and the fifth run above). The only `cors/*` failures left ar
 ### `PATCH` — RESOLVED as a route (N3 Patch); 1 scenario remains, and it is a media type this pod refuses by design
 
 The pod implements N3 Patch: `PATCH` with a `text/n3` body against an RDF document, per
-Solid Protocol §5.3.1 and
-[the design](../superpowers/specs/2026-07-30-n3-patch-design.md). `patch_impl`
+Solid Protocol §5.3.1. `patch_impl`
 (`src/http.rs:484`) authorizes before it parses, gates on `Content-Type`, and applies the
 patch — including against an absent target, which creates the resource. `Accept-Patch:
 text/n3` travels with `Allow` on every `GET`/`HEAD`/`OPTIONS` (`src/http.rs:182`). 65 of the
@@ -726,7 +720,7 @@ than a defect:
 |---|---|
 | **Test sends** | `PATCH` with `Content-Type: application/sparql-update` and body `INSERT DATA { <#hello> <#linked> <#world> . }`, asserting `responseStatus >= 200 && responseStatus < 300` |
 | **Pod does** | `415` — the `Content-Type` gate accepts `text/n3` and nothing else (`src/http.rs:509-511`) |
-| **Why** | `application/sparql-update` does not appear in the Solid Protocol at all — not as a MUST, not as a MAY, not as a mention. It is pre-N3-Patch ecosystem behaviour that the bundled `specification-tests` v0.0.19 still encodes. Accepting it would mean executing a client-authored database command against a store holding every resource, every ACL, and the server's own system graphs, separated from a `DROP ALL` only by a rejection list that must stay exhaustive against a `spargebra` AST that may gain a variant in any minor release — [design](../superpowers/specs/2026-07-30-n3-patch-design.md) §3. This is the only row in the whole suite that uses this media type. Adding it later remains possible and would be its own design. |
+| **Why** | `application/sparql-update` does not appear in the Solid Protocol at all — not as a MUST, not as a MAY, not as a mention. It is pre-N3-Patch ecosystem behaviour that the bundled `specification-tests` v0.0.19 still encodes. Accepting it would mean executing a client-authored database command against a store holding every resource, every ACL, and the server's own system graphs, separated from a `DROP ALL` only by a rejection list that must stay exhaustive against a `spargebra` AST that may gain a variant in any minor release (`docs/decisions.md`, ADR-8). This is the only row in the whole suite that uses this media type. Adding it later remains possible and would be its own design. |
 
 One honest note on the evidence: `harness.log` records this row as `did not evaluate to
 'true': responseStatus >= 200 && responseStatus < 300` — karate prints a status only for
@@ -812,9 +806,7 @@ ancestor-materialisation decision, surfacing as `409` instead of `201`.
 Previously filed here as a pending decision (see the second run's document, now
 superseded): "`format_for_content_type` is the single gate … RFC 9110 supports `415` …
 the suite reads Protocol's 'MUST reject' as `400`." All three legs of that reasoning
-fail, and
-[the design](../superpowers/specs/2026-07-29-non-rdf-resources-design.md) §9 is where the
-correction was made:
+fail, and the correction is:
 
 1. **The conflation argument does not survive the three-way gate.** It held only while
    "unsupported type" and "absent type" meant the same thing — no write. §8.1 of the

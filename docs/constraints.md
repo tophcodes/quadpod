@@ -1,8 +1,8 @@
 # Constraints
 
 Rules that must stay true, with the command that decides them. The reasoning
-lives in the design specs under `docs/superpowers/specs/`; this file only
-holds the check, so a rule cannot quietly stop being enforced.
+lives in [`architecture.md`](architecture.md) and [`decisions.md`](decisions.md);
+this file only holds the check, so a rule cannot quietly stop being enforced.
 
 A non-indented line is a rule. An indented `check:` line is the command that
 verifies it — non-zero exit means the rule is broken. `arch-check` runs them
@@ -16,7 +16,7 @@ trivially.
 ## Type model
 
 Only `AuxUrl` may be deleted on its own; only `ResourceUrl` and `ContainerUrl` may be written directly.
-    → 2026-07-27-acl-auxiliary-model-design.md §5, §6; the doc comments on
+    → the doc comments on
     `space::DirectlyWritable` / `DirectlyDeletable`; `tests/unrepresentable.rs`.
     Plan 7 found `aux::` was a convention rather than a construction —
     `put_rdf(&foo.aux(Acl))` compiled and skipped the subject-existence guard,
@@ -27,8 +27,7 @@ Only `AuxUrl` may be deleted on its own; only `ResourceUrl` and `ContainerUrl` m
     check: [ "$(rg -o 'impl DirectlyDeletable for [A-Za-z]+' src | wc -l)" = 1 ] && [ "$(rg -o 'impl DirectlyWritable for [A-Za-z]+' src | wc -l)" = 2 ]
 
 `space::GraphName` stays sealed.
-    → `space.rs`'s own comment on the trait; 2026-07-28-jsonld-datasets-design.md §3.6.
-    Every implementor's `graph_iri` is interpolated verbatim into SPARQL, so only
+    → `space.rs`'s own comment on the trait; Every implementor's `graph_iri` is interpolated verbatim into SPARQL, so only
     types minted through `StorageSpace::resolve` may implement it. Plan 7's review
     found the trait unsealed and compiled the repro: `impl GraphName for String`
     fed a raw request path straight into `INSERT DATA`. `mod sealed` being private
@@ -39,7 +38,7 @@ Only `AuxUrl` may be deleted on its own; only `ResourceUrl` and `ContainerUrl` m
 ## Storage addressing
 
 Only `resource` builds a system-graph IRI.
-    → 2026-07-28-jsonld-datasets-design.md §3, §3.2 invariant 5; `resource.rs`'s
+    → `resource.rs`'s
     module header. The presence marker is what makes existence a stored fact
     rather than a triple count — the ambiguity that made an empty ACL mean the
     opposite of what its author wrote. Its safety argument is that no
@@ -50,20 +49,20 @@ Only `resource` builds a system-graph IRI.
     check: ! rg -q '"urn:quadpod:sys:' src --glob '!src/resource.rs'
 
 Only `shelf::ShelfKey` mints a subgraph IRI.
-    → 2026-07-28-jsonld-datasets-design.md §3.1, §3.2 invariant 1. The key is a
+    → The key is a
     pure function of (resource IRI, graph name) with a `0x00` separator; a
     second place building that string by hand is how two resources come to
     share one shelf, which is a cross-resource read and write.
     check: ! rg -q "urn:quadpod:subgraph" src --glob '!src/shelf.rs'
 
 Only `dataset` mints or recognises a skolem IRI.
-    → §4. Skolemization preserves meaning only while the skolem IRIs occur
+    → Skolemization preserves meaning only while the skolem IRIs occur
     nowhere else (RDF 1.1 §3.5); a second place that writes or matches
     `urn:quadpod:bnode:` is a second place that can get the round trip wrong.
     check: ! rg -q "urn:quadpod:bnode" src --glob '!src/dataset.rs'
 
 A SPARQL literal is never interpolated by hand.
-    → 2026-07-29-non-rdf-resources-design.md §8.2; `sparql::Literal`. Every
+    → `sparql::Literal`. Every
     `<...>` interpolation in this crate is fed by a sealed or validated type, so
     the IRI half needs no rule; the quote half had exactly one site and no rule
     at all. A hand-written `"{}"` is a value that can close its own literal and
@@ -80,7 +79,7 @@ A SPARQL literal is never interpolated by hand.
     check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs' --glob '!src/http/tests/acl.rs' --glob '!src/http/tests/events.rs' --glob '!src/dataset.rs'
 
 Only `blob::BlobKey` builds an object key.
-    → 2026-07-29-non-rdf-resources-design.md §3.2. The key is the resource's
+    → The key is the resource's
     own path, so two resources sharing one object is a cross-resource read and
     write — the same failure `ShelfKey` guards against one layer up. It is also
     what the derived-key argument rests on: an interrupted write heals only
@@ -117,7 +116,7 @@ Only `blob::BlobKey` builds an object key.
     check: [ "$(rg -c 'self\.inner' src/store.rs)" = 1 ] && rg -q 'spawn_blocking' src/store.rs
     
 `GuardedClient` is the only `reqwest::Client` this crate builds.
-    → 2026-07-31-auth-caching-design.md §1; `safe_fetch.rs`'s own comment on the
+    → `safe_fetch.rs`'s own comment on the
     type. `guarded_get` no longer validates addresses for the connection it is
     about to make — its client does, in the DNS resolver it was built with. That
     is what allows one client to be shared, and it is also what makes a bare
@@ -131,7 +130,7 @@ Only `blob::BlobKey` builds an object key.
     check: [ "$(rg -o 'reqwest::Client::(builder|new)' src | wc -l)" = 1 ]
 
 Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
-    → 2026-07-30-shape-validation-design.md §2.1. `rudof_lib` pulls
+    → `rudof_lib` pulls
     `http-client` into the tree, which gives a bare `SparqlEvaluator::new()`
     a live `SERVICE` handler by default — a capability this pod's own
     server-authored queries never use and nothing here should be able to
@@ -145,8 +144,7 @@ Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     check: [ "$(rg -o 'SparqlEvaluator::(new|default)\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
 
 `SparqlStore` has exactly one implementor.
-    → 2026-07-24-sparql-solid-pod-design.md §16 ADR-2;
-    2026-07-28-jsonld-datasets-design.md §5.2. A tripwire, not a prohibition:
+    → `docs/decisions.md`, ADR-2. A tripwire, not a prohibition:
     dyn dispatch exists precisely so a backend can be swapped, but the
     `;`-sequence atomicity every write path rests on is a property of
     `OxigraphStore` rather than of SPARQL. A second implementor must reopen that
@@ -170,7 +168,7 @@ Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     check: ! rg -qU '(while|for)[^;{]*\.parent\(\)' src --glob '!src/space.rs'
 
 There is one content-negotiation path, one parser and one ETag.
-    → 2026-07-28-jsonld-datasets-design.md §6.3, §6.1. `Format` and
+    → `Format` and
     `negotiate` replaced `format_for_content_type` / `format_for_accept` /
     `rdf::parse` / `rdf::serialize` / `rdf::etag`. Two of each is how the
     Turtle path and the dataset path drift apart, and drift here is silent:
@@ -178,7 +176,7 @@ There is one content-negotiation path, one parser and one ETag.
     check: ! rg -q 'fn (format_for_accept|format_for_content_type)\b' src
 
 The write advertisement is built from `Format::ALL`.
-    → 2026-07-31-accept-put-post-design.md §2, §6. `Accept-Put` and
+    → `Accept-Put` and
     `Accept-Post` name the media types `classify_body` admits, and a
     hand-maintained second list is how the header comes to advertise a type
     the parser refuses — a disagreement invisible from either side, because
@@ -190,7 +188,7 @@ The write advertisement is built from `Format::ALL`.
     check: rg -q 'for f in Format::ALL' src/http.rs
 
 `patch` never reaches the store.
-    → 2026-07-30-n3-patch-design.md §3, §6. The argument that no client SPARQL
+    → `docs/decisions.md`, ADR-8. The argument that no client SPARQL
     exists rests on the patch document being parsed to terms in one place and
     turned into queries in another: `patch` decides whether a document is
     acceptable, `resource::patch_dataset` decides what it does to a resource.
@@ -210,7 +208,7 @@ No `#[allow]` attributes in `src/`.
     check: ! rg -q '#\[allow' src
 
 Only `aux` patches an auxiliary.
-    → 2026-07-30-n3-patch-design.md §8; `docs/constraints.md`'s `DirectlyWritable`
+    → `docs/constraints.md`'s `DirectlyWritable`
     rule, whose defect this is the patch-shaped version of. `patch_guarded` takes
     any `GraphName` so an auxiliary can reach it, and an auxiliary reaching it
     without the subject-existence guard plants a policy document on a path that
@@ -229,7 +227,7 @@ Only `aux` patches an auxiliary.
     check: ! rg -q 'patch_guarded' src --glob '!src/aux.rs' --glob '!src/resource.rs'
 
 The `Accept` header is parsed in exactly one place.
-    → 2026-07-29-non-rdf-resources-design.md §6.1. `negotiate` and
+    → `negotiate` and
     `accept_allows` ask different questions of the same header. The existing
     negotiation rule pins that two *named* functions do not return; this pins
     the property those names stood for. The q-value parse is what a second
@@ -240,7 +238,7 @@ The `Accept` header is parsed in exactly one place.
 ## Shape validation
 
 Only `shapes` reads the constraint binding.
-    → 2026-07-30-shape-validation-design.md §3.1, §3.2. The binding is what
+    → The binding is what
     decides whether a write is checked at all; a second reader is a second
     answer to "is this container constrained", and the one that says no wins
     silently. The lookup is also the seam a shape-tree binding would replace
@@ -269,7 +267,7 @@ Only `shapes` reads the constraint binding.
     check: ! rg -q 'ldp#constrainedBy' src --glob '!src/shapes.rs' --glob '!src/http.rs' --glob '!src/http/tests/shapes.rs' && [ "$(rg -o 'ldp#constrainedBy' src/http.rs src/http/tests/shapes.rs | wc -l)" = 7 ] && ! rg -q 'pub(\([^)]*\))? const LDP_CONSTRAINED_BY' src/shapes.rs
 
 The query string is read in exactly one place.
-    → §6. `?validate` is the only query parameter this pod gives meaning to,
+    → `?validate` is the only query parameter this pod gives meaning to,
     and the reason it is safe is that it changes no path and therefore no WAC
     target. A second reader elsewhere is behaviour hidden behind a parameter
     that no URL shows and no ACL names.
@@ -278,7 +276,7 @@ The query string is read in exactly one place.
 ## RDF version
 
 The RDF version of a dataset is classified in exactly one place.
-    → 2026-07-30-rdf12-design.md §3.1, §10. The write-side refusal and the
+    → The write-side refusal and the
     read-side projection ask the same question, and two classifiers is how
     they drift apart — silently, because both answer and one answers wrong.
     That already happened once: the refusal this replaced matched
@@ -290,7 +288,7 @@ The RDF version of a dataset is classified in exactly one place.
     check: [ "$(rg -o 'Term::Triple\(_\) => RdfVersion' src | wc -l)" = 1 ]
 
 The N3 Patch path refuses both RDF 1.2 additions, not just triple terms.
-    → 2026-07-30-rdf12-design.md §2; 2026-07-30-n3-patch-design.md. A patch is
+    → A patch is
     the only way into the store that does not go through `Format::parse`: a
     `text/n3` body builds no `Dataset`, so it cannot ask
     `Dataset::rdf_version`, and the refusal has to be repeated in `patch.rs`.
@@ -307,7 +305,7 @@ The N3 Patch path refuses both RDF 1.2 additions, not just triple terms.
     check: rg -q 'N3Term::Triple\(_\) => Err' src/patch.rs && rg -q 'l.direction\(\).is_some\(\) => Err' src/patch.rs
 
 The `version` media-type parameter is read in exactly one place.
-    → 2026-07-30-rdf12-design.md §4, §10. `Content-Type` on write and
+    → `Content-Type` on write and
     `Accept` on read ask the same question of the same syntax; a second
     reader is how `1.2` comes to mean one thing on the way in and another on
     the way out. Mirrors the single q-value parse rule above, and it is why
@@ -323,7 +321,7 @@ The `version` media-type parameter is read in exactly one place.
 ## Configuration
 
 The config file is never found, only named.
-    → 2026-07-31-cli-config-design.md §4. A pod must not be able to start
+    → A pod must not be able to start
     against a file that is invisible to whoever reads the command line, so
     `--config`/`POD_CONFIG` is the only route in and there is no search path.
     The rule is cheap to break by accident: adding a "just look in the working
@@ -365,7 +363,7 @@ The config file is never found, only named.
     check: ! rg -q 'XDG_CONFIG|dirs::|home_dir|\.toml"' src
 
 Precedence is clap's, never hand-written.
-    → 2026-07-31-cli-config-design.md §5, §5.1; `config.rs`'s module header,
+    → `config.rs`'s module header,
     which states the property this pins. File values reach clap as defaults,
     so flag > env > file > default falls out of clap's own resolution with no
     merge logic anywhere. The alternative — reading `ArgMatches::value_source`
@@ -381,7 +379,7 @@ Precedence is clap's, never hand-written.
 ## WAC
 
 The guard names the store exactly twice: the field it holds and the probe that fills it.
-    → 2026-07-31-request-scoped-guard-design.md §5, §9. The decision methods are
+    → The decision methods are
     synchronous and hold no store, so a second resolution of the same ACL — which
     would repeat the ancestor walk and could straddle a concurrent write — is not
     something a later edit has to remember not to write. Restoring a store parameter
@@ -457,7 +455,7 @@ Only `internal_error` builds a `500`.
 ## Notifications
 
 Every write handler emits exactly once.
-    → 2026-07-31-change-events-design.md §6.2. Emission at each success site
+    → Emission at each success site
     instead would be fifteen places to forget in `http.rs`, where a new write
     path compiles silently without an event and no test names the omission.
     Anchored on the router's method table rather than on a call count: the
@@ -477,7 +475,7 @@ Every write handler emits exactly once.
     check: awk '/\.route\(/ { s = $0; while (match(s, /(put|post|patch|delete)\([a-z_0-9]+\)/)) { h = substr(s, RSTART, RLENGTH); sub(/^[a-z]+\(/, "", h); sub(/\)$/, "", h); want[h] = 1; s = substr(s, RSTART + RLENGTH) } } /^[ \t]*(pub[a-z()]* )?(async )?fn [a-z_0-9]+/ { fn = $0; sub(/^.*fn /, "", fn); sub(/[^a-z_0-9].*/, "", fn) } match($0, /[a-z_0-9]+_impl\(/) { c = substr($0, RSTART, RLENGTH); sub(/\($/, "", c); if (index(" " callee[fn] " ", " " c " ") == 0) callee[fn] = callee[fn] " " c } /crate::notify::emit_/ { emits[fn]++ } END { for (h in want) { if (callee[h] == "") exit 1; k = split(callee[h], a, " "); for (j = 1; j <= k; j++) w[a[j]] = 1 } n = 0; for (i in w) { if (emits[i] != 1) exit 1; n += emits[i] } t = 0; for (f in emits) t += emits[f]; exit (t != n) }' src/http.rs
 
 Only `notify` fixes a format for `state`.
-    → 2026-07-31-change-events-design.md §5.1, §5.2. `state` is the N-Quads
+    → `state` is the N-Quads
     validator at the held version; a second site choosing a format is a second
     answer to "which of this resource's ETags is its state", and the two would
     drift silently because both would keep producing a plausible tag.
@@ -492,7 +490,7 @@ Only `notify` fixes a format for `state`.
     check: ! rg -q 'etag\(nquads\(\)' src --glob '!src/notify.rs'
 
 `Topic` is built only from a `Target`.
-    → 2026-07-31-change-events-design.md §2.1. The registry is where #18
+    → The registry is where #18
     authorizes subscriptions, so a key that did not pass
     `StorageSpace::resolve` is a subscription to a path the space never
     admitted. The private tuple field makes `From<&Target>` the only

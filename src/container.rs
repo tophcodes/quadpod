@@ -22,7 +22,7 @@ pub fn body_sets_containment(triples: &[Triple]) -> bool {
 /// the container's own IRI. What remains is exactly the graph a `PUT`/`POST`
 /// into this container was validated against — shape validation runs on the
 /// client's own body, before either is added
-/// (2026-07-30-shape-validation-design.md §3.4).
+/// (`docs/architecture.md`, Writing).
 ///
 /// The `rdf:type` pair is filtered only on `container_iri`: `ensure_container`
 /// never asserts it about any other subject, so a client-authored `<other> a

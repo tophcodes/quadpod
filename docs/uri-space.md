@@ -231,8 +231,7 @@ part of the contract.
 
 ## Design rationale
 
-See [`specs/2026-07-27-acl-auxiliary-model-design.md`](superpowers/specs/2026-07-27-acl-auxiliary-model-design.md)
-for why auxiliaries live under a reserved *prefix* rather than behind a filename suffix. In
-short: a reserved prefix is a total function over the path space, evaluated once by the
+Auxiliaries live under a reserved *prefix* rather than behind a filename suffix: a
+reserved prefix is a total function over the path space, evaluated once by the
 router, while a reserved suffix is a predicate that has to be re-evaluated everywhere a path
 is constructed — and every place it is forgotten is an authorization defect.
