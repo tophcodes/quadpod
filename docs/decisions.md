@@ -189,17 +189,16 @@ the idea of a second format.
 ## ADR-9 — The pod issues the credentials it verifies
 
 This pod is its own Solid-OIDC issuer (epic #57). It holds a signing key set, publishes it
-at `/.well-known/jwks.json`, names itself `iss` in an OIDC discovery document, and mints
-DPoP-bound access tokens carrying a `webid` claim. The root spec's "verify-only auth,
-external IdP" row is withdrawn: an external issuer is no longer required, and where the
-subject is one this pod owns, it is not wanted.
+at `/.well-known/jwks.json`, names itself `issuer` in an OIDC discovery document, and mints
+DPoP-bound access tokens carrying a `webid` claim. An external issuer is not required, and
+where the subject is one this pod owns, it is not wanted.
 
-What the pod still refuses is what made the original row attractive: **no third-party
-subjects** — it signs only for identities it is authoritative for — and **no registration
-for anyone but the owner**. Gaining a key does not make this a public IdP; every subject the
-epic will serve is the owner's, and that bound holds past this slice.
+What the pod refuses is the rest of the job: **no third-party subjects** — it signs only for
+identities it is authoritative for — and **no registration for anyone but the owner**.
+Gaining a key does not make this a public IdP; every subject the epic will serve is the
+owner's, and that bound holds past this slice.
 
-**Why the reversal.** `pod.toph.so` has to remain its own issuer across the JSS cutover
+**Why the pod signs at all.** `pod.toph.so` has to remain its own issuer across the JSS cutover
 (#48). An identity minted by an external IdP is an identity that leaves with it, and a pod
 whose owner's WebID authorizes a foreign issuer has handed that issuer the ability to
 impersonate the owner against every other pod that trusts him. The second half is
@@ -209,9 +208,8 @@ discovery document serve all three. Arranging each of them with an external issu
 three trust roots, three rotation stories, and three ways for a subject to become
 unverifiable.
 
-The withdrawn row's own reason — running an IdP is a whole subsystem — was never wrong. It
-is why the subsystem arrives in slices rather than at once, and why the discovery document
-advertises no endpoint before something answers it.
+Running an IdP is a whole subsystem, which is why it arrives in slices rather than at once,
+and why the discovery document advertises no endpoint before something answers it.
 
 **The part that is easy to get wrong.** Issuing does not fork the verification path. A
 token this pod minted is presented, resolved, and checked exactly like anyone else's: the

@@ -66,10 +66,10 @@ without damage:
 | `/box/` | `/.aux/box/.acl` |
 | `/a/b/c` | `/.aux/a/b/c.acl` |
 
-The auxiliary reservation is still the leading segment and nothing else: `/foo.acl` and `/notes/x.meta`
-are ordinary resources of yours, because they do not begin with `/.aux`. A path under `/.aux/`
-that ends in no kind's name — `/.aux/foo`, `/.aux/bogus/x`, `/.aux/` itself — names nothing
-and answers `404`.
+The auxiliary reservation is still the leading segment and nothing else: `/foo.acl` and
+`/notes/x.meta` are ordinary resources of yours, because they do not begin with `/.aux`. A
+path under `/.aux/` that ends in no kind's name — `/.aux/foo`, `/.aux/bogus/x`, `/.aux/`
+itself — names nothing and answers `404`.
 
 One shape under `/.aux/` answers `400`, not `404`: stripping a kind's suffix can leave a subject
 path that is itself malformed — `/.aux/..acl` strips to the subject `/.`, a dot-segment no
@@ -158,9 +158,9 @@ the signing key, and conformance does not depend on how the pod is fronted.
 
 The reservation is unconditional, but serving it takes an origin. In a path-based topology
 (`https://host/{user}/`) `/.well-known/` sits above the pod's base URI and is not part of
-its space at all — which is why the OP refuses to start there: `Config::op_keys` rejects a
-base URI with a path, because an issuer whose discovery document is not at its origin is not
-one a verifier can find.
+its space at all — which is why `--op-signing-keys` refuses the start on a base URI with a
+path: an issuer whose discovery document is not at its origin is not one a verifier can
+find.
 
 ## Do not construct auxiliary URLs — discover them
 

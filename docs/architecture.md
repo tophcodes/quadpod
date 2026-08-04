@@ -134,11 +134,11 @@ for local development.
 **With `--op-signing-keys` set the pod also issues** ([ADR-9](decisions.md#adr-9)). `op::keys`
 loads a private key set from that path, generating an ES256 key on first start and never
 rewriting the file; `/.well-known/jwks.json` publishes the public half, and
-`/.well-known/openid-configuration` names the pod as `iss`. `op::mint` produces access
+`/.well-known/openid-configuration` names the pod as `issuer`. `op::mint` produces access
 tokens carrying `webid`, `aud: ["solid"]`, a `cnf.jkt` that binds the token to the caller's
-DPoP key, and a ten-minute lifetime. Minting has no HTTP path — the callers are in-process
-(see [Limits](#limits)) — and a minted token is verified through the paragraphs above
-unchanged, fetches included. The pod accepts its own tokens only because `--trusted-issuer`
+DPoP key, and a ten-minute lifetime. Nothing reaches minting over HTTP (see
+[Limits](#limits)), and a minted token is verified through the paragraphs above unchanged,
+fetches included. The pod accepts its own tokens only because `--trusted-issuer`
 names it, like any other issuer.
 
 ## Authorization

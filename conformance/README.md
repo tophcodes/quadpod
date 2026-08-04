@@ -29,8 +29,8 @@ The triage lives in
 | — | `solidproject/conformance-test-harness`, in Docker | the runner |
 
 **The CSS is scaffolding for the test, not a component of this pod.** This pod
-is verify-only: it validates access tokens and never issues one, so a
-conformance run needs *some* Solid-OIDC IdP to mint the harness's credentials.
+exposes no token endpoint, so nothing here hands the harness a credential and a
+conformance run needs *some* Solid-OIDC IdP to mint one.
 The CSS is the cheapest one to stand up. Nothing in the pod depends on it,
 nothing in the pod talks to it outside a run, and a production deployment
 points `--trusted-issuer` at a real IdP instead. It runs in a container with no
