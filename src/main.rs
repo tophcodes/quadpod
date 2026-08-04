@@ -56,6 +56,13 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let op_keys = match cfg.op_keys() {
+        Ok(k) => k.map(Arc::new),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let state = AppState {
         store,
         events: Arc::new(sparql_pod::notify::Bus::new()),
@@ -72,7 +79,7 @@ async fn main() {
         auth_config: Arc::new(cfg.auth_config()),
         replay: Arc::new(InMemoryJtiReplayStore::new()),
         max_body_bytes: cfg.max_body_bytes,
-        op_keys: None,
+        op_keys,
     };
     sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
         .await.expect("provision root container");

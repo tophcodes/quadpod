@@ -13,7 +13,7 @@ use oxigraph::model::NamedNode;
 use thiserror::Error;
 
 use crate::auth::AuthConfig;
-use crate::space::{SpaceError, StorageSpace};
+use crate::space::{GraphName, SpaceError, StorageSpace};
 
 #[derive(Debug, Error, PartialEq)]
 #[error("owner WebID must be an absolute IRI")]
@@ -453,7 +453,23 @@ impl Config {
     /// document off the origin, so a base URI with a path refuses the start
     /// here.
     pub fn op_keys(&self) -> Result<Option<crate::op::KeySet>, String> {
-        todo!()
+        let Some(path) = &self.op_signing_keys else {
+            return Ok(None);
+        };
+        let root = self.base_uri.root().graph_iri().to_string();
+        let after_scheme = root
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(root.as_str());
+        if after_scheme.trim_end_matches('/').contains('/') {
+            return Err(format!(
+                "--op-signing-keys: the OP serves /.well-known/ off the origin, \
+                 which needs an origin-root base URI; got `{root}`"
+            ));
+        }
+        crate::op::KeySet::load_or_generate(path)
+            .map(Some)
+            .map_err(|e| format!("--op-signing-keys: {e}"))
     }
 
     /// The triple store this process will use, or the operator-facing reason it
@@ -995,6 +1011,43 @@ mod tests {
             "the file supplied a different, valid value: {err}"
         );
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn op_is_off_when_no_key_path_is_named() {
+        let c = parse(&["--owner-webid", "https://alice.example/card#me"]).unwrap();
+        assert!(c.op_keys().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_named_key_path_turns_the_op_on_and_generates_the_file() {
+        let p = std::env::temp_dir().join(format!("sparql-pod-opk-{}.json", uuid::Uuid::new_v4()));
+        let c = parse(&[
+            "--owner-webid", "https://alice.example/card#me",
+            "--op-signing-keys", p.to_str().unwrap(),
+        ]).unwrap();
+        assert!(c.op_keys().unwrap().is_some());
+        assert!(p.exists(), "the missing file was generated");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // The discovery document hangs off the origin (RFC 8615), so an OP under
+    // a path-based base URI would advertise an issuer whose discovery URL
+    // this pod can never serve.
+    #[test]
+    fn the_op_refuses_a_base_uri_with_a_path() {
+        let p = std::env::temp_dir().join(format!("sparql-pod-opk-{}.json", uuid::Uuid::new_v4()));
+        let c = parse(&[
+            "--base-uri", "https://host.example/alice/",
+            "--owner-webid", "https://alice.example/card#me",
+            "--op-signing-keys", p.to_str().unwrap(),
+        ]).unwrap();
+        // `.err().expect(…)` rather than `unwrap_err()`: the latter would
+        // need `Option<KeySet>: Debug`, i.e. a Debug rendering of private
+        // key material — see the same note in `op::keys`'s own tests.
+        let err = c.op_keys().err().expect("refuses");
+        assert!(err.contains("--op-signing-keys"), "{err}");
+        assert!(!p.exists(), "no key material for a refused configuration");
     }
 
     // The message an operator reads is the whole deliverable of this function.
