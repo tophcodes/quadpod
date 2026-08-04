@@ -138,6 +138,10 @@ host. It is the second reserved segment, and unlike `/.aux/` nothing inside it i
 | `/.well-known/openid-configuration` | the OIDC discovery document, `application/json` |
 | `/.well-known/jwks.json` | the public key set, `application/jwk-set+json` |
 
+Both are served to a request carrying **no credentials at all** — a verifier reads issuer
+metadata before it holds anything to present — while a request carrying *invalid* credentials
+is refused by authentication before any route answers.
+
 With the OP off, those two are `404` like every other name. The `405` on writes does not
 move with them: the segment is reserved unconditionally, so a pod that later turns the OP on
 does not have to take a name back from you.

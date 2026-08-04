@@ -30,6 +30,21 @@ control that closes it, and by default it refuses:
   the check and private for the connection;
 - bodies over 1 MiB, and anything slower than a 5 s connect / 10 s total timeout.
 
+### With the OP on, one of those destinations is the pod itself
+
+`--op-signing-keys` makes the pod its own issuer; it does not make it its own verifier
+shortcut. A token the pod minted names the pod's base URI as `iss`, and that issuer is
+resolved exactly like any other — discovery, then the `jwks_uri` it returns, through the same
+guarded fetch with the same defaults. So the pod has to be able to reach **its own public
+name over https, at a public address**.
+
+Three shapes where it cannot, all of them ordinary: a reverse proxy terminating TLS on the
+same host, so the name resolves to loopback; split-horizon DNS answering the internal address
+from inside the network; a tailnet address, which is CGNAT and therefore filtered. In each
+of them the fetch is refused, and every token the pod issued is then rejected as coming from
+an unknown issuer — the pod cannot verify its own tokens. The fix is to name the pod's own
+host to the flag below, with exactly the cost that section describes.
+
 ## `--allow-insecure-host`
 
     --allow-insecure-host <HOST>          repeatable
@@ -174,6 +189,16 @@ Back up the store directory and the blob directory together. They are one datase
 addressed by the resource path recorded in the triples, so a store restored without its blobs
 describes bytes that are not there.
 
+With the OP on, the file named by `--op-signing-keys` is a **third artifact to back up**. It
+holds private key material, is generated once and never rewritten, and is derivable from
+nothing else — not from the store, not from the blobs. Losing it invalidates every token the
+pod has issued: the pod generates a new key in its place, that key signs from then on, and
+the old signatures verify against nothing, so every live session has to authenticate again.
+Nothing needs repairing beyond that — the published JWKS changes with the key, and verifiers
+pick the new one up on their next fetch (this pod's own resolver caches a key set for five
+minutes). Treat it like a TLS private key, not like data: separate backup, tighter access,
+and never in the same restore path as the store.
+
 ## The config file
 
     --config <path>
@@ -194,6 +219,9 @@ listen       = "127.0.0.1:3000"
 trusted_issuers       = ["https://idp.toph.so/"]
 expected_audience     = "https://pod.toph.so/"
 allow_insecure_hosts  = []
+op_signing_keys       = "/var/lib/sparql-pod/op-keys.json"  # naming it turns the OP on;
+                                                            # omit the key entirely to stay
+                                                            # a verify-only pod
 reset_root_acl        = false  # a recovery lever, not a setting: leaving this `true` in
                                 # a file resets the root ACL on *every* start, silently
                                 # discarding any grant made to it over HTTP since. Turn
@@ -210,5 +238,6 @@ single array entry containing a comma is split in two and cannot be expressed. T
 trimming and filtering the environment form needs still runs on a file-supplied value as well.
 
 An error caused by a value the file supplied names the file and the key. An error about
-`--rdf-store`, `--blob-store` or `--allow-insecure-host` names the flag even when the value
-came from the file — those three are checked after the parse rather than inside it.
+`--rdf-store`, `--blob-store`, `--allow-insecure-host` or `--op-signing-keys` names the flag
+even when the value came from the file — those four are checked after the parse rather than
+inside it.
