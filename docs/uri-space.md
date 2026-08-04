@@ -3,21 +3,23 @@
 This is the contract between this pod and its clients about **which URLs mean what**. It is
 normative for the server and for anyone writing data into it.
 
-## Your space, and one segment that is not
+## Your space, and the two segments that are not
 
-Almost every path this pod serves is yours. Exactly one first-level segment is not:
+Almost every path this pod serves is yours. Exactly two first-level segments are not:
 
 | Path | Meaning |
 |---|---|
 | `/.aux/…` | auxiliary resources — your data, with a meaning the server has to understand |
+| `/.well-known/…` | origin infrastructure (RFC 8615) — the server's, not yours, and never writable |
 | everything else | ordinary resources and containers |
 
 That is the whole reservation. `/.hidden`, `/.config`, `/notes/.env` and any other
 dot-prefixed name are ordinary resources with no special treatment — the reservation costs
-you the single name `.aux` at the root, and nothing else, ever.
+you the two names `.aux` and `.well-known` at the root, and nothing else, ever.
 
-**One segment, not one per feature.** Every auxiliary kind lives inside `/.aux/`, so
-adding a kind later takes nothing away from you at that point.
+**One segment per reservation, not one per feature.** Every auxiliary kind lives inside
+`/.aux/`, and every well-known name inside `/.well-known/`, so adding either later takes
+nothing away from you at that point.
 
 ## `/box` and `/box/` are two names, and only one of them may exist
 
@@ -64,7 +66,7 @@ without damage:
 | `/box/` | `/.aux/box/.acl` |
 | `/a/b/c` | `/.aux/a/b/c.acl` |
 
-The reservation is still the leading segment and nothing else: `/foo.acl` and `/notes/x.meta`
+The auxiliary reservation is still the leading segment and nothing else: `/foo.acl` and `/notes/x.meta`
 are ordinary resources of yours, because they do not begin with `/.aux`. A path under `/.aux/`
 that ends in no kind's name — `/.aux/foo`, `/.aux/bogus/x`, `/.aux/` itself — names nothing
 and answers `404`.
@@ -118,18 +120,47 @@ has to be re-created after. The env variable accepts any boolish value: `1`, `0`
 `false`, `yes`, `no`, `on`, `off` (case-insensitive). This only exists for the root; an emptied
 ACL anywhere else has no equivalent flag and is a real dead end for that subtree.
 
-## `/.well-known/` belongs to the origin, not to the pod
+## `/.well-known/` is reserved and server-owned
 
-`/.well-known/` is defined by RFC 8615 as a place the *host* provides. `.well-known` is not
-the reserved segment (only `.aux` is, see above), so this pod does not reserve it or treat it
-specially: `PUT /.well-known/x` is an ordinary authorized write, like any other path. Serving
-`/.well-known/` is expected to be the deployment's job instead — in this architecture the
-reverse proxy that terminates TLS, which can answer it without the pod ever seeing the
-request.
+`/.well-known/` is defined by RFC 8615 as a place the *host* provides, and this pod is the
+host. It is the second reserved segment, and unlike `/.aux/` nothing inside it is yours:
 
-This only arises when the pod's base URI is the origin root. In a path-based topology
+- **Every write answers `405`.** `PUT`, `POST`, `DELETE` and `PATCH` anywhere under
+  `/.well-known/` — and on the bare `/.well-known` and `/.well-known/` themselves — are
+  refused by the router: no handler runs, no WAC decision is taken, and a valid credential
+  does not change the answer, the owner's included. It holds whether or not the pod is
+  running as an identity provider.
+- **`GET` serves the names the pod implements, and `404`s the rest.** Two names are
+  implemented, and only while the OP is on (`--op-signing-keys`):
+
+| Path | Answer |
+|---|---|
+| `/.well-known/openid-configuration` | the OIDC discovery document, `application/json` |
+| `/.well-known/jwks.json` | the public key set, `application/jwk-set+json` |
+
+With the OP off, those two are `404` like every other name. The `405` on writes does not
+move with them: the segment is reserved unconditionally, so a pod that later turns the OP on
+does not have to take a name back from you.
+
+**Why the whole segment rather than the two paths.** Once this origin is an identity
+provider, a writable name under `/.well-known/` is a spoofing surface. RFC 8414 lets a verifier
+look for issuer metadata at `/.well-known/oauth-authorization-server` — a name this pod does
+not serve, and therefore exactly the kind of gap someone could fill. The writer need not be
+the owner: any share granting `acl:Write` deep enough would do, which makes issuer metadata
+the one thing in this URL space that must not be delegable at all. Reserving names as they
+are implemented would turn each future name into a migration with a window in which the old
+content still answers; reserving the segment closes the class once, and `/.well-known/solid`
+(#16) lands in already-reserved space when it arrives.
+
+**The pod answers these itself.** A reverse proxy in front of it passes `/.well-known/`
+through rather than serving it, so a verifier reads the metadata of the process that holds
+the signing key, and conformance does not depend on how the pod is fronted.
+
+The reservation is unconditional, but serving it takes an origin. In a path-based topology
 (`https://host/{user}/`) `/.well-known/` sits above the pod's base URI and is not part of
-its space at all.
+its space at all — which is why the OP refuses to start there: `Config::op_keys` rejects a
+base URI with a path, because an issuer whose discovery document is not at its origin is not
+one a verifier can find.
 
 ## Do not construct auxiliary URLs — discover them
 

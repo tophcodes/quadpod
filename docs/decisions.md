@@ -185,3 +185,40 @@ the caller was not talking about.
 **What would reopen it.** A client that matters and cannot emit N3 Patch. Adding it later
 remains possible and would be its own design — the objection is to the blast radius, not to
 the idea of a second format.
+
+## ADR-9 — The pod issues the credentials it verifies
+
+This pod is its own Solid-OIDC issuer (epic #57). It holds a signing key set, publishes it
+at `/.well-known/jwks.json`, names itself `iss` in an OIDC discovery document, and mints
+DPoP-bound access tokens carrying a `webid` claim. The root spec's "verify-only auth,
+external IdP" row is withdrawn: an external issuer is no longer required, and where the
+subject is one this pod owns, it is not wanted.
+
+What the pod still refuses is what made the original row attractive: **no third-party
+subjects** — it signs only for identities it is authoritative for — and **no registration
+for anyone but the owner**. Gaining a key does not make this a public IdP; every subject the
+epic will serve is the owner's, and that bound holds past this slice.
+
+**Why the reversal.** `pod.toph.so` has to remain its own issuer across the JSS cutover
+(#48). An identity minted by an external IdP is an identity that leaves with it, and a pod
+whose owner's WebID authorizes a foreign issuer has handed that issuer the ability to
+impersonate the owner against every other pod that trusts him. The second half is
+arithmetic: every subject this epic must serve — service identity (#23), owner machines
+(#49), humans (#60) — needs a signature over a `webid` claim, and one key, one JWKS and one
+discovery document serve all three. Arranging each of them with an external issuer means
+three trust roots, three rotation stories, and three ways for a subject to become
+unverifiable.
+
+The withdrawn row's own reason — running an IdP is a whole subsystem — was never wrong. It
+is why the subsystem arrives in slices rather than at once, and why the discovery document
+advertises no endpoint before something answers it.
+
+**The part that is easy to get wrong.** Issuing does not fork the verification path. A
+token this pod minted is presented, resolved, and checked exactly like anyone else's: the
+issuer is fetched over `safe_fetch`, the keys come from the published JWKS, and the WebID
+profile still has to authorize the issuer. A shortcut for "our own token" would be a second
+verifier, and the one that gets less traffic is the one that rots.
+
+**What would reopen it.** An issuer the pod could delegate to while `pod.toph.so` remains
+the `iss` of its own tokens — which is not what OIDC delegation does. Short of that, the
+question is only how much of the subsystem is worth carrying, not whether the pod signs.

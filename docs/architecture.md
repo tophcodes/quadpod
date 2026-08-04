@@ -19,7 +19,8 @@ triple; there is no mirror and no sync process. Bytes that are not RDF live besi
 blob backend, described by triples in a server-owned graph.
 
 The pod speaks LDP over HTTP, enforces Web Access Control, and verifies Solid-OIDC
-credentials. It is not an identity provider today — see [Limits](#limits).
+credentials. With `--op-signing-keys` set it also signs its own — the core of an identity
+provider, not yet one a browser app can log in to; see [Limits](#limits).
 
 ## Storage model
 
@@ -109,12 +110,12 @@ LDP layer maintains cannot be bypassed.
 
 ## Authentication
 
-Credentials are verified, never issued. A caller presents a DPoP-bound Solid-OIDC access
-token; the pod checks the proof, resolves the token's issuer, fetches that issuer's keys,
-fetches the WebID profile named by the `webid` claim, and confirms the profile authorizes
-that issuer. The `DPoP` scheme is required — a `Bearer` credential is refused, because a
-Solid-OIDC access token is DPoP-bound by construction and a token presented without its
-proof is a token that has left its holder.
+Every credential takes the same path in, this pod's own included. A caller presents a
+DPoP-bound Solid-OIDC access token; the pod checks the proof, resolves the token's issuer,
+fetches that issuer's keys, fetches the WebID profile named by the `webid` claim, and
+confirms the profile authorizes that issuer. The `DPoP` scheme is required — a `Bearer`
+credential is refused, because a Solid-OIDC access token is DPoP-bound by construction and a
+token presented without its proof is a token that has left its holder.
 
 Proofs signed ES256 or RS256 are both accepted, with the thumbprint computed to match
 (see [ADR-3](decisions.md#adr-3)).
@@ -129,6 +130,16 @@ control: HTTPS only, no private or link-local addresses, no redirects, bounded b
 timeouts, with the address filter inside the resolver so a name cannot answer public for
 the check and private for the connection. `--allow-insecure-host` opens a named exception
 for local development.
+
+**With `--op-signing-keys` set the pod also issues** ([ADR-9](decisions.md#adr-9)). `op::keys`
+loads a private key set from that path, generating an ES256 key on first start and never
+rewriting the file; `/.well-known/jwks.json` publishes the public half, and
+`/.well-known/openid-configuration` names the pod as `iss`. `op::mint` produces access
+tokens carrying `webid`, `aud: ["solid"]`, a `cnf.jkt` that binds the token to the caller's
+DPoP key, and a ten-minute lifetime. Minting has no HTTP path — the callers are in-process
+(see [Limits](#limits)) — and a minted token is verified through the paragraphs above
+unchanged, fetches included. The pod accepts its own tokens only because `--trusted-issuer`
+names it, like any other issuer.
 
 ## Authorization
 
@@ -202,13 +213,16 @@ containment, `htu` — derives from the configured base URI.
 | `--blob-store` | `POD_BLOB_STORE` | `memory` or `local:<dir>` |
 | `--listen` | `POD_LISTEN` | socket, loopback by default |
 | `--max-body-bytes` | `POD_MAX_BODY_BYTES` | request body ceiling |
+| `--op-signing-keys` | `POD_OP_SIGNING_KEYS` | private JWKS the OP signs with; unset means no OP |
 | `--allow-insecure-host` | `POD_ALLOW_INSECURE_HOSTS` | SSRF-policy exception, development only |
 | `--config` | `POD_CONFIG` | file holding the same keys |
 
 Both stores default to `memory`, so an unconfigured pod is uniformly ephemeral rather than
 half-persistent. A `rocksdb:` directory may be opened by exactly one process
 ([ADR-7](decisions.md#adr-7)), which makes deployment a stop-then-start and rules out a
-second replica over the same directory.
+second replica over the same directory. `--op-signing-keys` requires a base URI at the
+origin root and refuses the start otherwise, because the discovery document it implies hangs
+off `/.well-known/`.
 
 `deployment.md` carries the operator-facing detail on outbound fetches and the SSRF policy.
 
@@ -222,9 +236,10 @@ and append-only because a measurement without its date is not a measurement.
 
 Present-tense statements of what this pod does not do, not a list of things once deferred:
 
-- **No identity provider.** Credentials are verified against an external Solid-OIDC
-  issuer. Nothing here issues a token, so there is no credential a client can obtain from
-  this pod.
+- **No endpoint issues a token.** The OP core exists — key set, JWKS, discovery document,
+  and minting — but nothing hands a credential to a caller: no authorization endpoint, no
+  token endpoint, no client registration, no human login (#58, #59, #60). A browser app
+  cannot log in against this pod.
 - **No SPARQL endpoint.** There is no query interface and no `application/sparql-update`
   write path. The store is reached only through LDP.
 - **No notification delivery.** The change-event bus exists; no channel type is served.
