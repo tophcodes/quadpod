@@ -69,6 +69,7 @@ async fn app() -> axum::Router {
         auth_config: Arc::new(AuthConfig::default()),
         replay: Arc::new(sparql_pod::auth::InMemoryJtiReplayStore::new()),
         max_body_bytes: 64 * 1024 * 1024,
+        op_keys: None,
     })
 }
 

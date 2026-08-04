@@ -32,6 +32,10 @@ pub struct AppState {
     /// here: two pods in one process each reject their own replays.
     pub replay: Arc<dyn JtiReplayStore>,
     pub max_body_bytes: usize,
+    /// The OP's signing keys, when the OP is on. `None` = verify-only pod:
+    /// the `/.well-known/` routes still answer (405 writes, 404 names), but
+    /// no name is implemented.
+    pub op_keys: Option<Arc<crate::op::KeySet>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -45,6 +49,15 @@ pub fn router(state: AppState) -> Router {
     // ran for.
     Router::new()
         .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).patch(handle_patch_root).options(handle_options_root))
+        // `/.well-known/` is origin infrastructure (RFC 8615), the second
+        // reserved segment next to `.aux`: only GET is routed, so every
+        // write answers 405 whether or not the OP is on — a WAC-authorized
+        // writer must not be able to plant a discovery document at the
+        // issuer origin (RFC 8414). Three spellings, because the wildcard
+        // requires a non-empty capture and matches neither bare form.
+        .route("/.well-known", get(handle_well_known))
+        .route("/.well-known/", get(handle_well_known))
+        .route("/.well-known/{*rest}", get(handle_well_known))
         .route("/{*path}", get(handle_get).put(handle_put).post(handle_post).delete(handle_delete).patch(handle_patch).options(handle_options))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))
@@ -73,6 +86,18 @@ pub fn router(state: AppState) -> Router {
                 ),
         )
         .with_state(state)
+}
+
+/// The reserved `/.well-known/` space. Implemented names, OP on:
+/// `openid-configuration` (`application/json`) and `jwks.json`
+/// (`application/jwk-set+json`, public members only). Everything else,
+/// the bare forms included, is 404.
+async fn handle_well_known(
+    State(state): State<AppState>,
+    rest: Option<Path<String>>,
+) -> Response {
+    let _ = (state, rest);
+    todo!()
 }
 
 /// The response headers a browser may read off a cross-origin response.

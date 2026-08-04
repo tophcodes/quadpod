@@ -141,6 +141,7 @@ async fn app() -> (axum::Router, Arc<ContainmentFailingStore>) {
         auth_config: Arc::new(AuthConfig::default()),
         replay: Arc::new(InMemoryJtiReplayStore::new()),
         max_body_bytes: 64 * 1024 * 1024,
+        op_keys: None,
     });
     (app, failing)
 }

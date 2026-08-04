@@ -107,6 +107,14 @@ pub struct Config {
     #[arg(long, env = "POD_BLOB_STORE", default_value = "memory")]
     pub blob_store: String,
 
+    /// Private JWKS file holding the OP's signing keys. Setting this turns
+    /// the OP on: the pod serves `/.well-known/openid-configuration` and
+    /// `/.well-known/jwks.json` and can mint tokens. Unset = the OP is off
+    /// and the pod stays the verify-only server it is without it. A missing
+    /// file is generated; an existing one is never rewritten.
+    #[arg(long, env = "POD_OP_SIGNING_KEYS")]
+    pub op_signing_keys: Option<std::path::PathBuf>,
+
     /// Largest request body accepted, in bytes, for every write path. axum
     /// applies a 2 MiB default of its own when nothing is set; naming it here
     /// makes a `413` a statement about this pod rather than a framework
@@ -155,6 +163,7 @@ struct FileConfig {
     reset_root_acl: Option<bool>,
     rdf_store: Option<String>,
     blob_store: Option<String>,
+    op_signing_keys: Option<String>,
     max_body_bytes: Option<u64>,
 }
 
@@ -199,6 +208,7 @@ impl FileConfig {
             ("listen", &self.listen),
             ("rdf_store", &self.rdf_store),
             ("blob_store", &self.blob_store),
+            ("op_signing_keys", &self.op_signing_keys),
         ] {
             if let Some(v) = value {
                 out.insert(key, vec![v.clone()]);
@@ -435,6 +445,15 @@ impl Config {
         Err(format!(
             "--blob-store: expected `memory` or `local:<dir>`, got `{spec}`"
         ))
+    }
+
+    /// The OP's key set, or the operator-facing reason it cannot be had:
+    /// `None` when `--op-signing-keys` is unset (the OP is off), the loaded
+    /// or freshly generated set when it is. The OP hangs its discovery
+    /// document off the origin, so a base URI with a path refuses the start
+    /// here.
+    pub fn op_keys(&self) -> Result<Option<crate::op::KeySet>, String> {
+        todo!()
     }
 
     /// The triple store this process will use, or the operator-facing reason it

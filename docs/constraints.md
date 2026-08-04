@@ -500,3 +500,19 @@ Only `notify` fixes a format for `state`.
     sentence: it catches a topic minted anywhere but `notify.rs`, not a second
     `From` impl added beside the first one there.
     check: ! rg -q 'Topic\(' src --glob '!src/notify.rs'
+
+Only `op::keys` touches the key file.
+    → The signing key set is the one secret this process persists, and
+    `KeySet::load_or_generate` is its single doorway: the 0600 mode, the
+    RFC 7638 `kid` fallback and the never-rewrite rule all live behind it,
+    and a second reader would re-decide them silently. Narrower than its
+    sentence: it catches filesystem access anywhere else in `src/op/`, not a
+    reader outside the module that is handed the path.
+    check: ! rg -q 'std::fs' src/op --glob '!src/op/keys.rs'
+
+`op` names no HTTP type and calls nothing in `http`.
+    → Same boundary as `wac`: `op` issues and serializes, `http` routes and
+    answers. The `/.well-known/` handlers call in; nothing calls out. This is
+    what keeps #58's endpoints from growing response construction inside the
+    signing module.
+    check: ! rg -q 'axum|http::' src/op

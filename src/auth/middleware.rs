@@ -194,6 +194,7 @@ mod tests {
             auth_config: Arc::new(crate::auth::AuthConfig::default()),
             replay: Arc::new(crate::auth::InMemoryJtiReplayStore::new()),
             max_body_bytes: 64 * 1024 * 1024,
+            op_keys: None,
         };
         Router::new().route("/{*path}", get(whoami))
             .layer(axum::middleware::from_fn_with_state(state.clone(), auth_layer))

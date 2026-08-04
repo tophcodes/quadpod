@@ -81,6 +81,7 @@ pub(super) async fn fixture_with_store_and_blobs(
         auth_config: Arc::new(crate::auth::AuthConfig::default()),
         replay: replay.clone(),
         max_body_bytes,
+        op_keys: None,
     };
     Fixture {
         app: router(state), events, store, blobs, space, replay, max_body_bytes, idp, client,
@@ -194,6 +195,7 @@ impl Fixture {
             // spendable again through the other.
             replay: self.replay.clone(),
             max_body_bytes: self.max_body_bytes,
+            op_keys: None,
         })
     }
 }
