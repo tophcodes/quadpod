@@ -1,8 +1,10 @@
 //! Verify-only Solid-OIDC + DPoP authentication.
 //!
 //! This module verifies credentials presented by callers (a DPoP-bound
-//! Solid-OIDC access token) against an external IdP's published keys and
-//! attaches an [`Agent`] to the request. It never issues tokens itself.
+//! Solid-OIDC access token) against the published keys of the issuer the
+//! token names — which may be this pod itself, when it runs as its own OP
+//! (`crate::op`) — and attaches an [`Agent`] to the request. It never issues
+//! tokens itself.
 
 pub mod access_token;
 pub mod agent;

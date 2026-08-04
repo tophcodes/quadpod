@@ -1,8 +1,19 @@
 //! Every route, every verb but OPTIONS, no credentials: the answer must
-//! always be a refusal. This is the structural safeguard for the per-handler
-//! guard design — a handler added later without an `authorize` call fails
-//! here rather than silently exposing the store. The `?validate` view is
-//! swept too, since it is a second handler reached through the same routes.
+//! always be a refusal, with one exemption. This is the structural safeguard
+//! for the per-handler guard design — a handler added later without an
+//! `authorize` call fails here rather than silently exposing the store. The
+//! `?validate` view is swept too, since it is a second handler reached
+//! through the same routes.
+//!
+//! The exemption is the reserved `/.well-known/` space, and it is the only
+//! one. Those documents are public by design — a verifier reads issuer
+//! metadata before it holds any credential to present — so a credential-less
+//! `GET` is answered rather than refused. The exemption is bounded to reads:
+//! the router carries no write method for that space at all, so nothing
+//! there can be planted, and no store is reached on the read either. Their
+//! coverage is `src/http/tests/well_known.rs`, which holds them to that
+//! shape with the OP on and off; no path of theirs appears in the sweeps
+//! below.
 
 use std::sync::Arc;
 
