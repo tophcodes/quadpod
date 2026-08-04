@@ -175,15 +175,20 @@ impl KeySet {
         serde_json::json!({ "keys": keys })
     }
 
-    /// The distinct signature algorithms of the set, for the discovery
-    /// document's `id_token_signing_alg_values_supported`.
+    /// The distinct signature algorithms of the set, in publication order,
+    /// for the discovery document's
+    /// `id_token_signing_alg_values_supported`.
+    ///
+    /// A key carrying no `alg` still signs — an EC P-256 key signs `ES256`
+    /// — so its algorithm is inferred from the key itself rather than
+    /// omitted: a set of one such key would otherwise advertise no
+    /// algorithm at all while the pod signs every token with it.
     pub fn signing_algs(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for k in &self.keys {
-            if let Some(alg) = k.algorithm() {
-                if !out.iter().any(|a| a == alg) {
-                    out.push(alg.to_string());
-                }
+            let Some(alg) = alg_of(k) else { continue };
+            if !out.iter().any(|a| a == alg) {
+                out.push(alg.to_string());
             }
         }
         out
@@ -211,6 +216,19 @@ impl KeySet {
 /// [`KeySet::sign_jwt`] cannot disagree about which signer a key gets: the
 /// probe is only worth anything if it builds exactly what signing later
 /// builds.
+/// The algorithm a key is published under: its declared `alg`, or the one
+/// its own members imply — `ES256` for an EC P-256 key, `RS256` for RSA.
+/// `None` where neither rule applies (an EC curve other than P-256), since
+/// there is then no algorithm to advertise the key under.
+fn alg_of(jwk: &josekit::jwk::Jwk) -> Option<&str> {
+    match (jwk.algorithm(), jwk.key_type(), jwk.curve()) {
+        (Some(alg), _, _) => Some(alg),
+        (None, "EC", Some("P-256")) => Some("ES256"),
+        (None, "RSA", _) => Some("RS256"),
+        _ => None,
+    }
+}
+
 fn signer_for(jwk: &josekit::jwk::Jwk) -> Result<Box<dyn josekit::jws::JwsSigner>, JoseError> {
     Ok(match jwk.algorithm() {
         Some("RS256") => Box::new(josekit::jws::RS256.signer_from_jwk(jwk)?),
@@ -372,6 +390,47 @@ mod tests {
         let set = KeySet::load_or_generate(&p).unwrap();
         assert_eq!(set.signing_algs(), vec!["ES256".to_string()]);
         std::fs::remove_file(&p).ok();
+    }
+
+    /// An EC P-256 key with no `alg` loads and signs `ES256`, so that is
+    /// what the set — and the discovery document built from it — must
+    /// advertise. Collecting only explicit `alg` members would publish an
+    /// empty list for a pod that signs every token.
+    #[test]
+    fn a_key_with_no_alg_is_advertised_under_the_one_it_signs_with() {
+        let jwk = josekit::jwk::Jwk::generate_ec_key(josekit::jwk::alg::ec::EcCurve::P256).unwrap();
+        assert!(jwk.algorithm().is_none(), "the key under test declares no alg");
+        let p = temp_path();
+        std::fs::write(&p, serde_json::json!({ "keys": [jwk] }).to_string()).unwrap();
+        let set = KeySet::load_or_generate(&p).expect("loads and can sign");
+        assert_eq!(set.signing_algs(), vec!["ES256".to_string()]);
+        let space = crate::space::StorageSpace::new("https://pod.toph.so/").unwrap();
+        assert_eq!(
+            crate::op::discovery::document(&space, &set)["id_token_signing_alg_values_supported"],
+            serde_json::json!(["ES256"]),
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// RFC 7638 §3.1's worked example, byte for byte. The construction is
+    /// only worth anything if it is the one every other implementation
+    /// performs: a `kid` assigned here has to be the string a client
+    /// computing this key's thumbprint arrives at.
+    #[test]
+    fn thumbprint_matches_the_rfc_7638_test_vector() {
+        let key = serde_json::json!({
+            "kty": "RSA",
+            "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7a\
+                  PFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXAr\
+                  wl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d\
+                  0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd\
+                  2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+            "e": "AQAB",
+            "alg": "RS256",
+            "kid": "2011-04-29",
+        });
+        let jwk = josekit::jwk::Jwk::from_map(key.as_object().unwrap().clone()).unwrap();
+        assert_eq!(thumbprint(&jwk), "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs");
     }
 
     /// An RSA key with no `alg` falls to the `ES256` arm of `signer_for`,
