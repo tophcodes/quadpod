@@ -116,6 +116,15 @@ impl KeySet {
                     reason: format!("unsupported key type {}", jwk.key_type()),
                 });
             }
+            // A key can claim `EC`/`RSA` and still be missing the public
+            // members (`crv`/`x`/`y`, `e`/`n`) those types require: deriving
+            // the public half is the same check `public_jwks` needs later,
+            // so doing it now turns a would-be runtime panic there into a
+            // refusal at start.
+            jwk.to_public_key().map_err(|e| KeyError::Malformed {
+                path: path.into(),
+                reason: e.to_string(),
+            })?;
             if jwk.key_id().is_none() {
                 let t = thumbprint(&jwk);
                 jwk.set_key_id(t);
@@ -131,19 +140,17 @@ impl KeySet {
 
     /// The public half of every key, as an RFC 7517 key set ready to serve:
     /// private members (`d`, RSA CRT parameters) are stripped before
-    /// serialization.
+    /// serialization. `kid` and `alg` are deliberately restored after that
+    /// stripping, since josekit's public-key derivation drops them too but
+    /// consumers of the published set need both to pick the right key.
     pub fn public_jwks(&self) -> serde_json::Value {
         let keys: Vec<serde_json::Value> = self
             .keys
             .iter()
             .map(|k| {
-                let mut public = k
-                    .to_public_key()
-                    .expect("every loaded key has a public half");
-                // `to_public_key` drops `kid`/`alg` along with the private
-                // members, but consumers of the published set (and the
-                // discovery document's alg list) need both to pick the
-                // right key.
+                let mut public = k.to_public_key().expect(
+                    "load_or_generate refuses any key to_public_key cannot derive from",
+                );
                 if let Some(kid) = k.key_id() {
                     public.set_key_id(kid);
                 }
@@ -319,6 +326,15 @@ mod tests {
         let p = temp_path();
         let set = KeySet::load_or_generate(&p).unwrap();
         assert_eq!(set.signing_algs(), vec!["ES256".to_string()]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_key_missing_its_public_members_refuses_at_load() {
+        let p = temp_path();
+        std::fs::write(&p, r#"{"keys":[{"kty":"EC","kid":"x","alg":"ES256"}]}"#).unwrap();
+        let err = KeySet::load_or_generate(&p).err().expect("refuses");
+        assert!(matches!(err, KeyError::Malformed { .. }), "{err}");
         std::fs::remove_file(&p).ok();
     }
 }
