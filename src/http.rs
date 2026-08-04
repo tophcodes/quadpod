@@ -1546,8 +1546,11 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     let slug = headers.get("slug").and_then(|v| v.to_str().ok());
     // A settled child name contains no `/`, so the child of a container is
     // always an ordinary resource — unless the server would have to allocate
-    // it inside the reserved namespace (`Slug: .aux` at the root), which
-    // `classify` refuses. A `Slug` can therefore never name an auxiliary.
+    // it inside a reserved segment (`Slug: .aux` or `Slug: .well-known` at
+    // the root), which `classify` refuses for both. A `Slug` can therefore
+    // neither name an auxiliary nor plant a document in the origin's own
+    // `/.well-known/` space, where the routes above would shadow it on GET
+    // and no write method could ever remove it.
     //
     // A `Link: rel="type"` naming a container asks for one, and under Solid
     // §3.1 the trailing slash is the *only* thing that tells the two apart —

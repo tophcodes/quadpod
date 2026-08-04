@@ -126,6 +126,32 @@ async fn post_with_slug_creates_named_child() {
     assert_eq!(got.status(), StatusCode::OK);
 }
 
+// A `Slug` names a child of the container POSTed to, so at the root it can
+// aim straight at a reserved segment. `classify` refuses both names, so the
+// POST answers `404` and allocates nothing — including with the `Link:
+// rel="type"` container form, which is the shape `/.well-known/` itself
+// would take. Without the space-level reservation the `.well-known` row
+// would be a `201` for a resource the `/.well-known/` routes shadow on GET
+// and no method can delete.
+#[tokio::test]
+async fn a_slug_cannot_allocate_a_reserved_segment_at_the_root() {
+    let f = fixture().await;
+    for slug in [".aux", ".well-known"] {
+        for type_link in [None, Some("<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"")] {
+            let mut post = f.owner_request("POST", "/")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .header("slug", slug);
+            if let Some(link) = type_link {
+                post = post.header(header::LINK, link);
+            }
+            let req = post.body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+            let res = f.app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "Slug: {slug}, link: {type_link:?}");
+            assert!(res.headers().get(header::LOCATION).is_none(), "Slug: {slug} allocated a URL");
+        }
+    }
+}
+
 #[tokio::test]
 async fn post_slug_collision_gets_distinct_url() {
     let f = fixture().await;

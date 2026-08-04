@@ -18,7 +18,7 @@ pub enum SpaceError {
     InvalidBaseIri,
     #[error("resource path does not form a valid IRI")]
     InvalidResourceIri,
-    #[error("path is in the reserved namespace but names no auxiliary resource")]
+    #[error("path is in a reserved namespace and names nothing addressable there")]
     Reserved,
     #[error("request path must start with '/'")]
     NotRooted,
@@ -26,9 +26,16 @@ pub enum SpaceError {
     NotNormalized,
 }
 
-/// The reserved first segment. Everything under it is server-understood;
-/// everything else is the user's.
+/// The reserved first segments. Everything under one of them is
+/// server-understood; everything else is the user's.
+///
+/// `.aux` holds auxiliary resources, which [`StorageSpace::resolve`] decodes
+/// into an [`AuxUrl`]. `.well-known` is origin infrastructure (RFC 8615),
+/// answered by routes of its own in `crate::http`: nothing under it is
+/// storage, so no path there resolves to anything at all.
 const AUX_SEGMENT: &str = ".aux";
+const WELL_KNOWN_SEGMENT: &str = ".well-known";
+const RESERVED_SEGMENTS: &[&str] = &[AUX_SEGMENT, WELL_KNOWN_SEGMENT];
 
 mod sealed {
     pub trait Sealed {}
@@ -309,7 +316,7 @@ impl StorageSpace {
     }
 
     /// Classify a raw request path. This is the only way a URL enters the
-    /// system, and the only place the reserved namespace is recognized.
+    /// system, and the only place the reserved namespaces are recognized.
     ///
     /// The IRI is validated here, once, because it is later interpolated
     /// verbatim into SPARQL as `<{iri}>`.
@@ -332,7 +339,17 @@ impl StorageSpace {
         if !Self::is_normalization_stable(request_path) {
             return Err(SpaceError::NotNormalized);
         }
-        if let Some(rest) = self.reserved_remainder(request_path) {
+        // `/.well-known/` is the origin's own space (RFC 8615), answered by
+        // routes of its own in `crate::http`, and it names no storage at any
+        // depth — the bare forms included. Refusing it here, not only in the
+        // router, is what stops a write from allocating inside it: a
+        // resource placed there — by `Slug: .well-known` at the root, say —
+        // would be shadowed by those routes on GET and undeletable, since
+        // they route no write method at all.
+        if Self::segment_remainder(request_path, WELL_KNOWN_SEGMENT).is_some() {
+            return Err(SpaceError::Reserved);
+        }
+        if let Some(rest) = Self::segment_remainder(request_path, AUX_SEGMENT) {
             // `rest` is everything after `/.aux`: "" for `/.aux` itself,
             // otherwise a path starting with `/`. Stripping the kind's suffix
             // inverts `ResourceUrl::aux` exactly — `/.aux/box/.acl` yields
@@ -348,8 +365,10 @@ impl StorageSpace {
             // ACL graph of `/foo`, and authorization would derive from it. The
             // check is on the *decoded subject*, so it refuses every nesting
             // depth: each strip peels one suffix, and the subject that remains
-            // still begins with the reserved segment.
-            if self.reserved_remainder(subject_path).is_some() {
+            // still begins with the reserved segment. It is every reserved
+            // segment, not just `.aux`: a subject the resource space itself
+            // refuses may not be reached through an auxiliary either.
+            if Self::reserved_segment(subject_path).is_some() {
                 return Err(SpaceError::Reserved);
             }
             // The subject is derived by removing a suffix, so — unlike the old
@@ -412,12 +431,21 @@ impl StorageSpace {
         init_ok && last_ok
     }
 
-    /// What follows `/.aux` when the path's *whole* first segment is the
-    /// reserved one. `/.auxiliary` is an ordinary resource: the reservation
-    /// costs exactly the name `.aux`, never a prefix of a longer name.
-    fn reserved_remainder<'p>(&self, request_path: &'p str) -> Option<&'p str> {
-        let rest = request_path.strip_prefix('/')?.strip_prefix(AUX_SEGMENT)?;
+    /// What follows `/{segment}` when the path's *whole* first segment is
+    /// `segment`. `/.auxiliary` and `/.well-known-x` are ordinary resources:
+    /// a reservation costs exactly its own name, never a prefix of a longer
+    /// name.
+    fn segment_remainder<'p>(request_path: &'p str, segment: &str) -> Option<&'p str> {
+        let rest = request_path.strip_prefix('/')?.strip_prefix(segment)?;
         (rest.is_empty() || rest.starts_with('/')).then_some(rest)
+    }
+
+    /// Which of [`RESERVED_SEGMENTS`] the path's first segment is, if any.
+    fn reserved_segment(request_path: &str) -> Option<&'static str> {
+        RESERVED_SEGMENTS
+            .iter()
+            .copied()
+            .find(|segment| Self::segment_remainder(request_path, segment).is_some())
     }
 
     fn resource(&self, request_path: &str) -> Result<ResourceUrl, SpaceError> {
@@ -466,10 +494,10 @@ mod tests {
         assert!(matches!(s.resolve("/.aux/.acl").unwrap(), Target::Aux(_)));
     }
 
-    // A dot is only special as the whole first segment `.aux`. Everything
-    // else a user might name stays ordinary.
+    // A dot is only special as the whole first segment `.aux` or
+    // `.well-known`. Everything else a user might name stays ordinary.
     #[test]
-    fn only_the_aux_segment_is_reserved() {
+    fn only_the_two_reserved_segments_are_special() {
         let s = sp();
         assert!(matches!(s.resolve("/.hidden").unwrap(), Target::Resource(_)));
         assert!(matches!(s.resolve("/.config/x").unwrap(), Target::Resource(_)));
@@ -478,6 +506,43 @@ mod tests {
         // The reserved name is the whole segment, never a prefix of a longer one.
         assert!(matches!(s.resolve("/.auxiliary").unwrap(), Target::Resource(_)));
         assert!(matches!(s.resolve("/.auxiliary/x").unwrap(), Target::Resource(_)));
+    }
+
+    // `/.well-known/` is the origin's, at every depth and in both bare
+    // forms: it names no storage, so nothing there resolves and nothing can
+    // be allocated there.
+    #[test]
+    fn the_well_known_segment_is_reserved_at_every_depth() {
+        let s = sp();
+        for path in [
+            "/.well-known",
+            "/.well-known/",
+            "/.well-known/openid-configuration",
+            "/.well-known/jwks.json",
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/a/b/c",
+        ] {
+            assert_eq!(s.resolve(path), Err(SpaceError::Reserved), "{path} must be reserved");
+        }
+        // ...and it is no subject either: an auxiliary may not reach a path
+        // the resource space itself refuses.
+        assert_eq!(s.resolve("/.well-known/x.acl"), Err(SpaceError::Reserved));
+        assert_eq!(s.resolve("/.aux/.well-known.acl"), Err(SpaceError::Reserved));
+        assert_eq!(s.resolve("/.aux/.well-known/x.acl"), Err(SpaceError::Reserved));
+    }
+
+    // The reservation costs exactly the name `.well-known` at the root — the
+    // same bound `/.auxiliary` pins for `.aux`.
+    #[test]
+    fn a_well_known_near_miss_is_an_ordinary_resource() {
+        let s = sp();
+        assert!(matches!(s.resolve("/.well-known-x").unwrap(), Target::Resource(_)));
+        assert!(matches!(s.resolve("/.well-knownish/x").unwrap(), Target::Resource(_)));
+        assert!(matches!(s.resolve("/x/.well-known/y").unwrap(), Target::Resource(_)));
+        assert!(matches!(s.resolve("/x/.well-known/").unwrap(), Target::Container(_)));
+        // ...and such a resource has an ACL like any other.
+        assert!(matches!(s.resolve("/.aux/.well-known-x.acl").unwrap(), Target::Aux(_)));
+        assert!(matches!(s.resolve("/.aux/x/.well-known/y.acl").unwrap(), Target::Aux(_)));
     }
 
     // The IRI comes from the configured base; the request host is ignored.
