@@ -3,9 +3,13 @@
 //! set signs; every key is published. This file is the only place that
 //! reads or writes the key file.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use josekit::jwt::JwtPayload;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Why a key file could not become a usable key set. Any variant refuses
@@ -41,9 +45,76 @@ impl KeySet {
     /// its directory. An existing file, read-only included, is never
     /// rewritten.
     pub fn load_or_generate(path: &Path) -> Result<Self, KeyError> {
-        let _ = path;
-        let _ = &Self { keys: Vec::new() }.keys;
-        todo!()
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut jwk =
+                    josekit::jwk::Jwk::generate_ec_key(josekit::jwk::alg::ec::EcCurve::P256)
+                        .map_err(|e| KeyError::Malformed {
+                            path: path.into(),
+                            reason: e.to_string(),
+                        })?;
+                jwk.set_algorithm("ES256");
+                jwk.set_key_id(thumbprint(&jwk));
+                let body = serde_json::json!({ "keys": [&jwk] }).to_string();
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(|e| KeyError::Io {
+                        path: path.into(),
+                        source: e,
+                    })?;
+                f.write_all(body.as_bytes()).map_err(|e| KeyError::Io {
+                    path: path.into(),
+                    source: e,
+                })?;
+                return Ok(Self { keys: vec![jwk] });
+            }
+            Err(e) => {
+                return Err(KeyError::Io {
+                    path: path.into(),
+                    source: e,
+                })
+            }
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| KeyError::Malformed {
+                path: path.into(),
+                reason: e.to_string(),
+            })?;
+        let raw = parsed
+            .get("keys")
+            .and_then(|k| k.as_array())
+            .ok_or_else(|| KeyError::Malformed {
+                path: path.into(),
+                reason: "no `keys` array".into(),
+            })?;
+        let mut keys = Vec::new();
+        for v in raw {
+            let map = v.as_object().ok_or_else(|| KeyError::Malformed {
+                path: path.into(),
+                reason: "key is not an object".into(),
+            })?;
+            let mut jwk =
+                josekit::jwk::Jwk::from_map(map.clone()).map_err(|e| KeyError::Malformed {
+                    path: path.into(),
+                    reason: e.to_string(),
+                })?;
+            if jwk.key_id().is_none() {
+                let t = thumbprint(&jwk);
+                jwk.set_key_id(t);
+            }
+            keys.push(jwk);
+        }
+        let set = Self { keys };
+        if set.keys.is_empty() {
+            return Err(KeyError::Empty { path: path.into() });
+        }
+        Ok(set)
     }
 
     /// The public half of every key, as an RFC 7517 key set ready to serve:
@@ -64,5 +135,118 @@ impl KeySet {
     pub(crate) fn sign_jwt(&self, payload: &JwtPayload) -> String {
         let _ = payload;
         todo!()
+    }
+}
+
+/// The RFC 7638 thumbprint of `jwk`, base64url-encoded without padding — the
+/// `kid` a key in the file gets when it carries none.
+///
+/// RFC 7638 §3.2 fixes the required members per key type: `crv`, `kty`, `x`,
+/// `y` for EC, `e`, `kty`, `n` for RSA. Those members and only those, as a
+/// JSON object with no whitespace and keys in lexicographic order, SHA-256'd
+/// — a `BTreeMap` through `serde_json` emits exactly that, the same
+/// construction the verifying side (`crate::auth::dpop`, `dpop-verifier`)
+/// uses, so a `kid` derived here is the same string a client computing this
+/// key's thumbprint arrives at.
+///
+/// A key of any other type is hashed over its `kty` alone: RFC 7638 defines
+/// no member set for it, [`KeySet::sign_jwt`] cannot sign with it, and the
+/// digest only has to be a stable identifier for publication.
+fn thumbprint(jwk: &josekit::jwk::Jwk) -> String {
+    let members: &[&str] = match jwk.key_type() {
+        "EC" => &["crv", "kty", "x", "y"],
+        "RSA" => &["e", "kty", "n"],
+        _ => &["kty"],
+    };
+    let canonical: BTreeMap<&str, &str> = members
+        .iter()
+        .filter_map(|name| {
+            jwk.parameter(name)
+                .and_then(|v| v.as_str())
+                .map(|v| (*name, v))
+        })
+        .collect();
+    let canonical_json = serde_json::to_string(&canonical)
+        .expect("a BTreeMap<&str, &str> always serializes as JSON");
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical_json.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("op-keys-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_missing_file_is_generated_with_0600_and_one_es256_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = temp_path();
+        let set = KeySet::load_or_generate(&p).expect("generates");
+        assert_eq!(set.keys.len(), 1);
+        assert_eq!(set.keys[0].curve(), Some("P-256"));
+        assert!(
+            set.keys[0].key_id().is_some(),
+            "generated key carries a kid"
+        );
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "private key file is 0600");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn the_kid_is_stable_across_two_loads() {
+        let p = temp_path();
+        let a = KeySet::load_or_generate(&p).unwrap();
+        let b = KeySet::load_or_generate(&p).unwrap();
+        assert_eq!(a.keys[0].key_id(), b.keys[0].key_id());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn an_existing_file_is_never_rewritten_and_a_kidless_key_gets_its_thumbprint() {
+        use std::os::unix::fs::PermissionsExt;
+        // A file whose key has no kid: the loaded set has one (the RFC 7638
+        // thumbprint), the bytes on disk stay exactly as written.
+        let mut jwk =
+            josekit::jwk::Jwk::generate_ec_key(josekit::jwk::alg::ec::EcCurve::P256).unwrap();
+        jwk.set_algorithm("ES256");
+        let body = serde_json::json!({ "keys": [jwk] }).to_string();
+        let p = temp_path();
+        std::fs::write(&p, &body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let set = KeySet::load_or_generate(&p).expect("loads read-only");
+        assert!(
+            set.keys[0].key_id().is_some(),
+            "thumbprint assigned in memory"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body, "file untouched");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_malformed_file_refuses_with_its_path_in_the_error() {
+        let p = temp_path();
+        std::fs::write(&p, "not json").unwrap();
+        // `.err().expect(…)` rather than `unwrap_err()`: the latter would
+        // need `KeySet: Debug`, i.e. a Debug rendering of private key
+        // material.
+        let err = KeySet::load_or_generate(&p).err().expect("refuses");
+        assert!(matches!(err, KeyError::Malformed { .. }), "{err}");
+        assert!(err.to_string().contains(p.to_str().unwrap()));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn an_empty_key_set_refuses() {
+        let p = temp_path();
+        std::fs::write(&p, r#"{"keys":[]}"#).unwrap();
+        assert!(matches!(
+            KeySet::load_or_generate(&p).err().expect("refuses"),
+            KeyError::Empty { .. }
+        ));
+        std::fs::remove_file(&p).ok();
     }
 }
