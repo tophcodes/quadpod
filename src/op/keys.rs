@@ -209,13 +209,6 @@ impl KeySet {
     }
 }
 
-/// The signer for `jwk`: `RS256` for a key declaring it, `ES256` otherwise —
-/// the only two algorithms this pod signs with.
-///
-/// One function so the probe in [`KeySet::load_or_generate`] and
-/// [`KeySet::sign_jwt`] cannot disagree about which signer a key gets: the
-/// probe is only worth anything if it builds exactly what signing later
-/// builds.
 /// The algorithm a key is published under: its declared `alg`, or the one
 /// its own members imply — `ES256` for an EC P-256 key, `RS256` for RSA.
 /// `None` where neither rule applies (an EC curve other than P-256), since
@@ -229,6 +222,13 @@ fn alg_of(jwk: &josekit::jwk::Jwk) -> Option<&str> {
     }
 }
 
+/// The signer for `jwk`: `RS256` for a key declaring it, `ES256` otherwise —
+/// the only two algorithms this pod signs with.
+///
+/// One function so the probe in [`KeySet::load_or_generate`] and
+/// [`KeySet::sign_jwt`] cannot disagree about which signer a key gets: the
+/// probe is only worth anything if it builds exactly what signing later
+/// builds.
 fn signer_for(jwk: &josekit::jwk::Jwk) -> Result<Box<dyn josekit::jws::JwsSigner>, JoseError> {
     Ok(match jwk.algorithm() {
         Some("RS256") => Box::new(josekit::jws::RS256.signer_from_jwk(jwk)?),
