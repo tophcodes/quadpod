@@ -133,13 +133,41 @@ impl KeySet {
     /// private members (`d`, RSA CRT parameters) are stripped before
     /// serialization.
     pub fn public_jwks(&self) -> serde_json::Value {
-        todo!()
+        let keys: Vec<serde_json::Value> = self
+            .keys
+            .iter()
+            .map(|k| {
+                let mut public = k
+                    .to_public_key()
+                    .expect("every loaded key has a public half");
+                // `to_public_key` drops `kid`/`alg` along with the private
+                // members, but consumers of the published set (and the
+                // discovery document's alg list) need both to pick the
+                // right key.
+                if let Some(kid) = k.key_id() {
+                    public.set_key_id(kid);
+                }
+                if let Some(alg) = k.algorithm() {
+                    public.set_algorithm(alg);
+                }
+                serde_json::to_value(&public).expect("a Jwk serializes")
+            })
+            .collect();
+        serde_json::json!({ "keys": keys })
     }
 
     /// The distinct signature algorithms of the set, for the discovery
     /// document's `id_token_signing_alg_values_supported`.
     pub fn signing_algs(&self) -> Vec<String> {
-        todo!()
+        let mut out: Vec<String> = Vec::new();
+        for k in &self.keys {
+            if let Some(alg) = k.algorithm() {
+                if !out.iter().any(|a| a == alg) {
+                    out.push(alg.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// `payload` as a compact JWS signed by the active (first) key, the
@@ -268,6 +296,29 @@ mod tests {
             KeySet::load_or_generate(&p).err().expect("refuses"),
             KeyError::Empty { .. }
         ));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn public_jwks_strips_private_members_and_keeps_kid() {
+        let p = temp_path();
+        let set = KeySet::load_or_generate(&p).unwrap();
+        let jwks = set.public_jwks();
+        let keys = jwks["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        let k = keys[0].as_object().unwrap();
+        assert!(k.contains_key("kid") && k.contains_key("kty") && k.contains_key("x"));
+        for private in ["d", "p", "q", "dp", "dq", "qi"] {
+            assert!(!k.contains_key(private), "leaked `{private}`");
+        }
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn signing_algs_reports_the_set() {
+        let p = temp_path();
+        let set = KeySet::load_or_generate(&p).unwrap();
+        assert_eq!(set.signing_algs(), vec!["ES256".to_string()]);
         std::fs::remove_file(&p).ok();
     }
 }
