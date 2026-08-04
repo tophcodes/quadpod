@@ -21,3 +21,4 @@ mod rdf12;
 mod shapes;
 mod slash_pairs;
 mod wac;
+mod well_known;

@@ -88,6 +88,45 @@ pub(super) async fn fixture_with_store_and_blobs(
     }
 }
 
+/// Like [`fixture`], but the pod is its own OP: `op_keys` is set, the
+/// resolver maps the pod's own issuer to the key set's public JWKS, and
+/// OWNER's WebID authorizes the pod as issuer — so a token minted by
+/// `op::mint_access_token` authenticates a request end to end.
+///
+/// The returned path is the key file the loader wrote; the caller removes it.
+pub(super) async fn fixture_with_op() -> (Fixture, Arc<crate::op::KeySet>, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("op-fixture-{}.json", uuid::Uuid::new_v4()));
+    let op = Arc::new(crate::op::KeySet::load_or_generate(&path).unwrap());
+    let mut f = fixture().await;
+
+    let parsed: Vec<josekit::jwk::Jwk> = op.public_jwks()["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| josekit::jwk::Jwk::from_map(v.as_object().unwrap().clone()).unwrap())
+        .collect();
+    let issuer = "https://pod.toph.so/";
+    let mut issuers = StaticWebIdIssuers::new();
+    issuers.allow(OWNER, issuer);
+
+    f.app = router(AppState {
+        store: f.store.clone(),
+        events: f.events.clone(),
+        blobs: f.blobs.clone(),
+        space: f.space.clone(),
+        resolver: Arc::new(StaticJwksResolver::new(
+            issuer,
+            crate::auth::Jwks { keys: parsed },
+        )),
+        webid_verifier: Arc::new(issuers),
+        auth_config: Arc::new(crate::auth::AuthConfig::default()),
+        replay: f.replay.clone(),
+        max_body_bytes: f.max_body_bytes,
+        op_keys: Some(op.clone()),
+    });
+    (f, op, path)
+}
+
 pub(super) fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }

@@ -92,12 +92,30 @@ pub fn router(state: AppState) -> Router {
 /// `openid-configuration` (`application/json`) and `jwks.json`
 /// (`application/jwk-set+json`, public members only). Everything else,
 /// the bare forms included, is 404.
+///
+/// No WAC guard and no store read: both documents are public by design, so
+/// there is no target to authorize and nothing here can fail.
 async fn handle_well_known(
     State(state): State<AppState>,
     rest: Option<Path<String>>,
 ) -> Response {
-    let _ = (state, rest);
-    todo!()
+    let Some(keys) = &state.op_keys else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Unwrapped one layer first: `Option<Path<String>>::as_deref` stops at
+    // `&String`, which no `&str` pattern below would match.
+    let name = rest.map(|Path(name)| name);
+    match name.as_deref() {
+        Some("openid-configuration") => {
+            axum::Json(crate::op::discovery::document(&state.space, keys)).into_response()
+        }
+        Some("jwks.json") => (
+            [(header::CONTENT_TYPE, "application/jwk-set+json")],
+            keys.public_jwks().to_string(),
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// The response headers a browser may read off a cross-origin response.
