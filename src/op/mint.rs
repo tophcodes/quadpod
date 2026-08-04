@@ -29,7 +29,12 @@ pub fn mint_access_token(
     let mut payload = JwtPayload::new();
     payload.set_issuer(&issuer);
     payload.set_subject(webid.as_str());
-    payload.set_audience(vec!["solid"]);
+    // `set_claim` rather than `set_audience`: the latter collapses a
+    // one-element list to a bare JSON string, and the contract above is the
+    // array `["solid"]`.
+    payload
+        .set_claim("aud", Some(json!(["solid"])))
+        .expect("set aud claim");
     payload
         .set_claim("webid", Some(json!(webid.as_str())))
         .expect("set webid claim");
@@ -54,7 +59,7 @@ pub fn mint_access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{verify_access_token, Jwks, StaticJwksResolver};
+    use crate::auth::{verify_access_token, AuthError, Jwks, StaticJwksResolver};
     use crate::op::keys::remove_test_key_file;
 
     /// A fresh key-file path per test. Cleaned up through
@@ -94,6 +99,21 @@ mod tests {
         assert_eq!(claims.jkt, "some-jkt-thumbprint");
         assert_eq!(claims.issuer, "https://pod.toph.so/");
         assert_eq!(claims.audience, vec!["solid".to_string()]);
+
+        // On the wire `aud` must be the array, not the bare string josekit's
+        // `set_audience` writes for a single value: the verifier's
+        // `parse_audience` accepts both, so the shape can only be pinned on
+        // the token itself.
+        use base64::Engine as _;
+        let payload_segment = token.split('.').nth(1).expect("compact JWS has a payload");
+        let raw: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload_segment)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["aud"], serde_json::json!(["solid"]));
+
         remove_test_key_file(&p);
     }
 
@@ -109,10 +129,11 @@ mod tests {
 
         let resolver = resolver_for(&keys);
         assert!(
-            verify_access_token(&token, &resolver, now + ACCESS_TOKEN_TTL_SECS + 1)
-                .await
-                .is_err(),
-            "past exp must refuse"
+            matches!(
+                verify_access_token(&token, &resolver, now + ACCESS_TOKEN_TTL_SECS + 1).await,
+                Err(AuthError::Expired)
+            ),
+            "past exp must refuse as expired"
         );
         remove_test_key_file(&p);
     }

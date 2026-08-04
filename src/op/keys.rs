@@ -9,6 +9,7 @@ use std::path::Path;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use josekit::jwt::JwtPayload;
+use josekit::JoseError;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -135,6 +136,17 @@ impl KeySet {
         if set.keys.is_empty() {
             return Err(KeyError::Empty { path: path.into() });
         }
+        // The first key is the one `sign_jwt` signs with, so its signer is
+        // built here: a key `josekit` cannot sign with (RSA without `alg`, an
+        // EC curve other than P-256, `use` restricted away from signing)
+        // would otherwise reach `sign_jwt` and panic on the first mint, long
+        // after start. Only the first key is held to this — the rest need
+        // only be publishable, which `to_public_key` above already decided,
+        // so a rotation state carrying a verify-only predecessor stays legal.
+        signer_for(&set.keys[0]).map_err(|e| KeyError::Malformed {
+            path: path.into(),
+            reason: e.to_string(),
+        })?;
         Ok(set)
     }
 
@@ -186,20 +198,24 @@ impl KeySet {
         header.set_key_id(key.key_id().expect("every loaded key carries a kid"));
         // `alg` is written by josekit from the signer, so the header's
         // algorithm cannot disagree with the signature.
-        let signer: Box<dyn josekit::jws::JwsSigner> = match key.algorithm() {
-            Some("RS256") => Box::new(
-                josekit::jws::RS256
-                    .signer_from_jwk(key)
-                    .expect("build RS256 signer"),
-            ),
-            _ => Box::new(
-                josekit::jws::ES256
-                    .signer_from_jwk(key)
-                    .expect("build ES256 signer"),
-            ),
-        };
+        let signer =
+            signer_for(key).expect("load_or_generate refuses any key it cannot build a signer for");
         josekit::jwt::encode_with_signer(payload, &header, &*signer).expect("sign JWT")
     }
+}
+
+/// The signer for `jwk`: `RS256` for a key declaring it, `ES256` otherwise —
+/// the only two algorithms this pod signs with.
+///
+/// One function so the probe in [`KeySet::load_or_generate`] and
+/// [`KeySet::sign_jwt`] cannot disagree about which signer a key gets: the
+/// probe is only worth anything if it builds exactly what signing later
+/// builds.
+fn signer_for(jwk: &josekit::jwk::Jwk) -> Result<Box<dyn josekit::jws::JwsSigner>, JoseError> {
+    Ok(match jwk.algorithm() {
+        Some("RS256") => Box::new(josekit::jws::RS256.signer_from_jwk(jwk)?),
+        _ => Box::new(josekit::jws::ES256.signer_from_jwk(jwk)?),
+    })
 }
 
 /// Delete a key file a test had [`KeySet::load_or_generate`] create.
@@ -355,6 +371,24 @@ mod tests {
         let p = temp_path();
         let set = KeySet::load_or_generate(&p).unwrap();
         assert_eq!(set.signing_algs(), vec!["ES256".to_string()]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// An RSA key with no `alg` falls to the `ES256` arm of `signer_for`,
+    /// which cannot sign with it. Publishable (`to_public_key` succeeds) but
+    /// not signable: without the load-time probe this file would load and
+    /// panic on the first mint instead.
+    #[test]
+    fn a_first_key_no_signer_can_be_built_for_refuses_at_load() {
+        let jwk = josekit::jwk::Jwk::generate_rsa_key(2048).unwrap();
+        assert!(
+            jwk.algorithm().is_none(),
+            "the key under test declares no alg"
+        );
+        let p = temp_path();
+        std::fs::write(&p, serde_json::json!({ "keys": [jwk] }).to_string()).unwrap();
+        let err = KeySet::load_or_generate(&p).err().expect("refuses");
+        assert!(matches!(err, KeyError::Malformed { .. }), "{err}");
         std::fs::remove_file(&p).ok();
     }
 
