@@ -202,6 +202,18 @@ impl KeySet {
     }
 }
 
+/// Delete a key file a test had [`KeySet::load_or_generate`] create.
+///
+/// Sibling test modules in `op` need this because only this file may touch
+/// the filesystem inside `src/op/` (`docs/constraints.md`: "Only `op::keys`
+/// touches the key file"), so they cannot remove what they made the loader
+/// write. `#[cfg(test)]`-gated: a release build has no file-removing path in
+/// this module at all.
+#[cfg(test)]
+pub(crate) fn remove_test_key_file(path: &std::path::Path) {
+    std::fs::remove_file(path).ok();
+}
+
 /// The RFC 7638 thumbprint of `jwk`, base64url-encoded without padding — the
 /// `kid` a key in the file gets when it carries none.
 ///

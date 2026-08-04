@@ -55,12 +55,11 @@ pub fn mint_access_token(
 mod tests {
     use super::*;
     use crate::auth::{verify_access_token, Jwks, StaticJwksResolver};
+    use crate::op::keys::remove_test_key_file;
 
-    /// A fresh key-file path per test. The file is deliberately left behind:
-    /// only `op::keys` may touch the filesystem inside `src/op/` (see
-    /// `docs/constraints.md`), so these tests cannot remove what
-    /// `load_or_generate` writes. The name is unique per run, and the file is
-    /// a few hundred bytes in the system temp directory.
+    /// A fresh key-file path per test. Cleaned up through
+    /// [`crate::op::keys::remove_test_key_file`], the only file removal
+    /// available here: `src/op/` may touch the filesystem in `keys.rs` alone.
     fn temp_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("op-mint-{}.json", uuid::Uuid::new_v4()))
     }
@@ -95,6 +94,7 @@ mod tests {
         assert_eq!(claims.jkt, "some-jkt-thumbprint");
         assert_eq!(claims.issuer, "https://pod.toph.so/");
         assert_eq!(claims.audience, vec!["solid".to_string()]);
+        remove_test_key_file(&p);
     }
 
     #[tokio::test]
@@ -114,5 +114,6 @@ mod tests {
                 .is_err(),
             "past exp must refuse"
         );
+        remove_test_key_file(&p);
     }
 }
