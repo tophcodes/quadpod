@@ -180,8 +180,25 @@ impl KeySet {
     /// `payload` as a compact JWS signed by the active (first) key, the
     /// header carrying `typ`, the key's `alg` and its `kid`.
     pub(crate) fn sign_jwt(&self, payload: &JwtPayload) -> String {
-        let _ = payload;
-        todo!()
+        let key = &self.keys[0];
+        let mut header = josekit::jws::JwsHeader::new();
+        header.set_token_type("JWT");
+        header.set_key_id(key.key_id().expect("every loaded key carries a kid"));
+        // `alg` is written by josekit from the signer, so the header's
+        // algorithm cannot disagree with the signature.
+        let signer: Box<dyn josekit::jws::JwsSigner> = match key.algorithm() {
+            Some("RS256") => Box::new(
+                josekit::jws::RS256
+                    .signer_from_jwk(key)
+                    .expect("build RS256 signer"),
+            ),
+            _ => Box::new(
+                josekit::jws::ES256
+                    .signer_from_jwk(key)
+                    .expect("build ES256 signer"),
+            ),
+        };
+        josekit::jwt::encode_with_signer(payload, &header, &*signer).expect("sign JWT")
     }
 }
 

@@ -2,9 +2,11 @@
 //! `crate::auth::access_token` verifies; there is no HTTP path to this —
 //! callers are the pod's own machinery (#23, #49, #58).
 
+use josekit::jwt::JwtPayload;
 use oxigraph::model::NamedNode;
+use serde_json::json;
 
-use crate::space::StorageSpace;
+use crate::space::{GraphName, StorageSpace};
 
 use super::KeySet;
 
@@ -23,7 +25,94 @@ pub fn mint_access_token(
     jkt: &str,
     now_unix: i64,
 ) -> String {
-    let _ = (KeySet::sign_jwt, space, webid, jkt, now_unix);
-    let _ = keys;
-    todo!()
+    let issuer = space.root().graph_iri().to_string();
+    let mut payload = JwtPayload::new();
+    payload.set_issuer(&issuer);
+    payload.set_subject(webid.as_str());
+    payload.set_audience(vec!["solid"]);
+    payload
+        .set_claim("webid", Some(json!(webid.as_str())))
+        .expect("set webid claim");
+    payload
+        .set_claim("cnf", Some(json!({ "jkt": jkt })))
+        .expect("set cnf claim");
+    payload
+        .set_claim("jti", Some(json!(uuid::Uuid::new_v4().to_string())))
+        .expect("set jti claim");
+    // `iat`/`exp` as raw numeric claims, not josekit's `SystemTime`-taking
+    // setters: the verifier reads `exp` as `as_i64`, and a `SystemTime`
+    // round-trip cannot represent the caller's `now_unix` exactly.
+    payload
+        .set_claim("iat", Some(json!(now_unix)))
+        .expect("set iat claim");
+    payload
+        .set_claim("exp", Some(json!(now_unix + ACCESS_TOKEN_TTL_SECS)))
+        .expect("set exp claim");
+    keys.sign_jwt(&payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{verify_access_token, Jwks, StaticJwksResolver};
+
+    /// A fresh key-file path per test. The file is deliberately left behind:
+    /// only `op::keys` may touch the filesystem inside `src/op/` (see
+    /// `docs/constraints.md`), so these tests cannot remove what
+    /// `load_or_generate` writes. The name is unique per run, and the file is
+    /// a few hundred bytes in the system temp directory.
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("op-mint-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    /// The published public half, in the shape a `JwksResolver` hands back.
+    fn resolver_for(keys: &KeySet) -> StaticJwksResolver {
+        let jwks_value = keys.public_jwks();
+        let parsed: Vec<josekit::jwk::Jwk> = jwks_value["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| josekit::jwk::Jwk::from_map(v.as_object().unwrap().clone()).unwrap())
+            .collect();
+        StaticJwksResolver::new("https://pod.toph.so/", Jwks { keys: parsed })
+    }
+
+    #[tokio::test]
+    async fn a_minted_token_passes_the_pods_own_verifier() {
+        let p = temp_path();
+        let keys = KeySet::load_or_generate(&p).unwrap();
+        let space = crate::space::StorageSpace::new("https://pod.toph.so/").unwrap();
+        let webid = NamedNode::new("https://pod.toph.so/profile#it").unwrap();
+        let now = 1_700_000_000_i64;
+
+        let token = mint_access_token(&keys, &space, &webid, "some-jkt-thumbprint", now);
+
+        let resolver = resolver_for(&keys);
+        let claims = verify_access_token(&token, &resolver, now + 10)
+            .await
+            .expect("verifies");
+        assert_eq!(claims.webid, webid.as_str());
+        assert_eq!(claims.jkt, "some-jkt-thumbprint");
+        assert_eq!(claims.issuer, "https://pod.toph.so/");
+        assert_eq!(claims.audience, vec!["solid".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_minted_token_expires_after_the_ttl() {
+        let p = temp_path();
+        let keys = KeySet::load_or_generate(&p).unwrap();
+        let space = crate::space::StorageSpace::new("https://pod.toph.so/").unwrap();
+        let webid = NamedNode::new("https://pod.toph.so/profile#it").unwrap();
+        let now = 1_700_000_000_i64;
+
+        let token = mint_access_token(&keys, &space, &webid, "jkt", now);
+
+        let resolver = resolver_for(&keys);
+        assert!(
+            verify_access_token(&token, &resolver, now + ACCESS_TOKEN_TTL_SECS + 1)
+                .await
+                .is_err(),
+            "past exp must refuse"
+        );
+    }
 }
