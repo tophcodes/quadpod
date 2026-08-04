@@ -34,7 +34,9 @@ pub enum KeyError {
 /// The pod's signing keys, in publication order: the first key signs, all
 /// keys are served in the public JWKS. Every key has a `kid` — one missing
 /// in the file gets its RFC 7638 thumbprint at load time, so the `kid` is
-/// stable across restarts and deterministic for the same key.
+/// stable across restarts and deterministic for the same key. Every key is
+/// `EC` or `RSA`: a key of any other type is refused at load time rather than
+/// published with no algorithm the pod could sign it with.
 pub struct KeySet {
     keys: Vec<josekit::jwk::Jwk>,
 }
@@ -104,6 +106,16 @@ impl KeySet {
                     path: path.into(),
                     reason: e.to_string(),
                 })?;
+            // Only key types this pod can sign with and thumbprint per RFC
+            // 7638 are admitted, so the rest of the crate may assume it: an
+            // `oct` or `OKP` key would otherwise reach `sign_jwt` and the
+            // published JWKS with no algorithm behind it.
+            if !matches!(jwk.key_type(), "EC" | "RSA") {
+                return Err(KeyError::Malformed {
+                    path: path.into(),
+                    reason: format!("unsupported key type {}", jwk.key_type()),
+                });
+            }
             if jwk.key_id().is_none() {
                 let t = thumbprint(&jwk);
                 jwk.set_key_id(t);
@@ -149,14 +161,13 @@ impl KeySet {
 /// uses, so a `kid` derived here is the same string a client computing this
 /// key's thumbprint arrives at.
 ///
-/// A key of any other type is hashed over its `kty` alone: RFC 7638 defines
-/// no member set for it, [`KeySet::sign_jwt`] cannot sign with it, and the
-/// digest only has to be a stable identifier for publication.
+/// Only `EC` and `RSA` keys reach this function: a generated key is `EC`, and
+/// a loaded one has had its type checked before it gets here.
 fn thumbprint(jwk: &josekit::jwk::Jwk) -> String {
     let members: &[&str] = match jwk.key_type() {
         "EC" => &["crv", "kty", "x", "y"],
         "RSA" => &["e", "kty", "n"],
-        _ => &["kty"],
+        other => unreachable!("no thumbprint rule for key type {other}"),
     };
     let canonical: BTreeMap<&str, &str> = members
         .iter()
@@ -236,6 +247,16 @@ mod tests {
         let err = KeySet::load_or_generate(&p).err().expect("refuses");
         assert!(matches!(err, KeyError::Malformed { .. }), "{err}");
         assert!(err.to_string().contains(p.to_str().unwrap()));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_key_of_an_unsignable_type_refuses_by_name() {
+        let p = temp_path();
+        std::fs::write(&p, r#"{"keys":[{"kty":"oct","k":"c2VjcmV0"}]}"#).unwrap();
+        let err = KeySet::load_or_generate(&p).err().expect("refuses");
+        assert!(matches!(err, KeyError::Malformed { .. }), "{err}");
+        assert!(err.to_string().contains("oct"), "{err}");
         std::fs::remove_file(&p).ok();
     }
 
