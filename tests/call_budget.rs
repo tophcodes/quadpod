@@ -18,7 +18,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use oxigraph::model::Triple;
 use oxigraph::sparql::QuerySolution;
-use sparql_pod::{
+use quadpod::{
     auth::{AuthConfig, StaticJwksResolver, StaticWebIdIssuers, Jwks},
     aux, container,
     http::{router, AppState},
@@ -99,7 +99,7 @@ const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
 /// store-call counts are identical either way — `pdp::decide` is pure, and the
 /// one branch that differs for an anonymous agent (reusing the user decision
 /// as the public one) touches nothing stored.
-async fn app() -> (axum::Router, Arc<CountingStore>, Arc<sparql_pod::notify::Bus>) {
+async fn app() -> (axum::Router, Arc<CountingStore>, Arc<quadpod::notify::Bus>) {
     let counting = Arc::new(CountingStore::new(OxigraphStore::in_memory().unwrap()));
     let store: Arc<dyn SparqlStore> = counting.clone();
     let space = StorageSpace::new("https://pod.toph.so/").unwrap();
@@ -140,18 +140,18 @@ async fn app() -> (axum::Router, Arc<CountingStore>, Arc<sparql_pod::notify::Bus
         )
         .unwrap()
         .quads().iter().cloned().map(Triple::from).collect();
-    sparql_pod::resource::put_rdf(store.as_ref(), &seeded, &content).await.unwrap();
+    quadpod::resource::put_rdf(store.as_ref(), &seeded, &content).await.unwrap();
 
-    let events = Arc::new(sparql_pod::notify::Bus::new());
+    let events = Arc::new(quadpod::notify::Bus::new());
     let app = router(AppState {
         store,
         events: events.clone(),
-        blobs: Arc::new(sparql_pod::blob::ObjectStoreBlobs::in_memory()),
+        blobs: Arc::new(quadpod::blob::ObjectStoreBlobs::in_memory()),
         space,
         resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
         webid_verifier: Arc::new(StaticWebIdIssuers::new()),
         auth_config: Arc::new(AuthConfig::default()),
-        replay: Arc::new(sparql_pod::auth::InMemoryJtiReplayStore::new()),
+        replay: Arc::new(quadpod::auth::InMemoryJtiReplayStore::new()),
         max_body_bytes: 64 * 1024 * 1024,
         op_keys: None,
     });
@@ -332,7 +332,7 @@ async fn a_subscriber_makes_a_put_cost_more_than_it_does_without_one() {
     let without = counts.take().total();
 
     let space = StorageSpace::new("https://pod.toph.so/").unwrap();
-    let _rx = events.subscribe(sparql_pod::notify::Topic::from(&space.resolve("/seeded").unwrap()));
+    let _rx = events.subscribe(quadpod::notify::Topic::from(&space.resolve("/seeded").unwrap()));
     app.oneshot(put_request("/seeded", "\"two\"")).await.unwrap();
     let with = counts.take().total();
 
@@ -362,7 +362,7 @@ async fn a_subscriber_makes_a_delete_cost_no_more_than_it_does_without_one() {
     let without = counts.take().total();
 
     let (watched, counts, events) = app().await;
-    let _rx = events.subscribe(sparql_pod::notify::Topic::from(&seeded));
+    let _rx = events.subscribe(quadpod::notify::Topic::from(&seeded));
     counts.take();
     let res = watched.oneshot(delete()).await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);

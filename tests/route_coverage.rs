@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use sparql_pod::{
+use quadpod::{
     auth::AuthConfig,
     auth::{StaticJwksResolver, StaticWebIdIssuers, Jwks},
     container,
@@ -44,17 +44,17 @@ async fn app() -> axum::Router {
     let Target::Resource(seeded) = space.resolve("/seeded").unwrap() else {
         unreachable!("/seeded is a resource path")
     };
-    let turtle = sparql_pod::rdf::Format::from_content_type("text/turtle").unwrap();
+    let turtle = quadpod::rdf::Format::from_content_type("text/turtle").unwrap();
     let t: Vec<oxigraph::model::Triple> = turtle
         .parse(
             b"<#it> <http://schema.org/name> \"seed\" .",
             seeded.graph_iri(),
-            sparql_pod::rdf::RdfVersion::Rdf11,
+            quadpod::rdf::RdfVersion::Rdf11,
         )
         .unwrap()
         .quads().iter().cloned().map(oxigraph::model::Triple::from).collect();
-    sparql_pod::resource::put_rdf(store.as_ref(), &seeded, &t).await.unwrap();
-    let acl = seeded.aux(sparql_pod::space::AuxKind::Acl);
+    quadpod::resource::put_rdf(store.as_ref(), &seeded, &t).await.unwrap();
+    let acl = seeded.aux(quadpod::space::AuxKind::Acl);
     let acl_triples: Vec<oxigraph::model::Triple> = turtle
         .parse(
             format!(
@@ -64,21 +64,21 @@ async fn app() -> axum::Router {
                 seeded.graph_iri(),
             ).as_bytes(),
             acl.graph_iri(),
-            sparql_pod::rdf::RdfVersion::Rdf11,
+            quadpod::rdf::RdfVersion::Rdf11,
         )
         .unwrap()
         .quads().iter().cloned().map(oxigraph::model::Triple::from).collect();
-    sparql_pod::aux::put(store.as_ref(), &acl, &acl_triples).await.unwrap();
+    quadpod::aux::put(store.as_ref(), &acl, &acl_triples).await.unwrap();
 
     router(AppState {
         store,
-        events: Arc::new(sparql_pod::notify::Bus::new()),
-        blobs: Arc::new(sparql_pod::blob::ObjectStoreBlobs::in_memory()),
+        events: Arc::new(quadpod::notify::Bus::new()),
+        blobs: Arc::new(quadpod::blob::ObjectStoreBlobs::in_memory()),
         space,
         resolver: Arc::new(StaticJwksResolver::new("https://idp.example/", Jwks { keys: vec![] })),
         webid_verifier: Arc::new(StaticWebIdIssuers::new()),
         auth_config: Arc::new(AuthConfig::default()),
-        replay: Arc::new(sparql_pod::auth::InMemoryJtiReplayStore::new()),
+        replay: Arc::new(quadpod::auth::InMemoryJtiReplayStore::new()),
         max_body_bytes: 64 * 1024 * 1024,
         op_keys: None,
     })

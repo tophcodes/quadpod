@@ -343,17 +343,17 @@ The config file is never found, only named.
     A false positive here argues with you out loud; a false negative would
     let a search path in without a word. Demonstrated red,
     each injected into and then reverted out of `src/config.rs` in turn,
-    against `let p = std::path::PathBuf::from("sparql-pod.toml");`, that same
+    against `let p = std::path::PathBuf::from("quadpod.toml");`, that same
     call as a bare expression with no binding, `let p =
-    std::path::Path::new("sparql-pod.toml");`,
-    `std::env::current_dir().unwrap().join("sparql-pod.toml")`, `static
-    SEARCH_PATH: &str = "sparql-pod.toml";`, and a `dirs::config_dir()` /
+    std::path::Path::new("quadpod.toml");`,
+    `std::env::current_dir().unwrap().join("quadpod.toml")`, `static
+    SEARCH_PATH: &str = "quadpod.toml";`, and a `dirs::config_dir()` /
     `std::env::var("XDG_CONFIG_HOME")` / `home_dir()` lookup; demonstrated to
     stay green on the unmodified tree, where the two fixture lines above
     build their temp filename through `std::env::temp_dir().join(...)` and
     `.with_extension("toml")` rather than a `.toml`-suffixed string literal.
     **What it does not catch:** a search path built by joining a non-literal
-    base — `std::env::current_dir().unwrap().join("sparql-pod").with_extension("toml")`,
+    base — `std::env::current_dir().unwrap().join("quadpod").with_extension("toml")`,
     the very idiom this rule's own prose recommends above for a test
     fixture's filename — produces no matching string literal and passes
     unseen, and a search path whose filename does not end in `.toml` at all

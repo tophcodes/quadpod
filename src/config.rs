@@ -20,7 +20,7 @@ use crate::space::{GraphName, SpaceError, StorageSpace};
 pub struct InvalidOwnerWebId;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "sparql-pod", about = "A SPARQL-authoritative Solid pod")]
+#[command(name = "quadpod", about = "A SPARQL-authoritative Solid pod")]
 pub struct Config {
     /// Public base URI of this pod. Absolute, with a trailing slash. All
     /// minted URLs and the DPoP `htu` derive from this, never from the socket.
@@ -276,7 +276,7 @@ where
 ///
 /// Two visible consequences follow from defaults being how the file is
 /// represented. With a file supplying a required argument, `--help`'s usage
-/// line changes from `sparql-pod --owner-webid <OWNER_WEBID>` to `sparql-pod
+/// line changes from `quadpod --owner-webid <OWNER_WEBID>` to `quadpod
 /// [OPTIONS]` — correct, since help reflects the effective configuration, but
 /// a visible change. And a repeatable flag given on the command line replaces
 /// the file's whole list rather than appending to it, because clap skips
@@ -504,12 +504,12 @@ mod tests {
     use crate::space::GraphName;
 
     fn parse(args: &[&str]) -> Result<Config, clap::Error> {
-        Config::try_parse_from(std::iter::once("sparql-pod").chain(args.iter().copied()))
+        Config::try_parse_from(std::iter::once("quadpod").chain(args.iter().copied()))
     }
 
     fn write_temp_toml(body: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir()
-            .join(format!("sparql-pod-{}", uuid::Uuid::new_v4()))
+            .join(format!("quadpod-{}", uuid::Uuid::new_v4()))
             .with_extension("toml");
         std::fs::write(&p, body).expect("write temp toml");
         p
@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn an_unreadable_path_refuses_the_start() {
         let p = std::env::temp_dir()
-            .join("sparql-pod-does-not-exist")
+            .join("quadpod-does-not-exist")
             .with_extension("toml");
         assert!(FileConfig::read(&p).is_err());
     }
@@ -748,11 +748,11 @@ mod tests {
 
     #[test]
     fn blob_store_selects_a_backend_and_refuses_an_unknown_one() {
-        let mut cfg = Config::parse_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+        let mut cfg = Config::parse_from(["quadpod", "--owner-webid", "https://a.example/#me"]);
         assert_eq!(cfg.blob_store, "memory", "the default matches the in-memory triple store");
         assert!(cfg.blobs().is_ok());
 
-        let dir = std::env::temp_dir().join(format!("sparql-pod-cfg-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quadpod-cfg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         cfg.blob_store = format!("local:{}", dir.display());
         assert!(cfg.blobs().is_ok());
@@ -768,7 +768,7 @@ mod tests {
     // Making it a flag is what turns a 413 into a decision.
     #[test]
     fn max_body_bytes_has_an_explicit_default() {
-        let cfg = Config::parse_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+        let cfg = Config::parse_from(["quadpod", "--owner-webid", "https://a.example/#me"]);
         assert_eq!(cfg.max_body_bytes, 64 * 1024 * 1024);
     }
 
@@ -778,12 +778,12 @@ mod tests {
     #[test]
     fn rdf_store_selects_a_backend_and_refuses_an_unknown_one() {
         let mut cfg =
-            Config::parse_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+            Config::parse_from(["quadpod", "--owner-webid", "https://a.example/#me"]);
         assert_eq!(cfg.rdf_store, "memory", "the default is the in-memory store");
         assert!(cfg.rdf_store().is_ok());
 
         let dir = std::env::temp_dir()
-            .join(format!("sparql-pod-cfg-store-{}", uuid::Uuid::new_v4()));
+            .join(format!("quadpod-cfg-store-{}", uuid::Uuid::new_v4()));
         cfg.rdf_store = format!("rocksdb:{}", dir.display());
         assert!(cfg.rdf_store().is_ok());
         std::fs::remove_dir_all(&dir).ok();
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn the_pre_parser_finds_config_beside_arguments_it_does_not_know() {
         let found = config_path_from([
-            "sparql-pod",
+            "quadpod",
             "--owner-webid",
             "https://a.example/#me",
             "--config",
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn the_pre_parser_returns_none_without_config() {
-        let found = config_path_from(["sparql-pod", "--owner-webid", "https://a.example/#me"]);
+        let found = config_path_from(["quadpod", "--owner-webid", "https://a.example/#me"]);
         assert_eq!(found, None);
     }
 
@@ -856,13 +856,13 @@ mod tests {
         };
         let want = Some(std::path::PathBuf::from(raw));
         assert_eq!(
-            config_path_from([std::ffi::OsString::from("sparql-pod"), joined]),
+            config_path_from([std::ffi::OsString::from("quadpod"), joined]),
             want,
             "--config=<path>"
         );
         assert_eq!(
             config_path_from([
-                std::ffi::OsString::from("sparql-pod"),
+                std::ffi::OsString::from("quadpod"),
                 std::ffi::OsString::from("--config"),
                 raw.to_os_string(),
             ]),
@@ -872,7 +872,7 @@ mod tests {
     }
 
     fn load(args: &[&str]) -> Result<Config, clap::Error> {
-        Config::try_load_from(std::iter::once("sparql-pod").chain(args.iter().copied()))
+        Config::try_load_from(std::iter::once("quadpod").chain(args.iter().copied()))
     }
 
     #[test]
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn a_named_key_path_turns_the_op_on_and_generates_the_file() {
-        let p = std::env::temp_dir().join(format!("sparql-pod-opk-{}.json", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("quadpod-opk-{}.json", uuid::Uuid::new_v4()));
         let c = parse(&[
             "--owner-webid", "https://alice.example/card#me",
             "--op-signing-keys", p.to_str().unwrap(),
@@ -1036,7 +1036,7 @@ mod tests {
     // this pod can never serve.
     #[test]
     fn the_op_refuses_a_base_uri_with_a_path() {
-        let p = std::env::temp_dir().join(format!("sparql-pod-opk-{}.json", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("quadpod-opk-{}.json", uuid::Uuid::new_v4()));
         let c = parse(&[
             "--base-uri", "https://host.example/alice/",
             "--owner-webid", "https://alice.example/card#me",

@@ -33,8 +33,8 @@ REPORT_DIR="${REPORT_DIR:-$HERE/reports}"
 POD_BIN="${POD_BIN:-}"
 KEEP_RUNNING="${KEEP_RUNNING:-0}"
 
-CSS_CONTAINER="sparql-pod-conformance-idp"
-HARNESS_CONTAINER="sparql-pod-conformance-harness"
+CSS_CONTAINER="quadpod-conformance-idp"
+HARNESS_CONTAINER="quadpod-conformance-harness"
 
 # The host string matters twice over and must be spelled the same way in both
 # places: `--allow-insecure-host` matches on the host as written in the URL
@@ -49,7 +49,7 @@ BOB_WEBID="${CSS_BASE}bob/profile/card#me"
 # The test-subject IRI is an identifier, not a location: it only has to match
 # the `--target` we pass. The `solid/conformance-test-harness/` prefix is the
 # convention the shipped test-subjects.ttl uses.
-TARGET_IRI="https://github.com/solid/conformance-test-harness/sparql-pod"
+TARGET_IRI="https://github.com/solid/conformance-test-harness/quadpod"
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*" >&2; }
 note() { printf '    %s\n' "$*" >&2; }
@@ -147,7 +147,7 @@ build_pod() {
     # Bare cargo does not work in this repo: oxigraph needs bindgen/libclang,
     # which only the flake dev shell provides.
     (cd "$REPO" && nix develop -c cargo build) || die "pod build failed"
-    POD_BIN="$REPO/target/debug/sparql-pod"
+    POD_BIN="$REPO/target/debug/quadpod"
     [[ -x "$POD_BIN" ]] || die "expected a binary at $POD_BIN after the build"
 }
 
@@ -217,10 +217,10 @@ write_harness_config() {
 
 <$TARGET_IRI>
     a earl:Software, earl:TestSubject ;
-    doap:name "sparql-pod"@en ;
+    doap:name "quadpod"@en ;
     doap:release <${TARGET_IRI}#release> ;
     doap:developer <https://github.com/tophcodes> ;
-    doap:homepage <https://github.com/tophcodes/sparql-pod> ;
+    doap:homepage <https://github.com/tophcodes/quadpod> ;
     doap:description "A SPARQL-authoritative, verify-only Solid pod."@en ;
     doap:programming-language "Rust"@en ;
     solid-test:skip "acp" .
@@ -296,7 +296,7 @@ run_harness() {
 require_cmd docker ""
 require_cmd curl ""
 [[ -n "$POD_BIN" ]] || require_cmd nix " (needed for 'nix develop -c cargo build'; \
-set POD_BIN=/path/to/sparql-pod to skip the build)"
+set POD_BIN=/path/to/quadpod to skip the build)"
 
 mkdir -p "$RUN_DIR"
 chmod 700 "$RUN_DIR"

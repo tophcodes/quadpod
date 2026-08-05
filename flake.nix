@@ -1,5 +1,5 @@
 {
-  description = "sparql-pod - SPARQL-authoritative Solid pod";
+  description = "quadpod - SPARQL-authoritative Solid pod";
 
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";

@@ -2677,6 +2677,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "quadpod"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.0",
+ "bytes",
+ "clap",
+ "dpop-verifier",
+ "hex",
+ "http",
+ "http-body-util",
+ "josekit",
+ "object_store",
+ "oxigraph",
+ "oxttl",
+ "reqwest 0.13.4",
+ "rudof_lib",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3889,39 +3922,6 @@ dependencies = [
  "oxrdf",
  "rand 0.9.5",
  "spargebra",
-]
-
-[[package]]
-name = "sparql-pod"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.23.0",
- "bytes",
- "clap",
- "dpop-verifier",
- "hex",
- "http",
- "http-body-util",
- "josekit",
- "object_store",
- "oxigraph",
- "oxttl",
- "reqwest 0.13.4",
- "rudof_lib",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

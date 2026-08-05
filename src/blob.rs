@@ -236,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_backend_writes_the_mirrored_tree_to_disk() {
-        let dir = std::env::temp_dir().join(format!("sparql-pod-blob-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quadpod-blob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let blobs = ObjectStoreBlobs::local(&dir).unwrap();
         let key = BlobKey::of(&res("/photos/cat.png")).unwrap();

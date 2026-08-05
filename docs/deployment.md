@@ -163,7 +163,7 @@ Local development and conformance runs against a locally-hosted IdP, e.g. a Comm
 Solid Server on `localhost:3001`:
 
 ```bash
-sparql-pod \
+quadpod \
   --owner-webid http://localhost:3001/alice/profile/card#me \
   --trusted-issuer http://localhost:3001/ \
   --allow-insecure-host localhost:3001
@@ -212,14 +212,14 @@ binary does not know refuses the start.
 ```toml
 base_uri     = "https://pod.toph.so/"
 owner_webid  = "https://toph.so/profile/card#me"
-rdf_store    = "rocksdb:/var/lib/sparql-pod/store"
-blob_store   = "local:/var/lib/sparql-pod/blobs"
+rdf_store    = "rocksdb:/var/lib/quadpod/store"
+blob_store   = "local:/var/lib/quadpod/blobs"
 listen       = "127.0.0.1:3000"
 
 trusted_issuers       = ["https://idp.toph.so/"]
 expected_audience     = "https://pod.toph.so/"
 allow_insecure_hosts  = []
-op_signing_keys       = "/var/lib/sparql-pod/op-keys.json"  # naming it turns the OP on;
+op_signing_keys       = "/var/lib/quadpod/op-keys.json"  # naming it turns the OP on;
                                                             # omit the key entirely to stay
                                                             # a verify-only pod
 reset_root_acl        = false  # a recovery lever, not a setting: leaving this `true` in

@@ -231,7 +231,7 @@ mod tests {
     /// see `the_probe_agent_only_finds_grants_that_are_really_there`.
     /// `grants_anything` no longer probes with a stand-in like this; see its
     /// own doc comment for what replaced probing.
-    const PROBE_AUTHENTICATED_AGENT: &str = "urn:sparql-pod:pdp:probe-authenticated-agent";
+    const PROBE_AUTHENTICATED_AGENT: &str = "urn:quadpod:pdp:probe-authenticated-agent";
 
     fn acl(turtle: &str) -> Vec<Triple> {
         Format::from_content_type("text/turtle").unwrap()

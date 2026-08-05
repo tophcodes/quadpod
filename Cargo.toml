@@ -1,13 +1,13 @@
 [package]
-name = "sparql-pod"
+name = "quadpod"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "sparql_pod"
+name = "quadpod"
 
 [[bin]]
-name = "sparql-pod"
+name = "quadpod"
 path = "src/main.rs"
 
 [dependencies]

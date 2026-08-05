@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use sparql_pod::{auth::{GuardedClient, HttpJwksResolver, HttpWebIdIssuers, InMemoryJtiReplayStore},
+use quadpod::{auth::{GuardedClient, HttpJwksResolver, HttpWebIdIssuers, InMemoryJtiReplayStore},
     config::Config, http::{AppState, router}};
 
 #[tokio::main]
@@ -25,7 +25,7 @@ async fn main() {
         for entry in &rejected_insecure_hosts {
             eprintln!(
                 "invalid --allow-insecure-host entry: {}",
-                sparql_pod::auth::safe_fetch::insecure_host_rejection_hint(entry)
+                quadpod::auth::safe_fetch::insecure_host_rejection_hint(entry)
             );
         }
         std::process::exit(2);
@@ -65,7 +65,7 @@ async fn main() {
     };
     let state = AppState {
         store,
-        events: Arc::new(sparql_pod::notify::Bus::new()),
+        events: Arc::new(quadpod::notify::Bus::new()),
         blobs,
         space,
         // One client for every outbound auth fetch in the process: cloning it
@@ -81,12 +81,12 @@ async fn main() {
         max_body_bytes: cfg.max_body_bytes,
         op_keys,
     };
-    sparql_pod::container::provision_root(state.store.as_ref(), &state.space.root())
+    quadpod::container::provision_root(state.store.as_ref(), &state.space.root())
         .await.expect("provision root container");
-    sparql_pod::wac::provision::provision_root_acl(
+    quadpod::wac::provision::provision_root_acl(
         state.store.as_ref(), &state.space, &cfg.owner_webid, cfg.reset_root_acl,
     ).await.expect("provision root ACL");
     let listener = tokio::net::TcpListener::bind(cfg.listen).await.unwrap();
-    tracing::info!("sparql-pod listening on {}", cfg.listen);
+    tracing::info!("quadpod listening on {}", cfg.listen);
     axum::serve(listener, router(state)).await.unwrap();
 }

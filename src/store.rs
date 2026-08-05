@@ -283,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn rocksdb_backend_survives_a_reopen() {
         let dir = std::env::temp_dir()
-            .join(format!("sparql-pod-store-{}", uuid::Uuid::new_v4()));
+            .join(format!("quadpod-store-{}", uuid::Uuid::new_v4()));
         {
             let store = OxigraphStore::open(&dir).expect("open");
             store

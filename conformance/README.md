@@ -48,7 +48,7 @@ the pod's DPoP check compares against `--base-uri` byte for byte, so
   running `createCredentials.js`. The two images are pulled on first use.
 - **Nix**, for `nix develop -c cargo build`. Bare `cargo` does not work in this
   repo: oxigraph needs bindgen/libclang, which only the flake dev shell
-  provides. Set `POD_BIN=/path/to/sparql-pod` to skip the build.
+  provides. Set `POD_BIN=/path/to/quadpod` to skip the build.
 - **Network access**, twice over: to pull the images, and during the run,
   because the harness resolves `https://solidproject.org/TR/protocol` and
   `.../TR/wac` to discover which requirements the manifests cover.

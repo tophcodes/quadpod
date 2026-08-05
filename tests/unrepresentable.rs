@@ -75,7 +75,7 @@
 //!
 //! The two that remain observable are tested below.
 
-use sparql_pod::{
+use quadpod::{
     aux, resource,
     space::{AuxKind, StorageSpace, Target},
     store::OxigraphStore,
@@ -108,7 +108,7 @@ async fn a_slug_cannot_reach_the_auxiliary_space() {
 #[tokio::test]
 async fn an_auxiliary_never_outlives_its_subject() {
     let store = OxigraphStore::in_memory().unwrap();
-    let blobs = sparql_pod::blob::ObjectStoreBlobs::in_memory();
+    let blobs = quadpod::blob::ObjectStoreBlobs::in_memory();
     let space = StorageSpace::new("https://pod.toph.so/").unwrap();
     let Target::Resource(doc) = space.resolve("/doc").unwrap() else { panic!() };
 
