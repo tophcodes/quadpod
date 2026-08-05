@@ -220,3 +220,45 @@ verifier, and the one that gets less traffic is the one that rots.
 **What would reopen it.** An issuer the pod could delegate to while `pod.toph.so` remains
 the `iss` of its own tokens — which is not what OIDC delegation does. Short of that, the
 question is only how much of the subsystem is worth carrying, not whether the pod signs.
+
+## ADR-10 — Extraction that needs code runs out of band, and an external extractor is a first-class one
+
+Writing a blob never runs an extractor inline. The write path stores bytes, emits its change
+event and answers; extraction happens afterwards, in another process, and reports back by
+writing the derived index. A subscriber on `WebhookChannel2023` (#19) is therefore not a
+lesser way to extract than a module the pod loads — it is the ordinary way, and the
+declarative tier that stays in-process is the exception for inputs small enough to deserve it.
+
+Three consequences, each of which settles a question the extraction design left open:
+
+- **The write path has no extraction failure mode** (#74). Bytes the extractor cannot read are
+  bytes with an empty derived index, not a refused `PUT`.
+- **`.meta` is writable, and partitioned per extractor** (#65). It has to be, or an external
+  extractor has nowhere to put its output; and it has to be partitioned, or two extractors
+  overwrite each other.
+- **A WASM tier is optional for v1** (#69). It is the tier that exists for logic a mapping
+  cannot express, and that is now covered.
+
+**Why.** The workload that decides it is OCR, and it fits none of the three tiers the design
+names. Declarative mapping needs a tree, and a scanned PDF is not one. WASM is specified with
+no network and a fuel bound, and a real scan is seconds to minutes of CPU and hundreds of
+megabytes — a bound that admits it bounds nothing, and one that bites kills every honest
+document. Shell hooks are refused outright, and that refusal is not negotiable on a pod that
+is internet-facing and its own issuer.
+
+Two lesser reasons point the same way. An extractor that needs the network while mapping is
+normal rather than exceptional: resolving an identifier to the concept it denotes is a fetch,
+and a sandbox defined as network-less cannot do it. And this pod mints its own tokens, so a
+request thread spending a minute in Tesseract is a request thread not answering `/token`.
+
+**The part that is easy to get wrong.** The loop closes only because auxiliaries stay out of
+containment. An extractor subscribes to the container its documents land in; it writes
+`/.aux/{subject}.meta`; that write publishes on the auxiliary's own topic and produces no
+`Add` on the parent, because `Guard::materialize` holds `may_be_member = !matches!(target,
+Target::Aux(_))` and `publish_containment` only walks what materialization recorded. Make an
+auxiliary a container member and every extractor starts hearing its own output.
+
+**What would reopen it.** A sandbox that can express a work budget of minutes and hundreds of
+megabytes without the budget becoming a fiction, *and* a way for a sandboxed extractor to
+resolve an identifier it does not already hold. Both, not either — the second is what a
+mapping needs even when the first is generous.
