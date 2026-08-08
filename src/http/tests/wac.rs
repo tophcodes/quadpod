@@ -540,7 +540,9 @@ async fn append_only_agent_can_still_post_into_its_inbox() {
     assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
 
     // Append on the container itself (acl:accessTo) plus Append for the
-    // children it will hold (acl:default) — post_impl checks both.
+    // children it will hold (acl:default). Only the first is what authorizes
+    // the POST; the second is here because this is the ACL an inbox would
+    // realistically carry, and it must not get in the way.
     let acl_body = format!(
         "<#bob-here> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
          <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/inbox/> ; \
@@ -560,6 +562,81 @@ async fn append_only_agent_can_still_post_into_its_inbox() {
         .header("slug", "note")
         .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
     assert_eq!(bob_app.oneshot(post).await.unwrap().status(), StatusCode::CREATED);
+}
+
+// A POST authorizes an operation on the CONTAINER: the server allocates the
+// child's name, so `acl:accessTo` on the container is the only grant a client
+// can be expected to hold for it. This is the shape node-solid-server ships as
+// the default inbox ACL of every new pod — `acl:accessTo <./>; acl:mode
+// acl:Append`, with no `acl:default` anywhere — so refusing it would make the
+// canonical Solid inbox unusable.
+//
+// WAC's create rule reads "on the resource to be created", which taken alone
+// says the opposite. That wording came out of solid/web-access-control-spec#95,
+// which replaced "on the container for new members" and was approved as
+// carrying no change in meaning; the container reading is the documented one
+// (solid/specification#118, web-access-control-spec#105).
+#[tokio::test]
+async fn post_needs_only_access_to_append_on_the_container() {
+    let f = fixture().await;
+    let bob = "https://bob.example/card#me";
+    let mk = f.owner_request("PUT", "/inbox/")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .body(Body::from("")).unwrap();
+    assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+    // Deliberately no `acl:default` rule: nothing grants the child anything.
+    let acl_body = format!(
+        "<#bob-here> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+         <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/inbox/> ; \
+         <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> ."
+    );
+    let put_acl = f.owner_request("PUT", "/.aux/inbox/.acl")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .body(Body::from(acl_body)).unwrap();
+    assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+    let bob_app = f.app_also_trusting(bob);
+    let post = f.sign(Request::builder().method("POST").uri("/inbox/"), bob, "POST", "/inbox/")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .header("slug", "note")
+        .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+    assert_eq!(bob_app.oneshot(post).await.unwrap().status(), StatusCode::CREATED);
+}
+
+// The other direction of the same rule, and the reason the check above cannot
+// simply be dropped in favour of the child's: an `acl:default` grant says what
+// the container's MEMBERS allow, not what may be added to the container. A
+// caller holding Append only through `acl:default` may write an existing child
+// it reaches that way, but may not create a new one.
+#[tokio::test]
+async fn post_is_refused_when_append_is_granted_only_to_the_children() {
+    let f = fixture().await;
+    let bob = "https://bob.example/card#me";
+    let mk = f.owner_request("PUT", "/inbox/")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .body(Body::from("")).unwrap();
+    assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
+
+    // The mirror of the test above: `acl:default` and nothing else. Bob may do
+    // as he likes below the container; the container itself grants him nothing.
+    let acl_body = format!(
+        "<#bob-below> <http://www.w3.org/ns/auth/acl#agent> <{bob}> ; \
+         <http://www.w3.org/ns/auth/acl#default> <https://pod.toph.so/inbox/> ; \
+         <http://www.w3.org/ns/auth/acl#mode> <http://www.w3.org/ns/auth/acl#Append> , \
+         <http://www.w3.org/ns/auth/acl#Write> ."
+    );
+    let put_acl = f.owner_request("PUT", "/.aux/inbox/.acl")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .body(Body::from(acl_body)).unwrap();
+    assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
+
+    let bob_app = f.app_also_trusting(bob);
+    let post = f.sign(Request::builder().method("POST").uri("/inbox/"), bob, "POST", "/inbox/")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .header("slug", "note")
+        .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
+    assert_eq!(bob_app.oneshot(post).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
 
 // A narrowing ACL is WAC's ONLY mechanism for revoking rights that an

@@ -1584,15 +1584,17 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
             Err(d) => return with_aux_links(d.into_response(), &child),
         };
     }
-    // The container's Append is not enough to authorize the CHILD: it may
-    // carry an ACL of its own that grants less than the container does.
-    // Mode::Append (not Write) to stay consistent with the container-level
-    // check above, or the append-only inbox pattern this design targets would
-    // break — every legitimate append-only POST would suddenly need Write on
-    // the child it creates.
-    if let Err(d) = child_guard.authorize(Mode::Append) {
-        return with_aux_links(d.into_response(), &child);
-    }
+    // The child is NOT authorized separately. A POST authorizes an operation
+    // on the container — the server picks the child's name, so no client can
+    // be expected to hold a grant naming it, and requiring one would refuse
+    // the append-only inbox (`acl:accessTo <./>; acl:mode acl:Append` with no
+    // `acl:default`), which is what a Solid pod ships by default. WAC's create
+    // rule reads "on the resource to be created", but that wording replaced
+    // "on the container for new members" in a change its editor approved as
+    // carrying no difference in meaning; the container reading is the
+    // documented one. PUT and PATCH keep their own child-level check, because
+    // there the client names the resource.
+
     let repr = match classify_body(&headers, &body, &child, st.store.rdf_version()) {
         Ok(r) => r,
         Err(res) => return *res,
