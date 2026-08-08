@@ -65,8 +65,9 @@ format claim.
 
 Measured against `solidproject/conformance-test-harness` with the `protocol` and
 `web-access-control` manifests: **638 of 652 scenarios pass, 34 of 41 features fully green**
-(ninth run, 2026-08-08). Conditions: plain HTTP on loopback, with Community Solid Server
-7.2.0 standing in as the identity provider because this pod has no token endpoint yet.
+(ninth run, 2026-08-08). Conditions worth knowing: plain HTTP on loopback, an in-memory store
+so the persistence path is not exercised, and Community Solid Server 7.2.0 standing in as the
+identity provider because this pod has no token endpoint yet.
 
 Of the 14 remaining failures: **3 are open Web Access Control defects** (`DELETE` of a
 container authorized only through inheritance — an over-denial, not an incorrect allow), 8

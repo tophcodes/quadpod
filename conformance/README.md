@@ -11,14 +11,12 @@ starts, it stops.
 
 ## Current status
 
-The full suite runs and a report lands on disk. As of the merge of the blob and
-header slices plus the `Vary` fix (`9d47b1a`): **41 features, 652 scenarios, 567
-passed, 85 failed** — 29 features fully green. Non-RDF resources unblocked 540
-previously-untestable scenarios, and the `WAC-Allow`/`OPTIONS`/CORS slice cleared
-most of what remained behind them. The largest remaining gap is `PATCH`, which
-this pod does not implement at all.
-The triage lives in
-[`docs/conformance-findings.md`](../docs/conformance-findings.md).
+The full suite runs and a report lands on disk. The numbers are deliberately not
+repeated here: they change with every run, and a copy in a second file is a copy
+that goes stale without anyone noticing. Each run is dated and reconciled against
+the one before it in
+[`docs/conformance-findings.md`](../docs/conformance-findings.md), which is where
+the current figures and the triage both live.
 
 ## What it starts
 
@@ -81,8 +79,9 @@ certificate.
    the `Link` header.
 7. Runs the harness against the `protocol` and `web-access-control` manifests
    — the two the harness's own `application.yaml` links by default. The
-   `sparql-update` manifest stays off; it is commented out upstream and this
-   pod has no PATCH.
+   `sparql-update` manifest stays off; it is commented out upstream, and this
+   pod refuses `application/sparql-update` by design ([ADR-8](../docs/decisions.md#adr-8))
+   — `PATCH` here is N3 Patch.
 8. Stops everything.
 
 Cleanup between runs is a **pod restart**. The store is in-memory
