@@ -190,8 +190,10 @@ current implementation, and a cost worth knowing about.
   its own issuer, so "writing a file runs a program" means whoever can `PUT` can execute
   ([ADR-10](docs/decisions.md#adr-10)).
 - **`application/sparql-update` as a patch format.** N3 Patch only
-  ([ADR-8](docs/decisions.md#adr-8)). The concrete cost: rdflib.js's `UpdateManager` emits
-  SPARQL Update, so SolidOS and mashlib cannot currently write to this pod.
+  ([ADR-8](docs/decisions.md#adr-8)). rdflib.js clients still write here — its
+  `UpdateManager` reads `Accept-Patch` and falls through to N3 Patch when that is all a
+  server offers — but they take a code path rdflib itself currently deprioritises, so
+  blank-node inserts are the place to expect trouble.
 - **Byte preservation for RDF.** See the storage model. Write bytes as bytes if the bytes
   matter.
 - **Mandatory validation and mandatory convergence.** Both are opt-in per container; either
