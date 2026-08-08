@@ -316,6 +316,21 @@ index entry, an ACL subject and a WebID profile name one URL no matter which rep
 it. The alternative, an origin per replica, makes every one of those references ask which
 copy it meant.
 
+**A replica's identity is not its address.** The base URI above is the identity, and it is
+the only one of the two that may appear in data — in a graph name, a type index entry, an
+ACL subject, a containment triple, a reference of any kind. How you reach one particular
+copy is separate, it is configuration, and it is never stored and never referenced. This is
+the ordinary HTTP separation between the name in `Host` and the endpoint a connection is
+opened to, and it is spelled out here because the paragraph above rests its whole weight on
+one URI meaning one thing, which reads as though a second address could not exist.
+
+It has to be stated before replicas talk to each other rather than after. A hub topology
+hides the need — every replica addresses one peer and can hold that in configuration without
+thinking about it — while replicas syncing pairwise must address each other by something that
+is not their shared identity. Retrofitting the distinction is expensive in exactly one way,
+and it is the way that does not announce itself: a transport address that has leaked into a
+stored triple is indistinguishable from an identity until the copy it names goes away.
+
 The cost is that reachability varies where identity does not, and `404` alone cannot say
 which of the two it means. A client that reads `404` for a resource it wrote yesterday
 concludes the resource was deleted and reconciles by dropping what it holds. Partial
