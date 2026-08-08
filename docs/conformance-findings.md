@@ -629,12 +629,59 @@ directory holds only the summary pages, no per-feature HTML. The claims above co
 `harness.log`'s `ERROR` lines and its per-feature `failed:` banners, and from
 `conformance/reports/report.html` for per-scenario detail.
 
-The buckets below hold the same 20 scenarios, but **one row changed bucket after this
-run** — not because the pod or the measurement moved, but because the specification was
-looked up. The six `POST`-into-an-`accessTo`-only-container scenarios move from Bucket 3
-(defect) to Bucket 2 (pending decision); the reasoning and its sources are in that entry.
-The split is now **3 expected gap, 14 pending decision, 3 defect** — `3 + 14 + 3 = 20`,
-against `3 + 8 + 9` before. Bucket 4 stays empty.
+The buckets hold the same 20 scenarios, but **one row changed bucket after this run** — not
+because the pod or the measurement moved, but because the specification was looked up. The
+six `POST`-into-an-`accessTo`-only-container scenarios moved from Bucket 3 (defect) to
+Bucket 2 (pending decision), making the split at that point **3 expected gap, 14 pending
+decision, 3 defect** — `3 + 14 + 3 = 20`, against `3 + 8 + 9` before. The ninth run below
+undoes that move for a better reason than the one that made it; the entry carries the whole
+story.
+
+## Ninth run — after the `accessTo`-only `POST` fix
+
+| | |
+|---|---|
+| **Date** | 2026-08-08 |
+
+| | Features | Scenarios | Passed | Failed |
+|---|---|---|---|---|
+| karate (everything that ran) | 41 | 652 | 638 | 14 |
+| harness's MUST-linked subset | 38 | 649 | 627 | 14 |
+
+Same 41 features, same 652 scenarios, `skipped: 0` — no feature aborted in its
+`Background`, which is the failure mode a change to the write path could have caused. 20
+residual failures fall to 14, and every one of the six that moved is a
+`POST`-into-an-`accessTo`-only-container row:
+
+| Feature | Eighth run | Ninth run | Δ |
+|---|---|---|---|
+| `wac/protected-operation/write-access-agent` | 80/84 | **82/84** | +2 |
+| `wac/protected-operation/write-access-bob` | 80/84 | **82/84** | +2 |
+| `wac/protected-operation/write-access-public` | 49/53 | **51/53** | +2 |
+
+`632 + 6 = 638`. **34 of 41 features pass every scenario, 7 have at least one failure** —
+the same 34 and 7 as the three runs before, because those three `write-access-*` features
+still carry their `DELETE` failures and so stay in the failing column.
+
+The change was to `post_impl` alone: the second authorization, against the newly-allocated
+child, is gone. `PUT` and `PATCH` are untouched. Both directions of the rule are pinned in
+`src/http/tests/wac.rs` — `post_needs_only_access_to_append_on_the_container` and
+`post_is_refused_when_append_is_granted_only_to_the_children`. The second is the one that
+matters: it fails if the fix is ever "simplified" into dropping the container check too.
+
+### The 14 residual failures
+
+| Cause | Scenarios | Bucket | Status |
+|---|---|---|---|
+| `DELETE` of a container/fictive resource via inherited-only access | 6 | 2 + 3 | unchanged (3 defect, 3 pending-decision) |
+| `post-target-not-found` (ancestor materialization) | 4 | 2 | unchanged since the first run |
+| CORS/`OPTIONS` scheme-rewrite redirect, unreachable over `http` | 2 | 1 | unchanged in kind |
+| `containment:122` (trailing-slash pair) | 1 | 2 | unchanged since the first run |
+| `containment:38` (`application/sparql-update`) | 1 | 1 | unchanged, refused by design |
+| **Total** | **14** | | |
+
+`6 + 4 + 2 + 1 + 1 = 14`, and the buckets reconcile: **3 expected gap, 8 pending decision,
+3 defect**. Bucket 4 stays empty.
 
 ## Bucket 1 — Expected gap (3 scenarios, as of the sixth run)
 
@@ -764,70 +811,54 @@ in the suite for four consecutive runs.
 
 ---
 
-## Bucket 2 — Pending decision (14 scenarios)
+## Bucket 2 — Pending decision (8 scenarios)
 
 The pod behaves deliberately and differently from the test. **Do not change these without
 a decision.**
 
-### `POST` into a container whose own grant is `accessTo`-only — 6 scenarios
+### `POST` into a container whose own grant is `accessTo`-only — RESOLVED
 
 `wac/protected-operation/write-access-{agent,bob,public}`, the `POST … type: container`
-rows, 2 per feature (`resource: W` and `resource: A`, `container: no`).
+rows, 2 per feature. Filed as a defect, reclassified as a pending decision on the strength
+of a literal reading of WAC, and now resolved as a defect after all — **the reading was
+wrong.**
 
-| | |
-|---|---|
-| **Test wants** | `POST` into an existing, empty *nested* container succeeds when that container holds a *direct* (`acl:accessTo`) Append/Write grant on itself |
-| **Pod does** | Denies (retry against `[200, 201, 204, 205]` exhausts 3 attempts) |
-| **Why** | `post_impl` authorizes twice: `Mode::Append` on the container (`src/http.rs:1540`), then `Mode::Append` on the newly-allocated child (`src/http.rs:1593`). The container check passes on its `accessTo` grant. The child check does not: the child has no ACL of its own, so `Guard::decide_from` walks up to the container's ACL and evaluates it as *inherited*, which `pdp::decide` scores against `acl:default` only (`src/wac/pdp.rs:61`). An `accessTo`-only grant never satisfies the child gate. |
+`post_impl` used to authorize twice: `Mode::Append` on the container, then again on the
+newly-allocated child, which can only inherit and so is scored against `acl:default` alone
+(`src/wac/pdp.rs:61`). The second check is gone. A `POST` authorizes an operation on the
+container — the server picks the child's name, so no client can be expected to hold a grant
+naming it.
 
-**The pod's behaviour is what the specification says, and the test encodes what the
-reference implementation does.** WAC's normative text makes the child the subject of the
-check — "when an operation requests to create a resource as a member of a container
-resource, the server MUST match an Authorization allowing the `acl:Append` or `acl:Write`
-access privilege (as needed by the operation) *on the resource to be created*". The
-resource to be created has no ACL, so its effective ACL is the container's (WAC's
-effective-ACL algorithm: walk up to the first ACL with a representation), and within it
-only `acl:default` reaches "a resource lower in the collection hierarchy" — the definition
-of `acl:default` itself. An `accessTo`-only container therefore grants the new resource
-nothing.
+Three things settle it, none of which turns on how the sentence is parsed:
 
-That reading is settled, not inferred: [solid/specification#186] asked whether an
-`acl:accessTo` rule in a container's ACL can apply to a child that has no ACL of its own,
-and the answer — closed by the editor as "consensus is deemed to be captured in WAC
-Editor's Draft" — is that step 3 of the walk inherits *only* rules marked `acl:default`,
-"therefore no rules grant access, therefore all access is denied".
+- **The inverse case.** `web-access-control-tests`' companion test grants `acl:default`
+  Read+Append+Write+Control and no `accessTo` Append, and expects `403`. Under the
+  child-as-subject reading there is plenty to match, so it would be `201`. The reading does
+  not merely refuse too much — it also permits what every implementation refuses. It is not
+  a stricter version of the rule, it is a different rule.
+- **The canonical inbox.** `acl:accessTo <./>; acl:mode acl:Append` with no `acl:default`
+  is what node-solid-server writes as the inbox ACL of every pod it creates. Under the
+  literal reading, LDN delivery into any such inbox never worked.
+- **The wording's own history.** "on the resource to be created" replaced "on the container
+  for new members" in `solid/web-access-control-spec#95` — a change its editor approved
+  with "about the same to me - a bit redundant". No difference in meaning was intended, and
+  a proposal in that same PR to tie the requirement to `acl:default` was rejected outright.
 
-CSS diverges, and the bundled suite follows CSS. Measured against a fresh CSS 7.2.0
-(`@css:config/file-root.json`, root open, everything anonymous through `acl:agentClass
-foaf:Agent` — no WebID involved), with the container's ACL carrying exactly one
-Authorization:
+[solid/specification#186] does not support the old reading either. It asks whether an
+`acl:accessTo` rule naming a *child* applies to that child from the parent's ACL, i.e.
+which rules inherit downward. Here the Authorization names the container and the container
+is the request target, so nothing inherits and the inheritance rule never engages. Citing
+it silently swapped the subject of the check, which is precisely the disputed point.
 
-| The container's only Authorization | CSS `POST` | this pod |
-|---|---|---|
-| `acl:accessTo`, mode `acl:Append` | **201** | `401` |
-| `acl:default`, mode `acl:Append` | **401** | `401` |
-| both | 201 | 201 |
+`PUT` and `PATCH` keep their child-level check: there the client names the resource, and
+WAC asks for both — Append/Write on the container *as well as* Write on the new resource.
+That is the one place the two-subject formula is actually written down.
 
-Both columns are measured the same way — anonymous, one Authorization, nothing else in the
-hierarchy — so the rows compare like for like. (`401` rather than `403` in both servers
-because the agent is unauthenticated; the suite's six failures are the same shape with an
-authenticated agent.)
-
-CSS therefore requires precisely the predicate the inheritance rule does not use, and
-refuses the one it does. This pod requires both, which is why
-`append_only_agent_can_still_post_into_its_inbox` (`src/http/tests/wac.rs:534`) writes both and says
-so. The three shapes disagree pairwise, so an ACL that authorizes a `POST` on one server
-does not on the other unless it carries both predicates.
-
-**Reclassified from Bucket 3 (defect) on 2026-08-03.** The sentence that filed it there —
-"no document records this as intended" — was false: the specification's own text and
-[solid/specification#186] both do. Nothing about the pod changed; what changed is that the
-question was looked up rather than assumed. The divergence is open with the community, and
-until it resolves this pod keeps the spec-literal behaviour. If the outcome is that the
-spec text is too narrow, the fix is small and belongs in the creation path, not in
-`pdp::decide` — the `accessTo`/`acl:default` separation is load-bearing everywhere else
-(it is what lets an ACL grant read on a container's members without granting a listing of
-the container).
+What is left is a defect in the specification's text rather than in any server: the
+container reading lives entirely in non-normative Notes and issue threads, while the one
+normative sentence says something else. Worth an issue against
+`solid/web-access-control-spec`; `solid-contrib/specification-tests#124` asked it from the
+wrong end and should be withdrawn.
 
 [solid/specification#186]: https://github.com/solid/specification/issues/186
 
