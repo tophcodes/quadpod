@@ -126,7 +126,7 @@ empty ACL mean different things.
 This is legal — the specification requires discovery through `Link: rel="acl"` — but it is
 this pod's largest interop deviation, and the failure mode is silent: a client that assumes
 the sibling URL and writes `/foo.acl` gets a `201` and no access control. See
-[`docs/uri-space.md`](docs/uri-space.md).
+[Do not construct auxiliary URLs — discover them](docs/uri-space.md#do-not-construct-auxiliary-urls--discover-them).
 
 ## Roadmap
 
