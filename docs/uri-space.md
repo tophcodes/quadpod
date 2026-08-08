@@ -3,6 +3,13 @@
 This is the contract between this pod and its clients about **which URLs mean what**. It is
 normative for the server and for anyone writing data into it.
 
+One term runs through all of it. An **auxiliary resource** carries information *about*
+another resource — its subject — rather than content of its own. The standing example is an
+access control list: a document that says who may read the resource it belongs to. An
+auxiliary has its own URL and you write it like anything else, but it is bound to its subject
+rather than merely sitting next to it, and what that binding costs and buys is
+[its own section](#auxiliary-resources) below.
+
 ## Your space, and the two segments that are not
 
 Almost every path this pod serves is yours. Exactly two first-level segments are not:

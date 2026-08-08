@@ -16,6 +16,8 @@ follows, or getting it wrong is silent.
 
 ---
 
+<a id="adr-1"></a>
+
 ## ADR-1 — The WAC decision point is ours
 
 `wac::pdp::decide` is a pure function of this codebase, taking ACL triples plus request
@@ -40,6 +42,8 @@ bug.
 rather than a slot chain. Or ACP arriving — the standalone `acp` crate was the original
 argument for keeping the seam, and it fits behind the same `PolicyDecisionPoint`.
 
+<a id="adr-2"></a>
+
 ## ADR-2 — `SparqlStore` is dyn-dispatched, and sequence atomicity is the implementor's obligation
 
 `AppState` holds `Arc<dyn SparqlStore>`, object-safe through `async_trait`. Every write path
@@ -59,6 +63,8 @@ property of `OxigraphStore`, measured, not of the query language.
 **What would reopen it.** A second `SparqlStore` implementor — at which point the obligation
 stops being a note and becomes something that must be verified. `constraints.md` carries the
 tripwire that fires when one appears.
+
+<a id="adr-3"></a>
 
 ## ADR-3 — DPoP proofs signed RS256 are accepted
 
@@ -87,6 +93,8 @@ because it fails open rather than closed.
 path be deleted. Or a decision to advertise a narrower `algs` list in the `WWW-Authenticate`
 challenge, which `wac::guard`'s challenge constant would then have to track.
 
+<a id="adr-5"></a>
+
 ## ADR-5 — An ACL rule does not need an explicit `a acl:Authorization`
 
 Every subject in an ACL graph is a candidate authorization. The type triple is not required.
@@ -104,7 +112,9 @@ of the dead text. It is not.
 **What would reopen it.** ACP, or a conformance scenario that requires the type triple. The
 current suite does not exercise one.
 
-## ADR-6 — RDF 1.2 is served, and silence on the wire means RDF 1.1
+<a id="adr-6"></a>
+
+## ADR-6 — RDF 1.2 is served, and an undeclared representation is RDF 1.1
 
 The pod stores and serves RDF 1.2. A representation declares itself with the `version`
 media-type parameter going in, and is told what it got coming out. An absent parameter means
@@ -112,13 +122,18 @@ RDF 1.1, and the parameter is emitted only on representations that actually use 
 functionality.
 
 **Why the pod is stricter than the specification here.** RDF 1.2 Concepts treats an absent
-`version` as 1.2, written for a world where 1.2 is ambient. Every deployed Solid client —
-rdflib.js, SolidOS, the Inrupt libraries, CSS — is a 1.1 parser, and passing the Solid
-conformance suites is a goal. The cost is asymmetric: being too conservative makes a
-document less useful, being too eager makes it unreadable. Announcing `version` on every
-response was rejected for the same reason, plus Concepts' own guidance that only documents
-using 1.2 functionality should announce one — and it would break every client comparing
-`Content-Type` for equality.
+`version` as 1.2, written for a world where 1.2 is ambient. The cost of guessing wrong is
+asymmetric, and that is what decides the default: a document declared 1.1 that a 1.2 reader
+meets is merely unambitious, while a document declared 1.2 that a 1.1 reader meets is
+unreadable. Passing the Solid conformance suites points the same way. Announcing `version` on
+every response was rejected for the same reason, plus Concepts' own guidance that only
+documents using 1.2 functionality should announce one — and it would break every client
+comparing `Content-Type` for equality.
+
+A census of deployed parsers is not the argument and should not be reinstated as one. It was,
+and it was wrong: a parser advertises the RDF 1.2 grammars without thereby handling triple
+terms, which is the functionality actually at stake, so the claim was simultaneously
+unfalsifiable in the direction that mattered and quick to rot.
 
 **Why a marker trait was not used for the capability.** `Rdf12Store: SparqlStore` would make
 the capability a property of the type, which the remote case is not: one generic client has
@@ -136,6 +151,8 @@ directly rather than inheriting it, so the capability is not a dependency's priv
 following, at which point Concepts' default becomes the right one and this inverts. Or a
 `SparqlStore` implementor that declares RDF 1.1, which turns the degradation path from a
 specified case into an exercised one.
+
+<a id="adr-7"></a>
 
 ## ADR-7 — Embedded Oxigraph, one process per store directory
 
@@ -165,6 +182,8 @@ rather than removing its single-writer property.
 whose volume makes HTTP untenable. Or a requirement that the pod stay reachable across a
 process restart.
 
+<a id="adr-8"></a>
+
 ## ADR-8 — `application/sparql-update` is not a PATCH format
 
 `PATCH` accepts `text/n3` and nothing else. `Accept-Patch` advertises `text/n3` alone.
@@ -185,6 +204,8 @@ the caller was not talking about.
 **What would reopen it.** A client that matters and cannot emit N3 Patch. Adding it later
 remains possible and would be its own design — the objection is to the blast radius, not to
 the idea of a second format.
+
+<a id="adr-9"></a>
 
 ## ADR-9 — The pod issues the credentials it verifies
 
@@ -220,6 +241,8 @@ verifier, and the one that gets less traffic is the one that rots.
 **What would reopen it.** An issuer the pod could delegate to while `pod.toph.so` remains
 the `iss` of its own tokens — which is not what OIDC delegation does. Short of that, the
 question is only how much of the subsystem is worth carrying, not whether the pod signs.
+
+<a id="adr-10"></a>
 
 ## ADR-10 — Extraction that needs code runs out of band, and an external extractor is a first-class one
 
@@ -262,3 +285,70 @@ auxiliary a container member and every extractor starts hearing its own output.
 megabytes without the budget becoming a fiction, *and* a way for a sandboxed extractor to
 resolve an identifier it does not already hold. Both, not either — the second is what a
 mapping needs even when the first is generous.
+
+---
+
+<a id="adr-11"></a>
+
+## ADR-11 — Replication scopes existence separately from content, and what is withheld does not converge
+
+Replicas of one pod answer as the same base URI. A replica carries a subtree's content, or
+only its existence, or neither, and those are two dials set independently per subtree.
+
+Three answers follow, and a replica gives exactly one of them for any URL:
+
+| The replica | Answer |
+|---|---|
+| holds the resource | the representation |
+| knows it exists elsewhere | `421 Misdirected Request` |
+| is not entitled to know it exists | `404` |
+
+Existence is the server-owned graph, containment and the ACL. Content is the user graph and
+the blob. A replica that carries existence can authorize and can redirect; a replica that
+carries neither is indistinguishable from a pod where the resource was never written, which
+is the point.
+
+**A subtree withheld for confidentiality withholds existence too, and is not a participant
+in convergence.** Not a replica that lags — not a participant.
+
+**Why.** Sharing one base URI across replicas is what keeps identity unambiguous: a type
+index entry, an ACL subject and a WebID profile name one URL no matter which replica answers
+it. The alternative, an origin per replica, makes every one of those references ask which
+copy it meant.
+
+The cost is that reachability varies where identity does not, and `404` alone cannot say
+which of the two it means. A client that reads `404` for a resource it wrote yesterday
+concludes the resource was deleted and reconciles by dropping what it holds. Partial
+replication answered with `404` is a data-loss primitive aimed at every generic client,
+including the ones that behave correctly. `421` is the status that already means this server
+cannot produce a response for this URI, which is the claim being made and no larger one.
+
+But `421` asserts that the resource exists, so it cannot be the answer for a subtree whose
+existence is the sensitive fact. Hence three answers rather than two: withholding content and
+withholding existence are different decisions and a single dial cannot express both.
+
+**The part that is easy to get wrong.** Convergence undoes this if it is allowed to see it. A
+merge exists to eliminate divergence without losing writes, and a deliberately withheld
+subtree is divergence that looks exactly like a replica one write behind. Containment is
+where it bites first: the root container lists different members on different replicas, and a
+convergent union of those member sets restores precisely what was withheld. So the exclusion
+has to be declared as non-participation, using the per-container opt-in that convergence
+already needs — never as data a replica happens not to have yet.
+
+The private type index is the instance to get right first. It registers classes against
+locations, so it leaks the *category* of what is held rather than a path that could mean
+anything; `solid:forClass` naming a medical record says what a container called `/health/`
+only hints at. It is always the withheld case, and it answers `404` — `421` would concede
+that it exists.
+
+**What replication breaks on the way in.** DPoP replay protection is a `JtiReplayStore`, and
+the only implementor is in-memory. That is correct while exactly one process answers for a
+base URI, which [ADR-7](#adr-7) guarantees today. It stops being correct here: replicas share
+one base URI by construction, so a proof's `htu` is byte-identical at every one of them, and a
+proof spent at one replica is unspent at all the others. Replication needs a replay store the
+replicas share, or a proof binding narrower than the base URI — and the seam for the first
+already exists, since the store is a trait rather than the process-wide static it started as.
+
+**What would reopen it.** Replicas ceasing to share a base URI. If an origin identifies the
+copy, location is carried by the identifier, every reference names the copy it meant, and
+none of the three answers above has anything to distinguish.
