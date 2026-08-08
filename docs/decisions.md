@@ -104,7 +104,7 @@ of the dead text. It is not.
 **What would reopen it.** ACP, or a conformance scenario that requires the type triple. The
 current suite does not exercise one.
 
-## ADR-6 — RDF 1.2 is served, and silence on the wire means RDF 1.1
+## ADR-6 — RDF 1.2 is served, and an undeclared representation is RDF 1.1
 
 The pod stores and serves RDF 1.2. A representation declares itself with the `version`
 media-type parameter going in, and is told what it got coming out. An absent parameter means
@@ -112,13 +112,18 @@ RDF 1.1, and the parameter is emitted only on representations that actually use 
 functionality.
 
 **Why the pod is stricter than the specification here.** RDF 1.2 Concepts treats an absent
-`version` as 1.2, written for a world where 1.2 is ambient. Every deployed Solid client —
-rdflib.js, SolidOS, the Inrupt libraries, CSS — is a 1.1 parser, and passing the Solid
-conformance suites is a goal. The cost is asymmetric: being too conservative makes a
-document less useful, being too eager makes it unreadable. Announcing `version` on every
-response was rejected for the same reason, plus Concepts' own guidance that only documents
-using 1.2 functionality should announce one — and it would break every client comparing
-`Content-Type` for equality.
+`version` as 1.2, written for a world where 1.2 is ambient. The cost of guessing wrong is
+asymmetric, and that is what decides the default: a document declared 1.1 that a 1.2 reader
+meets is merely unambitious, while a document declared 1.2 that a 1.1 reader meets is
+unreadable. Passing the Solid conformance suites points the same way. Announcing `version` on
+every response was rejected for the same reason, plus Concepts' own guidance that only
+documents using 1.2 functionality should announce one — and it would break every client
+comparing `Content-Type` for equality.
+
+A census of deployed parsers is not the argument and should not be reinstated as one. It was,
+and it was wrong: a parser advertises the RDF 1.2 grammars without thereby handling triple
+terms, which is the functionality actually at stake, so the claim was simultaneously
+unfalsifiable in the direction that mattered and quick to rot.
 
 **Why a marker trait was not used for the capability.** `Rdf12Store: SparqlStore` would make
 the capability a property of the type, which the remote case is not: one generic client has
