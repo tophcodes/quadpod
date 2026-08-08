@@ -267,3 +267,60 @@ auxiliary a container member and every extractor starts hearing its own output.
 megabytes without the budget becoming a fiction, *and* a way for a sandboxed extractor to
 resolve an identifier it does not already hold. Both, not either — the second is what a
 mapping needs even when the first is generous.
+
+---
+
+## ADR-11 — Replication scopes existence separately from content, and what is withheld does not converge
+
+Replicas of one pod answer as the same base URI. A replica carries a subtree's content, or
+only its existence, or neither, and those are two dials set independently per subtree.
+
+Three answers follow, and a replica gives exactly one of them for any URL:
+
+| The replica | Answer |
+|---|---|
+| holds the resource | the representation |
+| knows it exists elsewhere | `421 Misdirected Request` |
+| is not entitled to know it exists | `404` |
+
+Existence is the server-owned graph, containment and the ACL. Content is the user graph and
+the blob. A replica that carries existence can authorize and can redirect; a replica that
+carries neither is indistinguishable from a pod where the resource was never written, which
+is the point.
+
+**A subtree withheld for confidentiality withholds existence too, and is not a participant
+in convergence.** Not a replica that lags — not a participant.
+
+**Why.** Sharing one base URI across replicas is what keeps identity unambiguous: a type
+index entry, an ACL subject and a WebID profile name one URL no matter which replica answers
+it. The alternative, an origin per replica, makes every one of those references ask which
+copy it meant.
+
+The cost is that reachability varies where identity does not, and `404` alone cannot say
+which of the two it means. A client that reads `404` for a resource it wrote yesterday
+concludes the resource was deleted and reconciles by dropping what it holds. Partial
+replication answered with `404` is a data-loss primitive aimed at every generic client,
+including the ones that behave correctly. `421` is the status that already means this server
+cannot produce a response for this URI, which is the claim being made and no larger one.
+
+But `421` asserts that the resource exists, so it cannot be the answer for a subtree whose
+existence is the sensitive fact. Hence three answers rather than two: withholding content and
+withholding existence are different decisions and a single dial cannot express both.
+
+**The part that is easy to get wrong.** Convergence undoes this if it is allowed to see it. A
+merge exists to eliminate divergence without losing writes, and a deliberately withheld
+subtree is divergence that looks exactly like a replica one write behind. Containment is
+where it bites first: the root container lists different members on different replicas, and a
+convergent union of those member sets restores precisely what was withheld. So the exclusion
+has to be declared as non-participation, using the per-container opt-in that convergence
+already needs — never as data a replica happens not to have yet.
+
+The private type index is the instance to get right first. It registers classes against
+locations, so it leaks the *category* of what is held rather than a path that could mean
+anything; `solid:forClass` naming a medical record says what a container called `/health/`
+only hints at. It is always the withheld case, and it answers `404` — `421` would concede
+that it exists.
+
+**What would reopen it.** Replicas ceasing to share a base URI. If an origin identifies the
+copy, location is carried by the identifier, every reference names the copy it meant, and
+none of the three answers above has anything to distinguish.
