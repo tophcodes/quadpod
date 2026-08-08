@@ -16,6 +16,8 @@ follows, or getting it wrong is silent.
 
 ---
 
+<a id="adr-1"></a>
+
 ## ADR-1 — The WAC decision point is ours
 
 `wac::pdp::decide` is a pure function of this codebase, taking ACL triples plus request
@@ -40,6 +42,8 @@ bug.
 rather than a slot chain. Or ACP arriving — the standalone `acp` crate was the original
 argument for keeping the seam, and it fits behind the same `PolicyDecisionPoint`.
 
+<a id="adr-2"></a>
+
 ## ADR-2 — `SparqlStore` is dyn-dispatched, and sequence atomicity is the implementor's obligation
 
 `AppState` holds `Arc<dyn SparqlStore>`, object-safe through `async_trait`. Every write path
@@ -59,6 +63,8 @@ property of `OxigraphStore`, measured, not of the query language.
 **What would reopen it.** A second `SparqlStore` implementor — at which point the obligation
 stops being a note and becomes something that must be verified. `constraints.md` carries the
 tripwire that fires when one appears.
+
+<a id="adr-3"></a>
 
 ## ADR-3 — DPoP proofs signed RS256 are accepted
 
@@ -87,6 +93,8 @@ because it fails open rather than closed.
 path be deleted. Or a decision to advertise a narrower `algs` list in the `WWW-Authenticate`
 challenge, which `wac::guard`'s challenge constant would then have to track.
 
+<a id="adr-5"></a>
+
 ## ADR-5 — An ACL rule does not need an explicit `a acl:Authorization`
 
 Every subject in an ACL graph is a candidate authorization. The type triple is not required.
@@ -103,6 +111,8 @@ of the dead text. It is not.
 
 **What would reopen it.** ACP, or a conformance scenario that requires the type triple. The
 current suite does not exercise one.
+
+<a id="adr-6"></a>
 
 ## ADR-6 — RDF 1.2 is served, and an undeclared representation is RDF 1.1
 
@@ -142,6 +152,8 @@ following, at which point Concepts' default becomes the right one and this inver
 `SparqlStore` implementor that declares RDF 1.1, which turns the degradation path from a
 specified case into an exercised one.
 
+<a id="adr-7"></a>
+
 ## ADR-7 — Embedded Oxigraph, one process per store directory
 
 Embedded Oxigraph selected by `--rdf-store rocksdb:<dir>` is the recommended deployment.
@@ -170,6 +182,8 @@ rather than removing its single-writer property.
 whose volume makes HTTP untenable. Or a requirement that the pod stay reachable across a
 process restart.
 
+<a id="adr-8"></a>
+
 ## ADR-8 — `application/sparql-update` is not a PATCH format
 
 `PATCH` accepts `text/n3` and nothing else. `Accept-Patch` advertises `text/n3` alone.
@@ -190,6 +204,8 @@ the caller was not talking about.
 **What would reopen it.** A client that matters and cannot emit N3 Patch. Adding it later
 remains possible and would be its own design — the objection is to the blast radius, not to
 the idea of a second format.
+
+<a id="adr-9"></a>
 
 ## ADR-9 — The pod issues the credentials it verifies
 
@@ -225,6 +241,8 @@ verifier, and the one that gets less traffic is the one that rots.
 **What would reopen it.** An issuer the pod could delegate to while `pod.toph.so` remains
 the `iss` of its own tokens — which is not what OIDC delegation does. Short of that, the
 question is only how much of the subsystem is worth carrying, not whether the pod signs.
+
+<a id="adr-10"></a>
 
 ## ADR-10 — Extraction that needs code runs out of band, and an external extractor is a first-class one
 
@@ -269,6 +287,8 @@ resolve an identifier it does not already hold. Both, not either — the second 
 mapping needs even when the first is generous.
 
 ---
+
+<a id="adr-11"></a>
 
 ## ADR-11 — Replication scopes existence separately from content, and what is withheld does not converge
 
@@ -320,6 +340,14 @@ locations, so it leaks the *category* of what is held rather than a path that co
 anything; `solid:forClass` naming a medical record says what a container called `/health/`
 only hints at. It is always the withheld case, and it answers `404` — `421` would concede
 that it exists.
+
+**What replication breaks on the way in.** DPoP replay protection is a `JtiReplayStore`, and
+the only implementor is in-memory. That is correct while exactly one process answers for a
+base URI, which [ADR-7](#adr-7) guarantees today. It stops being correct here: replicas share
+one base URI by construction, so a proof's `htu` is byte-identical at every one of them, and a
+proof spent at one replica is unspent at all the others. Replication needs a replay store the
+replicas share, or a proof binding narrower than the base URI — and the seam for the first
+already exists, since the store is a trait rather than the process-wide static it started as.
 
 **What would reopen it.** Replicas ceasing to share a base URI. If an origin identifies the
 copy, location is carried by the identifier, every reference names the copy it meant, and
