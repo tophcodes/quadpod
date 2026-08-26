@@ -2026,7 +2026,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         // client that something was withheld and where to get it whole.
         for name in visible.named_graphs() {
             out.append(header::LINK, format!(
-                "<{}>; rel=\"https://quadpod.toph.so/ns#containsGraph\"", name.as_str()
+                "<{}>; rel=\"https://w3id.org/quadpod/ns#containsGraph\"", name.as_str()
             ).parse().expect("graph name is header-safe"));
         }
         for alt in ["application/trig", "application/ld+json"] {

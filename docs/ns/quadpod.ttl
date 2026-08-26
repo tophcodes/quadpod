@@ -1,0 +1,26 @@
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix vann:    <http://purl.org/vocab/vann/> .
+@prefix quadpod: <https://w3id.org/quadpod/ns#> .
+
+<https://w3id.org/quadpod/ns#>
+    a owl:Ontology ;
+    dcterms:title "The quadpod vocabulary"@en ;
+    dcterms:description """Terms quadpod mints because no registered vocabulary carries them.
+
+A term enters this namespace only when the alternative is a claim a server cannot make in any registered vocabulary. Everything quadpod can say in LDP, WAC, SHACL, PROV-O or schema.org is said there instead."""@en ;
+    vann:preferredNamespacePrefix "quadpod" ;
+    vann:preferredNamespaceUri "https://w3id.org/quadpod/ns#" ;
+    rdfs:seeAlso <https://github.com/tophcodes/quadpod> .
+
+quadpod:containsGraph
+    a rdf:Property ;
+    rdfs:label "contains graph"@en ;
+    rdfs:comment """Names a graph that the subject's dataset contains and that the representation at hand does not carry.
+
+quadpod uses it as an HTTP link relation (RFC 8288) on a response whose media type has no syntax for named graphs, such as Turtle or N-Triples, served for a resource whose stored form is a dataset. The body is the default graph, and one `Link: <g>; rel="https://w3id.org/quadpod/ns#containsGraph"` header names each graph left out, so the response is complete about what it omits. A client that wants the whole dataset re-requests it in a format that can hold one; those are advertised alongside with `rel="alternate"`.
+
+No registered link relation states that a representation omits part of a resource, which is why this term exists. It follows the shape LDP uses for `ldp:constrainedBy`: an RDF property that also serves as a link relation."""@en ;
+    rdfs:isDefinedBy <https://w3id.org/quadpod/ns#> .

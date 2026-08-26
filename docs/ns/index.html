@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The quadpod vocabulary</title>
+<link rel="alternate" type="text/turtle" href="quadpod.ttl">
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    max-width: 46rem; margin: 3rem auto; padding: 0 1.25rem;
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+  pre { overflow-x: auto; padding: 0.75rem 1rem; border-radius: 6px; background: rgba(127,127,127,0.12); }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.15rem; margin-top: 2.5rem; }
+  dt { font-weight: 600; margin-top: 1rem; }
+  dd { margin: 0.25rem 0 0 0; }
+  .ns { color: inherit; opacity: 0.75; }
+  footer { margin-top: 3rem; font-size: 0.9em; opacity: 0.75; }
+</style>
+</head>
+<body>
+
+<h1>The quadpod vocabulary</h1>
+<p class="ns"><code>https://w3id.org/quadpod/ns#</code>, preferred prefix <code>quadpod:</code></p>
+
+<p>Terms <a href="https://github.com/tophcodes/quadpod">quadpod</a> mints because no
+registered vocabulary carries them. A term enters this namespace only when the alternative
+is a claim a server cannot make in any registered vocabulary. Everything quadpod can say in
+LDP, WAC, SHACL, PROV-O or schema.org is said there instead.</p>
+
+<p>Machine-readable: <a href="quadpod.ttl">quadpod.ttl</a>.</p>
+
+<h2>Terms</h2>
+
+<dl>
+  <dt id="containsGraph"><code>quadpod:containsGraph</code> <span class="ns">(rdf:Property)</span></dt>
+  <dd>
+    <p>Names a graph that the subject's dataset contains and that the representation at hand
+    does not carry.</p>
+
+    <p>quadpod uses it as an HTTP link relation (RFC 8288) on a response whose media type has
+    no syntax for named graphs, such as Turtle or N-Triples, served for a resource whose
+    stored form is a dataset. The body is the default graph, and one header names each graph
+    left out, so the response is complete about what it omits:</p>
+
+<pre>GET /notes HTTP/1.1
+Accept: text/turtle
+
+HTTP/1.1 200 OK
+Content-Type: text/turtle
+Link: &lt;urn:example:g1&gt;; rel="https://w3id.org/quadpod/ns#containsGraph"
+Link: &lt;/notes&gt;; rel="alternate"; type="application/trig"</pre>
+
+    <p>A client that wants the whole dataset re-requests it in a format that can hold one;
+    those are advertised alongside with <code>rel="alternate"</code>.</p>
+
+    <p>No registered link relation states that a representation omits part of a resource,
+    which is why this term exists. It follows the shape LDP uses for
+    <code>ldp:constrainedBy</code>: an RDF property that also serves as a link relation.</p>
+  </dd>
+</dl>
+
+<footer>
+  <p>The namespace resolves through <a href="https://w3id.org/">w3id.org</a>, so the terms
+  keep their identity if the hosting moves. Source and issue tracker:
+  <a href="https://github.com/tophcodes/quadpod">github.com/tophcodes/quadpod</a>.</p>
+</footer>
+
+</body>
+</html>

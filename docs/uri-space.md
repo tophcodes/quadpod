@@ -250,7 +250,7 @@ query parameter is ignored, as it always has been.
 One link relation is minted here, because none is registered for what it says:
 
 ```
-Link: <urn:example:g1>; rel="https://quadpod.toph.so/ns#containsGraph"
+Link: <urn:example:g1>; rel="https://w3id.org/quadpod/ns#containsGraph"
 ```
 
 It appears on a `GET` answered in a format that cannot carry named graphs, Turtle or
@@ -264,13 +264,19 @@ only requirement is an absolute IRI.
 representation exists, and it makes no claim about completeness. No registered relation says
 "this response is lossy", which is why `containsGraph` exists at all.
 
-**This IRI is provisional.** It is not dereferenceable yet, and it is tied to a hostname that
-may change. Moving it later is a breaking change for anything that reads it, so it gets
-settled, as a permanent identifier or as a hosted document at that address, before this pod is
-deployed anywhere, and at the latest before 1.0. The internal `urn:quadpod:` namespace is a
-different thing entirely: it never leaves the server ([`architecture.md`](architecture.md)),
-while this one is
-part of the contract.
+**The namespace resolves through w3id.org**, the W3C Permanent Identifier Community Group's
+redirect service, so the terms keep their identity if the hosting moves. A term written into
+stored data is the expensive kind to relocate: an access mode in an ACL document has to mean
+the same thing across pods, or the documents stop being portable. The redirect is a line in a
+public repository, so relocating the document is a configuration change rather than a
+breaking one.
+
+The vocabulary is served by the project rather than by a pod. A pod that served its own
+terms would make their definitions depend on some deployment staying up, and every deployment
+would answer with its own copy.
+
+The internal `urn:quadpod:` namespace is a different thing entirely: it never leaves the
+server ([`architecture.md`](architecture.md)), while this one is part of the contract.
 
 ## Design rationale
 
