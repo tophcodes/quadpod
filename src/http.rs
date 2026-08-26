@@ -2017,13 +2017,20 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     // resource served as Turtle has nothing to point `alternate` at, and
     // must not carry these headers just because Turtle itself is lossy.
     if !fmt.carries_dataset() && stored.has_named_graphs() {
+        // The one header that cannot degenerate: it is a claim about the
+        // representation as a whole, so it needs nothing nameable to exist
+        // (`docs/decisions.md`, ADR-13). Emitted first because it is
+        // the claim the rest of this block qualifies.
+        out.append(header::LINK, format!(
+            "<{}>; rel=\"https://w3id.org/quadpod/ns#partialDataset\"", r.graph_iri()
+        ).parse().expect("resource iri is header-safe"));
         // `containsGraph` names what a client would recognise, so it is drawn
         // from the visible view: a graph the client named with a blank node
         // has no IRI it ever wrote, and the IRI the server minted for it is
         // reserved (§3.2.2), so there is nothing this header could name it
-        // with. The `alternate` links below are emitted for either kind, so a
-        // resource whose only withheld graph is blank-named still tells the
-        // client that something was withheld and where to get it whole.
+        // with. A resource whose only withheld graph is blank-named therefore
+        // gets no `containsGraph` at all, and is told what happened by
+        // `partialDataset` above and the `alternate` links below.
         for name in visible.named_graphs() {
             out.append(header::LINK, format!(
                 "<{}>; rel=\"https://w3id.org/quadpod/ns#containsGraph\"", name.as_str()

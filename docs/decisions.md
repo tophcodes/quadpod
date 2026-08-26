@@ -413,3 +413,71 @@ cost is accepted, because the alternative is a projection that reports triples n
 **What would reopen it.** A write interface that is not a projection: a second front end
 addressing the same resources LDP addresses, by the same identifiers, with the same
 conditional requests. That is not a view, and this decision would not apply to it.
+
+<a id="adr-13"></a>
+
+## ADR-13: A resource may hold a dataset, and a format that cannot carry one still answers
+
+A resource's stored form may be a dataset rather than a single graph. A read in a format
+with no syntax for named graphs, Turtle or N-Triples, answers `200` with the default graph
+and states in `Link` headers that it did so.
+
+**Why a resource may hold a dataset.** Verifiable Credentials put each proof in its own
+named graph, because the credential's context declares `proof` with `"@container": "@graph"`
+and the proof object carries no identifier, so the graph name is a blank node. The signature
+is over the canonicalized dataset (RDFC-1.0) with the proof graph excluded, which is what
+the separate graph achieves. A store that flattens the proof into the credential's graph
+changes the canonicalization input, and the signature is then unverifiable for good, with no
+error at the moment of loss.
+
+That is the reason. Holding credentials as queryable RDF whose signatures still verify is a
+goal of this pod, and it is not reachable without dataset-valued resources. The conformance
+suite's `content-negotiation-named-graphs` scenario is satisfied by the same capability, and
+is too thin to carry the decision on its own: one scenario, `td:unreviewed` where the two
+sibling test cases under the same requirement are `td:approved`, and the requirement itself
+says nothing about named graphs.
+
+A credential stored as an opaque blob keeps its bytes and needs none of this. So does a
+proof over a byte canonicalization such as `eddsa-jcs-2022`, which an RDF round trip cannot
+preserve at all. Dataset-valued resources are for the case where the credential must be
+queryable *and* verifiable.
+
+**Why `200` where a `406` would also be defensible.** A `406` is the honest status for "no
+acceptable representation exists", and it loses on four counts:
+
+- RDF 1.1 Concepts §4.2 is the only published recommendation on the question, and it says a
+  consumer expecting a graph is expected to use the dataset's default graph.
+- The Solid Protocol requires a server to answer `text/turtle` and `application/ld+json` on
+  an RDF source. A `406` for Turtle on a resource that is one stands against that.
+- The conformance suite treats the question as open: the scenario that would pin it, a
+  `GET` of a named-graph document as Turtle, is present but disabled, with a comment calling
+  the expected response disputed.
+- The LDP working group ran the same argument and reversed itself. ISSUE-90, "An LDPC/LDPR
+  is a Named Graph", was resolved in favour in December 2013, landed in the March 2014
+  Last Call draft, and was gone six weeks later.
+
+Merging the named graphs into the Turtle response is refused separately and for a different
+reason: a statement in a named graph is not asserted in the default graph, so a merge
+manufactures assertions the document never made. The default graph is a subset of what was
+written; a merge reaches outside it.
+
+**The loss signal must not degenerate.** Two terms are minted, and the split between them is
+load-bearing. `quadpod:containsGraph` names a withheld graph, and can only name one that has
+an IRI. `quadpod:partialDataset` states that the representation is a default graph and
+carries the resource's own URL, so it appears on every lossy answer including the one where
+nothing is nameable.
+
+Without the second term the credential case, the case this whole capability exists for,
+receives the weakest signal of any: its proof graph is blank-named, so no graph can be named,
+and a `200` carrying a credential's claims without its proof would be distinguishable from a
+complete one only by an `alternate` link. A signal has to hold where the stakes are highest, and
+that case is this one.
+
+What this does not do is protect a client that ignores `Link` headers. Such a client reads
+`200` and a body that parses, and nothing in either says the proof is missing. The floor
+this raises is from no signal to a signal always present.
+
+**What would reopen it.** A registered link relation for a representation that omits part of
+its resource, which would replace both minted terms. Or the Solid Protocol resolving the
+disputed scenario in favour of `406`, which would settle the question the other way and cost
+only the removal of a code path and two terms.

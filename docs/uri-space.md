@@ -247,22 +247,31 @@ query parameter is ignored, as it always has been.
 
 ## The vocabulary this pod mints
 
-One link relation is minted here, because none is registered for what it says:
+Two link relations are minted here, because none is registered for what they say. Both
+appear on a `GET` answered in a format that cannot carry named graphs, Turtle or N-Triples
+against a dataset-valued resource, and together they are why that response is a `200` with
+the default graph in place of a `406` ([ADR-13](decisions.md#adr-13)). RFC 8288 permits
+extension relations; the only requirement is an absolute IRI.
 
 ```
+Link: </notes>; rel="https://w3id.org/quadpod/ns#partialDataset"
 Link: <urn:example:g1>; rel="https://w3id.org/quadpod/ns#containsGraph"
 ```
 
-It appears on a `GET` answered in a format that cannot carry named graphs, Turtle or
-N-Triples against a dataset-valued resource, and names a graph the response therefore does
-**not** contain. It is what makes that partial answer honest, and it is why the response is a
-`200` with the default graph in place of a `406`. RFC 8288 permits extension relations; the
-only requirement is an absolute IRI.
+`partialDataset` targets the resource itself and says the body is a default graph. It is a
+claim about the whole representation, so it appears on every lossy answer.
 
-`rel="alternate"` accompanies it, with `type="application/trig"` and
+`containsGraph` names one graph the response does **not** contain, and appears once per such
+graph. It can only name a graph that has an IRI. A graph the client named with a blank node
+has none it ever wrote, and the skolem the server minted for it is reserved, so a resource
+whose withheld graphs are all blank-named carries no `containsGraph` at all. That case is
+the Verifiable Credential, whose proof graph is blank-named, and it is why the first relation
+exists separately from the second.
+
+`rel="alternate"` accompanies both, with `type="application/trig"` and
 `type="application/ld+json"`. That one carries its ordinary meaning, that another
 representation exists, and it makes no claim about completeness. No registered relation says
-"this response is lossy", which is why `containsGraph` exists at all.
+"this response is lossy", which is why the two above exist at all.
 
 **The namespace resolves through w3id.org**, the W3C Permanent Identifier Community Group's
 redirect service, so the terms keep their identity if the hosting moves. A term written into

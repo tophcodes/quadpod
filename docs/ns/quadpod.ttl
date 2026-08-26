@@ -24,3 +24,13 @@ quadpod uses it as an HTTP link relation (RFC 8288) on a response whose media ty
 
 No registered link relation states that a representation omits part of a resource, which is why this term exists. It follows the shape LDP uses for `ldp:constrainedBy`: an RDF property that also serves as a link relation."""@en ;
     rdfs:isDefinedBy <https://w3id.org/quadpod/ns#> .
+
+quadpod:partialDataset
+    a rdf:Property ;
+    rdfs:label "partial dataset"@en ;
+    rdfs:comment """States that the representation at hand carries only the default graph of the dataset stored at the subject.
+
+quadpod uses it as an HTTP link relation (RFC 8288), with the resource's own URL as the target, on every response whose media type has no syntax for named graphs and whose resource is stored as a dataset. It is a claim about the representation as a whole and names no parts, so it holds where `quadpod:containsGraph` cannot: a graph the client named with a blank node has no IRI a `Link` header could carry, so a response withholding only such graphs would otherwise state nothing. The deployed case is a Verifiable Credential, whose proof sits in a blank-node-named graph.
+
+The two terms are emitted together and answer different questions. This one says the representation is partial; `quadpod:containsGraph` says which graphs are missing, for those that can be named."""@en ;
+    rdfs:isDefinedBy <https://w3id.org/quadpod/ns#> .

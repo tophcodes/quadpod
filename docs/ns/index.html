@@ -51,6 +51,7 @@ Accept: text/turtle
 
 HTTP/1.1 200 OK
 Content-Type: text/turtle
+Link: &lt;/notes&gt;; rel="https://w3id.org/quadpod/ns#partialDataset"
 Link: &lt;urn:example:g1&gt;; rel="https://w3id.org/quadpod/ns#containsGraph"
 Link: &lt;/notes&gt;; rel="alternate"; type="application/trig"</pre>
 
@@ -60,6 +61,35 @@ Link: &lt;/notes&gt;; rel="alternate"; type="application/trig"</pre>
     <p>No registered link relation states that a representation omits part of a resource,
     which is why this term exists. It follows the shape LDP uses for
     <code>ldp:constrainedBy</code>: an RDF property that also serves as a link relation.</p>
+  </dd>
+
+  <dt id="partialDataset"><code>quadpod:partialDataset</code> <span class="ns">(rdf:Property)</span></dt>
+  <dd>
+    <p>States that the representation at hand carries only the default graph of the dataset
+    stored at the subject.</p>
+
+    <p>quadpod uses it as an HTTP link relation (RFC 8288), with the resource's own URL as
+    the target, on every response whose media type has no syntax for named graphs and whose
+    resource is stored as a dataset. It is a claim about the representation as a whole and
+    names no parts, so it holds where <code>quadpod:containsGraph</code>
+    cannot: a graph the client named with a blank node has no IRI a header could carry, so a
+    response withholding only such graphs would otherwise state nothing.</p>
+
+<pre>GET /credential HTTP/1.1
+Accept: text/turtle
+
+HTTP/1.1 200 OK
+Content-Type: text/turtle
+Link: &lt;/credential&gt;; rel="https://w3id.org/quadpod/ns#partialDataset"
+Link: &lt;/credential&gt;; rel="alternate"; type="application/trig"</pre>
+
+    <p>That is the deployed case: a Verifiable Credential keeps its proof in a
+    blank-node-named graph, so no graph can be named and this header is the only one stating
+    that the claims arrived without the proof.</p>
+
+    <p>The two terms are emitted together and answer different questions. This one says the
+    representation is partial; <code>quadpod:containsGraph</code> says which graphs are
+    missing, for those that can be named.</p>
   </dd>
 </dl>
 

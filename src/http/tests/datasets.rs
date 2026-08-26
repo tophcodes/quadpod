@@ -148,6 +148,8 @@ async fn a_blank_named_graph_is_a_dataset_and_a_graph_format_is_told_so() {
         "the client must be told the whole thing is available elsewhere: {links:?}");
     assert!(!links.iter().any(|l| l.contains("containsGraph")),
         "and not under a name it never wrote: {links:?}");
+    assert!(links.iter().any(|l| l.contains("partialDataset") && l.contains("/c/notes")),
+        "ADR-13: the one header that holds when nothing is nameable: {links:?}");
     assert!(!body_string(res).await.contains("Alice"),
         "the withheld graph is withheld, not merged into the default graph");
 }
@@ -483,6 +485,8 @@ async fn a_blank_named_graph_and_an_iri_named_graph_together() {
         "the IRI-named graph is nameable: {links:?}");
     assert_eq!(links.iter().filter(|l| l.contains("containsGraph")).count(), 1,
         "the blank-named graph has no IRI a Link header can name: {links:?}");
+    assert_eq!(links.iter().filter(|l| l.contains("partialDataset")).count(), 1,
+        "one claim about the representation, however many graphs it withheld: {links:?}");
     assert!(!body_string(res).await.contains("Alice"),
         "neither named graph leaked into the default graph");
 
@@ -491,4 +495,32 @@ async fn a_blank_named_graph_and_an_iri_named_graph_together() {
     let out = body_string(f.app.oneshot(dataset_get).await.unwrap()).await;
     assert!(out.contains("Alice"), "the blank-named graph's content still round-trips: {out}");
     assert!(out.contains("Bob"), "and the IRI-named graph's content: {out}");
+}
+
+// The negative half of ADR-13, which the code has asserted in a comment
+// since these headers existed and nothing pinned: a graph-shaped resource
+// carries neither term. Turtle is lossy as a format, and that is not what
+// these headers report; they report that *this resource* held more than the
+// response carries. `partialDataset` appears on every lossy answer, so it is
+// the term whose absence here has to be a test rather than an intention.
+#[tokio::test]
+async fn a_graph_shaped_resource_carries_no_dataset_links() {
+    let f = fixture().await;
+    let put = f.owner_request("PUT", "/c/notes")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .body(Body::from("<http://example.org/bob> <http://schema.org/name> \"Bob\" .")).unwrap();
+    assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+    let get = f.owner_request("GET", "/c/notes")
+        .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
+    let res = f.app.clone().oneshot(get).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let links: Vec<String> = res.headers().get_all(header::LINK).iter()
+        .map(|v| v.to_str().unwrap().to_owned()).collect();
+    assert!(!links.iter().any(|l| l.contains("partialDataset")),
+        "nothing was withheld, so nothing may say otherwise: {links:?}");
+    assert!(!links.iter().any(|l| l.contains("containsGraph")),
+        "and there is no graph to name: {links:?}");
+    assert!(!links.iter().any(|l| l.contains("alternate") && l.contains("application/trig")),
+        "nor anywhere fuller to point at: {links:?}");
 }
