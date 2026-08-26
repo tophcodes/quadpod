@@ -17,10 +17,19 @@ jobs:
       - uses: actions/checkout@v4
 
       # The build needs bindgen and libclang for Oxigraph, which only the flake
-      # provides — a bare `cargo build` fails.
+      # provides. A bare `cargo build` fails.
       - uses: DeterminateSystems/nix-installer-action@main
 
+      # The cache key has to name the toolchain that actually compiled the
+      # artifacts. cargo and rustc come from the dev shell, so a key derived
+      # from the runner image's own rustc restores objects the flake's compiler
+      # then refuses with E0514.
+      - id: toolchain
+        run: echo "id=$(nix develop -c rustc -V | tr -c '[:alnum:].' '-')" >> "$GITHUB_OUTPUT"
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.toolchain.outputs.id }}
 
       - name: Clippy
         run: nix develop -c cargo clippy --all-targets -- -D warnings
