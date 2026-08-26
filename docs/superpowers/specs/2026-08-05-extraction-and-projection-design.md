@@ -2,13 +2,13 @@
 
 How bytes in the blob store become triples in the quad store, how that is configured, and
 how triples become visible again as files. This is a design, not an implementation report:
-nothing here is built yet, and the open questions at the end are genuinely open.
+nothing here is built yet, and the open questions at the end are open.
 
 ## The setting that motivates it
 
 The blob store is a directory a human uses directly. `--blob-store local:$HOME/pod` makes
 `$HOME/pod` both this pod's byte storage and an Obsidian vault, which works only because
-`BlobKey` is the resource's own path — the backing store mirrors the URL tree and can be
+`BlobKey` is the resource's own path: the backing store mirrors the URL tree and can be
 read with ordinary tools. Notes are Markdown blobs, preserved byte for byte; their metadata
 is YAML frontmatter, which is JSON-LD once it has a context.
 
@@ -27,17 +27,17 @@ triples are an index over them.
 
 One direction, always. A blob's bytes are the truth; extraction produces triples about
 those bytes; nothing ever writes back into the file. This is what makes the whole design
-tractable — no round-trip fidelity to defend, no merge, no two writers.
+tractable: no round-trip fidelity to defend, no merge, no two writers.
 
 The target is the description auxiliary, which `uri-space.md` currently lists as *reserved,
-candidate — not promised*. This design promises it, with a narrower meaning than "metadata":
+candidate, unpromised*. This design promises it, with a narrower meaning than "metadata":
 
 > `/.aux/{subject}.meta` is the derived index over the bytes of its subject.
 
 The four properties `uri-space.md` requires of an auxiliary are already true of it:
 it exists only for an existing subject and dies with it, it stays out of container
 listings, its authorization derives from the subject, and it is discoverable from the
-subject by `Link`. Writability is the one open question — see below.
+subject by `Link`. Writability is the one open question; see below.
 
 Extraction is per media type, and every extractor writes to the same place:
 
@@ -49,18 +49,18 @@ Extraction is per media type, and every extractor writes to the same place:
 
 **A `.ttl` in the blob store stays a blob.** It is not reclassified into the quad store.
 `classify_body` decides RDF-vs-blob from `Content-Type`, and a file on disk has no
-`Content-Type` — extension is not a format claim, which is why extensionless URLs are the
+`Content-Type`. An extension is no format claim, which is why extensionless URLs are the
 recommendation in the first place. So the rule is positional and needs no sniffing: what is
 in the blob store is bytes, and what its bytes mean is what extraction reports. A Turtle
 document you can edit and diff is worth more than one whose whitespace the pod ate.
 
-RDF written over HTTP with `text/turtle` is unaffected — it is parsed into the quad store as
+RDF written over HTTP with `text/turtle` is unaffected. It is parsed into the quad store as
 it is today, and it has no bytes, so it has nothing to extract.
 
 ## Configuring extractors
 
 Extraction is behaviour the server performs on the user's data, so its configuration is
-the user's data with a meaning the server has to understand — the definition of an
+the user's data with a meaning the server has to understand, which is the definition of an
 auxiliary. It lives at `/.aux/{subject}.config` and inherits down the container tree the
 way an ACL does, so the root container can configure the whole pod and a subtree can
 refine it.
@@ -83,8 +83,8 @@ a script" means whoever can `PUT` can execute.
 
 Extractor configuration is triples the user writes that steer what the server executes.
 The question the pod has to answer on such a write is not "may this agent write here" but
-**"is this agent trusted to supply logic this server will run"** — and if not, the write is
-refused, not accepted-and-ignored.
+**"is this agent trusted to supply logic this server will run"**, and a no there means the write is
+refused rather than accepted and ignored.
 
 That is a distinct capability, so it is a distinct WAC mode. Two constraints on it:
 
@@ -93,7 +93,7 @@ never appears where a client can address it. An access mode is the opposite: it 
 into ACL documents by clients and has to be dereferenceable. It needs an `https:` namespace
 this pod serves.
 
-**Name it for what it grants.** Not `ManageAcl` — that is the definition of `acl:Control`,
+**Name it for what it grants.** `ManageAcl` is the wrong name, because that is the definition of `acl:Control`,
 and a mode by that name which does not manage ACLs is a trap for the reader. It grants the
 right to configure extractors; say so.
 
@@ -101,14 +101,14 @@ right to configure extractors; say so.
 mode is `403`. The distinction matters here because the failure is expected in normal
 operation, not only under attack.
 
-**The ceiling.** A mode below `acl:Control` is not a boundary against `acl:Control` —
+**The ceiling.** A mode below `acl:Control` is no boundary against `acl:Control`:
 whoever can write the ACL can grant themselves any mode in it. The value of a separate mode
 is delegation downward: an agent that may configure extraction without also being able to
 redistribute access. That is a real gain, and it is the only one.
 
 **Stale grants.** The gate is checked when the configuration is written, but the
 configuration keeps executing afterwards. Revoking an agent's trust must therefore do
-something about configurations it already wrote — either the check is repeated at execution
+something about configurations it already wrote: either the check is repeated at execution
 time against the recorded author, or revocation sweeps existing configurations. Deciding
 nothing here means revocation silently does not revoke.
 
@@ -117,12 +117,12 @@ nothing here means revocation silently does not revoke.
 Two layers, and the split between them is the whole point.
 
 **The watcher is advisory.** It says "look at this path" and decides nothing. inotify is
-lossy — queue overflow under load, a blind window at startup, nothing at all on network
+lossy: queue overflow under load, a blind window at startup, nothing at all on network
 filesystems. Advisory, a lost event costs latency; authoritative, it would cost data.
 
 **Reconcile is authoritative.** It walks a set of paths, mints presence markers and
 containment for bytes the store does not know, retires markers whose bytes are gone, and
-runs extraction. Idempotent, and it never copies bytes — the key is derived from the path,
+runs extraction. Idempotent, and it never copies bytes, since the key is derived from the path,
 so a file already in the right place is already stored.
 
 Around that, three things that decide whether it is cheap or wasteful:
@@ -138,7 +138,7 @@ exactly when a batch of foreign writes has landed.
 
 **Regular files only.** Reconcile skips symlinks and `.quads/`. Without that rule it finds
 the projection symlinks below, treats them as blobs, and mints presence markers for derived
-content — which is then itself projected.
+content, which is then itself projected.
 
 ## Projection
 
@@ -167,14 +167,14 @@ operation that serializes.
 
 **Canonicalization.** [RDFC-1.0](https://www.w3.org/TR/rdf-canon/) canonicalizes a dataset
 to canonical N-Quads: deterministic blank node labels, one LF per quad, byte-identical
-output for isomorphic datasets. Turtle has no such standard — prefixes, abbreviations, list
+output for isomorphic datasets. Turtle has no such standard: prefixes, abbreviations, list
 syntax and ordering are all free. So N-Quads is the canonical basis, the ETag is a hash over
 it, and every other serialization is a deterministic function of the same dataset. A
 canonical Turtle writer is a quadpod-local convention, which is acceptable because this
 FUSE layer is quadpod's, not a generic Solid client.
 
 **ETags identify representations.** If `.ttl` and `.nq` differ in bytes they need different
-ETags, and over HTTP content negotiation that also means `Vary: Accept` — otherwise a cache
+ETags, and over HTTP content negotiation that also means `Vary: Accept`, or a cache
 answers an N-Quads request with Turtle bytes. In the projection the serialization is in the
 path, so they are different URLs and the problem does not arise; over the API it does.
 
@@ -189,7 +189,7 @@ derived graph and an asserted one.
 the obvious answer, but extraction results and user triples must not be able to overwrite
 each other, and `constraints.md` will want a check that says so in one place.
 
-**Trust revocation.** See above — repeated check at execution, or a sweep. Unresolved.
+**Trust revocation.** See above: repeated check at execution, or a sweep. Unresolved.
 
 **Does the config auxiliary need its own kind, or is it `.meta` with a reserved
 predicate?** A separate `.config` kind is cleaner to authorize; a predicate is one fewer
