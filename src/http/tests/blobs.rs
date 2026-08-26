@@ -42,7 +42,7 @@ async fn a_posted_blob_joins_and_leaves_its_container() {
 }
 
 // §8.4: axum's own 2 MiB default already applied here. This pins that the
-// configured number is the one in force — a body over it is refused, and
+// configured number is the one in force, a body over it is refused, and
 // one under it is not.
 //
 // The under-limit body must be a format `put_impl` accepts today (only an
@@ -158,7 +158,7 @@ async fn wac_governs_a_blob_exactly_as_it_governs_a_graph() {
 // Whole-branch review, Important 1: `put_status` mapped `ResourceError::Blob`
 // through its `_` arm to `400`, telling a client a server-side outage was
 // their malformed request. `resource::`'s own `FailingBlobs` never caught
-// this because it never goes through a handler — this one does.
+// this because it never goes through a handler, this one does.
 #[tokio::test]
 async fn a_blob_backend_outage_answers_500_not_400() {
     let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;
@@ -172,7 +172,7 @@ async fn a_blob_backend_outage_answers_500_not_400() {
 
 /// The backend's own words are for the log, not for the client: the body
 /// says the same thing whatever failed underneath. `tests/observability.rs`
-/// holds the other half — that the words really are in the log.
+/// holds the other half, that the words reach the log.
 #[tokio::test]
 async fn a_500_says_nothing_about_the_backend_that_failed() {
     let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;

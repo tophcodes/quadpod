@@ -6,7 +6,7 @@ use quadpod::{auth::{GuardedClient, HttpJwksResolver, HttpWebIdIssuers, InMemory
 async fn main() {
     tracing_subscriber::fmt::init();
     // Both the base URI and the owner WebID are checked by the parser that
-    // produced them, so there is nothing left to validate here — and an error
+    // produced them, so there is nothing left to validate here, and an error
     // in either still names the config file when that is where it came from,
     // which a check at this point could not do.
     let cfg = Config::load().unwrap_or_else(|e| e.exit());
@@ -15,7 +15,7 @@ async fn main() {
     if !rejected_insecure_hosts.is_empty() {
         // An entry that reaches here is a non-blank string the operator
         // typed (config.rs trims and drops empty/whitespace entries before
-        // parsing) that this process could not understand unambiguously —
+        // parsing) that this process could not understand unambiguously,
         // the same class of mistake as an invalid --base-uri or
         // --owner-webid above. Refuse to start rather than silently grant
         // fewer hosts than configured: a pod that starts clean here is
@@ -34,7 +34,7 @@ async fn main() {
     if !understood_insecure_hosts.is_empty() {
         // Loud on purpose: this is the operator relaxing an SSRF control.
         // For these hosts the pod will talk plain http and reach private
-        // addresses on pre-authentication fetches. Logs what was actually
+        // addresses on pre-authentication fetches. Logs what was
         // understood after trimming/parsing, not the raw flag value.
         tracing::warn!(
             hosts = %understood_insecure_hosts.join(", "),

@@ -3,7 +3,7 @@
 //! The ACL of `<res>` is `<res>`'s auxiliary of kind [`AuxKind::Acl`]. If it
 //! has no representation, WAC inheritance applies: walk up the container
 //! chain and use the first ACL found there, evaluated through `acl:default`.
-//! The first ACL found wins completely — ancestor rules are never merged in,
+//! The first ACL found wins completely, ancestor rules are never merged in,
 //! because merging would make revoking access on a subtree impossible.
 //!
 //! The candidate chain comes from [`ResourceUrl::ancestors`], the same
@@ -22,13 +22,13 @@ use crate::{
 /// resource it governs.
 ///
 /// `present` is the probe's answer (`resource::exists_many`), so this asks the
-/// store nothing about existence — it reads the set it was handed and fetches
+/// store nothing about existence: it reads the set it was handed and fetches
 /// only the graphs already known to be there, in one query.
 ///
 /// Eager rather than lazy, and that is forced: `Guard::authorize` is
 /// synchronous, so there is no `await` left at the point a level's ACL is
 /// chosen. Loading the whole chain's ACLs costs one query for a set bounded by
-/// the chain, and is usually one document — a lazy per-level fetch would cost
+/// the chain, and is usually one document, a lazy per-level fetch would cost
 /// the synchronous decision instead.
 pub async fn load_chain_acls(
     store: &dyn SparqlStore,
@@ -49,7 +49,7 @@ pub async fn load_chain_acls(
         governed.insert(acl_iri.to_owned(), element.graph_iri().to_owned());
     }
     // Seeded with an empty vector per existing ACL *before* the query: an ACL
-    // that holds no triples yields no solutions, and it must still be found —
+    // that holds no triples yields no solutions, and it must still be found,
     // an empty ACL grants nothing, which is the opposite of falling through to
     // an ancestor.
     let mut out: std::collections::HashMap<String, Vec<Triple>> =

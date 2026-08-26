@@ -18,7 +18,7 @@ use super::authenticate;
 ///
 /// `htu` is a wire-level concept, not a storage one. RFC 9449 §4.2 defines it
 /// as "the HTTP target URI … of the request to which the JWT is attached", and
-/// a client signs the URL it is about to put on the wire — `/caf%C3%A9`, never
+/// a client signs the URL it is about to put on the wire, `/caf%C3%A9`, never
 /// `/café`. This function must therefore hand `verify_dpop` that same wire
 /// form, and nothing else: the percent-DECODED path is a *storage* question,
 /// answered downstream by [`StorageSpace::resolve`] and the handlers' own
@@ -26,9 +26,9 @@ use super::authenticate;
 ///
 /// It used to. `derive_htu` percent-decoded the path and returned the target's
 /// **graph IRI**, and `verify_dpop` compensated by percent-decoding both sides
-/// of its own comparison. That made two distinct wire URLs interchangeable:
-/// a proof minted for `/a%41` (which the handlers see as `/aA`) also verified
-/// against a request to `/a%2541` (which the handlers see as `/a%41`) — a
+/// of its own comparison. That made two distinct wire URLs interchangeable: a
+/// proof minted for `/a%41` (which the handlers see as `/aA`) also verified
+/// against a request to `/a%2541` (which the handlers see as `/a%41`), a
 /// *different* resource. Both comparisons decoded their way to `/aA` and
 /// accepted, so a signed body could be re-targeted at a resource its client
 /// never addressed. Empirically it was also broken for the honest case: a
@@ -38,8 +38,8 @@ use super::authenticate;
 /// `url` crate re-creates on parse (non-ASCII UTF-8, e.g. `/caf%C3%A9`)
 /// happened to line up.
 ///
-/// Returning base + raw path makes both comparisons — `dpop-verifier`'s and
-/// [`crate::auth::dpop`]'s own exact one — operate on the wire form, so they
+/// Returning base + raw path makes both comparisons, `dpop-verifier`'s and
+/// [`crate::auth::dpop`]'s own exact one, operate on the wire form, so they
 /// agree, the aliasing disappears, and the honest case works. There is no
 /// fallible step left: every request path is a `htu` a client can sign,
 /// including one in the reserved namespace, one that breaks the IRI, and one
@@ -60,9 +60,9 @@ fn derive_htu(space: &StorageSpace, raw_path: &str) -> String {
 ///
 /// `htu` (the DPoP-bound target URL) is derived from the CONFIGURED public
 /// base URI plus the RAW request path (see [`derive_htu`]), never from the
-/// request's socket scheme/host — the pod may sit behind a reverse proxy that
+/// request's socket scheme/host, the pod may sit behind a reverse proxy that
 /// rewrites those, so trusting them would let an attacker mint proofs against
-/// a URL the pod never actually serves under. `now_unix` uses the real wall
+/// a URL the pod does not serve under. `now_unix` uses the real wall
 /// clock; see `auth::dpop::InMemoryJtiReplayStore` for the matching
 /// single-instance replay-store limitation, and `auth::http_jwks` for the
 /// JWKS-TTL one.
@@ -125,7 +125,7 @@ mod tests {
 
     // The property the whole DPoP check now rests on: `htu` is the URL as the
     // client put it on the wire, character for character. A percent-escape is
-    // preserved, never decoded — decoding it is what once let a proof for
+    // preserved, never decoded, decoding it is what once let a proof for
     // `/a%41` verify against a request to `/a%2541`, two different resources.
     #[test]
     fn derive_htu_is_the_wire_form_of_the_request_path() {
@@ -138,7 +138,7 @@ mod tests {
     }
 
     // For every path that needs no escaping, the wire form and the target's
-    // graph IRI coincide — which is why the change is invisible to ordinary
+    // graph IRI coincide, which is why the change is invisible to ordinary
     // requests. Auxiliaries are included deliberately: their IRI is
     // reassembled from the reserved segment and the subject's path, so if that
     // reassembly ever stopped being "base + request path", every authenticated
@@ -155,8 +155,8 @@ mod tests {
     }
 
     // A path in the reserved namespace that names no auxiliary is answered by
-    // the handler (404), which it can only do if the credential check passed
-    // — so the `htu` must be the one a client signs for that URL, not a
+    // the handler (404), which it can only do if the credential check passed,
+    // so the `htu` must be the one a client signs for that URL, not a
     // fail-closed sentinel that would turn the 404 into a misleading 401.
     #[test]
     fn derive_htu_still_matches_a_signed_url_that_resolves_to_nothing() {
@@ -168,7 +168,7 @@ mod tests {
     }
 
     // A raw path whose percent-decoding is not valid UTF-8 is, on the wire,
-    // an ordinary signable URL — so it gets an ordinary `htu` rather than the
+    // an ordinary signable URL, so it gets an ordinary `htu` rather than the
     // unmatchable sentinel the decoding version needed. Nothing is loosened:
     // the handlers extract their path with axum's `Path<String>`, which
     // refuses the same invalid UTF-8 with a `400`, so such a request is

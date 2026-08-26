@@ -67,7 +67,7 @@ async fn a_graph_format_write_over_named_graphs_is_refused() {
 #[tokio::test]
 async fn the_reserved_namespace_and_container_datasets_are_refused() {
     let f = fixture().await;
-    // Any IRI under the reserved prefix triggers the refusal — this one
+    // Any IRI under the reserved prefix triggers the refusal, this one
     // avoids the skolem sub-namespace that only `dataset` may write or
     // match (`docs/constraints.md`).
     let reserved = f.owner_request("PUT", "/c/notes")
@@ -87,10 +87,10 @@ async fn the_reserved_namespace_and_container_datasets_are_refused() {
 #[tokio::test]
 async fn an_acl_containing_a_blank_node_round_trips_as_a_blank_node() {
     let f = fixture().await;
-    // A second, named authorization keeps OWNER's Control over /c/notes —
+    // A second, named authorization keeps OWNER's Control over /c/notes,
     // without it this ACL would deny even its own author the Control
-    // needed to read it back, which is a real (and separately tested)
-    // WAC rule, not what this test is about.
+    // needed to read it back, which is a real (and separately tested) WAC
+    // rule, not what this test is about.
     let acl = format!(
         "@prefix acl: <http://www.w3.org/ns/auth/acl#> .\n\
          <#owner> a acl:Authorization ; acl:agent <{OWNER}> ; \
@@ -126,7 +126,7 @@ const BLANK_NAMED_GRAPH_TRIG: &str =
 
 // §6.2, on the input that used to be invisible to every dataset decision:
 // a blank-node graph name is not an IRI, so nothing a `Link` header can
-// name — but the resource is still a dataset, and a graph format still
+// name, but the resource is still a dataset, and a graph format still
 // serves only part of it. Before, this answered `200` with an empty body
 // and no indication anything existed at all, which is the exact silent
 // loss §6.2 exists to prevent.
@@ -154,8 +154,8 @@ async fn a_blank_named_graph_is_a_dataset_and_a_graph_format_is_told_so() {
 
 // §6.3 on the same input: the client offered a format that carries the
 // whole resource, so preferring the lossy one it happened to list first is
-// the wrong answer — and it is what a shape read off the de-skolemized
-// view produces, since the graph name is a blank node again there.
+// the wrong answer, and it is what a shape read off the de-skolemized view
+// produces, since the graph name is a blank node again there.
 #[tokio::test]
 async fn a_blank_named_graph_makes_negotiation_prefer_a_dataset_format() {
     let f = fixture().await;
@@ -173,8 +173,8 @@ async fn a_blank_named_graph_makes_negotiation_prefer_a_dataset_format() {
         "under a blank node, not the server's internal IRI: {out}");
 }
 
-// §6.2.1 on the same input. The refusal cannot name the graph — the client
-// never wrote a name for it — but it must still refuse, or a Turtle write
+// §6.2.1 on the same input. The refusal cannot name the graph (the client
+// never wrote a name for it), but it must still refuse, or a Turtle write
 // destroys it with a `201` and no warning.
 #[tokio::test]
 async fn a_graph_format_write_over_a_blank_named_graph_is_refused() {
@@ -226,7 +226,7 @@ async fn a_blank_named_graph_is_refused_on_a_container_and_an_auxiliary() {
 
 // Every other `containsGraph` assertion uses one named graph, where
 // `insert` and `append` are indistinguishable. Two of them tell them
-// apart — `insert` would replace the first `Link` with the second, and the
+// apart, `insert` would replace the first `Link` with the second, and the
 // client would be told about half of what it did not get.
 #[tokio::test]
 async fn every_withheld_graph_is_named_not_just_the_last() {
@@ -290,7 +290,7 @@ async fn a_resource_containing_a_blank_node_round_trips_as_a_blank_node() {
     assert!(out.contains("Alice"), "and the statement itself survived: {out}");
 }
 
-// §6.3, against a resource that is genuinely dataset-shaped: the client
+// §6.3, against a resource that is dataset-shaped: the client
 // offered a format carrying everything, so the lossy one it listed first
 // is the wrong answer. A shape hardcoded to `Graph` answers Turtle here.
 #[tokio::test]
@@ -311,7 +311,7 @@ async fn a_dataset_shaped_resource_negotiates_away_from_a_lossy_format() {
     }
 
     // §6.3: `text/*` admits Turtle, and Turtle can serve the default
-    // graph — that is a `200` with `Link`s, never a `406`.
+    // graph: that is a `200` with `Link`s, never a `406`.
     let get = f.owner_request("GET", "/c/notes")
         .header(header::ACCEPT, "text/*").body(Body::empty()).unwrap();
     let res = f.app.oneshot(get).await.unwrap();
@@ -319,9 +319,9 @@ async fn a_dataset_shaped_resource_negotiates_away_from_a_lossy_format() {
     assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/turtle");
 }
 
-// §9.5. Folding this into the default graph would be a document rewrite —
-// a statement in a named graph is not asserted in the default graph — and
-// it is the obvious accidental implementation of the split.
+// §9.5. Folding this into the default graph would be a document rewrite
+// (a statement in a named graph is not asserted in the default graph),
+// and it is the obvious accidental implementation of the split.
 #[tokio::test]
 async fn a_graph_named_like_its_own_resource_stays_a_named_graph() {
     let f = fixture().await;
@@ -370,7 +370,7 @@ async fn naming_another_resources_url_as_a_graph_touches_nothing() {
 }
 
 // §9.1: an empty named graph produces no quads, so it cannot survive. The
-// isomorphism oracle passes vacuously here — this needs a direct assertion
+// isomorphism oracle passes vacuously here: this needs a direct assertion
 // on the response instead, or the limit stops being a decision and becomes
 // a surprise.
 #[tokio::test]
@@ -390,14 +390,14 @@ async fn an_empty_named_graph_is_documented_as_lost() {
         "documented limit (§9.1): a graph with no quads does not round-trip");
 }
 
-// §6.2.1's check reads `get_dataset` to decide whether an existing
-// resource has named graphs a graph-format write would destroy. If the
-// registry is corrupt — a shelf `sys:hasSubgraph` lists with no
-// `sys:graphName`, the state §3.2.3 says should never occur — `get_dataset`
-// fails closed with `InvalidIri` (pinned directly against the store in
-// `resource.rs`). This pins that `put_impl` propagates the refusal instead
-// of reading the store error as "no named graphs" and proceeding with
-// exactly the overwrite the check exists to refuse.
+// §6.2.1's check reads `get_dataset` to decide whether an existing resource
+// has named graphs a graph-format write would destroy. If the registry is
+// corrupt, a shelf `sys:hasSubgraph` lists with no `sys:graphName`, the
+// state §3.2.3 says should never occur, `get_dataset` fails closed with
+// `InvalidIri` (pinned directly against the store in `resource.rs`). This
+// pins that `put_impl` propagates the refusal instead of reading the store
+// error as "no named graphs" and proceeding with exactly the overwrite the
+// check exists to refuse.
 #[tokio::test]
 async fn a_corrupt_registry_refuses_the_write_instead_of_overwriting() {
     let f = fixture().await;

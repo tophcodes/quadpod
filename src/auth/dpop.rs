@@ -2,15 +2,15 @@
 //!
 //! `dpop-verifier` checks the proof's own signature, `htu`/`htm` match, and
 //! `jti` replay, but it has **no concept of an access token's `cnf` claim at
-//! all** — its only access-token-aware feature is the separate, unused-here
+//! all**, its only access-token-aware feature is the separate, unused-here
 //! `ath` hash-binding mechanism. So after `dpop-verifier` accepts the proof,
 //! this module manually compares the proof key's thumbprint (which
-//! `dpop-verifier` returns as `VerifiedDpop::jkt`) against `expected_jkt` —
-//! the access token's `cnf.jkt` — and rejects on any mismatch. Without that
-//! manual compare, a valid DPoP proof from *any* key would be accepted for
-//! an access token bound to a *different* key, breaking proof-of-possession
-//! entirely. Fails closed: every verification error, or a `jkt` mismatch,
-//! is rejected.
+//! `dpop-verifier` returns as `VerifiedDpop::jkt`) against `expected_jkt`,
+//! the access token's `cnf.jkt`, and rejects on any mismatch. Without that
+//! manual compare, a valid DPoP proof from *any* key would be accepted for an
+//! access token bound to a *different* key, breaking proof-of-possession
+//! entirely. Fails closed: every verification error, or a `jkt` mismatch, is
+//! rejected.
 //!
 //! # Two signature paths, one set of downstream checks
 //!
@@ -18,18 +18,18 @@
 //! its private `verify_signature_and_compute_jkt` (ES256, plus EdDSA behind a
 //! feature this pod does not enable); `VerifyOptions` exposes no algorithm
 //! knob, and its `Jwk` type is an untagged enum with only EC-P-256 and
-//! OKP-Ed25519 variants, so an RSA JWK does not even deserialize. RS256 —
+//! OKP-Ed25519 variants, so an RSA JWK does not even deserialize. RS256,
 //! which RFC 9449 permits, and which the official Solid conformance harness
-//! signs its proofs with — therefore cannot be reached through the crate at
+//! signs its proofs with, therefore cannot be reached through the crate at
 //! all. [`verify_rs256_proof`] is that one missing path, written here and
 //! deliberately confined to RS256: every other algorithm still goes to
 //! `dpop-verifier` unchanged, so its `none`, `HS*` and unsupported-alg
 //! rejections, and its EC signature verification, are exactly what they were.
 //!
-//! The two paths meet at a [`VerifiedDpop`], and *everything* after that —
-//! the exact wire-form `htu` comparison, the saturating freshness arithmetic,
-//! the `cnf.jkt` binding, and recording the `jti` only once all of those have
-//! passed — is shared. No property is re-implemented per algorithm.
+//! The two paths meet at a [`VerifiedDpop`], and *everything* after that, the
+//! exact wire-form `htu` comparison, the saturating freshness arithmetic, the
+//! `cnf.jkt` binding, and recording the `jti` only once all of those have
+//! passed, is shared. No property is re-implemented per algorithm.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 use super::AuthError;
 
 /// `dpop-verifier`'s own freshness check (`check_timestamp_freshness`) is
-/// hardcoded to the real wall clock (`OffsetDateTime::now_utc()`) — it
+/// hardcoded to the real wall clock (`OffsetDateTime::now_utc()`). It
 /// cannot be parameterized by the `now_unix` this module is given, which
 /// would make it untestable with fixed clocks. We disable it here (a very
 /// large window that never rejects) and instead check freshness ourselves,
@@ -64,24 +64,24 @@ const FUTURE_SKEW_SECONDS: i64 = 5;
 /// How far `now_unix` must move, in either direction, before
 /// [`InMemoryJtiReplayStore`] runs another eviction sweep.
 ///
-/// The sweep is O(n) over the whole set, and n scales with throughput —
+/// The sweep is O(n) over the whole set, and n scales with throughput,
 /// every accepted request records a `jti` that lives for the freshness
 /// window, so n ≈ requests-per-second × `MAX_AGE_SECONDS`. Sweeping on
-/// every call therefore puts an O(n) scan inside the store's mutex on
-/// a tokio worker thread, and the serialized cost per request grows with
-/// the very throughput it is trying to serve: the sustainable rate
-/// collapses to `sqrt(1 / (per-entry cost × window))`, a few hundred
-/// requests a second, and no number of cores moves it. Sweeping at most
-/// once per interval makes it O(1) amortized and leaves an O(1) hash
-/// insert as the whole critical section.
+/// every call therefore puts an O(n) scan inside the store's mutex on a
+/// tokio worker thread, and the serialized cost per request grows with the
+/// very throughput it is trying to serve: the sustainable rate collapses
+/// to `sqrt(1 / (per-entry cost × window))`, a few hundred requests a
+/// second, and no number of cores moves it. Sweeping at most once per
+/// interval makes it O(1) amortized and leaves an O(1) hash insert as the
+/// whole critical section.
 ///
 /// The cost is that an entry can outlive the freshness window by up to
 /// this interval. That is strictly *more* replay rejection than the window
-/// alone, never less, so it cannot admit a replay — and it cannot reject a
+/// alone, never less, so it cannot admit a replay, and it cannot reject a
 /// legitimate proof either, because a `jti` re-presented that late is
 /// re-presented on a proof `verify_dpop`'s own `iat` freshness check has
-/// already rejected. The bound on the set becomes
-/// `throughput × (MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS + this)`.
+/// already rejected. The bound on the set becomes `throughput ×
+/// (MAX_AGE_SECONDS + FUTURE_SKEW_SECONDS + this)`.
 const EVICTION_INTERVAL_SECONDS: i64 = 60;
 
 /// Where this pod remembers the `jti` of every proof it has accepted, so a
@@ -89,8 +89,8 @@ const EVICTION_INTERVAL_SECONDS: i64 = 60;
 ///
 /// **Not** `dpop_verifier::ReplayStore`, imported into this module as
 /// `DpopVerifierReplayStore`: that one is the crate's own interface,
-/// consulted from inside `DpopVerifier::verify` — i.e. *before* this
-/// module's freshness and `cnf.jkt` checks have run — and is deliberately
+/// consulted from inside `DpopVerifier::verify` (i.e. *before* this
+/// module's freshness and `cnf.jkt` checks have run), and is deliberately
 /// given a store that records nothing ([`NoopReplayStore`]). This trait is
 /// the pod's replay set, consulted by [`verify_dpop`] only once every other
 /// check has passed.
@@ -125,12 +125,12 @@ pub trait JtiReplayStore: Send + Sync {
 /// in-memory map for the lifetime of this value.
 ///
 /// A `jti` is therefore only rejected as a replay by the very store that
-/// first saw it — a restart, or a second replica, starts empty. That is the
+/// first saw it, a restart, or a second replica, starts empty. That is the
 /// single-instance limitation a shared/persistent (e.g. Redis) implementor
 /// would lift.
 ///
 /// Each entry is keyed by the `jti` hash and holds the `now_unix` at which
-/// it was recorded, which is what lets stale entries be evicted so the set
+/// it was recorded, so stale entries can be evicted and the set
 /// stays bounded instead of growing for as long as the pod runs.
 #[derive(Default)]
 pub struct InMemoryJtiReplayStore {
@@ -163,8 +163,8 @@ impl JtiReplayStore for InMemoryJtiReplayStore {
     /// why the resulting slightly-longer entry lifetime is safe.
     ///
     /// The interval is compared in absolute value, so a `now_unix` that
-    /// moves *backwards* — a stepped wall clock, or a caller simulating one
-    /// — also forces a sweep instead of suppressing eviction until the clock
+    /// moves *backwards*, a stepped wall clock, or a caller simulating one,
+    /// also forces a sweep instead of suppressing eviction until the clock
     /// catches up.
     ///
     /// The whole critical section is that O(1) amortized bookkeeping plus a
@@ -207,11 +207,11 @@ fn hash_jti(jti: &str) -> [u8; 32] {
 /// i.e. before our own freshness (Fix 1) and `cnf.jkt` binding checks run.
 /// If it were given a recording store, a proof that fails one of *our* later
 /// checks would still have permanently burned its `jti` inside
-/// `dpop-verifier` — letting an attacker who merely observes (or replays
-/// with a wrong key) a proof deny that `jti` to the legitimate client
-/// forever. Using this no-op store here means `dpop-verifier` never
-/// consumes a `jti`; the real replay check is the injected
-/// [`JtiReplayStore`], consulted only once every check has passed.
+/// `dpop-verifier`, letting an attacker who merely observes (or replays with
+/// a wrong key) a proof deny that `jti` to the legitimate client forever.
+/// Using this no-op store here means `dpop-verifier` never consumes a `jti`;
+/// the real replay check is the injected [`JtiReplayStore`], consulted only
+/// once every check has passed.
 struct NoopReplayStore;
 
 #[async_trait]
@@ -228,8 +228,8 @@ impl DpopVerifierReplayStore for NoopReplayStore {
 /// Read the `htu` claim out of a proof whose signature has ALREADY been
 /// verified.
 ///
-/// `dpop-verifier`'s `VerifiedDpop` carries only `jkt`, `jti` and `iat` — it
-/// never hands back the `htu` it compared — so the claim has to be decoded
+/// `dpop-verifier`'s `VerifiedDpop` carries only `jkt`, `jti` and `iat` (it
+/// never hands back the `htu` it compared), so the claim has to be decoded
 /// here. The caller must only ever pass a `proof` string that
 /// `DpopVerifier::verify` has just accepted: the signature covers exactly
 /// the `header.payload` prefix of that same string, so re-decoding its
@@ -259,68 +259,66 @@ fn verified_htu_claim(proof: &str) -> Result<String, AuthError> {
 /// Whether the proof's own `htu` names exactly the resource `expected`
 /// names.
 ///
-/// `dpop-verifier` compares the two through `uri::normalize_htu`, which
-/// **drops empty path segments** — and a trailing slash is an empty final
-/// segment. In this pod the trailing slash is precisely what separates a
-/// container from a resource: `/foo` and `/foo/` are distinct named graphs
-/// with distinct ACLs. Left at `dpop-verifier`'s comparison, a proof minted
-/// for `PUT /foo` also verifies against `PUT /foo/`, so an on-path adversary
-/// can re-target a signed resource write at the container of the same
-/// name — a different resource from the one the client authorized, with its
-/// own, independent ACL. (An auxiliary URL's kind is a suffix, e.g.
-/// `/.aux/foo.acl`, so it has no exactly analogous case: appending a
-/// trailing slash still collapses under `normalize_htu`, but the result,
-/// `/.aux/foo.acl/`, ends in no kind's suffix and resolves to `Reserved` ->
-/// 404 regardless of what this comparison decides.) Refusing trailing
-/// slashes the way [`crate::space::StorageSpace::resolve`] refuses
-/// the other normalization-unstable shapes is not an option here, so the
-/// comparison is tightened instead.
+/// `dpop-verifier` compares the two through `uri::normalize_htu`, which **drops
+/// empty path segments**, and a trailing slash is an empty final segment. In
+/// this pod the trailing slash is precisely what separates a container from a
+/// resource: `/foo` and `/foo/` are distinct named graphs with distinct ACLs.
+/// Left at `dpop-verifier`'s comparison, a proof minted for `PUT /foo` also
+/// verifies against `PUT /foo/`, so an on-path adversary can re-target a signed
+/// resource write at the container of the same name, a different resource from
+/// the one the client authorized, with its own, independent ACL. (An auxiliary
+/// URL's kind is a suffix, e.g. `/.aux/foo.acl`, so it has no exactly analogous
+/// case: appending a trailing slash still collapses under `normalize_htu`, but
+/// the result, `/.aux/foo.acl/`, ends in no kind's suffix and resolves to
+/// `Reserved` -> 404 regardless of what this comparison decides.) Refusing
+/// trailing slashes the way [`crate::space::StorageSpace::resolve`] refuses the
+/// other normalization-unstable shapes is not an option here, so the comparison
+/// is tightened instead.
 ///
-/// The tightening is deliberately scoped to the **path only** — scheme,
-/// host, port and query are left to `dpop-verifier`'s own
-/// RFC-3986-following comparison. `normalize_htu` already lowercases
-/// scheme/host and elides a default port, and RFC 9449 §4.3 says a server
-/// SHOULD apply exactly that normalization "to reduce the likelihood of
-/// false negatives"; comparing the whole URL byte-for-byte here would
-/// silently re-impose case- and default-port-sensitivity that
-/// `dpop-verifier` deliberately relaxed, 401-ing e.g. `solid-client-authn-js`
-/// clients that mint `htu` with an explicit `:443` or a differently-cased
-/// host. Comparing only `.path()` keeps the trailing-slash fix (`Url::path`
-/// preserves it; `normalize_htu` only loses it because it rebuilds the path
-/// from `path_segments()`, which yields no empty final segment) without
-/// discarding any of `dpop-verifier`'s own RFC-conformant tolerance.
+/// The tightening is deliberately scoped to the **path only**, scheme, host,
+/// port and query are left to `dpop-verifier`'s own RFC-3986-following
+/// comparison. `normalize_htu` already lowercases scheme/host and elides a
+/// default port, and RFC 9449 §4.3 says a server SHOULD apply exactly that
+/// normalization "to reduce the likelihood of false negatives"; comparing the
+/// whole URL byte-for-byte here would silently re-impose case- and
+/// default-port-sensitivity that `dpop-verifier` deliberately relaxed, 401-ing
+/// e.g. `solid-client-authn-js` clients that mint `htu` with an explicit `:443`
+/// or a differently-cased host. Comparing only `.path()` keeps the
+/// trailing-slash fix (`Url::path` preserves it; `normalize_htu` only loses it
+/// because it rebuilds the path from `path_segments()`, which yields no empty
+/// final segment) without discarding any of `dpop-verifier`'s own
+/// RFC-conformant tolerance.
 ///
-/// Within the path, the comparison is **not** raw byte equality: `Url::path`
-/// is the WHATWG-URL-Standard-normalized wire path, not the literal wire
-/// bytes. `Url::parse` runs that parsing to get there, and it resolves
-/// `.`/`..` segments (`/a/../b` → `/b`), maps a lone `\` to `/`, and — for a
-/// few bytes that are not valid unescaped IRI characters anyway (space, `<`,
-/// `>`, `"`, `{`, `}`, a backtick) — percent-encodes them if they appear raw.
-/// It still does no empty-segment collapsing and no case folding, and no
-/// *further* percent-decoding is layered on top of any of that: an escape
-/// neither side introduced is still compared verbatim, so `/a%41` and
-/// `/a%2541` remain different strings below (see the tests). Both sides are
-/// this normalized form: `expected` comes from `auth::middleware::derive_htu`,
-/// which is the configured base plus the raw request path, and a client signs
-/// the URL as it puts it on the wire (`/caf%C3%A9`, not `/café`); `Url::path`
-/// turns each side into its WHATWG form the same way, so the two still line up.
+/// Within the path, the comparison is **not** raw byte equality: `Url::path` is
+/// the WHATWG-URL-Standard-normalized wire path, not the literal wire bytes.
+/// `Url::parse` runs that parsing to get there, and it resolves `.`/`..`
+/// segments (`/a/../b` → `/b`), maps a lone `\` to `/`, and, for a few bytes
+/// that are not valid unescaped IRI characters anyway (space, `<`, `>`, `"`,
+/// `{`, `}`, a backtick), percent-encodes them if they appear raw. It still
+/// does no empty-segment collapsing and no case folding, and no *further*
+/// percent-decoding is layered on top of any of that: an escape neither side
+/// introduced is still compared verbatim, so `/a%41` and `/a%2541` remain
+/// different strings below (see the tests). Both sides are this normalized
+/// form: `expected` comes from `auth::middleware::derive_htu`, which is the
+/// configured base plus the raw request path, and a client signs the URL as it
+/// puts it on the wire (`/caf%C3%A9`, not `/café`); `Url::path` turns each side
+/// into its WHATWG form the same way, so the two still line up.
 ///
 /// Dot-segment resolution and the backslash mapping are the two ways this
 /// normalization could, in principle, make two distinct wire paths compare
-/// equal — and closing that off is not this function's job. It is closed one
-/// layer up, and the closure argument belongs here:
+/// equal. Closing that off belongs one layer up, and the closure argument belongs here:
 ///
 /// - A wire path containing a raw `.`/`..` segment, or an internal empty
 ///   segment, is refused by
 ///   [`crate::space::StorageSpace::is_normalization_stable`] at `resolve`
 ///   time, before the store is ever touched.
-/// - A wire path containing a raw `\` — or any of the other bytes named
-///   above, or `^`, `|`, a lone backtick — is refused by `NamedNode::new`'s
+/// - A wire path containing a raw `\`: or any of the other bytes named
+///   above, or `^`, `|`, a lone backtick, is refused by `NamedNode::new`'s
 ///   IRI validation, also invoked from `resolve`, with "Invalid IRI code
 ///   point" (the same rejection `http::tests::iri_breaking_path_is_400`
 ///   exercises for a raw `<` and space). This holds regardless of whether
 ///   `Url::path` happens to percent-encode that particular byte or leaves it
-///   untouched — either way it never becomes part of a stored graph IRI.
+///   untouched. Either way it never becomes part of a stored graph IRI.
 ///
 /// So no request carrying one of these raw shapes ever names a stored
 /// resource, and there is no real graph IRI for the WHATWG-normalized form to
@@ -331,16 +329,16 @@ fn verified_htu_claim(proof: &str) -> Result<String, AuthError> {
 /// comparison exists to close, even though nothing in this function would
 /// have changed.
 ///
-/// None of this touches percent-escapes the client itself chose to send:
-/// those pass through `Url::path` unchanged, so a proof minted for `/a%41`
-/// still does not verify against a request to `/a%2541` — a *different*
-/// resource, per `derive_htu`'s doc comment — and a client signing `/a%2541`
-/// for a request to `/a%2541` still matches exactly.
+/// None of this touches percent-escapes the client itself chose to send: those
+/// pass through `Url::path` unchanged, so a proof minted for `/a%41` still does
+/// not verify against a request to `/a%2541` (a *different* resource, per
+/// `derive_htu`'s doc comment), and a client signing `/a%2541` for a request to
+/// `/a%2541` still matches exactly.
 ///
 /// Either side failing to parse as a URL (the proof's claimed `htu` is
 /// attacker-controlled and need not be one) is treated as a mismatch, not a
-/// separate error — the caller already turns "not the same resource" into
-/// the one `DpopInvalid` rejection.
+/// separate error, the caller already turns "not the same resource" into the
+/// one `DpopInvalid` rejection.
 fn htu_names_the_same_resource(proof_htu: &str, expected: &str) -> bool {
     fn wire_path(s: &str) -> Option<String> {
         Some(url::Url::parse(s).ok()?.path().to_string())
@@ -353,13 +351,13 @@ fn htu_names_the_same_resource(proof_htu: &str, expected: &str) -> bool {
 
 /// The one JWS algorithm this module verifies itself, because
 /// `dpop-verifier` cannot (see the module docs). Written once and compared
-/// against twice — by [`proof_alg_is_rs256`] to route, and again inside
+/// against twice, by [`proof_alg_is_rs256`] to route, and again inside
 /// [`verify_rs256_proof`] to confirm.
 const RS256_ALG: &str = "RS256";
 
 /// `dpop-verifier`'s own `JTI_MAX_LENGTH`, which its ES256 path applies to
 /// every proof it accepts. Restated here so the RS256 path bounds the `jti`
-/// it hands to the [`JtiReplayStore`] identically — an unbounded `jti` is an
+/// it hands to the [`JtiReplayStore`] identically, an unbounded `jti` is an
 /// unbounded key into the replay map.
 const JTI_MAX_LENGTH: usize = 512;
 
@@ -387,8 +385,8 @@ fn decode_jws_segment(segment: &str, what: &str) -> Result<Value, AuthError> {
 /// `none`, every `HS*`, and everything it does not implement. So a lie here
 /// only sends the proof to a verifier that then rejects it; there is no
 /// algorithm a proof can claim in order to be checked *less* than it would
-/// have been. Anything other than exactly `RS256` — including a missing or
-/// non-string `alg`, or a header that is not JSON at all — routes to
+/// have been. Anything other than exactly `RS256`, including a missing or
+/// non-string `alg`, or a header that is not JSON at all, routes to
 /// `dpop-verifier`, which is the behaviour this pod had before RS256 existed.
 fn proof_alg_is_rs256(proof: &str) -> bool {
     let Some(header_b64) = proof.split('.').next() else {
@@ -403,12 +401,12 @@ fn proof_alg_is_rs256(proof: &str) -> bool {
 /// The RFC 7638 thumbprint of an RSA public key, as `cnf.jkt` carries it.
 ///
 /// RFC 7638 §3.2 fixes the required members per key type, and for `RSA` they
-/// are `e`, `kty` and `n` — a *different* set from the `crv`/`kty`/`x`/`y`
-/// that `dpop_verifier::thumbprint_ec_p256` hashes for an EC key. Getting
-/// the member set wrong does not fail loudly: it yields a well-formed
-/// 43-character thumbprint that simply never equals the one the issuer put in
+/// are `e`, `kty` and `n` (a *different* set from the `crv`/`kty`/`x`/`y`
+/// that `dpop_verifier::thumbprint_ec_p256` hashes for an EC key. Getting the
+/// member set wrong does not fail loudly: it yields a well-formed
+/// 43-character thumbprint that never equals the one the issuer put in
 /// `cnf.jkt`, which would turn the proof-of-possession binding into a
-/// permanent 401 for every RSA client — or, if the mistake ran the other way
+/// permanent 401 for every RSA client), or, if the mistake ran the other way
 /// and *both* sides computed it wrongly, into a binding over fewer key
 /// members than the key has. So the member set is the load-bearing part here,
 /// and [`tests::rsa_thumbprint_matches_the_rfc_7638_worked_example`] pins it
@@ -417,13 +415,13 @@ fn proof_alg_is_rs256(proof: &str) -> bool {
 /// The canonical form is those members and only those, as a JSON object with
 /// no whitespace and keys in lexicographic order (`e` < `kty` < `n`),
 /// SHA-256'd and base64url-encoded without padding. `serde_json` over a
-/// `BTreeMap` emits exactly that — the same construction `dpop-verifier`
-/// uses for its EC and Ed25519 thumbprints.
+/// `BTreeMap` emits exactly that, the same construction `dpop-verifier` uses
+/// for its EC and Ed25519 thumbprints.
 ///
 /// `n_b64` and `e_b64` are hashed as the proof spelled them. RFC 7638 hashes
 /// the JWK's own encoding and defines no re-canonicalization of the integers,
 /// so a proof that pads `n` with a leading zero byte gets a different
-/// thumbprint — which is not an attack, only a proof whose `jkt` no longer
+/// thumbprint, which is not an attack, only a proof whose `jkt` no longer
 /// matches the `cnf.jkt` its issuer computed, i.e. a rejection.
 fn thumbprint_rsa(n_b64: &str, e_b64: &str) -> String {
     let mut canonical_jwk_map = BTreeMap::new();
@@ -439,7 +437,7 @@ fn thumbprint_rsa(n_b64: &str, e_b64: &str) -> String {
 /// `dpop-verifier` would have produced had it supported RS256.
 ///
 /// This mirrors `dpop-verifier`'s ES256 path check for check, in its order,
-/// with the same strictness — the module docs explain why the path has to
+/// with the same strictness, the module docs explain why the path has to
 /// exist at all. Specifically:
 ///
 /// - exactly three compact-JWS segments;
@@ -447,24 +445,24 @@ fn thumbprint_rsa(n_b64: &str, e_b64: &str) -> String {
 /// - `alg` is `RS256`, re-read here rather than taken from the routing peek;
 /// - the embedded `jwk` carries no `d`, so a proof can never ship private key
 ///   material (RFC 9449 §4.2, and `dpop-verifier`'s own `parse_token` check);
-/// - **`kty` is `RSA`** — the alg↔key-type correspondence, checked twice
+/// - **`kty` is `RSA`**: the alg↔key-type correspondence, checked twice
 ///   over: once here on the raw header, and again by `josekit`, which refuses
 ///   to build an `RS256` verifier from a JWK of any other type. An RS256
 ///   header over an EC key is the alg-confusion shape a fixed ES256 pin used
 ///   to make unreachable, and widening the accepted set is exactly when it
 ///   becomes reachable, so it is refused explicitly rather than incidentally.
-///   The mirror case — an ES256 (or any non-RS256) header over an RSA key —
+///   The mirror case, an ES256 (or any non-RS256) header over an RSA key,
 ///   never arrives here at all: it routes to `dpop-verifier`, whose `Jwk`
 ///   enum has no RSA variant to deserialize into;
 /// - the signature verifies over `header.payload` under that key, through
-///   `josekit`, which additionally refuses any RSA modulus below 2048 bits —
+///   `josekit`, which additionally refuses any RSA modulus below 2048 bits,
 ///   this pod enforces no such floor itself; it is entirely `josekit`'s own
 ///   enforcement (`RS256.verifier_from_jwk`), not a documented contract of
 ///   the crate, so a future `josekit` version could in principle relax or
 ///   move it. [`tests::rs256_proof_with_a_1024_bit_key_is_rejected`] pins the
 ///   current behaviour;
 /// - `jti` is bounded, and `htm`/`htu` match, through the *same*
-///   `dpop_verifier::uri` normalizers the ES256 path uses — so the two paths
+///   `dpop_verifier::uri` normalizers the ES256 path uses, so the two paths
 ///   cannot drift, and `htu_names_the_same_resource` layers its exact
 ///   wire-form comparison on top of an identical baseline for both.
 ///
@@ -472,7 +470,7 @@ fn thumbprint_rsa(n_b64: &str, e_b64: &str) -> String {
 /// NOT done here: they belong to [`verify_dpop`], which applies them to
 /// whichever path produced the [`VerifiedDpop`]. In particular this function
 /// never touches the replay store, exactly as `NoopReplayStore` keeps the
-/// crate from touching it — a proof rejected downstream must not burn its
+/// crate from touching it, a proof rejected downstream must not burn its
 /// `jti`.
 fn verify_rs256_proof(
     proof: &str,
@@ -572,8 +570,8 @@ fn verify_rs256_proof(
 }
 
 /// Verify a DPoP proof: signature (against its own embedded `jwk`), `htu`
-/// and `htm` match, `iat` freshness (against `now_unix`), `jti` replay, and
-/// — critically — that the proof key's thumbprint matches `expected_jkt`
+/// and `htm` match, `iat` freshness (against `now_unix`), `jti` replay,
+/// and, critically, that the proof key's thumbprint matches `expected_jkt`
 /// (the access token's `cnf.jkt`). Fails closed.
 pub async fn verify_dpop(
     proof: &str,
@@ -583,7 +581,7 @@ pub async fn verify_dpop(
     now_unix: i64,
     replay: &dyn JtiReplayStore,
 ) -> Result<(), AuthError> {
-    // Only RS256 — the one algorithm `dpop-verifier` cannot reach — is
+    // Only RS256, the one algorithm `dpop-verifier` cannot reach, is
     // verified here; everything else, `none` and `HS*` included, still goes
     // to the crate exactly as before. See `proof_alg_is_rs256` for why
     // routing on an unverified header is safe, and the module docs for why
@@ -602,13 +600,13 @@ pub async fn verify_dpop(
             .map_err(|e| AuthError::DpopInvalid(e.to_string()))?
     };
 
-    // Whichever path produced `verified` — `dpop-verifier` for ES256, or
-    // `verify_rs256_proof` above for RS256 — has now checked the proof's
+    // Whichever path produced `verified`, `dpop-verifier` for ES256, or
+    // `verify_rs256_proof` above for RS256, has now checked the proof's
     // `htu` against ours, but only through its normalizing comparison, which
     // erases the trailing slash that separates a container from a resource
     // in this pod. Redo it exactly, on the signed claim (see
     // `verified_htu_claim` and `htu_names_the_same_resource`), and reject
-    // with the same `DpopInvalid` a plain htu mismatch produces — the
+    // with the same `DpopInvalid` a plain htu mismatch produces, the
     // middleware answers 401 either way.
     if !htu_names_the_same_resource(&verified_htu_claim(proof)?, htu) {
         return Err(AuthError::DpopInvalid(
@@ -669,25 +667,24 @@ mod tests {
         .is_ok());
     }
 
-    /// The trailing slash is what separates a container from a resource
-    /// here, and `dpop-verifier`'s `normalize_htu` drops it — so on its
-    /// comparison alone a proof minted for `/foo` verifies against a request
-    /// for `/foo/` and vice versa. Both directions must be rejected: the
-    /// dangerous one is a signed `PUT /foo` re-delivered as `PUT /foo/`,
-    /// which would install the body as the *container* of the same name — a
-    /// different resource from the one the client authorized. See
+    /// The trailing slash is what separates a container from a resource here, and
+    /// `dpop-verifier`'s `normalize_htu` drops it, so on its comparison alone a
+    /// proof minted for `/foo` verifies against a request for `/foo/` and vice
+    /// versa. Both directions must be rejected: the dangerous one is a signed `PUT
+    /// /foo` re-delivered as `PUT /foo/`, which would install the body as the
+    /// *container* of the same name, a different resource from the one the client
+    /// authorized. See
     /// `http::tests::a_proof_for_a_resource_cannot_write_its_container_counterpart`
-    /// for that scenario pinned end to end, including the mutation evidence
-    /// that this comparison is what stops it.
+    /// for that scenario pinned end to end, including the mutation evidence that
+    /// this comparison is what stops it.
     ///
-    /// The auxiliary case below is included for completeness, not because
-    /// it is exploitable: an auxiliary's kind is a suffix, so appending `/`
-    /// directly to its URL (`/.aux/foo.acl` -> `/.aux/foo.acl/`) still
-    /// collapses under `normalize_htu`, but `/.aux/foo.acl/` ends in no
-    /// kind's suffix and resolves to `Reserved` -> 404 whatever
-    /// `verify_dpop` decides — so this assertion confirms the tightened
-    /// comparison also rejects it, not that leaving it unrejected would be
-    /// dangerous.
+    /// The auxiliary case below is included for completeness, not because it is
+    /// exploitable: an auxiliary's kind is a suffix, so appending `/` directly to
+    /// its URL (`/.aux/foo.acl` -> `/.aux/foo.acl/`) still collapses under
+    /// `normalize_htu`, but `/.aux/foo.acl/` ends in no kind's suffix and resolves
+    /// to `Reserved` -> 404 whatever `verify_dpop` decides, so this assertion
+    /// confirms the tightened comparison also rejects it, not that leaving it
+    /// unrejected would be dangerous.
     #[tokio::test]
     async fn trailing_slash_difference_is_rejected_in_both_directions() {
         let replay = InMemoryJtiReplayStore::new();
@@ -760,8 +757,8 @@ mod tests {
     }
 
     /// A client signs the URL as it goes on the wire, and `derive_htu` now
-    /// hands `verify_dpop` that same wire form — so a percent-encoded path
-    /// verifies for the request it was actually signed for, with no decoding
+    /// hands `verify_dpop` that same wire form, so a percent-encoded path
+    /// verifies for the request it was signed for, with no decoding
     /// step on either side. Both an escape the `url` crate would itself
     /// produce (`%C3%A9`) and one it would not (`%41`, a plain `A`) must work;
     /// before this fix the latter was answered `401` even for the honest
@@ -792,10 +789,10 @@ mod tests {
     }
 
     /// A percent-escape difference in the path is a mismatch, full stop: this
-    /// comparison never decodes its way to an equivalence. `/a%41` and
-    /// `/a%2541` name different resources here — the handlers read them as
-    /// `/aA` and `/a%41` — so a proof for one must not verify against the
-    /// other, in either direction.
+    /// comparison never decodes its way to an equivalence. `/a%41` and `/a%2541`
+    /// name different resources here (the handlers read them as `/aA` and
+    /// `/a%41`), so a proof for one must not verify against the other, in either
+    /// direction.
     ///
     /// `dpop-verifier`'s own comparison rejects these too, because
     /// `normalize_htu` preserves percent-escapes; this pins the property at
@@ -856,7 +853,7 @@ mod tests {
     /// The tightened check compares only the path; scheme/host/port are left
     /// to `dpop-verifier`'s own RFC-3986 normalization. A proof minted with
     /// an explicit default port (`:443`) must still verify against a request
-    /// `htu` that omits it — before this fix, comparing the whole URL
+    /// `htu` that omits it, before this fix, comparing the whole URL
     /// byte-for-byte rejected this even though `dpop-verifier` itself (and
     /// `solid-client-authn-js`, which elides default ports via `new URL()`)
     /// treats the two as identical.
@@ -1028,7 +1025,7 @@ mod tests {
     ///
     /// Any drift in the member set, their order, the JSON spacing, the digest
     /// or the encoding moves this value. Reusing `thumbprint_ec_p256`'s
-    /// `crv`/`kty`/`x`/`y` members would too — which is exactly the silent
+    /// `crv`/`kty`/`x`/`y` members would too, which is exactly the silent
     /// failure the widened algorithm set could otherwise have introduced.
     #[test]
     fn rsa_thumbprint_matches_the_rfc_7638_worked_example() {
@@ -1044,7 +1041,7 @@ mod tests {
     }
 
     /// RFC 9449 permits any asymmetric JWS algorithm, and the official Solid
-    /// conformance harness signs its proofs `RS256` — which this pod refused
+    /// conformance harness signs its proofs `RS256`, which this pod refused
     /// outright, 401-ing the harness before it ran a single test. An RS256
     /// proof over an RSA JWK, presented for an access token whose `cnf.jkt`
     /// is that key's RFC 7638 thumbprint, must now verify end to end.
@@ -1071,7 +1068,7 @@ mod tests {
     ///
     /// Both halves are asserted here on purpose, and the positive one is what
     /// makes this test mutation-sensitive: an `is_err()` assertion alone
-    /// would still pass if [`thumbprint_rsa`] were computing garbage — every
+    /// would still pass if [`thumbprint_rsa`] were computing garbage, every
     /// jkt would mismatch, including the honest client's. Break the
     /// thumbprint (feed it the EC member set, reorder the members, drop
     /// `kty`) and the *acceptance* below fails, which is how a silently
@@ -1105,13 +1102,13 @@ mod tests {
 
     /// The 2048-bit modulus floor `verify_rs256_proof`'s doc comment
     /// attributes to `josekit` is not enforced anywhere in this pod's own
-    /// code — it lives entirely inside `josekit`'s `RS256.verifier_from_jwk`,
+    /// code. It lives entirely inside `josekit`'s `RS256.verifier_from_jwk`,
     /// which is an implementation detail rather than a documented contract.
     /// If a future `josekit` version relaxed or moved that check, this test
     /// is what would catch a smaller RSA key becoming accepted.
     ///
     /// A genuine signature cannot be produced for a sub-2048-bit key at all
-    /// (`josekit`'s own signer refuses one — see
+    /// (`josekit`'s own signer refuses one, see
     /// `TestClient::mint_dpop_with_dummy_signature`), which is fine here:
     /// `verify_rs256_proof` rejects the key while building its own verifier,
     /// strictly before it ever inspects the signature bytes.
@@ -1146,9 +1143,9 @@ mod tests {
 
     /// RFC 9449 §4.2 forbids a DPoP proof's embedded `jwk` from ever carrying
     /// private key material, and `verify_rs256_proof` checks for it
-    /// explicitly. If that check were deleted, `josekit` would simply build
-    /// the public verifier from the embedded `n`/`e` and this proof — signed
-    /// with a genuine key, over genuine claims — would verify: the check
+    /// explicitly. If that check were deleted, `josekit` would build
+    /// the public verifier from the embedded `n`/`e` and this proof, signed
+    /// with a genuine key, over genuine claims, would verify: the check
     /// exists only to refuse a client that leaks its own private key, not to
     /// close a server-side hole, which is why coverage of it was missing.
     #[tokio::test]
@@ -1212,19 +1209,18 @@ mod tests {
 
     /// `alg_confusion_is_refused_in_both_directions`'s ES256-over-RSA half is
     /// refused only because `dpop-verifier`'s `Jwk` enum has no RSA variant
-    /// to deserialize into — a fact about that crate, not a rule this pod
+    /// to deserialize into, a fact about that crate, not a rule this pod
     /// enforces itself. This test lands on the pod's *own* `kty` check
     /// instead (`verify_rs256_proof`'s `kty` must be `RSA`, checked right
-    /// after the `d` check), using an RS256 header over an OKP/Ed25519 JWK —
-    /// a key type `dpop-verifier` has no concept of at all, and `josekit`
-    /// would happily deserialize as a `Jwk` (it just isn't RSA). Unlike the
+    /// after the `d` check), using an RS256 header over an OKP/Ed25519 JWK, a
+    /// key type `dpop-verifier` has no concept of at all, and `josekit` would
+    /// happily deserialize as a `Jwk` (it just isn't RSA). Unlike the
     /// existing test, this one stays meaningful even if `dpop-verifier` ever
     /// grew an RSA variant.
     ///
-    /// The rejection happens on the `kty` check, before any verifier is
-    /// built or signature inspected, so — as with the 1024-bit-key test — no
-    /// genuine signature is needed; an arbitrary one exercises the same
-    /// path.
+    /// The rejection happens on the `kty` check, before any verifier is built
+    /// or signature inspected, so, as with the 1024-bit-key test, no genuine
+    /// signature is needed; an arbitrary one exercises the same path.
     #[tokio::test]
     async fn rs256_header_over_an_okp_key_is_refused_by_the_pods_own_kty_check() {
         let replay = InMemoryJtiReplayStore::new();
@@ -1265,7 +1261,7 @@ mod tests {
     }
 
     /// Widening the accepted algorithms must not widen them to `none` or to
-    /// any symmetric MAC — with a symmetric `alg` the embedded `jwk` is the
+    /// any symmetric MAC, with a symmetric `alg` the embedded `jwk` is the
     /// verification key *and* the signing key, so accepting one would let
     /// anyone mint a proof for any `cnf.jkt` they like. Refused for both key
     /// types the pod now accepts, so neither the ES256 nor the RS256 route
@@ -1301,13 +1297,13 @@ mod tests {
     /// widening the allowlist is exactly the moment to close by hand: the
     /// header's `alg` must agree with the embedded JWK's key type.
     ///
-    /// Both proofs below carry a genuine key and a genuine signature — only
-    /// the `alg` label is wrong — so neither is rejected merely for failing
+    /// Both proofs below carry a genuine key and a genuine signature (only
+    /// the `alg` label is wrong), so neither is rejected merely for failing
     /// to verify. An `RS256` header over an EC JWK is caught on the RS256
     /// path's explicit `kty` check (and again by `josekit`, which will not
     /// build an RS256 verifier from a non-RSA key); an `ES256` header over an
-    /// RSA JWK never reaches that path at all, and `dpop-verifier` refuses
-    /// it because its `Jwk` type has no RSA variant to deserialize into.
+    /// RSA JWK never reaches that path at all, and `dpop-verifier` refuses it
+    /// because its `Jwk` type has no RSA variant to deserialize into.
     #[tokio::test]
     async fn alg_confusion_is_refused_in_both_directions() {
         let replay = InMemoryJtiReplayStore::new();
@@ -1357,12 +1353,11 @@ mod tests {
     }
 
     /// The RS256 path is a second way into `verify_dpop`, so every hardened
-    /// check downstream of it must still apply — starting with the exact
-    /// wire-form `htu` comparison, whose absence would let a signed
-    /// `PUT /foo` be re-delivered as `PUT /foo/`, installing the body as
-    /// the *container* of the same name. That check is shared code, and
-    /// this pins that RS256 actually reaches it rather than routing around
-    /// it.
+    /// check downstream of it must still apply, starting with the exact
+    /// wire-form `htu` comparison, whose absence would let a signed `PUT
+    /// /foo` be re-delivered as `PUT /foo/`, installing the body as the
+    /// *container* of the same name. That check is shared code, and this
+    /// pins that RS256 reaches it rather than routing around it.
     #[tokio::test]
     async fn an_rs256_proof_is_held_to_the_exact_htu_comparison_too() {
         let replay = InMemoryJtiReplayStore::new();
@@ -1381,8 +1376,8 @@ mod tests {
         .is_err());
     }
 
-    /// The replay ordering — `jti` recorded only after every other check has
-    /// passed — is shared code, but the RS256 path could have consumed one on
+    /// The replay ordering, `jti` recorded only after every other check has
+    /// passed, is shared code, but the RS256 path could have consumed one on
     /// its way through. It must not: a rejected RS256 proof leaves its `jti`
     /// available to the honest client, and only a fully-valid one burns it.
     #[tokio::test]
@@ -1436,13 +1431,13 @@ mod tests {
     }
 
     /// The eviction sweep is O(n) over the whole set, and the set's size
-    /// scales with throughput — so running it on every call is what would
+    /// scales with throughput, so running it on every call is what would
     /// cap this pod's request rate (see [`EVICTION_INTERVAL_SECONDS`]).
     /// This pins that it does *not* run on every call, in the one way that
     /// is observable from outside the function: an entry that has passed
-    /// the freshness window survives until the next sweep is actually due.
+    /// the freshness window survives until the next sweep falls due.
     ///
-    /// Restoring a per-call sweep flips the assertion at `310` — with a
+    /// Restoring a per-call sweep flips the assertion at `310`, with a
     /// sweep there, the entry recorded at `0` is gone and its `jti` is
     /// accepted again.
     ///
@@ -1462,7 +1457,7 @@ mod tests {
         }
 
         // 310 is past the freshness window for the entry recorded at 0
-        // (300 + 5 = 305), but only 10 seconds on from the last sweep — so
+        // (300 + 5 = 305), but only 10 seconds on from the last sweep, so
         // no sweep runs and the entry is still there to catch the replay.
         assert!(
             replay.record_or_reject("jti-amort", 310).await.is_err(),
@@ -1476,7 +1471,7 @@ mod tests {
         );
     }
 
-    /// Two [`InMemoryJtiReplayStore`]s hold two replay sets, not one — which
+    /// Two [`InMemoryJtiReplayStore`]s hold two replay sets, not one, which
     /// is the whole point of the store being a collaborator rather than
     /// something `verify_dpop` reaches for.
     ///

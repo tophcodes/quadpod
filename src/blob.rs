@@ -2,8 +2,8 @@
 //!
 //! The storage model of design spec §3.2. The key is the resource's own path,
 //! so the backing store mirrors the URL tree and can be read with ordinary
-//! tools; it is derived rather than recorded, which is what makes an
-//! interrupted write or delete heal on the next write to the same URL instead
+//! tools; it is derived rather than recorded, so an
+//! interrupted write or delete heals on the next write to the same URL instead
 //! of leaking an object nobody can find.
 
 use crate::space::ResourceUrl;
@@ -19,7 +19,7 @@ pub enum BlobError {
 }
 
 /// Longest path segment most filesystems accept, and longest whole path most
-/// object stores accept — `object_store`'s own documented wording. Checked at
+/// object stores accept, `object_store`'s own documented wording. Checked at
 /// key construction so an over-long URL is refused with `414` before anything
 /// is written, rather than failing inside a backend that phrases it
 /// differently.
@@ -30,7 +30,7 @@ const MAX_PATH_BYTES: usize = 1024;
 /// `/photos/cat.png` is stored at `photos/cat.png`.
 ///
 /// Constructible only through [`BlobKey::of`], which is what keeps the
-/// derivation in one place — a second site building a key by hand is how two
+/// derivation in one place, a second site building a key by hand is how two
 /// resources come to share one object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobKey(Path);
@@ -76,7 +76,7 @@ impl BlobKey {
 /// check them.
 ///
 /// Deliberately narrower than `object_store::ObjectStore`, whose multipart,
-/// listing, copy and rename surface this pod does not use — and narrower on
+/// listing, copy and rename surface this pod does not use, and narrower on
 /// purpose in the other direction too, since a remote Solid pod is a plausible
 /// future implementor and is not an `ObjectStore`.
 #[async_trait::async_trait]
@@ -91,7 +91,7 @@ pub trait BlobStore: Send + Sync {
 pub struct ObjectStoreBlobs(Arc<dyn ObjectStore>);
 
 impl ObjectStoreBlobs {
-    /// Bytes live for the process, matching `OxigraphStore::in_memory` — the
+    /// Bytes live for the process, matching `OxigraphStore::in_memory`, the
     /// pod stays uniformly ephemeral rather than making blobs outlive the
     /// triples that describe them.
     pub fn in_memory() -> Self {
@@ -151,7 +151,7 @@ mod tests {
 
     // §3.2: the key mirrors the URL. Asserted on the key itself and not on a
     // round trip, because a round trip passes under ANY injective key
-    // function — a hash included — and mirroring is the whole property.
+    // function (a hash included), and mirroring is the whole property.
     #[test]
     fn the_key_mirrors_the_resource_path() {
         assert_eq!(BlobKey::of(&res("/photos/cat.png")).unwrap().as_str(), "photos/cat.png");
@@ -159,7 +159,7 @@ mod tests {
     }
 
     // `Path::from` drops a trailing empty segment, so without this check
-    // `/box` and `/box/` would mint the same key — a container and its
+    // `/box` and `/box/` would mint the same key, a container and its
     // slash-pair counterpart colliding on one object. A container is never a
     // blob, so there is no key to mint.
     #[test]
@@ -194,20 +194,20 @@ mod tests {
         let deep: String = std::iter::repeat_n("seg/", 300).collect();
         assert!(BlobKey::of(&res(&format!("/{deep}leaf"))).is_none());
 
-        // The boundary itself is storable — an off-by-one here would refuse
+        // The boundary itself is storable, an off-by-one here would refuse
         // legal URLs, which is the mirror-image bug.
         let at_limit = "a".repeat(255);
         assert!(BlobKey::of(&res(&format!("/{at_limit}"))).is_some());
 
         // `~` is legal and unescaped in a URL, but `object_store`'s
-        // `PathPart` percent-encodes it anyway — one raw byte becomes three
+        // `PathPart` percent-encodes it anyway, one raw byte becomes three
         // stored bytes. The limits must bind on the stored length, not the
         // raw one: 255 raw `~` encode to 765 bytes and must have no key...
         let over_limit_encoded = "~".repeat(255);
         assert!(BlobKey::of(&res(&format!("/{over_limit_encoded}"))).is_none());
 
         // ...while 85 raw `~` encode to exactly 255 bytes and must still
-        // have a key. Without this half, a fix that simply refuses anything
+        // have a key. Without this half, a fix that refuses anything
         // containing `~` would also pass.
         let at_limit_encoded = "~".repeat(85);
         assert!(BlobKey::of(&res(&format!("/{at_limit_encoded}"))).is_some());

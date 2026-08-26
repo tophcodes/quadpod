@@ -14,7 +14,7 @@ pub enum StoreError {
 ///
 /// **Obligation on every implementor: a `;`-separated update sequence is
 /// atomic.** Either every operation in it takes effect or none does. This is
-/// not something SPARQL guarantees — it is a property of the backend, and
+/// not something SPARQL guarantees: it is a property of the backend, and
 /// `OxigraphStore` has it because `BoundPreparedSparqlUpdate::execute`
 /// evaluates all operations before it commits.
 ///
@@ -31,7 +31,7 @@ pub trait SparqlStore: Send + Sync {
     async fn ask(&self, sparql: &str) -> Result<bool, StoreError>;
 
 
-    /// The richest [`RdfVersion`] this backend can hold — a capability, not a product
+    /// The richest [`RdfVersion`] this backend can hold, a capability, not a product
     /// class. The write path refuses a representation above it with `415`.
     ///
     /// Neither `async` nor fallible: an implementor either knows this from
@@ -39,11 +39,11 @@ pub trait SparqlStore: Send + Sync {
     /// client for a remote endpoint, whose capability is a property of the
     /// endpoint and not of its own code).
     ///
-    /// Deliberately **not** a marker subtrait. That would make the capability
-    /// a property of the *type*, which the remote case is not — one type, two
-    /// capabilities depending on config — and `AppState` holds
-    /// `Arc<dyn SparqlStore>` (ADR-2), so a subtrait would be reachable only
-    /// by `Any` downcasting: a bool with ceremony.
+    /// Deliberately **not** a marker subtrait. That would make the capability a
+    /// property of the *type*, which the remote case is not (one type, two
+    /// capabilities depending on config), and `AppState` holds `Arc<dyn SparqlStore>`
+    /// (ADR-2), so a subtrait would be reachable only by `Any` downcasting: a bool
+    /// with ceremony.
     fn rdf_version(&self) -> RdfVersion;
 
     /// A `SELECT`'s solutions, in the order the backend produced them.
@@ -73,9 +73,9 @@ impl OxigraphStore {
 
     /// The store held in `dir`, created if it is not there yet.
     ///
-    /// Only one process may hold a directory at a time — `Store::open` takes an
-    /// exclusive lock, so a second pod aimed at the same path fails here rather
-    /// than sharing it. That bound is the whole of the single-writer constraint
+    /// Only one process may hold a directory at a time: `Store::open` takes an
+    /// exclusive lock, so a second pod aimed at the same path fails here rather than
+    /// sharing it. That bound is the whole of the single-writer constraint
     /// (`docs/decisions.md`, ADR-7): it is about processes, not about the tasks inside
     /// this one, which write concurrently as before.
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
@@ -89,7 +89,7 @@ impl OxigraphStore {
     /// Oxigraph is a synchronous library: `Store::update` and a query's
     /// `execute` run to completion on the calling thread. Awaiting them
     /// directly inside an `async fn` occupies a runtime worker for the whole
-    /// evaluation, and a runtime has one worker per core — so a handful of
+    /// evaluation, and a runtime has one worker per core, so a handful of
     /// concurrent queries stall *every* request in flight, including those
     /// that never touch the store.
     ///
@@ -99,7 +99,7 @@ impl OxigraphStore {
     /// call sites, because the trait is `async` precisely so a backend can
     /// decide how it yields.
     ///
-    /// **This is the only place that reaches for the store handle** — pinned
+    /// **This is the only place that reaches for the store handle**, pinned
     /// by a rule in `docs/constraints.md`, since a trait method evaluating
     /// against the handle directly compiles and passes every test.
     async fn blocking<T, F>(&self, f: F) -> Result<T, StoreError>
@@ -159,7 +159,7 @@ impl SparqlStore for OxigraphStore {
         // making this a lie (`GroundTerm::Triple` converts from
         // `Term::Triple`, which that feature is what provides).
         //
-        // `cfg!(feature = "rdf-12")` would answer a different question — it
+        // `cfg!(feature = "rdf-12")` would answer a different question, it
         // tests *this* crate's features, and oxigraph's are not visible from
         // here.
         RdfVersion::Rdf12
@@ -200,7 +200,7 @@ mod tests {
     use super::*;
 
     /// §3.2: the capability belongs to the implementor. `OxigraphStore`
-    /// answers from a constant because the feature is compiled in — and
+    /// answers from a constant because the feature is compiled in, and
     /// `Cargo.toml` declares it rather than inheriting it from `rudof_lib`
     /// (§3.3), so the constant is a fact about this crate.
     #[test]
@@ -267,13 +267,13 @@ mod tests {
         ).await.unwrap();
         assert_eq!(rows.len(), 2);
 
-        // LIMIT is honoured, which is what makes counting cheap.
+        // LIMIT is honoured, which is why counting is cheap.
         let capped = store.query_solutions(
             "SELECT ?s WHERE { GRAPH <https://pod.toph.so/foo> { ?s <http://schema.org/name> ?n } } LIMIT 1",
         ).await.unwrap();
         assert_eq!(capped.len(), 1);
 
-        // A query of the wrong shape is an error, not an empty answer — the
+        // A query of the wrong shape is an error, not an empty answer, the
         // same line `query_triples` and `ask` already draw.
         assert!(store.query_solutions("ASK { ?s ?p ?o }").await.is_err());
     }

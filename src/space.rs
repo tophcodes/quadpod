@@ -1,6 +1,6 @@
 //! The pod's URI topology: which URLs exist, what they mean, and how they
 //! relate. Every path enters the system through [`StorageSpace::resolve`],
-//! which classifies it exactly once — the constructors below are private, so
+//! which classifies it exactly once, the constructors below are private, so
 //! no other module can mint a URL or re-derive what kind of thing it is.
 //!
 //! See `docs/uri-space.md` for the client-facing contract.
@@ -53,7 +53,7 @@ pub trait GraphName: sealed::Sealed + Sync {
 /// be true of anything else first. Sealed through [`GraphName`].
 ///
 /// Not [`AuxUrl`]: an auxiliary may only be written for a subject that
-/// exists, and that condition is part of the write itself — see `aux::put`,
+/// exists, and that condition is part of the write itself, see `aux::put`,
 /// which carries it inside the update. A direct `resource::put_rdf` would
 /// plant a policy document on a path that was never created, and
 /// nearest-ACL-wins would then make it permanent and unremovable. That is the
@@ -62,13 +62,13 @@ pub trait GraphName: sealed::Sealed + Sync {
 ///
 /// Not [`Target`]: a `Target` has not yet been decided into resource-or-
 /// auxiliary, so it cannot say which lifecycle rule applies. Match on it
-/// first — the arm you land in carries the right bound.
+/// first, the arm you land in carries the right bound.
 pub trait DirectlyWritable: GraphName {}
 
 /// A graph that may be deleted on its own, taking nothing else with it.
 /// Sealed through [`GraphName`].
 ///
-/// Only [`AuxUrl`]: removing an auxiliary is a complete operation — the path
+/// Only [`AuxUrl`]: removing an auxiliary is a complete operation, the path
 /// falls back to inherited policy, which is exactly what its absence means.
 ///
 /// Not [`ResourceUrl`]/[`ContainerUrl`]: deleting a subject must take every
@@ -115,8 +115,8 @@ impl AuxKind {
     ///
     /// No two kinds' suffixes may be suffixes of one another, or this split
     /// would be ambiguous. Guaranteed by `aux_kind_names_are_well_formed`'s
-    /// no-dot rule on every name — see its doc comment for why that alone
-    /// is enough.
+    /// no-dot rule on every name, see its doc comment for why that alone is
+    /// enough.
     fn split_suffix(rest: &str) -> Option<(Self, &str)> {
         AuxKind::ALL
             .iter()
@@ -125,7 +125,7 @@ impl AuxKind {
     }
 }
 
-/// A URL in the resource space — the user's data.
+/// A URL in the resource space, the user's data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceUrl {
     path: String,
@@ -195,9 +195,9 @@ impl ResourceUrl {
     }
 
     /// This resource's auxiliary of the given kind: `/.aux`, this resource's
-    /// own path, and the kind's name as a suffix. Total — every resource has
-    /// an auxiliary URL whether or not that auxiliary has a representation —
-    /// and inverted by [`AuxUrl::subject`].
+    /// own path, and the kind's name as a suffix. Total (every resource has an
+    /// auxiliary URL whether or not that auxiliary has a representation), and
+    /// inverted by [`AuxUrl::subject`].
     ///
     /// The kind is a suffix rather than a leading segment so that an auxiliary
     /// URL never ends in `/`, which is the shape every other Solid server
@@ -210,27 +210,27 @@ impl ResourceUrl {
         AuxUrl { kind, subject: self.clone(), iri }
     }
 
-    /// The other half of this URL's trailing-slash pair — `/box/` for `/box`,
-    /// `/box` for `/box/` — or `None` for the root, whose counterpart would be
+    /// The other half of this URL's trailing-slash pair (`/box/` for `/box`,
+    /// `/box` for `/box/`), or `None` for the root, whose counterpart would be
     /// the empty path and is no URL in this space at all.
     ///
     /// Solid Protocol §3.1: "If two URIs differ only in the trailing slash,
     /// and the server has associated a resource with one of them, then the
     /// other URI MUST NOT correspond to another resource." The pair stays
-    /// *addressable* — `/box` and `/box/` are still two names, one of which
-    /// may exist — so this derivation is what a create consults, not a
+    /// *addressable* (`/box` and `/box/` are still two names, one of which may
+    /// exist), so this derivation is what a create consults, not a
     /// canonicalization of one onto the other.
     ///
     /// Unlike `resource()`, this mints the `ResourceUrl` directly rather than
-    /// re-running `NamedNode::new` on the result — which is exactly what the
+    /// re-running `NamedNode::new` on the result, which is exactly what the
     /// module header says the private constructors exist to prevent going
     /// unexamined. It is safe here: `self.iri` was already validated by
-    /// whichever constructor produced `self`, and adding or removing a
-    /// single trailing `/` is the only byte-level change made to it — it
-    /// cannot turn a valid IRI into an invalid one (and the root, the one
-    /// path whose counterpart would be the empty string, is handled above by
-    /// returning `None` before an IRI is built at all). The `debug_assert!`
-    /// pins that argument rather than leaving it asserted only in prose.
+    /// whichever constructor produced `self`, and adding or removing a single
+    /// trailing `/` is the only byte-level change made to it, it cannot turn a
+    /// valid IRI into an invalid one (and the root, the one path whose
+    /// counterpart would be the empty string, is handled above by returning
+    /// `None` before an IRI is built at all). The `debug_assert!` pins that
+    /// argument rather than leaving it asserted only in prose.
     pub fn slash_counterpart(&self) -> Option<ResourceUrl> {
         let path = match self.path.strip_suffix('/') {
             Some("") => return None, // the root
@@ -267,7 +267,7 @@ impl ResourceUrl {
 
     /// Every container between this resource and the root, nearest first.
     /// This is the chain a create may materialize, and the same chain the
-    /// guard authorizes — one derivation, used by both.
+    /// guard authorizes, one derivation, used by both.
     pub fn ancestors(&self) -> Vec<ContainerUrl> {
         let mut out = Vec::new();
         let mut current = self.clone();
@@ -328,7 +328,7 @@ impl StorageSpace {
         // empty path segments, resolves `.`/`..`, and strips fragments before
         // comparing. A path that normalization would change names one
         // resource here but a DIFFERENT, canonicalized one to that
-        // comparison — so two distinct named graphs with independent ACLs
+        // comparison, so two distinct named graphs with independent ACLs
         // (e.g. `/box` and `/box//`, or `/a/b` and `/a/%23/../b`) would look
         // like the same `htu` to a replayed or re-routed request. Refusing
         // the non-stable shape outright is cheaper and safer than trying to
@@ -341,9 +341,9 @@ impl StorageSpace {
         }
         // `/.well-known/` is the origin's own space (RFC 8615), answered by
         // routes of its own in `crate::http`, and it names no storage at any
-        // depth — the bare forms included. Refusing it here, not only in the
+        // depth, the bare forms included. Refusing it here, not only in the
         // router, is what stops a write from allocating inside it: a
-        // resource placed there — by `Slug: .well-known` at the root, say —
+        // resource placed there, by `Slug: .well-known` at the root, say,
         // would be shadowed by those routes on GET and undeletable, since
         // they route no write method at all.
         if Self::segment_remainder(request_path, WELL_KNOWN_SEGMENT).is_some() {
@@ -352,27 +352,27 @@ impl StorageSpace {
         if let Some(rest) = Self::segment_remainder(request_path, AUX_SEGMENT) {
             // `rest` is everything after `/.aux`: "" for `/.aux` itself,
             // otherwise a path starting with `/`. Stripping the kind's suffix
-            // inverts `ResourceUrl::aux` exactly — `/.aux/box/.acl` yields
+            // inverts `ResourceUrl::aux` exactly, `/.aux/box/.acl` yields
             // `/box/`, `/.aux/.acl` yields `/`. A path under `/.aux` that ends
             // in no kind's suffix (including `/.aux` and `/.aux/` themselves)
-            // names no auxiliary and is reserved, not data.
+            // names no auxiliary and is reserved rather than data.
             let Some((kind, subject_path)) = AuxKind::split_suffix(rest) else {
                 return Err(SpaceError::Reserved);
             };
-            // An auxiliary has no auxiliary — `AuxUrl` cannot build one, and the
+            // An auxiliary has no auxiliary, `AuxUrl` cannot build one, and the
             // path space must not name one either. Without this, the subject of
             // `/.aux/.aux/foo.acl.acl` would be a plain resource whose IRI is the
             // ACL graph of `/foo`, and authorization would derive from it. The
             // check is on the *decoded subject*, so it refuses every nesting
             // depth: each strip peels one suffix, and the subject that remains
             // still begins with the reserved segment. It is every reserved
-            // segment, not just `.aux`: a subject the resource space itself
+            // segment, and `.aux` is only the first: a subject the resource space itself
             // refuses may not be reached through an auxiliary either.
             if Self::reserved_segment(subject_path).is_some() {
                 return Err(SpaceError::Reserved);
             }
-            // The subject is derived by removing a suffix, so — unlike the old
-            // shape, where it was a suffix of the request path — it can be a
+            // The subject is derived by removing a suffix, so, unlike the old
+            // shape, where it was a suffix of the request path, it can be a
             // path this pod would refuse in its own right: `/.aux/..acl` names
             // the subject `/.`, which `dpop-verifier`'s `htu` normalization
             // would resolve to something else entirely. An auxiliary may only
@@ -407,8 +407,8 @@ impl StorageSpace {
     ///
     /// The single trailing slash is deliberately not a segment: `/box` and
     /// `/box/` are different resources here (a resource and a container) and
-    /// both must stay stable. It is any OTHER empty segment — `//` anywhere,
-    /// including a doubled trailing slash — that normalization would remove.
+    /// both must stay stable. It is any OTHER empty segment, `//` anywhere,
+    /// including a doubled trailing slash, that normalization would remove.
     fn is_normalization_stable(request_path: &str) -> bool {
         if request_path.contains('#') {
             return false;
@@ -418,13 +418,13 @@ impl StorageSpace {
             return true; // "/" itself — the root, nothing to check
         }
         let segments: Vec<&str> = rest.split('/').collect();
-        // Every segment but the last must be non-empty and not a dot-segment
-        // — an empty or dot segment there is exactly what normalization would
+        // Every segment but the last must be non-empty and not a dot-segment,
+        // an empty or dot segment there is exactly what normalization would
         // drop or resolve. The last segment is different: empty is how a
         // legitimate single trailing slash appears here (the container
-        // marker, not a removable segment), so it is allowed to be empty,
-        // but if it is NOT empty it is an ordinary segment and must pass the
-        // same check as any other.
+        // marker, not a removable segment), so it is allowed to be empty, but
+        // if it is NOT empty it is an ordinary segment and must pass the same
+        // check as any other.
         let (init, last) = segments.split_at(segments.len() - 1);
         let init_ok = init.iter().all(|seg| !seg.is_empty() && *seg != "." && *seg != "..");
         let last_ok = last[0].is_empty() || (last[0] != "." && last[0] != "..");
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(s.resolve("/.aux/.well-known/x.acl"), Err(SpaceError::Reserved));
     }
 
-    // The reservation costs exactly the name `.well-known` at the root — the
+    // The reservation costs exactly the name `.well-known` at the root, the
     // same bound `/.auxiliary` pins for `.aux`.
     #[test]
     fn a_well_known_near_miss_is_an_ordinary_resource() {
@@ -577,7 +577,7 @@ mod tests {
 
     // The subject is what remains after the suffix comes off, so it can be a
     // path the resource space would refuse in its own right. `/.aux/..acl`
-    // would name the subject `/.`, and `/.aux/...acl` the subject `/..` —
+    // would name the subject `/.`, and `/.aux/...acl` the subject `/..`,
     // both shapes `dpop-verifier`'s `htu` normalization resolves elsewhere,
     // and both are refused for the auxiliary exactly as they are for the
     // resource.
@@ -593,7 +593,7 @@ mod tests {
     }
 
     // `AuxUrl` has no `aux()`, so no auxiliary-of-an-auxiliary can be built.
-    // The path space must not offer one either — at any nesting depth.
+    // The path space must not offer one either, at any nesting depth.
     #[test]
     fn an_auxiliary_is_never_the_subject_of_an_auxiliary() {
         let s = sp();
@@ -692,7 +692,7 @@ mod tests {
         }
     }
 
-    // The chain a create actually mutates: nearest first, root last.
+    // The chain a create mutates: nearest first, root last.
     #[test]
     fn ancestors_are_nearest_first_and_end_at_root() {
         let s = sp();
@@ -711,7 +711,7 @@ mod tests {
 
     // Pins `AuxKind`'s invariants so a new variant can't silently misbehave:
     // the `match` is exhaustive over the enum, so forgetting to add the
-    // variant here — and to `ALL` — is a compile error, not a silent gap in
+    // variant here, and to `ALL`, is a compile error, not a silent gap in
     // routing or `Link` headers. Each kind's name must also be non-empty and
     // slash-free (a `/` would make the suffix span segments and the split
     // ambiguous) and IRI-safe (it is interpolated into a graph IRI).
@@ -720,7 +720,7 @@ mod tests {
     // kinds are added, with no separate test needed for it: every suffix is
     // `"." + name`, and a name here contains no `.`, so the only `.` in a
     // suffix is its own leading one. One suffix can therefore never be a
-    // suffix of a different one — that would require the shorter suffix's
+    // suffix of a different one. That would require the shorter suffix's
     // leading `.` to land on some OTHER `.` inside the longer one, and there
     // is no such character to land on.
     #[test]
@@ -739,7 +739,7 @@ mod tests {
     }
 
     // The pair Protocol §3.1 forbids from co-existing. Both directions, and
-    // the root — whose counterpart would be the empty path, which is no URL.
+    // the root, whose counterpart would be the empty path, which is no URL.
     #[test]
     fn slash_counterpart_is_the_other_half_of_the_pair() {
         let s = sp();
@@ -763,7 +763,7 @@ mod tests {
     // segments, resolve dot-segments, strip fragments) must never let two
     // paths this pod treats as distinct named graphs compare equal as `htu`.
     // `resolve` closes that gap by refusing every shape normalization would
-    // change, rather than by canonicalizing it — see the doc comment on
+    // change, rather than by canonicalizing it, see the doc comment on
     // `is_normalization_stable`.
     #[test]
     fn resolve_rejects_paths_normalization_would_alias() {
@@ -787,7 +787,7 @@ mod tests {
         }
     }
 
-    // The trailing slash is NOT a segment normalization would remove — it is
+    // The trailing slash is NOT a segment normalization would remove: it is
     // what distinguishes a container from a resource, and it must keep
     // resolving exactly as before this rule existed.
     #[test]

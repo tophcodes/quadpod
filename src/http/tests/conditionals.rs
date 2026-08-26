@@ -140,7 +140,7 @@ async fn a_validator_from_any_format_satisfies_a_conditional_write() {
 
 // RFC 9110 §15.4.5: a `304` carries the `ETag` it was matched on, or the
 // client cannot refresh its cache entry. `Vary` for the same reason it is
-// on the `200` (§6.3) — the answer depended on `Accept`.
+// on the `200` (§6.3): the answer depended on `Accept`.
 #[tokio::test]
 async fn a_304_still_carries_its_validator_and_vary() {
     let f = fixture().await;
@@ -181,7 +181,7 @@ async fn a_container_read_varies_on_accept_including_its_304() {
 
 // `current_tags` contributes no validator for a container or an
 // auxiliary in any existing test, and nothing exercised `If-Match` on an
-// ACL — exactly the read-modify-write pattern SolidOS uses on every
+// ACL, exactly the read-modify-write pattern SolidOS uses on every
 // write: `GET`, keep the `ETag`, `PUT` back conditionally.
 #[tokio::test]
 async fn if_match_on_an_acl_succeeds_with_the_right_tag_and_412s_with_the_wrong_one() {
@@ -227,7 +227,7 @@ async fn if_match_on_an_acl_succeeds_with_the_right_tag_and_412s_with_the_wrong_
 // Unifying container and auxiliary ETags onto `Skolemized::etag` made
 // them format-aware (RFC 9110 §8.8.1): Turtle and JSON-LD renderings of
 // the same container are different representations, so they must not
-// share a validator — and the same representation, fetched twice, must.
+// share a validator, and the same representation, fetched twice, must.
 #[tokio::test]
 async fn a_containers_etag_tracks_the_selected_format() {
     let f = fixture().await;
@@ -252,8 +252,8 @@ async fn a_containers_etag_tracks_the_selected_format() {
     assert_eq!(turtle_tag, turtle_again_tag, "same format, same content → same ETag");
 
     // RFC 9110 §13.1.1: `If-Match` matches *any* current representation,
-    // not just the one the server would negotiate by default — so a
-    // write carrying the JSON-LD-negotiated tag must be accepted too.
+    // beyond the one the server would negotiate by default, so a write
+    // carrying the JSON-LD-negotiated tag must be accepted too.
     let put = f.app.clone().oneshot(f.owner_request("PUT", "/")
         .header(header::CONTENT_TYPE, "text/turtle")
         .header(header::IF_MATCH, &jsonld_tag)

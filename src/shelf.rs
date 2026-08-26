@@ -2,15 +2,15 @@
 //! names it back.
 //!
 //! The storage model of §3. The key is server-minted from values the server
-//! already holds, which is what makes the same graph name in two resources
-//! land in two different shelves — §2.1's decision expressed as an address
+//! already holds, so the same graph name in two resources
+//! lands in two different shelves, §2.1's decision expressed as an address
 //! rather than as a rule someone has to remember.
 
 use crate::space::{GraphName, ResourceUrl};
 use oxigraph::model::NamedNodeRef;
 use sha2::{Digest, Sha256};
 
-/// The bookkeeping vocabulary, under `urn:quadpod:sys#` — the same prefix
+/// The bookkeeping vocabulary, under `urn:quadpod:sys#`, the same prefix
 /// `resource::SYS_PRESENT` already uses. The `#` is what keeps these
 /// predicate IRIs from colliding with the system-*graph* naming scheme
 /// `urn:quadpod:sys:<resource-iri>`.
@@ -51,7 +51,7 @@ impl ShelfKey {
         &self.0
     }
 
-    /// Reconstruct a key the registry already holds. Not a parse — the caller
+    /// Reconstruct a key the registry already holds. Not a parse, the caller
     /// asserts this came out of `sys:hasSubgraph`, never off the wire.
     pub fn from_registry(iri: &str) -> Self {
         Self(iri.to_owned())
@@ -80,7 +80,7 @@ mod tests {
         let b = ShelfKey::of(&res("/a:urn"), NamedNode::new("x:b").unwrap().as_ref());
         assert_ne!(a.graph_iri(), b.graph_iri());
 
-        // Same graph name, two resources — the case §2.1 exists for.
+        // Same graph name, two resources, the case §2.1 exists for.
         let g = NamedNode::new("urn:example:g1").unwrap();
         assert_ne!(
             ShelfKey::of(&res("/one"), g.as_ref()).graph_iri(),
@@ -104,7 +104,7 @@ mod tests {
     // The collision no separator at all admits: with nothing between the two
     // parts, `<resource><graph>` cannot be split back apart, so the byte
     // split can move from the resource/graph boundary to anywhere inside the
-    // concatenation — including right before a scheme, since a graph name
+    // concatenation, including right before a scheme, since a graph name
     // must be an absolute IRI. Both pairs below concatenate to
     // `https://pod.toph.so/ax:urn:1:2`.
     #[test]

@@ -1,17 +1,17 @@
 //! What a resource *is*, and the one place blank nodes are dealt with.
 //!
 //! The load-bearing distinction is between the two types below, and it is a
-//! type distinction rather than a convention: §4's invariant — *no blank
-//! node ever reaches the store* — must hold everywhere, and a rule enforced
+//! type distinction rather than a convention: §4's invariant, *no blank node
+//! ever reaches the store*, must hold everywhere, and a rule enforced
 //! locally, one call site at a time, is exactly the shape that misses one
-//! (design spec §4). [`Skolemized`] is the only thing the write path
-//! accepts, so "forgot to skolemize" is a compile error and not a leak.
+//! (design spec §4). [`Skolemized`] is the only thing the write path accepts,
+//! so "forgot to skolemize" is a compile error and not a leak.
 //!
 //! It carries [`GroundQuad`], not `Quad`: the invariant is the *shape* of the
 //! term types, so a blank node in a stored quad is unwritable rather than
 //! merely unwritten. That is what makes [`skolemize`](Skolemized::skolemize)
-//! total — it cannot leak a blank node it forgot, because the target has no
-//! variant to put one in — and it is why the only fallible construction left,
+//! total (it cannot leak a blank node it forgot, because the target has no
+//! variant to put one in), and it is why the only fallible construction left,
 //! [`from_store`](Skolemized::from_store), sits at the store boundary, where
 //! the quads come from outside this type system and refusing them is a parse
 //! and not a self-check.
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// The reserved namespace. Every server-minted IRI lives under it, and §3.2.2
-/// refuses it in request bodies — RDF 1.1 §3.5 preserves meaning only
+/// refuses it in request bodies, RDF 1.1 §3.5 preserves meaning only
 /// "provided that the Skolem IRIs do not occur anywhere else".
 pub const RESERVED_PREFIX: &str = "urn:quadpod:";
 
@@ -33,14 +33,14 @@ pub struct Dataset(Vec<Quad>);
 /// Whether an IRI is the server's rather than a client's.
 ///
 /// The one recogniser of the reserved namespace, so a caller holding terms
-/// rather than a [`Dataset`] — an N3 Patch document, whose IRIs must be checked
-/// before any binding is substituted —
-/// asks here instead of matching the prefix itself.
+/// rather than a [`Dataset`], an N3 Patch document, whose IRIs must be checked
+/// before any binding is substituted, asks here instead of matching the prefix
+/// itself.
 ///
-/// `urn:quadpod:` — scheme and NID are case-insensitive (RFC 8141), the rest of
+/// `urn:quadpod:`, scheme and NID are case-insensitive (RFC 8141), the rest of
 /// the NSS is not, and only the prefix is ours. `get` returns `None` rather than
-/// panicking when byte 12 is not a char boundary — `<urn:quadpodé:x>` is a legal
-/// IRI whose 13th byte (the 2-byte `é` starts at byte 11) lands mid-character —
+/// panicking when byte 12 is not a char boundary, `<urn:quadpodé:x>` is a legal
+/// IRI whose 13th byte (the 2-byte `é` starts at byte 11) lands mid-character,
 /// which also folds in the length check.
 pub fn is_reserved_iri(iri: &str) -> bool {
     iri.get(..RESERVED_PREFIX.len())
@@ -52,7 +52,7 @@ pub fn is_reserved_iri(iri: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skolemized(Vec<GroundQuad>);
 
-/// A quad with no blank node in any position — the store's currency.
+/// A quad with no blank node in any position, the store's currency.
 ///
 /// `Quad`'s subject, object and graph name each admit a `BlankNode`, so the
 /// stored invariant could only ever be asserted about a `Quad`, and asserted
@@ -67,7 +67,7 @@ pub struct GroundQuad {
     pub graph_name: GroundGraphName,
 }
 
-/// `Term` minus its blank node — the object position of a [`GroundQuad`].
+/// `Term` minus its blank node, the object position of a [`GroundQuad`].
 ///
 /// Recursive since RDF 1.2: a triple term's own object is a term, and it is
 /// ground under exactly the same rule. `Box` because a type cannot contain
@@ -84,8 +84,8 @@ pub enum GroundTerm {
 /// Its subject is a `NamedNode` rather than a `NamedOrBlankNode` for the same
 /// reason a [`GroundQuad`]'s is: a blank node anywhere in a stored quad is
 /// what skolemization removes, and nesting does not exempt it. Without that,
-/// `skolemize`'s totality claim — *no input maps to something that still
-/// holds a blank node* — would be false one level down, and false silently.
+/// `skolemize`'s totality claim, *no input maps to something that still holds
+/// a blank node*, would be false one level down, and false silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroundTriple {
     pub subject: NamedNode,
@@ -94,7 +94,7 @@ pub struct GroundTriple {
 }
 
 /// `GraphName` minus its blank node. Every graph a stored quad names is
-/// named by an IRI, which is what makes
+/// named by an IRI, which makes
 /// [`Skolemized::named_graphs`] exhaustive where [`Dataset::named_graphs`]
 /// cannot be (§6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +169,7 @@ impl From<&GroundQuad> for Quad {
     }
 }
 
-/// N-Triples term syntax, as `Term`'s own `Display` writes it — the escaping
+/// N-Triples term syntax, as `Term`'s own `Display` writes it, the escaping
 /// of quotes, newlines, language tags and datatypes that
 /// `resource::serialize_for_insert` interpolates into a SPARQL body.
 impl fmt::Display for GroundTerm {
@@ -192,14 +192,14 @@ impl Dataset {
 
     /// The least [`RdfVersion`] under which every term here is expressible.
     ///
-    /// **The only place a dataset's version is classified** — see
+    /// **The only place a dataset's version is classified**, see
     /// `docs/constraints.md`. Two classifiers is how the write-side check and
     /// the read-side projection drift apart, and the drift is silent: both
     /// answer, one answers wrong. The check that this replaced saw only
     /// triple terms, and every directional literal walked past it.
     ///
-    /// Only the object position can hold a triple term — subjects are
-    /// `NamedOrBlankNode` — and only a literal can carry a base direction, so
+    /// Only the object position can hold a triple term (subjects are
+    /// `NamedOrBlankNode`), and only a literal can carry a base direction, so
     /// one pass over the objects decides it.
     pub fn rdf_version(&self) -> RdfVersion {
         let mut found = RdfVersion::Rdf11;
@@ -220,13 +220,13 @@ impl Dataset {
     /// This dataset as it can be expressed at `target`.
     ///
     /// The two RDF 1.2 additions degrade unequally, and that asymmetry is the
-    /// point. A base direction is presentation metadata *on* a literal —
-    /// strip it and the statement survives. A triple term *is* the object:
-    /// there is nothing to strip, so the whole triple goes.
+    /// point. A base direction is presentation metadata *on* a literal, strip
+    /// it and the statement survives. A triple term *is* the object: there is
+    /// nothing to strip, so the whole triple goes.
     ///
     /// The result is a **subset** of what was written, never a rewriting of
     /// it. Approximating a triple term with something a 1.1 client could read
-    /// would manufacture assertions the document never made — the same
+    /// would manufacture assertions the document never made, the same
     /// argument §6.2 of the datasets design makes against merging named
     /// graphs into the default one.
     pub fn project_to(&self, target: RdfVersion) -> Dataset {
@@ -264,7 +264,7 @@ impl Dataset {
     /// name a graph by IRI and by nothing else, so a graph whose name is a
     /// blank node is deliberately absent from this list.
     ///
-    /// It is therefore not the predicate for "is this a dataset" —
+    /// It is therefore not the predicate for "is this a dataset",
     /// [`has_named_graphs`](Self::has_named_graphs) is.
     pub fn named_graphs(&self) -> Vec<NamedNode> {
         let mut seen: Vec<NamedNode> = Vec::new();
@@ -278,23 +278,22 @@ impl Dataset {
         seen
     }
 
-    /// Whether any quad sits outside the default graph — a blank-node graph
-    /// name counts, which is why this reads the quads rather than asking
+    /// Whether any quad sits outside the default graph, a blank-node graph name
+    /// counts, which is why this reads the quads rather than asking
     /// [`named_graphs`](Self::named_graphs), whose list is narrower on purpose.
     ///
-    /// This is what §3.4 refuses on containers and auxiliaries, asked of a
-    /// body on its way in. Defining it as "`named_graphs` is non-empty" makes
-    /// `GRAPH _:g { … }` invisible to that decision, and that shape — a blank
-    /// node that is both graph name and term — is the deployed Verifiable
-    /// Credentials `proof` pattern §4 exists for. On the way back out the
-    /// question is asked of [`Skolemized`], where it cannot come apart from
-    /// the list at all.
+    /// This is what §3.4 refuses on containers and auxiliaries, asked of a body
+    /// on its way in. Defining it as "`named_graphs` is non-empty" makes `GRAPH
+    /// _:g { … }` invisible to that decision, and that shape, a blank node that
+    /// is both graph name and term, is the deployed Verifiable Credentials
+    /// `proof` pattern §4 exists for. On the way back out the question is asked
+    /// of [`Skolemized`], where it cannot come apart from the list at all.
     pub fn has_named_graphs(&self) -> bool {
         self.0.iter().any(|q| q.graph_name != oxigraph::model::GraphName::DefaultGraph)
     }
 
-    /// §3.2.2: any reserved IRI anywhere — subject, predicate, object or graph
-    /// name — is a `400`.
+    /// §3.2.2: any reserved IRI anywhere, subject, predicate, object or graph
+    /// name, is a `400`.
     pub fn uses_reserved_namespace(&self) -> bool {
         self.0.iter().any(|q| {
             let subject = match &q.subject {
@@ -325,19 +324,19 @@ impl Dataset {
 }
 
 /// A dataset's quads as triples, graph name dropped. Used only where the
-/// caller has already established there is no graph name worth keeping —
+/// caller has already established there is no graph name worth keeping,
 /// either every quad is already in the default graph, or (the containment
 /// check) the graph name is exactly what must not hide anything from it.
 pub(crate) fn triples_of(dataset: &Dataset) -> Vec<Triple> {
     dataset.quads().iter().cloned().map(Triple::from).collect()
 }
 
-/// The skolem namespace. Only this module writes or matches it — see
+/// The skolem namespace. Only this module writes or matches it, see
 /// `docs/constraints.md`.
 const SKOLEM_PREFIX: &str = "urn:quadpod:bnode:";
 
 impl Skolemized {
-    /// Quads the caller already holds in ground form — server-built content
+    /// Quads the caller already holds in ground form, server-built content
     /// (`container::ensure_container`, `add_containment`) and the buckets
     /// `resource::put_dataset` splits a stored dataset into. Total, because
     /// [`GroundQuad`] can carry nothing this type would have to refuse.
@@ -346,7 +345,7 @@ impl Skolemized {
     }
 
     /// §4: replace every blank node with a minted IRI, one per distinct blank
-    /// node within this document, so co-reference survives — including the
+    /// node within this document, so co-reference survives, including the
     /// case where a blank node is both a graph name and a term.
     ///
     /// The only conversion from client data, and it is total in both
@@ -399,15 +398,15 @@ impl Skolemized {
     }
 
     /// Quads read back out of the store. `None` when one of them is not
-    /// ground, which is the store disagreeing with §4 — corruption, not a
+    /// ground, which is the store disagreeing with §4, corruption, not a
     /// caller mistake, and the callers say so with `expect`.
     ///
     /// This is the only fallible way into the type, and it is a **parse**:
     /// `query_triples` hands back oxigraph's `Term`, outside this module's
     /// type system, and something has to decide what it is. Nothing on the
-    /// write path may call it — client data goes through
+    /// write path may call it (client data goes through
     /// [`skolemize`](Self::skolemize), server-built data through
-    /// [`new`](Self::new) — because a check that runs on our own values is
+    /// [`new`](Self::new)), because a check that runs on our own values is
     /// the check that quietly stops running.
     pub fn from_store(quads: Vec<Quad>) -> Option<Self> {
         use oxigraph::model::{GraphName, NamedOrBlankNode};
@@ -453,12 +452,12 @@ impl Skolemized {
         &self.0
     }
 
-    /// The graphs this dataset names, in no particular order — **all** of
-    /// them, unlike [`Dataset::named_graphs`], because a stored graph name is
-    /// an IRI by construction. Every dataset decision the read and write paths
-    /// make (§6.2's shape, §6.2.1's refusal, the `containsGraph` count) is
-    /// taken over this list rather than the visible one, where a graph the
-    /// client named with a blank node would be missing from it.
+    /// The graphs this dataset names, in no particular order, **all** of them,
+    /// unlike [`Dataset::named_graphs`], because a stored graph name is an IRI
+    /// by construction. Every dataset decision the read and write paths make
+    /// (§6.2's shape, §6.2.1's refusal, the `containsGraph` count) is taken
+    /// over this list rather than the visible one, where a graph the client
+    /// named with a blank node would be missing from it.
     pub fn named_graphs(&self) -> Vec<NamedNode> {
         let mut seen: Vec<NamedNode> = Vec::new();
         for q in &self.0 {
@@ -479,7 +478,7 @@ impl Skolemized {
     }
 
     /// §4: back to blank nodes, one per distinct skolem IRI, **with a label
-    /// derived from the skolem IRI** — a fresh label per read would break
+    /// derived from the skolem IRI**, a fresh label per read would break
     /// §6.4's byte-identical guarantee.
     pub fn deskolemize(&self) -> Dataset {
         use oxigraph::model::{BlankNode, GraphName, NamedOrBlankNode, Term};
@@ -534,8 +533,8 @@ impl Skolemized {
     ///
     /// A method rather than a free function because the thing it identifies is
     /// this value: hashing something else, or hashing after the blank nodes
-    /// come back, is the mistake — and both are harder to write by accident
-    /// when the hash belongs to the stored form.
+    /// come back, is the mistake, and both are harder to write by accident when
+    /// the hash belongs to the stored form.
     pub fn etag(&self, fmt: Format, served: RdfVersion) -> String {
         let mut lines: Vec<String> = self.0.iter().map(|q| Quad::from(q).to_string()).collect();
         lines.sort();
@@ -575,7 +574,7 @@ mod tests {
         assert_eq!(projected.rdf_version(), RdfVersion::Rdf11);
     }
 
-    /// §5: a base direction *is* strippable — the triple survives, and only
+    /// §5: a base direction *is* strippable, the triple survives, and only
     /// the presentation metadata is lost.
     #[test]
     fn projecting_to_1_1_strips_the_base_direction() {
@@ -588,7 +587,7 @@ mod tests {
         assert_eq!(l.language(), Some("en"), "the language tag must remain");
     }
 
-    /// `1.2-basic` keeps directions and drops only triple terms — the middle
+    /// `1.2-basic` keeps directions and drops only triple terms, the middle
     /// label earning its place.
     #[test]
     fn projecting_to_1_2_basic_keeps_the_direction() {
@@ -613,7 +612,7 @@ mod tests {
     }
 
     /// §9: two representations of one state must not share a strong
-    /// validator (RFC 9110 §8.8.1) — the same rule the selected *format*
+    /// validator (RFC 9110 §8.8.1), the same rule the selected *format*
     /// already answers to, one axis over.
     #[test]
     fn the_served_version_changes_the_etag() {
@@ -731,7 +730,7 @@ mod tests {
         )
     }
 
-    /// A quad whose object is a directional language-tagged string — the
+    /// A quad whose object is a directional language-tagged string, the
     /// RDF 1.2 addition that is *not* a triple term (§2).
     fn q_directional(s: &str, g: oxigraph::model::GraphName) -> Quad {
         use oxigraph::model::BaseDirection;
@@ -816,7 +815,7 @@ mod tests {
     }
 
     // A `Link` header can name a graph by IRI and by nothing else, so
-    // `named_graphs` lists only those — but a blank-named graph is still a
+    // `named_graphs` lists only those, but a blank-named graph is still a
     // graph, and every dataset decision (§3.4's refusal, §6.2's shape,
     // §6.2.1's refusal) hangs off `has_named_graphs`. Defining the predicate
     // as "the list is non-empty" makes `GRAPH _:g { … }` invisible to all
@@ -832,7 +831,7 @@ mod tests {
     }
 
     // §3.2.2. RFC 8141 makes the URN scheme and NID case-insensitive, so a
-    // literal prefix comparison lets `URN:QUADPOD:` through — and a document that
+    // literal prefix comparison lets `URN:QUADPOD:` through, and a document that
     // gets through here comes back with its IRI rewritten into a blank node.
     #[test]
     fn the_reserved_namespace_is_refused_in_any_position_and_any_case() {
@@ -866,8 +865,8 @@ mod tests {
             NamedNode::new("urn:podcast:1").unwrap().into())]);
         assert!(!clean.uses_reserved_namespace(), "a longer NID is a different namespace");
 
-        // §3.2.2 says *any* IRI in the namespace, and the exact prefix IRI is
-        // in it — a `>` comparison let it through as neither longer nor shorter.
+        // §3.2.2 says *any* IRI in the namespace, and the exact prefix IRI is in
+        // it, a `>` comparison let it through as neither longer nor shorter.
         let exact = Dataset::new(vec![q(
             "http://example.org/a", "x",
             NamedNode::new(RESERVED_PREFIX).unwrap().into())]);
@@ -876,7 +875,7 @@ mod tests {
 
     // Whole-branch review: `iri[..RESERVED_PREFIX.len()]` slices at byte 12
     // with no char-boundary check. `<urn:quadpodé:x>` is a legal IRI oxrdf
-    // accepts, and its `é` (bytes 11-12) puts that cut point mid-character —
+    // accepts, and its `é` (bytes 11-12) puts that cut point mid-character,
     // a panic, not a `400`. Checked in all four quad positions because the
     // guard in `reserved` is applied separately to each one.
     #[test]
@@ -937,7 +936,7 @@ mod tests {
         // That no blank node reaches the store, not even as a graph name, is
         // no longer assertable here: `GroundGraphName` has no variant to
         // compare against. What is still worth pinning is that the identity
-        // survives the round trip — see `tests/unrepresentable.rs`.
+        // survives the round trip, see `tests/unrepresentable.rs`.
         let stored = Skolemized::skolemize(&ds);
         let back = stored.deskolemize();
         let graph_node = back.quads().iter()
@@ -1051,8 +1050,8 @@ mod tests {
 
     // Every other etag test uses a single-quad dataset, so it can't tell
     // `lines.sort()` apart from no sort at all. This one builds the same two
-    // quads in two different orders — mirroring rdf.rs's
-    // `serialization_is_canonical_not_merely_repeatable` — so a missing sort
+    // quads in two different orders (mirroring rdf.rs's
+    // `serialization_is_canonical_not_merely_repeatable`), so a missing sort
     // fails it.
     #[test]
     fn the_etag_is_order_independent() {

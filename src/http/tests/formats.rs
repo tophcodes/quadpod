@@ -35,7 +35,7 @@ async fn a_write_with_content_and_no_content_type_is_a_400() {
 
 // The live injection vector: a legal HTTP header value that is not a legal
 // media type, whose quote would close the SPARQL literal it is
-// interpolated into. A CRLF payload would NOT do here — hyper rejects it
+// interpolated into. A CRLF payload would NOT do here, hyper rejects it
 // before any handler runs, so that test would pin hyper and pass no matter
 // what MediaType::parse does.
 #[tokio::test]

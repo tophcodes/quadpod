@@ -41,16 +41,16 @@ pub(super) async fn fixture_with_body_limit(max_body_bytes: usize) -> Fixture {
     fixture_with_blobs(Arc::new(crate::blob::ObjectStoreBlobs::in_memory()), max_body_bytes).await
 }
 
-/// Like [`fixture`], but with a caller-chosen `BlobStore` — for a fixture
-/// whose blob backend is failing (see `a_blob_backend_outage_answers_500_not_400`).
+/// Like [`fixture`], but with a caller-chosen `BlobStore`, for a fixture whose blob
+/// backend is failing (see `a_blob_backend_outage_answers_500_not_400`).
 pub(super) async fn fixture_with_blobs(blobs: Arc<dyn crate::blob::BlobStore>, max_body_bytes: usize) -> Fixture {
     fixture_with_store_and_blobs(
         Arc::new(OxigraphStore::in_memory().unwrap()), blobs, max_body_bytes,
     ).await
 }
 
-/// Like [`fixture_with_blobs`], but with a caller-chosen `SparqlStore` too
-/// — for a fixture whose store backend starts failing partway through a
+/// Like [`fixture_with_blobs`], but with a caller-chosen `SparqlStore`
+/// too, for a fixture whose store backend starts failing partway through a
 /// test (see `a_failed_write_after_a_warning_carries_no_report_link`).
 pub(super) async fn fixture_with_store_and_blobs(
     store: Arc<dyn crate::store::SparqlStore>,
@@ -90,7 +90,7 @@ pub(super) async fn fixture_with_store_and_blobs(
 
 /// Like [`fixture`], but the pod is its own OP: `op_keys` is set, the
 /// resolver maps the pod's own issuer to the key set's public JWKS, and
-/// OWNER's WebID authorizes the pod as issuer — so a token minted by
+/// OWNER's WebID authorizes the pod as issuer, so a token minted by
 /// `op::mint_access_token` authenticates a request end to end.
 ///
 /// The returned path is the key file the loader wrote; the caller removes it.
@@ -134,7 +134,7 @@ pub(super) fn now_unix() -> i64 {
 impl Fixture {
     /// Add credentials for `webid` to a request builder. The DPoP proof's
     /// `htu` must be the CONFIGURED base plus the path (never the socket),
-    /// and its `jti` must be unique — the replay store rejects reuse.
+    /// and its `jti` must be unique, the replay store rejects reuse.
     pub(super) fn sign(
         &self,
         builder: axum::http::request::Builder,
@@ -275,7 +275,7 @@ pub(super) async fn put_acl(f: &Fixture, subject_path: &str, body: &str) -> axum
 }
 
 /// A `BlobStore` whose `put` always fails, standing in for a backend
-/// outage — disk full, bucket unreachable. Reached only through the HTTP
+/// outage, disk full, bucket unreachable. Reached only through the HTTP
 /// handlers here, unlike `resource::`'s own `FailingBlobs`: that one
 /// pins `put_dataset`'s write order, but nothing at that level ever
 /// passes through `put_status`, which is the function this test exists
@@ -297,7 +297,7 @@ impl crate::blob::BlobStore for FailingBlobs {
 }
 
 /// A `SparqlStore` that delegates to a real in-memory store until
-/// [`FailingStore::arm`] is called, after which every `update` fails —
+/// [`FailingStore::arm`] is called, after which every `update` fails,
 /// standing in for a backend outage that starts partway through a test.
 /// Reads (`query_triples`, `ask`) always delegate, so shape lookup and
 /// validation, which never write, are unaffected.

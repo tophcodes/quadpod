@@ -4,7 +4,7 @@
 //! The bus is a registry keyed by topic rather than one broadcast channel: a
 //! notification channel has exactly one `notify:topic`, and a single firehose
 //! would make one subscriber anywhere in the pod the reason every write
-//! computes a validator. [`Bus::live`] is where that cost is gated — nothing
+//! computes a validator. [`Bus::live`] is where that cost is gated: nothing
 //! reads a `state` for a topic with no live channel.
 //!
 //! Every write goes through LDP (the SPARQL endpoint is internal-only), so
@@ -26,7 +26,7 @@ use crate::wac::guard::Materialized;
 /// subscription against.
 ///
 /// Constructible only from a [`Target`], so a request path cannot become a key
-/// without passing `StorageSpace::resolve` first — the same guarantee
+/// without passing `StorageSpace::resolve` first, the same guarantee
 /// `space::GraphName`, `shelf::ShelfKey` and `blob::BlobKey` are built with.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Topic(String);
@@ -71,7 +71,7 @@ pub struct Event {
     pub object: String,
     /// The container, on `Add`/`Remove` only.
     pub target: Option<String>,
-    /// The **topic's** validator after the write — never the `object`'s, or a
+    /// The **topic's** validator after the write, never the `object`'s, or a
     /// subscriber could not hand it back as `notify:state`. `None` on
     /// `Delete`, and when the read-back failed.
     pub state: Option<String>,
@@ -92,7 +92,7 @@ impl Bus {
         Self { channels: RwLock::new(HashMap::new()) }
     }
 
-    /// Which of `topics` have a live channel — the one gate every `state`
+    /// Which of `topics` have a live channel, the one gate every `state`
     /// computation sits behind.
     ///
     /// Evicts any sender whose receiver count has fallen to zero, which is
@@ -167,8 +167,8 @@ impl Default for Bus {
 /// no other reader is left.
 ///
 /// Not a Solid notification channel and deliberately not named one. A
-/// `WebSocketChannel2023` or `WebhookChannel2023` is #18's and #19's object —
-/// it carries a channel type, a `receiveFrom` or `sendTo`, an `accept`, the
+/// `WebSocketChannel2023` or `WebhookChannel2023` is #18's and #19's object. It
+/// carries a channel type, a `receiveFrom` or `sendTo`, an `accept`, the
 /// optional `startAt`/`endAt`/`rate` features, and for webhooks it outlives the
 /// process. Each of those *holds* one of these to get its events. Nothing about
 /// the protocol belongs on this type.
@@ -201,7 +201,7 @@ impl Drop for Receiver {
     }
 }
 
-/// Whether the target was there before the write — what decides `Create` from
+/// Whether the target was there before the write, what decides `Create` from
 /// `Update`.
 ///
 /// A `bool`, for the reason [`crate::rdf::Shape`] is not one:
@@ -219,7 +219,7 @@ pub enum Existence {
 ///
 /// Takes the response's `status`, not the response: `axum::body::Body` is not
 /// `Sync`, so a `&Response` is not `Send`, and an `async fn` holds every
-/// argument for the whole of its body — one such parameter makes the calling
+/// argument for the whole of its body, one such parameter makes the calling
 /// handler's future `!Send` and unusable as an axum `Handler`. The status is
 /// all the emit reads.
 pub async fn emit_put(
@@ -266,7 +266,7 @@ async fn publish_own(st: &AppState, target: &Target, activity: Activity) {
 ///
 /// No `Update` beside the `Add`: it says nothing the `Add` does not, and the
 /// container's new state rides on the same event (design §4.1). A container
-/// that was both created and gained a child gets both events — they are two
+/// that was both created and gained a child gets both events: they are two
 /// facts, and this bus is keyed by (topic, activity).
 async fn publish_containment(st: &AppState, target_iri: &str, materialized: &Materialized) {
     for created in &materialized.created {
@@ -278,7 +278,7 @@ async fn publish_containment(st: &AppState, target_iri: &str, materialized: &Mat
             // `Guard::materialize` records as created is an ancestor container,
             // except the request's own target, which the skip above has already
             // taken out. A skip rather than an `expect`, because `created` is a
-            // `Vec<ResourceUrl>` and nothing in the type says so — and a write
+            // `Vec<ResourceUrl>` and nothing in the type says so, and a write
             // that already committed must not be turned into a panic by the
             // notification it triggers.
             continue;
@@ -303,7 +303,7 @@ async fn publish_containment(st: &AppState, target_iri: &str, materialized: &Mat
 }
 
 /// `POST`: as [`emit_put`], on the allocated child rather than the request
-/// target, and always a `Create` — the name is fresh by construction.
+/// target, and always a `Create`, the name is fresh by construction.
 pub async fn emit_post(
     st: &AppState,
     child: &Target,
@@ -322,7 +322,7 @@ pub async fn emit_post(
 /// `PATCH`: `Update`, or the `Create` shape when `create_by_patch` ran. For a
 /// resource or container, `existence` comes from
 /// [`crate::wac::guard::Guard::target_exists`], read before the guard was
-/// consumed — `create_by_patch` takes it by value. For an auxiliary it is
+/// consumed: `create_by_patch` takes it by value. For an auxiliary it is
 /// always `Existed`: `aux::patch` refuses an absent one itself, so this point
 /// is never reached without one (design §4.3).
 pub async fn emit_patch(
@@ -386,12 +386,12 @@ pub async fn emit_delete(
     });
 }
 
-/// The topic's validator after the write — §5.1.
+/// The topic's validator after the write, §5.1.
 ///
 /// Called only for a topic [`Bus::live`] returned, which is what keeps a pod
 /// with no subscribers doing no extra I/O. `None` where there is no state to
 /// report: the target is gone (a `Delete`), or the read-back failed, which
-/// must not turn a successful write into a `500` — the protocol makes `state`
+/// must not turn a successful write into a `500`, the protocol makes `state`
 /// optional precisely so this case has an answer.
 async fn state_of(st: &AppState, target: &Target) -> Option<String> {
     let store = st.store.as_ref();
@@ -418,7 +418,7 @@ async fn state_of(st: &AppState, target: &Target) -> Option<String> {
 
 /// §5.1: N-Quads at the version the stored state holds. N-Quads because
 /// `Skolemized::etag` renders each quad through oxigraph's `Display`, which is
-/// N-Quads — so the media type keying the hash describes what is under it. The
+/// N-Quads, so the media type keying the hash describes what is under it. The
 /// held version rather than 1.1, or two RDF 1.2 states differing only in triple
 /// terms would share a validator and a real change would report none.
 fn etag_of(stored: &Skolemized) -> String {
@@ -485,7 +485,7 @@ mod tests {
     /// Two readers of one topic dropping at once. Each `Drop` decides from
     /// the count of the readers that *remain*, so exactly one of them sees
     /// zero and evicts. A `Drop` that counted itself would have both see two,
-    /// both decline, and leave an entry with no readers behind — reclaimable
+    /// both decline, and leave an entry with no readers behind, reclaimable
     /// only by a `live` call, which happens only when that topic is written
     /// to again, so a topic nobody writes to leaks for the process's life
     /// (design §2.2).
@@ -586,8 +586,8 @@ mod tests {
     /// The recheck under `live`'s write lock, pinned directly: a `subscribe`
     /// that revives a dead sender between `live`'s read phase and its write
     /// phase must leave that sender in the map, and a later `publish` must
-    /// still reach the receiver `subscribe` handed back — a surviving map
-    /// entry that drops the event is exactly as broken as an evicted one.
+    /// still reach the receiver `subscribe` handed back, a surviving map entry
+    /// that drops the event is exactly as broken as an evicted one.
     ///
     /// Both `live`'s write-lock attempt and `subscribe`'s only lock are queued
     /// behind one held read guard and released together, so which of the two
@@ -620,8 +620,8 @@ mod tests {
             };
             held.recv().unwrap();
 
-            // `live`'s read phase runs freely — readers coexist with the
-            // holder's guard — and finds the topic dead. Its write phase then
+            // `live`'s read phase runs freely (readers coexist with the
+            // holder's guard), and finds the topic dead. Its write phase then
             // queues behind the holder, alongside `subscribe`'s only lock.
             let (live_ready, live_started) = std::sync::mpsc::channel::<()>();
             let live_thread = {
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(got.state.as_deref(), Some("\"abc\""));
     }
 
-    /// Publishing must not be what creates a channel — otherwise the registry
+    /// Publishing must not be what creates a channel, otherwise the registry
     /// fills up with every topic ever written to, which is the unbounded growth
     /// `live`'s eviction exists to prevent.
     #[tokio::test]
@@ -709,7 +709,7 @@ mod tests {
 
     /// The pieces every `state_of` fixture shares: a full `AppState` over an
     /// in-memory store and blob store, exactly as `tests/call_budget.rs`'s
-    /// `app()` assembles one, minus the router — `state_of` is called
+    /// `app()` assembles one, minus the router: `state_of` is called
     /// directly, not through a request.
     fn assemble_state(
         store: OxigraphStore, blobs: ObjectStoreBlobs, space: StorageSpace,
@@ -794,13 +794,13 @@ mod tests {
 
     /// §8: a failed read-back reports `state: None`. A `kind_of` that fails
     /// must not fall through to `get_dataset`, which for a binary answers
-    /// `Some(<empty dataset>)` — its presence marker is in the store — and
+    /// `Some(<empty dataset>)` (its presence marker is in the store), and
     /// would put a plausible validator of nothing on the event.
     #[tokio::test]
     async fn state_of_a_binary_whose_kind_cannot_be_read_is_none() {
         let (st, target) = binary_fixture("/photo.png", b"\x89PNG\r\n\x1a\n").await;
         let Target::Resource(r) = &target else { unreachable!() };
-        // §3.1's invariant broken — a binary with no stored media type — which
+        // §3.1's invariant broken (a binary with no stored media type), which
         // is the state `kind_of` fails closed on.
         let sys = crate::resource::sys_graph_iri(r);
         st.store.update(&format!(
@@ -824,13 +824,13 @@ mod tests {
     }
 
     /// `state_is_the_n_quads_etag_at_the_held_version` fixes the format and
-    /// the version by recomputing both independently — but its fixture is
+    /// the version by recomputing both independently, but its fixture is
     /// pure RDF 1.1, so a broken `state_of` that hashed at a hard-coded
     /// `RdfVersion::Rdf11` instead of the stored state's own held version
     /// would pass that test too. This one holds an RDF 1.2-basic directional
     /// literal, where the two versions provably diverge, so it fails if
     /// `state_of` ever collapses a 1.2 state to its 1.1 projection's
-    /// validator — the exact failure the module doc comment on `etag_of`
+    /// validator, the exact failure the module doc comment on `etag_of`
     /// warns about.
     #[tokio::test]
     async fn state_of_a_1_2_basic_state_is_not_its_1_1_projections_etag() {

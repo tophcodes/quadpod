@@ -45,13 +45,13 @@ pub fn router(state: AppState) -> Router {
     // `Router::layer` wraps everything built so far, so the LAST call is the
     // outermost: `cors_layer` sees the `401` that `auth_layer` produces, which
     // is where the CORS fields are required, and the trace layer outside both
-    // sees every response this pod emits — including the ones no handler ever
+    // sees every response this pod emits, including the ones no handler ever
     // ran for.
     Router::new()
         .route("/", get(handle_get_root).put(handle_put_root).post(handle_post_root).delete(handle_delete_root).patch(handle_patch_root).options(handle_options_root))
         // `/.well-known/` is origin infrastructure (RFC 8615), the second
         // reserved segment next to `.aux`: only GET is routed, so every
-        // write answers 405 whether or not the OP is on — a WAC-authorized
+        // write answers 405 whether or not the OP is on, a WAC-authorized
         // writer must not be able to plant a discovery document at the
         // issuer origin (RFC 8414). Three spellings, because the wildcard
         // requires a non-empty capture and matches neither bare form.
@@ -68,8 +68,8 @@ pub fn router(state: AppState) -> Router {
                     // The id is minted here rather than read off a header: an
                     // inbound `X-Request-Id` is client-controlled, so trusting
                     // it lets one caller file its requests under another's id.
-                    // Every event a request produces — the `error!` at each
-                    // `500` included — inherits this span, so a log line always
+                    // Every event a request produces, the `error!` at each
+                    // `500` included, inherits this span, so a log line always
                     // says which request it belongs to.
                     tracing::info_span!(
                         "request",
@@ -121,7 +121,7 @@ async fn handle_well_known(
 /// The response headers a browser may read off a cross-origin response.
 ///
 /// Enumerated rather than `*` because a wildcard names nothing a client can act
-/// on, and because every field here is one some handler on this pod actually
+/// on, and because every field here is one some handler on this pod
 /// emits. Both properties are asserted: `protocol/cors/enumerate-headers`
 /// requires the header to be present and to differ from `*`.
 const EXPOSED_HEADERS: &str =
@@ -138,23 +138,22 @@ const EXPOSED_HEADERS: &str =
 /// `Authorization` header, which CORS treats as a request header to allow, not
 /// as a credential to flag; the flag exists for cookies and TLS client
 /// certificates, neither of which this pod accepts. That is what makes
-/// reflecting an arbitrary origin safe here — the browser attaches no
-/// credential of its own, so a foreign page can only send a token it already
-/// holds, and a page holding the token never needed CORS to use it. Setting the
-/// flag is the change that would make ambient authority usable against this
-/// pod.
+/// reflecting an arbitrary origin safe here, the browser attaches no credential
+/// of its own, so a foreign page can only send a token it already holds, and a
+/// page holding the token never needed CORS to use it. Setting the flag is the
+/// change that would make ambient authority usable against this pod.
 pub async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let origin = req.headers().get(header::ORIGIN).cloned();
     let mut res = next.run(req).await;
     let Some(origin) = origin else { return res };
     let h = res.headers_mut();
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    // `Origin` joins whatever `Vary` the handler already set — typically
-    // `Accept` from a negotiated read — as **one field line**, not a second
+    // `Origin` joins whatever `Vary` the handler already set, typically
+    // `Accept` from a negotiated read, as **one field line**, not a second
     // one. Appending would be legal (RFC 9110 §5.3 lets a list-valued field
     // repeat) and still wrong in practice: a client that reads the first line
     // and stops sees half the list, and the conformance harness is such a
-    // client. Replacing outright would be worse — a cache would then serve one
+    // client. Replacing outright would be worse, a cache would then serve one
     // representation for every `Accept`.
     //
     // The spelling matters: the suite compares this field value as a
@@ -184,7 +183,7 @@ pub async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Nex
 /// Classify a request path, or answer it outright.
 ///
 /// A path in the reserved namespace that names no auxiliary resource is a
-/// `404`: it is not data, and it never will be — no representation can be
+/// `404`: it is not data, and it never will be, no representation can be
 /// stored there and none can be read from there. Anything else `resolve`
 /// refuses is a malformed request URL.
 fn classify(space: &StorageSpace, request_path: &str) -> Result<Target, StatusCode> {
@@ -196,8 +195,8 @@ fn classify(space: &StorageSpace, request_path: &str) -> Result<Target, StatusCo
 
 /// Every auxiliary this resource has, advertised whether or not it exists.
 ///
-/// A client must not derive these URLs — in this pod's URI space `<url>.acl`
-/// is an ordinary resource, not a policy document — so this header is the
+/// A client must not derive these URLs (in this pod's URI space `<url>.acl`
+/// is an ordinary resource, not a policy document), so this header is the
 /// only place it can learn them, and it needs them precisely in order to
 /// create the first one. Built from [`AuxKind::ALL`], so a new kind is
 /// advertised the moment it exists.
@@ -219,7 +218,7 @@ fn aux_links(target: &Target) -> Option<String> {
     )
 }
 
-/// Attach [`aux_links`] to a response — including refusals and `404`s, which
+/// Attach [`aux_links`] to a response, including refusals and `404`s, which
 /// is where a client mid-create-flow needs them most: SolidOS string-derives
 /// `<url>.acl` exactly when this header is absent, and would then write its
 /// policy to a path this pod treats as ordinary data.
@@ -236,11 +235,11 @@ fn with_aux_links(mut res: Response, target: &Target) -> Response {
     res
 }
 
-/// The methods a target actually accepts, as an `Allow` field value.
+/// The methods a target accepts, as an `Allow` field value.
 ///
 /// Derived from the router's own shape rather than a fixed list: a container
 /// is the only thing `POST` may address, and the root is the only container
-/// `DELETE` refuses (`delete_impl`). `OPTIONS` is accepted everywhere — it
+/// `DELETE` refuses (`delete_impl`). `OPTIONS` is accepted everywhere: it
 /// answers from the request URL alone and needs no representation to describe.
 fn allowed_methods(target: &Target) -> &'static str {
     match target {
@@ -253,9 +252,9 @@ fn allowed_methods(target: &Target) -> &'static str {
 /// The one patch format this pod accepts. Protocol §5.3 makes advertising it a
 /// MUST, and it travels with `Allow` because both answer "what may I do here?".
 ///
-/// A constant rather than a lookup, unlike [`accept_write`]: `text/n3` is not
-/// a [`Format`] — nothing in `rdf.rs` parses it, `patch.rs` owns it end to end
-/// — so there is no list here for a second one to drift from.
+/// A constant rather than a lookup, unlike [`accept_write`]: `text/n3` is not a
+/// [`Format`] (nothing in `rdf.rs` parses it, `patch.rs` owns it end to end),
+/// so there is no list here for a second one to drift from.
 const ACCEPT_PATCH: &str = "text/n3";
 
 /// Which write method an advertisement describes. A two-arm enum rather than a
@@ -273,13 +272,13 @@ enum Write {
 /// addresses containers alone, and a header naming a method the same response
 /// refuses in `Allow` is worse than an absent one.
 ///
-/// Every RDF format appears twice — bare, and with the store's own `version`
+/// Every RDF format appears twice, bare, and with the store's own `version`
 /// label. Both are true: [`RdfVersion::from_media_type`] reads an *absent*
 /// parameter as `Rdf11`, so the two spellings are two acceptable
-/// representations. The versioned twin is dropped on an `Rdf11` store, where
-/// it would be a second spelling of the first entry. Only the store's maximum
-/// is named; a lower `version` is accepted — [`classify_body`] refuses only
-/// `declared > store_version` — and is what the bare entry already covers.
+/// representations. The versioned twin is dropped on an `Rdf11` store, where it
+/// would be a second spelling of the first entry. Only the store's maximum is
+/// named; a lower `version` is accepted, [`classify_body`] refuses only
+/// `declared > store_version`, and is what the bare entry already covers.
 ///
 /// `*/*` is [LDP §4.5.2][ldp]'s "any media type", and it is [`classify_body`]'s
 /// blob arm read back out: a `POST`ed child and a `PUT` resource may be blobs;
@@ -305,8 +304,8 @@ fn accept_write(target: &Target, method: Write, version: RdfVersion) -> Option<S
     Some(types.join(", "))
 }
 
-/// Attach [`allowed_methods`] to a read that succeeded — Protocol §4.1 makes
-/// it a MUST on `GET`/`HEAD` — alongside the three `Accept-*` headers §5.3
+/// Attach [`allowed_methods`] to a read that succeeded, Protocol §4.1 makes
+/// it a MUST on `GET`/`HEAD`, alongside the three `Accept-*` headers §5.3
 /// makes a MUST beside it.
 fn with_allow(mut res: Response, target: &Target, version: RdfVersion) -> Response {
     res.headers_mut().insert(
@@ -329,7 +328,7 @@ fn with_allow(mut res: Response, target: &Target, version: RdfVersion) -> Respon
 /// and what an anonymous caller may do.
 ///
 /// Both groups always appear. An empty group is `public=""` and not an omitted
-/// group — the field parses into a list per group, and an absent group does not
+/// group, the field parses into a list per group, and an absent group does not
 /// yield the empty list a client (or the conformance suite) reads it as.
 ///
 /// Modes are read through [`AccessModes::allows`], so a grant of `acl:Write`
@@ -366,7 +365,7 @@ fn with_read_headers(
 }
 
 /// The one sentence a self-denying ACL is reported with, in both places it is
-/// reported — [`warn_if_acl_grants_nothing`] logs this string and puts this
+/// reported, [`warn_if_acl_grants_nothing`] logs this string and puts this
 /// same string on the response, so the two can never drift.
 ///
 /// `acl_iri` is where the document now lives, `subject_iri` the resource it
@@ -375,7 +374,7 @@ fn with_read_headers(
 /// resource's ancestor chain never contains the resource itself, so its ACL
 /// governs exactly that one resource and nothing "below" it. `is_root` adds
 /// the recovery instruction, which only applies to the root: for any other
-/// subtree there is genuinely no way back, since removing the ACL needs the
+/// subtree there is no way back, since removing the ACL needs the
 /// `Control` it just revoked from everyone.
 fn acl_grants_nothing_message(
     acl_iri: &str,
@@ -397,8 +396,8 @@ fn acl_grants_nothing_message(
 
 /// A `Warning` header carrying `message`, if it can be expressed as one.
 ///
-/// `Warning` is obsolete — RFC 9111 §5.5 retired it along with the cache
-/// semantics it was invented for — and it is still the right field here. It
+/// `Warning` is obsolete (RFC 9111 §5.5 retired it along with the cache
+/// semantics it was invented for), and it is still the right field here. It
 /// was never reassigned, `199` is precisely its "miscellaneous warning, text
 /// MAY be presented to a human" code, and a `curl -i` user reads it as a
 /// warning without being told anything about this pod, which no bespoke
@@ -409,14 +408,14 @@ fn acl_grants_nothing_message(
 ///
 /// [`acl_grants_nothing_message`] interpolates IRIs, and RFC 3987 permits
 /// non-ASCII IRI characters, so the message is not guaranteed to be pure
-/// ASCII — only guaranteed to contain no `"` or `\`, which is what actually
+/// ASCII, only guaranteed to contain no `"` or `\`, which is what
 /// keeps the `quoted-string` this builds well-formed. `HeaderValue::from_str`
 /// accepts any byte `>= 32` except `127`, so a non-ASCII subject IRI becomes
 /// obs-text in the header value rather than being rejected: legal, if not
 /// always readable by a client that assumes ASCII. The `Option` return is for
-/// what actually can make `from_str` fail — a `"` or `\` that somehow reached
+/// what can make `from_str` fail, a `"` or `\` that somehow reached
 /// this point despite the guard below, or a control byte below `32`. Should
-/// that ever happen, the header is dropped rather than a malformed one sent —
+/// that ever happen, the header is dropped rather than a malformed one sent,
 /// the log still carries the whole story.
 fn warning_header(message: &str) -> Option<header::HeaderValue> {
     if message.contains(['"', '\\']) {
@@ -428,13 +427,13 @@ fn warning_header(message: &str) -> Option<header::HeaderValue> {
 /// Say so, twice, when a just-written ACL grants nobody anything.
 ///
 /// This pod treats an empty ACL as "nothing is granted here" rather than
-/// "absent" — existence is a stored marker, not a triple count — so such a
+/// "absent" (existence is a stored marker, not a triple count), so such a
 /// document wins over every ancestor and denies its whole subtree, including
 /// the `Control` that removing it would need. At the root that means the pod
 /// is locked out of itself and only `--reset-root-acl` gets back in; anywhere
 /// else there is no route back at all. Neither the empty body nor the far more
 /// likely near-miss (the wrong predicate, an `acl:accessTo` naming something
-/// else) was signalled before this — a typo in a WebID is not among the
+/// else) was signalled before this, a typo in a WebID is not among the
 /// near-misses this catches: see [`pdp::grants_anything`]'s doc comment for
 /// why.
 ///
@@ -445,11 +444,11 @@ fn warning_header(message: &str) -> Option<header::HeaderValue> {
 /// `curl` user sees it without reading server logs. Both carry the identical
 /// sentence from [`acl_grants_nothing_message`].
 ///
-/// The question itself is [`pdp::grants_anything`]'s — the layer that owns
-/// what a grant *is*. Asking it here, by re-reading the triples, is exactly
-/// the duplication this codebase has spent its ACL defects unlearning.
-/// `triples` is what `aux::put` just stored, so no second round-trip is
-/// needed to know the document's contents.
+/// The question itself is [`pdp::grants_anything`]'s, the layer that owns what
+/// a grant *is*. Asking it here, by re-reading the triples, is exactly the
+/// duplication this codebase has spent its ACL defects unlearning. `triples`
+/// is what `aux::put` just stored, so no second round-trip is needed to know
+/// the document's contents.
 fn warn_if_acl_grants_nothing(
     space: &StorageSpace,
     aux: &AuxUrl,
@@ -493,8 +492,8 @@ fn put_status(e: &ResourceError) -> StatusCode {
 
 /// The body every `500` carries, whatever failed underneath.
 ///
-/// A store or blob failure names this pod's internals — an Oxigraph message, a
-/// bucket, a path — and none of that is something the client can act on. The
+/// A store or blob failure names this pod's internals (an Oxigraph message, a
+/// bucket, a path), and none of that is something the client can act on. The
 /// detail is not lost, it is moved: [`internal_error`] logs the cause with the
 /// request's own span around it. A `4xx` keeps its text, because there the text
 /// describes what the caller sent.
@@ -534,8 +533,8 @@ const SLASH_PAIR_MESSAGE: &str =
 /// The guard decides *that* a request is refused and on which ground; the
 /// status codes, the bodies and the challenge header are this layer's, and
 /// this is the only place they are chosen. A store failure keeps the road
-/// every other `500` takes — [`internal_error`], which logs the cause and
-/// answers [`INTERNAL_ERROR_BODY`] — so the detail the guard carried out
+/// every other `500` takes ([`internal_error`], which logs the cause and
+/// answers [`INTERNAL_ERROR_BODY`]), so the detail the guard carried out
 /// reaches the operator and nothing of it reaches the client.
 impl IntoResponse for Denial {
     fn into_response(self) -> Response {
@@ -568,10 +567,10 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> &str {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
-/// Every `ETag` `target` currently answers with, one per representation —
-/// what `If-Match`/`If-None-Match` compare against, since neither header
-/// carries a format the way `Accept` does. `None` means the target does not
-/// exist, which is what `If-None-Match: *` tests.
+/// Every `ETag` `target` currently answers with, one per representation, what
+/// `If-Match`/`If-None-Match` compare against, since neither header carries a
+/// format the way `Accept` does. `None` means the target does not exist, which
+/// is what `If-None-Match: *` tests.
 ///
 /// A [`Target::Resource`]'s validator embeds the format it labels (§6.4, RFC
 /// 9110 §8.8.1: different representations are different entities), so there is
@@ -625,7 +624,7 @@ async fn current_tags(
 /// with: each servable format, at RDF 1.1 and at the state's own version.
 ///
 /// The version comes from [`Dataset::rdf_version`] via de-skolemization
-/// rather than from a second classifier over the stored quads — one
+/// rather than from a second classifier over the stored quads, one
 /// classifier is a rule (`docs/constraints.md`), and this is the caller that
 /// would most naturally have broken it.
 fn etag_candidates(stored: &Skolemized) -> Vec<String> {
@@ -642,7 +641,7 @@ fn etag_candidates(stored: &Skolemized) -> Vec<String> {
 }
 
 /// Lifts a container's or auxiliary's raw triples (always default-graph,
-/// always ground — §3.4 and skolemization at the write path guarantee both)
+/// always ground, §3.4 and skolemization at the write path guarantee both)
 /// into the same [`Skolemized`] type a resource's dataset is held as, so the
 /// two paths share one `etag`/`deskolemize` implementation.
 pub(crate) fn ground_dataset(triples: Vec<Triple>) -> Skolemized {
@@ -673,27 +672,27 @@ async fn handle_put_root(
 
 /// `PATCH`. The sequence runs in this order and no other:
 ///
-/// 1. `authorize(…, Mode::Append)` — before anything is parsed, so an
+/// 1. `authorize(…, Mode::Append)`: before anything is parsed, so an
 ///    unauthorized caller learns nothing, and the returned `Decision` carries
 ///    the full mode set §9 needs.
 /// 2. The `Content-Type` gate: `text/n3`, with `classify_body`'s split for a
-///    missing type — `400` on a non-empty body, `415` on an empty one.
-/// 3. `patch::Patch::parse` — `400` for unparseable N3 or a reserved IRI, `422`
+///    missing type: `400` on a non-empty body, `415` on an empty one.
+/// 3. `patch::Patch::parse`: `400` for unparseable N3 or a reserved IRI, `422`
 ///    for a shape violation.
 /// 4. `RequiredModes::satisfied_by` against the decision already in hand. No
 ///    second ACL resolution.
-/// 5. `kind_of` — a binary resource is `409`; the bytes are not triples.
+/// 5. `kind_of`: a binary resource is `409`; the bytes are not triples.
 /// 6. On a container, refuse a patch touching `ldp:contains` with `409`, through
 ///    the same `container::body_sets_containment` `put_impl` uses.
-/// 7. `check_conditionals` — `412`.
+/// 7. `check_conditionals`: `412`.
 /// 8. An absent target is patched against an empty dataset (§7): a patch that
-///    asks nothing of the prior state — no conditions and no deletions — is a
+///    asks nothing of the prior state (no conditions and no deletions) is a
 ///    creation through the `PUT` path, `create_by_patch` → `201`. A patch that
 ///    asks anything of it gets from the empty dataset the same `409` a target
 ///    without those triples gives, and no write. An existing target goes to
 ///    `resource::patch_dataset` → `204`, or the `409` its `PatchResult` names.
 /// 9. On a container, `container::ensure_container` afterwards, exactly as
-///    `put_impl` does — the server's type triples are its own, and a patch
+///    `put_impl` does: the server's type triples are its own, and a patch
 ///    that deleted them would otherwise leave the container untyped.
 async fn patch_impl(
     st: AppState,
@@ -708,7 +707,7 @@ async fn patch_impl(
         Err(d) => return with_aux_links(d.into_response(), &target),
     };
     // Append is the weakest mode any patch §5.1 admits can need, and
-    // `AccessModes::allows` makes Write subsume it — so this refuses exactly
+    // `AccessModes::allows` makes Write subsume it, so this refuses exactly
     // those callers who could do nothing anyway, and it runs before the body
     // is looked at so an unauthorized caller learns nothing.
     let decision = match guard.authorize(Mode::Append) {
@@ -737,20 +736,20 @@ async fn patch_impl(
     };
 
     // §9: the modes this particular patch needs, against the set `authorize`
-    // already resolved. `deny` rather than a second `authorize` — the answer
+    // already resolved. `deny` rather than a second `authorize`: the answer
     // is in hand, and re-resolving would walk the ancestor chain again and
     // could read an ACL written in between.
     //
     // §8: not for an auxiliary. `authorize` substituted `Control` for it
     // regardless of the mode asked for, so asking again with modes derived
     // from the patch's parts would demand `Read` or `Write` on top of
-    // `Control` — refusing an ACL patch from an agent WAC says may make it.
+    // `Control`, refusing an ACL patch from an agent WAC says may make it.
     if !matches!(target, Target::Aux(_)) && !patch.required_modes().satisfied_by(decision.user) {
         return with_aux_links(guard.deny().into_response(), &target);
     }
 
     // §8: `text/n3` is a perfectly good request body, so the conflict is with
-    // the state of the target — bytes, which have no triples to patch.
+    // the state of the target, bytes, which have no triples to patch.
     if let Target::Resource(r) = &target {
         match kind_of(store, r).await {
             Ok(Some(Kind::Binary(_))) => {
@@ -760,7 +759,7 @@ async fn patch_impl(
             Err(e) => return put_error(&e),
         }
     }
-    // A shape-constrained container refuses every PATCH outright — see
+    // A shape-constrained container refuses every PATCH outright, see
     // `patch_shape_conflict` for why validating one is not an option. Checked
     // after the two refusals above, which are about the caller and the
     // target's own state and must win first: `authorize`'s own comment says
@@ -781,15 +780,14 @@ async fn patch_impl(
     if let Err(res) = check_conditionals(store, st.blobs.as_ref(), &headers, &target).await {
         return res;
     }
-    // An auxiliary is written through `aux`, whose subject-existence guard is
-    // what keeps a policy document off a path that names nothing, and it
-    // answers the same `404` `put_impl` does when the subject is gone. It
-    // takes its own branch here because the `target_exists` check below is not
-    // the one it needs: §7's creation path is closed for an auxiliary as well, and
-    // `aux::patch` refuses an absent one itself, with a body that says which
-    // of the two is missing. That refusal also means this arm never creates —
-    // it is always an `Update` (§4.3), the same activity `put_write`'s `Aux`
-    // arm reports on the same topic.
+    // An auxiliary is written through `aux`, whose subject-existence guard is what
+    // keeps a policy document off a path that names nothing, and it answers the
+    // same `404` `put_impl` does when the subject is gone. It takes its own branch
+    // here because the `target_exists` check below is not the one it needs: §7's
+    // creation path is closed for an auxiliary as well, and `aux::patch` refuses
+    // an absent one itself, with a body that says which of the two is missing.
+    // That refusal also means this arm never creates: it is always an `Update`
+    // (§4.3), the same activity `put_write`'s `Aux` arm reports on the same topic.
     let (res, existence, materialized) = if let Target::Aux(a) = &target {
         let res = match aux::patch(store, a, &patch).await {
             Ok(result) => patch_response(result, &patch),
@@ -821,7 +819,7 @@ async fn patch_impl(
         } else {
             let res = match patch_dataset(store, r, &patch).await {
                 // A container's type triples are the server's, and a patch names
-                // its own triples — including them. Re-asserting them here is
+                // its own triples, including them. Re-asserting them here is
                 // what `put_impl` does after writing a container body, and it is
                 // why a container patch is not refused outright: the client
                 // stays free to patch everything else the container's graph
@@ -845,16 +843,16 @@ async fn patch_impl(
     res
 }
 
-/// §7: a target that does not exist is patched against an empty RDF dataset,
-/// so a patch that asks nothing of the prior state creates it — through the
-/// same [`crate::wac::guard::Guard::materialize`] walk, the same containment linking and
-/// the same [`created`] response `PUT` uses. There is no second creation path.
+/// §7: a target that does not exist is patched against an empty RDF dataset, so a patch
+/// that asks nothing of the prior state creates it, through the same
+/// [`crate::wac::guard::Guard::materialize`] walk, the same containment linking and the
+/// same [`created`] response `PUT` uses. There is no second creation path.
 ///
 /// A patch creates only when the empty dataset answers everything it asks:
 /// [`crate::patch::Patch::ground_insertions`] is `Some` exactly when it has no
-/// conditions, and it must delete nothing. Either part unmet is §6's `409` and
-/// touches nothing — a condition finds no mapping in an empty dataset, and a
-/// triple to delete is not in one either.
+/// conditions, and it must delete nothing. Either part unmet is §6's `409` and touches
+/// nothing, a condition finds no mapping in an empty dataset, and a triple to delete is
+/// not in one either.
 ///
 /// The media type recorded for a resource created this way is `text/turtle`:
 /// a patch declares no representation format, and Turtle is what negotiation
@@ -863,9 +861,9 @@ async fn patch_impl(
 /// Only a resource or a container reaches here. An auxiliary is answered by
 /// `aux::patch`, which refuses an absent one itself.
 ///
-/// The second element of the pair is what the ancestor walk materialized —
-/// what `emit_patch` needs and cannot re-derive. A failing exit's is never
-/// read: `emit_patch` gates emission on `status` alone, before it looks at it.
+/// The second element of the pair is what the ancestor walk materialized, what
+/// `emit_patch` needs and cannot re-derive. A failing exit's is never read: `emit_patch`
+/// gates emission on `status` alone, before it looks at it.
 async fn create_by_patch(
     st: &AppState,
     guard: Guard<'_>,
@@ -953,8 +951,8 @@ impl ContainmentConflict {
 /// Whether a patch would write the containment triples the server manages,
 /// and why.
 ///
-/// Over the insertions and the deletions both — unlinking a member forges the
-/// container's contents exactly as inserting one does — and over the patterns
+/// Over the insertions and the deletions both (unlinking a member forges the
+/// container's contents exactly as inserting one does), and over the patterns
 /// rather than over what they would bind to, because the refusal has to land
 /// before the write.
 ///
@@ -979,13 +977,13 @@ fn patch_sets_containment(patch: &crate::patch::Patch, c: &ContainerUrl) -> Opti
 ///
 /// The patterns are the client's own words, and they are all a message ever
 /// carries: a *binding* may be a skolem IRI the client has never seen, while a
-/// pattern cannot be one — `Patch::parse` refuses any document that names the
+/// pattern cannot be one: `Patch::parse` refuses any document that names the
 /// reserved namespace.
 fn patch_conflict(reason: &str, patterns: &[crate::patch::Pattern]) -> Response {
     (StatusCode::CONFLICT, format!("{reason}: {}", show_patterns(patterns))).into_response()
 }
 
-/// Triple patterns as message text — never as SPARQL, which
+/// Triple patterns as message text, never as SPARQL, which
 /// `resource::patch_dataset` builds for itself. A variable prints by its
 /// index: the name the client chose does not leave `patch` (§6.1).
 fn show_patterns(patterns: &[crate::patch::Pattern]) -> String {
@@ -1033,7 +1031,7 @@ enum Repr {
     /// The declared [`RdfVersion`] travels with the parsed body because the
     /// write path needs it after `classify_body` has returned, and re-reading
     /// it from the header there would be a second reader of the `version`
-    /// parameter — which `docs/constraints.md` forbids.
+    /// parameter, which `docs/constraints.md` forbids.
     Rdf(Dataset, Format, RdfVersion),
     Blob(Bytes, MediaType),
 }
@@ -1042,7 +1040,7 @@ enum Repr {
 ///
 /// The order matters. A missing `Content-Type` on a request with content is
 /// Solid Protocol §2.2's `400` and is answered before anything else, because
-/// it is a different failure from a type this pod cannot use — a distinction
+/// it is a different failure from a type this pod cannot use, a distinction
 /// that only exists now that an unrecognised type is a blob rather than a
 /// refusal.
 ///
@@ -1133,7 +1131,7 @@ async fn check_conditionals(
 ///
 /// `Err` is the response to send; `Ok(Some(report))` is a write that may
 /// proceed but has findings to advertise; `Ok(None)` is an unconstrained
-/// write. Auxiliaries are never validated — an ACL is server-understood data
+/// write. Auxiliaries are never validated, an ACL is server-understood data
 /// with its own rules.
 async fn enforce_shape(
     st: &AppState,
@@ -1177,12 +1175,12 @@ async fn enforce_shape(
     Ok(if report.is_empty() { None } else { Some(report) })
 }
 
-/// Whether `target`'s parent container binds a shape — and if it does, the
+/// Whether `target`'s parent container binds a shape, and if it does, the
 /// `409` that refuses a `PATCH` outright, without attempting to validate it.
 ///
 /// A patch is applied as one SPARQL update whose `WHERE` clause carries the
 /// deletion-presence check, so the graph a patch produces never exists as a
-/// [`crate::dataset::Dataset`] in this process — there is nothing for
+/// [`crate::dataset::Dataset`] in this process: there is nothing for
 /// [`crate::shapes::validate`] to run against. Checking only the insertions
 /// would be cheap, but wrong: a `sh:Violation` can be produced by a deletion
 /// as readily as by an insertion (removing the one triple that satisfied an
@@ -1332,12 +1330,12 @@ async fn put_write(
             }, existence, materialized);
         }
     };
-    // §3.2.2 — the skolem namespace is the server's.
+    // §3.2.2, the skolem namespace is the server's.
     if dataset.uses_reserved_namespace() {
         return ((StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response(),
             existence, Materialized::default());
     }
-    // §3.4 — a container's graph carries containment; an auxiliary's rules
+    // §3.4, a container's graph carries containment; an auxiliary's rules
     // would be invisible to WAC inside a subgraph.
     if dataset.has_named_graphs() && !matches!(target, Target::Resource(_)) {
         return ((StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response(),
@@ -1377,7 +1375,7 @@ async fn put_write(
             }
         }
     }
-    // §6.2.1 — a graph-format write must not silently discard what a graph
+    // §6.2.1, a graph-format write must not silently discard what a graph
     // format could not have shown the client in the first place.
     if let Target::Resource(r) = target {
         if !fmt.carries_dataset() {
@@ -1389,10 +1387,10 @@ async fn put_write(
                 Err(e) => return (put_error(&e), existence, Materialized::default()),
             };
             if let Some(existing) = existing {
-                // Over the stored quads, where every graph name is an IRI. A
-                // graph the client named with a blank node is destroyed by
-                // this write just as surely, and the de-skolemized view shows
-                // it as a blank node again — invisible to `Dataset::named_graphs`.
+                // Over the stored quads, where every graph name is an IRI. A graph
+                // the client named with a blank node is destroyed by this write
+                // just as surely, and the de-skolemized view shows it as a blank
+                // node again, invisible to `Dataset::named_graphs`.
                 if existing.has_named_graphs() {
                     // Only IRI names go in the message: a blank-named graph
                     // has no name the client ever wrote, and the IRI the
@@ -1425,7 +1423,7 @@ async fn put_write(
         Err(res) => return (res, existence, Materialized::default()),
     };
     // Creating a resource materializes every missing ancestor container and
-    // links it into the first one that already exists — real mutations of
+    // links it into the first one that already exists, real mutations of
     // resources the caller may hold nothing on. One traversal authorizes
     // exactly the levels it writes (see `wac::guard`), so there is no second
     // rule here that could drift from it.
@@ -1434,7 +1432,7 @@ async fn put_write(
     // not leave containers behind for a resource that was never created.
     //
     // This is also where a create that Solid Protocol §3.1 forbids is refused
-    // with a `409` — `PUT /box` while `/box/` exists, or the reverse. That
+    // with a `409`, `PUT /box` while `/box/` exists, or the reverse. That
     // rule belongs to the same one traversal, because the set of URLs it
     // applies to is the set of URLs this call would create; there is no
     // separate check here that could drift from it.
@@ -1444,7 +1442,7 @@ async fn put_write(
     };
     let res = match target {
         // An auxiliary exists only for an existing subject, and that rule is
-        // inside `aux::put`'s update rather than a check here — a check and a
+        // inside `aux::put`'s update rather than a check here, a check and a
         // write are two round-trips, and an interleaved DELETE between them
         // would plant a policy document on a path that no longer exists.
         Target::Aux(a) => {
@@ -1455,11 +1453,11 @@ async fn put_write(
                     (StatusCode::NOT_FOUND, AUX_SUBJECT_MISSING_MESSAGE).into_response(),
                 // RFC 9110 §15.5.14: the content is larger than this server is
                 // willing to process. The document is well-formed RDF and its
-                // meaning is understood — nothing about it is a client
-                // mistake a `400` would describe — so what is refused is its
-                // size, which is also what tells the caller a smaller
-                // document would be accepted. Same answer the configured
-                // `max_body_bytes` gives one layer out, for the same reason.
+                // meaning is understood (nothing about it is a client mistake
+                // a `400` would describe), so what is refused is its size,
+                // which is also what tells the caller a smaller document would
+                // be accepted. Same answer the configured `max_body_bytes`
+                // gives one layer out, for the same reason.
                 Err(e @ AuxError::TooLarge(_)) =>
                     (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
                 // Unreachable: `put` writes the auxiliary, so it never asks
@@ -1531,7 +1529,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // meaningless grant in practice: the 409 below is derived from the
     // request path alone, but no handler branch may answer before `authorize`
     // runs, so an unauthorized caller never learns even that much about the
-    // path they probed. An auxiliary lands here too — POST is how one would
+    // path they probed. An auxiliary lands here too: POST is how one would
     // try to create one, and it is refused as "not a container".
     let parent_guard = match Guard::probe(store, agent.clone(), target.clone()).await {
         Ok(g) => g,
@@ -1545,19 +1543,19 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     };
     let slug = headers.get("slug").and_then(|v| v.to_str().ok());
     // A settled child name contains no `/`, so the child of a container is
-    // always an ordinary resource — unless the server would have to allocate
-    // it inside a reserved segment (`Slug: .aux` or `Slug: .well-known` at
-    // the root), which `classify` refuses for both. A `Slug` can therefore
-    // neither name an auxiliary nor plant a document in the origin's own
-    // `/.well-known/` space, where the routes above would shadow it on GET
-    // and no write method could ever remove it.
+    // always an ordinary resource, unless the server would have to allocate it
+    // inside a reserved segment (`Slug: .aux` or `Slug: .well-known` at the
+    // root), which `classify` refuses for both. A `Slug` can therefore neither
+    // name an auxiliary nor plant a document in the origin's own
+    // `/.well-known/` space, where the routes above would shadow it on GET and
+    // no write method could ever remove it.
     //
     // A `Link: rel="type"` naming a container asks for one, and under Solid
-    // §3.1 the trailing slash is the *only* thing that tells the two apart —
-    // so it is appended as a separate `suffix`, and the name it decorates
-    // stays a bare segment. Anything that has to vary the name varies that
-    // segment and re-applies the suffix; folding the slash into the name would
-    // put the retry *inside* the container instead of beside it.
+    // §3.1 the trailing slash is the *only* thing that tells the two apart, so
+    // it is appended as a separate `suffix`, and the name it decorates stays a
+    // bare segment. Anything that has to vary the name varies that segment and
+    // re-applies the suffix; folding the slash into the name would put the
+    // retry *inside* the container instead of beside it.
     let wants_container =
         container::type_link_requests_container(header_str(&headers, header::LINK));
     let suffix = if wants_container { "/" } else { "" };
@@ -1585,9 +1583,9 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         };
     }
     // The child is NOT authorized separately. A POST authorizes an operation
-    // on the container — the server picks the child's name, so no client can
-    // be expected to hold a grant naming it, and requiring one would refuse
-    // the append-only inbox (`acl:accessTo <./>; acl:mode acl:Append` with no
+    // on the container, the server picks the child's name, so no client can be
+    // expected to hold a grant naming it, and requiring one would refuse the
+    // append-only inbox (`acl:accessTo <./>; acl:mode acl:Append` with no
     // `acl:default`), which is what a Solid pod ships by default. WAC's create
     // rule reads "on the resource to be created", but that wording replaced
     // "on the container for new members" in a change its editor approved as
@@ -1602,29 +1600,29 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     // The dataset checks below have no meaning for a blob: no named graphs,
     // no reserved namespace, no containment triples. It gets its own
     // over-long-key check instead, run here for the same reason the dataset
-    // checks are — before the ancestor walk below writes anything.
+    // checks are, before the ancestor walk below writes anything.
     let mut findings = None;
     let skolemized = match &repr {
         Repr::Rdf(dataset, _, _) => {
-            // §3.2.2 — the skolem namespace is the server's.
+            // §3.2.2, the skolem namespace is the server's.
             if dataset.uses_reserved_namespace() {
                 return (StatusCode::BAD_REQUEST, "the urn:quadpod: namespace is reserved").into_response();
             }
-            // §3.4 — the allocated child is always a resource or a container
-            // (never an auxiliary, see above), so this is exactly `put_impl`'s check.
+            // §3.4, the allocated child is always a resource or a container (never an
+            // auxiliary, see above), so this is exactly `put_impl`'s check.
             if dataset.has_named_graphs() && !matches!(child, Target::Resource(_)) {
                 return (StatusCode::BAD_REQUEST, "named graphs are only allowed on resources").into_response();
             }
             // Containment is server-managed, for a container POST asks for
-            // exactly as much as for one a PUT names — and refused before
+            // exactly as much as for one a PUT names, and refused before
             // anything is written, for the same reason.
             if matches!(child, Target::Container(_)) && container::body_sets_containment(&triples_of(dataset)) {
                 return StatusCode::CONFLICT.into_response();
             }
             // Against the settled child, not the requested slug: the binding
             // lives on the child's parent, which for a POST is the container
-            // this request targets, and refusing here — before the ancestor
-            // walk below creates anything — leaves nothing behind to clean up.
+            // this request targets, and refusing here, before the ancestor
+            // walk below creates anything, leaves nothing behind to clean up.
             findings = match enforce_shape(&st, &child, dataset).await {
                 Ok(f) => f,
                 Err(res) => return res,
@@ -1642,7 +1640,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
         }
     };
     // POSTing into a container that does not exist yet materializes it and
-    // its missing ancestors, so those need authorizing too — the same single
+    // its missing ancestors, so those need authorizing too, the same single
     // traversal `put_impl` uses.
     let materialized = match child_guard.materialize().await {
         Ok(m) => m,
@@ -1663,7 +1661,7 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
                 }
             }
         },
-        // A freshly allocated name, so there are no members to preserve — the
+        // A freshly allocated name, so there are no members to preserve: the
         // read-then-merge `put_impl` does for an existing container has
         // nothing to read here.
         Target::Container(c) => {
@@ -1692,13 +1690,13 @@ async fn post_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMa
     res
 }
 
-/// Answer a CORS preflight — and a bare `OPTIONS`, which the suite also sends
+/// Answer a CORS preflight, and a bare `OPTIONS`, which the suite also sends
 /// (`protocol/cors/acao-vary` omits `Access-Control-Request-Method`).
 ///
 /// Deliberately unauthorized. A preflight arrives without credentials by
 /// construction, so demanding them makes a pod unusable from a browser; and
-/// the answer is derived entirely from the request URL's shape —
-/// [`allowed_methods`] takes a [`Target`] and never reaches the store — so it
+/// the answer is derived entirely from the request URL's shape
+/// ([`allowed_methods`] takes a [`Target`] and never reaches the store), so it
 /// discloses nothing about what exists. That is the line `post_impl` already
 /// draws when it answers `409` from the path shape rather than let `POST`
 /// become an existence oracle. The [`RdfVersion`] this also takes is a
@@ -1768,7 +1766,7 @@ async fn handle_get_root(
 
 /// Whether this request asks for the validation report rather than the
 /// resource. The only query parameter this pod gives meaning to; every other
-/// parameter — including a near-miss like `?validat` — is ignored and the
+/// parameter, including a near-miss like `?validat`, is ignored and the
 /// resource itself is served, exactly as before this parameter existed.
 fn wants_validation(query: Option<&str>) -> bool {
     query.is_some_and(|q| q.split('&').any(|p| p == "validate"))
@@ -1789,7 +1787,7 @@ async fn validate_view(
     if let Err(d) = guard.authorize(Mode::Read) {
         return with_aux_links(d.into_response(), &target);
     }
-    // The container whose `ldp:constrainedBy` binds a shape to `target` —
+    // The container whose `ldp:constrainedBy` binds a shape to `target`,
     // its parent, the same lookup a write validates against (§3.2).
     let container = match &target {
         Target::Aux(_) => return with_aux_links(StatusCode::NOT_FOUND.into_response(), &target),
@@ -1804,9 +1802,9 @@ async fn validate_view(
         Ok(Some(s)) => s,
         Err(e) => return shape_status(e),
     };
-    // `target`'s own content — what the shape is validated against.
+    // `target`'s own content, what the shape is validated against.
     let dataset = match &target {
-        // §5.3: a blob has no triples, so it is never validated — the same
+        // §5.3: a blob has no triples, so it is never validated, the same
         // "no report here" answer as an unconstrained resource, not a
         // vacuous `sh:conforms true` for a representation SHACL never saw.
         Target::Resource(r) if matches!(kind_of(store, r).await, Ok(Some(Kind::Binary(_)))) =>
@@ -1817,8 +1815,8 @@ async fn validate_view(
             Err(e) => return put_error(&e),
         },
         Target::Container(c) => match get_rdf(store, c).await {
-            // Minus what this pod adds on write — `ldp:contains` and the
-            // type triples `ensure_container` asserts — so this is exactly
+            // Minus what this pod adds on write (`ldp:contains` and the
+            // type triples `ensure_container` asserts), so this is exactly
             // the graph a write into `c` was validated against (§3.4). The
             // full stored graph would let a shape targeting those
             // server-managed triples report `Violation` here while every
@@ -1931,7 +1929,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Err(ResourceError::InvalidIri) => return StatusCode::BAD_REQUEST.into_response(),
         Err(e) => return internal_error(&e),
     }
-    // §6.1: read everything first — the ETag covers the resource, not the
+    // §6.1: read everything first, the ETag covers the resource, not the
     // body, so the shelves are read even when only the default graph will be
     // served.
     let stored = match get_dataset(store, r).await {
@@ -1959,8 +1957,8 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     let Some((fmt, requested)) = negotiate(header_str(&headers, header::ACCEPT), shape, stored_type) else {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     };
-    // §5: what is actually served is the lower of what the client asked for
-    // and what the resource is — asking for 1.2 of a plain 1.1 resource is
+    // §5: what is served is the lower of what the client asked for
+    // and what the resource is, asking for 1.2 of a plain 1.1 resource is
     // answered, and advertised, as 1.1.
     let held = visible.rdf_version();
     let served_version = requested.min(held);
@@ -1981,7 +1979,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
         Err(e) => return internal_error(&e),
     };
     let mut out = HeaderMap::new();
-    // §5: the response states the version it carries — but only where a
+    // §5: the response states the version it carries, but only where a
     // version is in play at all. RDF 1.2 Concepts encourages announcing a
     // version for "documents that make use of RDF 1.2-specific
     // functionality"; stamping `version=1.1` on every plain Turtle response
@@ -1990,7 +1988,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     //
     // On a resource that *is* 1.2, the parameter carries real information in
     // both directions: `version=1.2` says the triple terms are here, and
-    // `version=1.1` says they were left out — which, with the `alternate`
+    // `version=1.1` says they were left out, which, with the `alternate`
     // link below, is the whole loss signal. No minted vocabulary, because a
     // version is a property of the representation as a whole and has no
     // parts to enumerate.
@@ -2005,8 +2003,8 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
     );
     out.insert(header::ETAG, tag.parse().expect("etag is header-safe"));
     out.insert(header::VARY, "Accept".parse().expect("static"));
-    // §5: only when the version actually cost something. The link names the
-    // resource's *own* classification, not a blanket 1.2 — promising triple
+    // §5: only when the version cost something. The link names the
+    // resource's *own* classification, not a blanket 1.2, promising triple
     // terms a `1.2-basic` resource does not have would be a worse answer than
     // saying nothing.
     if served_version < held {
@@ -2015,7 +2013,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
             r.graph_iri(), fmt.media_type(), held.label()
         ).parse().expect("media type and version label are token-safe"));
     }
-    // Only when something was actually left out — an ordinary graph-shaped
+    // Only when something was left out, an ordinary graph-shaped
     // resource served as Turtle has nothing to point `alternate` at, and
     // must not carry these headers just because Turtle itself is lossy.
     if !fmt.carries_dataset() && stored.has_named_graphs() {
@@ -2045,7 +2043,7 @@ async fn get_impl(st: AppState, agent: Agent, target: Target, headers: HeaderMap
 /// [`get_impl`]'s dataset machinery would add.
 ///
 /// Containers and auxiliaries are skolemized on the way in through `put_rdf`
-/// and `aux::put` — an ACL may legitimately contain `[]` — so the matching
+/// and `aux::put` (an ACL may legitimately contain `[]`), so the matching
 /// step out belongs here, the one place this shared path serializes, rather
 /// than inside a resource-shaped branch (design spec §4).
 async fn legacy_graph_read(
@@ -2136,14 +2134,14 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
     if let Err(d) = guard.authorize(Mode::Write) {
         return with_aux_links(d.into_response(), &target);
     }
-    // The auxiliary arm's response carries no `present_auxes` of its own — an
-    // auxiliary cascades no others — so both arms reach the single emit below
+    // The auxiliary arm's response carries no `present_auxes` of its own (an
+    // auxiliary cascades no others), so both arms reach the single emit below
     // through the same pair.
     let (res, present_auxes): (Response, Vec<AuxUrl>) = if let Target::Aux(a) = &target {
         // Removing an auxiliary is a complete operation on its own: the path
         // falls back to inherited policy, which is exactly what its absence
-        // means. Nothing else refers to it — an auxiliary is never a
-        // container member — so there is no containment to repair.
+        // means. Nothing else refers to it (an auxiliary is never a
+        // container member), so there is no containment to repair.
         let res = match delete_rdf(store, a).await {
             Ok(true) => StatusCode::NO_CONTENT.into_response(),
             Ok(false) => StatusCode::NOT_FOUND.into_response(),
@@ -2163,16 +2161,16 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
         // Deleting a subject takes every auxiliary it has with it (that cascade
         // is `aux::delete_subject`'s definition, not a step remembered here), so
         // the caller must be allowed to remove each one that exists. Without
-        // this, a narrowing ACL — WAC's only mechanism for revoking what an
-        // ancestor hands down through `acl:default` — could be erased by someone
+        // this, a narrowing ACL, WAC's only mechanism for revoking what an
+        // ancestor hands down through `acl:default`, could be erased by someone
         // holding merely Write: delete the resource, recreate it, and the wider
         // ancestor grant applies again. The residual signal ("this resource has
         // an auxiliary of kind k") is only ever observable to a caller who
         // already holds Write on it.
         //
         // `authorize_aux` answers `Ok(Some(_))` exactly for a kind the probe
-        // found present, so that same call collects `present_auxes` — the set
-        // `emit_delete` reports — without a second probe.
+        // found present, so that same call collects `present_auxes`, the set
+        // `emit_delete` reports, without a second probe.
         let mut present_auxes: Vec<AuxUrl> = Vec::new();
         for kind in AuxKind::ALL {
             match guard.authorize_aux(*kind) {
@@ -2192,7 +2190,7 @@ async fn delete_impl(st: AppState, agent: Agent, target: Target) -> Response {
             }
         }
         // The parent's containment triple goes with the subject, inside
-        // `delete_subject`'s own update — this handler cannot leave the two
+        // `delete_subject`'s own update, this handler cannot leave the two
         // half-applied because it never holds them apart.
         let res = match aux::delete_subject(store, st.blobs.as_ref(), subject).await {
             Ok(true) => StatusCode::NO_CONTENT.into_response(),

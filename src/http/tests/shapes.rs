@@ -3,10 +3,10 @@
 use super::fixture::*;
 
 /// The shapes document, and a container bound to it. Returns nothing;
-/// both are ordinary resources afterwards.
-/// Binds `shape_ttl`, stored at `shape_path`, to `container_path` — the
-/// one place this file spells `ldp:constrainedBy` to set a binding up
-/// (data, not a read; see `docs/constraints.md`).
+/// both are ordinary resources afterwards. Binds `shape_ttl`, stored at
+/// `shape_path`, to `container_path`, the one place this file spells
+/// `ldp:constrainedBy` to set a binding up (data, not a read; see
+/// `docs/constraints.md`).
 async fn bind_shape(f: &Fixture, container_path: &str, shape_path: &str, shape_ttl: &str) {
     f.put_turtle(shape_path, shape_ttl).await;
     f.put_turtle(container_path, &format!(
@@ -63,7 +63,7 @@ async fn a_refused_write_names_the_shape_in_a_link_header() {
 }
 
 /// §5.1: validation runs before the traversal that adds the containment
-/// triple, so a refusal leaves the container exactly as it was — no
+/// triple, so a refusal leaves the container exactly as it was, no
 /// `ldp:contains` pointing at a resource that was never created.
 #[tokio::test]
 async fn a_refused_write_adds_no_containment() {
@@ -126,7 +126,7 @@ async fn a_conforming_write_carries_no_report_link() {
 /// for a write that never persisted.
 ///
 /// The resource is pre-created so the failing write adds no containment
-/// triple — `store.update` runs exactly once for it, inside `put_dataset`
+/// triple, `store.update` runs exactly once for it, inside `put_dataset`
 /// itself, which is the call `FailingStore` is armed to fail.
 #[tokio::test]
 async fn a_failed_write_after_a_warning_carries_no_report_link() {
@@ -167,8 +167,8 @@ async fn an_acl_write_is_never_validated() {
     f.put_turtle("/notes/n1", "<> a <http://schema.org/NoteDigitalDocument> ; \
         <http://schema.org/name> \"ok\" .").await;
 
-    // Alongside the authorization the ACL actually needs, a subject typed
-    // `schema:NoteDigitalDocument` with no `schema:name` — a triple
+    // Alongside the authorization the ACL needs, a subject typed
+    // `schema:NoteDigitalDocument` with no `schema:name`, a triple
     // `NoteShape` would refuse if this write were validated like any
     // other resource. Without it, this test would still pass `201` even
     // if the `Target::Aux(_)` exemption in `enforce_shape` were deleted.
@@ -346,7 +346,7 @@ async fn validate_view_response_varies_on_accept() {
 }
 
 /// A container's shape lookup uses its own parent, exactly as a PUT to
-/// the container does — here the root, which binds the shape that
+/// the container does, here the root, which binds the shape that
 /// `/notes/` itself is validated against.
 #[tokio::test]
 async fn validate_view_on_a_container_uses_its_own_parent() {
@@ -366,11 +366,11 @@ async fn validate_view_on_a_container_uses_its_own_parent() {
 }
 
 /// §3.4/§10: `ldp:contains` is never in a data graph, so a container that
-/// was accepted at write time — its own body carried no members — must
-/// still conform at `?validate` after the ancestor walk adds one. A
-/// shape targeting `ldp:contains` directly on the container's own IRI is
-/// what would trip if the read path validated the full stored graph
-/// instead of what the write path actually checked.
+/// was accepted at write time, its own body carried no members, must
+/// still conform at `?validate` after the ancestor walk adds one. A shape
+/// targeting `ldp:contains` directly on the container's own IRI is what
+/// would trip if the read path validated the full stored graph instead of
+/// what the write path checked.
 #[tokio::test]
 async fn validate_view_on_a_container_matches_what_its_write_was_validated_against() {
     let f = fixture().await;
@@ -395,18 +395,18 @@ async fn validate_view_on_a_container_matches_what_its_write_was_validated_again
 /// `without_server_managed` used to strip `rdf:type ldp:Container`/
 /// `ldp:BasicContainer` on *any* subject, but `ensure_container` only ever
 /// asserts that pair on the container's own IRI. A client-authored type
-/// triple about a subject the server never touches — `<#x>` here — must
+/// triple about a subject the server never touches, `<#x>` here, must
 /// therefore survive into the `?validate` view exactly as the write path
 /// validated it.
 ///
 /// The container's own subject is a different story: `ensure_container`
-/// re-asserts the same pair there on every write, so a client-authored
-/// `<> a ldp:Container` and the server's own assertion collapse into one
-/// stored triple with no way to tell which wrote it — that focus node
-/// keeps reporting `sh:Violation` for `sh:hasValue ldp:Container` even
-/// though the write that produced it was accepted. Narrowing the strip to
-/// the container's own subject cannot recover that; it only stops the
-/// filter from reaching past it onto `<#x>`.
+/// re-asserts the same pair there on every write, so a client-authored `<>
+/// a ldp:Container` and the server's own assertion collapse into one
+/// stored triple with no way to tell which wrote it, that focus node keeps
+/// reporting `sh:Violation` for `sh:hasValue ldp:Container` even though
+/// the write that produced it was accepted. Narrowing the strip to the
+/// container's own subject cannot recover that; it only stops the filter
+/// from reaching past it onto `<#x>`.
 #[tokio::test]
 async fn without_server_managed_only_strips_the_containers_own_type_pair() {
     let f = fixture().await;
@@ -433,9 +433,9 @@ async fn without_server_managed_only_strips_the_containers_own_type_pair() {
          report a violation for it: {body}");
 }
 
-/// §5.3: a blob is never validated — `?validate` on one answers `404`,
-/// the same "no report here" a resource never validated at all gets, not
-/// a vacuous `200, sh:conforms true` for a representation SHACL never saw.
+/// §5.3: a blob is never validated, `?validate` on one answers `404`, the
+/// same "no report here" a resource never validated at all gets, not a
+/// vacuous `200, sh:conforms true` for a representation SHACL never saw.
 #[tokio::test]
 async fn validate_view_on_a_blob_is_404() {
     let f = fixture().await;
@@ -447,7 +447,7 @@ async fn validate_view_on_a_blob_is_404() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
-/// An auxiliary is never validated, whatever its subject's shape says —
+/// An auxiliary is never validated, whatever its subject's shape says,
 /// both the ACL and the subject it governs exist here, so the 404 proves
 /// the rule rather than an absent resource answering incidentally.
 #[tokio::test]

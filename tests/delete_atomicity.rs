@@ -5,14 +5,14 @@
 //! gone is a state no request can reach and no client can repair, because
 //! containment is server-managed and a retry finds nothing left to delete.
 //! `SparqlStore`'s atomicity obligation covers one `;`-separated update, so
-//! the property holds only while both halves ride in the same one — which is
+//! the property holds only while both halves ride in the same one, which is
 //! what a store that refuses the containment half specifically can pin.
 //!
 //! The store decorator lives here for the reason `tests/call_budget.rs` and
 //! `tests/observability.rs` state for theirs: `docs/constraints.md` pins
 //! `SparqlStore` to one implementor under `src/`, and that rule is about a
 //! backend carrying ADR-2's atomicity obligation. A decorator that forwards
-//! every call is not a second backend — but the check cannot tell, and
+//! every call is not a second backend, but the check cannot tell, and
 //! weakening it would weaken it against a real one too.
 
 use std::sync::{
@@ -40,7 +40,7 @@ use tower::ServiceExt;
 const LDP_CONTAINS: &str = "http://www.w3.org/ns/ldp#contains";
 
 /// Forwards to `inner` until [`ContainmentFailingStore::arm`], then refuses
-/// every update that would rewrite containment — and only those.
+/// every update that would rewrite containment, and only those.
 ///
 /// A store that failed everything could not tell the two designs apart: it
 /// would stop the first update as readily as the second, and a delete that
@@ -154,7 +154,7 @@ async fn status(app: &axum::Router, method: &str, uri: &str) -> StatusCode {
         .status()
 }
 
-/// Whether the root container's own representation still names `iri` — the
+/// Whether the root container's own representation still names `iri`, the
 /// client-visible form of "the parent lists this member". Read over HTTP
 /// rather than out of the store, because the dangling triple's whole harm is
 /// that a client sees it and cannot act on it.
@@ -178,7 +178,7 @@ async fn root_lists(app: &axum::Router, iri: &str) -> bool {
 
 /// The property: a delete whose containment half cannot happen leaves the
 /// resource alone. Split in two updates, the drops commit and the unlink does
-/// not, and the root is left listing a member that answers `404` — permanently,
+/// not, and the root is left listing a member that answers `404`, permanently,
 /// since the retry that would repair it finds nothing to delete.
 #[tokio::test]
 async fn a_delete_that_cannot_unlink_the_member_leaves_the_member_in_place() {

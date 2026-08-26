@@ -11,7 +11,7 @@ fn warning_of(res: &axum::response::Response) -> Option<String> {
 
 // The empty body: the obvious way to write an ACL that denies its whole
 // subtree, including the Control that removing it would need. It is
-// accepted — that is a legitimate thing to want — but never silently.
+// accepted (that is a legitimate thing to want), but never silently.
 #[tokio::test]
 async fn an_empty_acl_is_created_and_warned_about() {
     let f = fixture().await;
@@ -33,9 +33,9 @@ async fn an_empty_acl_is_created_and_warned_about() {
     assert!(!expected.contains("--reset-root-acl"), "only the root can be reset");
 }
 
-// The case that actually happens: a document full of triples that grant
+// The case that happens in practice: a document full of triples that grant
 // nothing, because `acl:accessTo` names the wrong resource. Identical
-// effect to the empty body, so it must get identical treatment — an
+// effect to the empty body, so it must get identical treatment, an
 // emptiness check on the body would have missed this entirely.
 #[tokio::test]
 async fn an_acl_whose_triples_grant_nothing_is_warned_about_too() {
@@ -91,13 +91,13 @@ async fn an_empty_root_acl_warning_names_the_recovery_flag() {
     assert!(warning.contains("--reset-root-acl"), "{warning}");
     assert!(warning.contains("https://pod.toph.so/.aux/.acl"), "{warning}");
 
-    // And it is really locked: the owner can no longer read their own pod.
+    // And it is locked: the owner can no longer read their own pod.
     let get = f.owner_request("GET", "/").body(Body::empty()).unwrap();
     assert_eq!(f.app.oneshot(get).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
 
-// An orphaned ACL would outlive its resource and be resurrected — with
-// its old grants — the moment anyone recreates that path.
+// An orphaned ACL would outlive its resource and be resurrected, with
+// its old grants, the moment anyone recreates that path.
 #[tokio::test]
 async fn deleting_a_resource_deletes_its_acl() {
     let f = fixture().await;
@@ -152,13 +152,13 @@ async fn acl_is_not_listed_as_a_container_child() {
 }
 
 // The suffix rule is gone: `.acl` is an ordinary name, and a `Slug` can no
-// longer name an access-control document at all — every auxiliary lives
-// in the reserved namespace, which `container::child_name` cannot reach
-// (its output is one segment, appended to the container's own path).
+// longer name an access-control document at all, every auxiliary lives in
+// the reserved namespace, which `container::child_name` cannot reach (its
+// output is one segment, appended to the container's own path).
 //
 // This replaces two tests that pinned the old escalation (an append-only
 // agent POSTing `Slug: .acl`, or `Slug: note.acl`, to write a policy
-// document). That attack is no longer refused — it is no longer
+// document). That attack is no longer refused: it is no longer
 // expressible, which is the stronger property, so what is pinned here is
 // that the created child is ordinary data and changes no policy anywhere.
 #[tokio::test]
@@ -170,7 +170,7 @@ async fn a_slug_can_no_longer_name_an_access_control_document() {
         .body(Body::from("")).unwrap();
     assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
 
-    // Bob holds Append below `/` and nothing else — in particular no
+    // Bob holds Append below `/` and nothing else, in particular no
     // Control anywhere.
     let root_acl_body = format!(
         "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
@@ -204,8 +204,8 @@ async fn a_slug_can_no_longer_name_an_access_control_document() {
     }
 
     // The container's real access-control document was never touched: it
-    // still does not exist, and Bob — who now owns a child literally
-    // named `.acl` — still holds no Control over `/inbox/`.
+    // still does not exist, and Bob, who now owns a child literally
+    // named `.acl`, still holds no Control over `/inbox/`.
     assert!(f.stored("/.aux/inbox/.acl").await.is_none(),
         "a Slug must not have been able to reach the reserved namespace");
     let hijack = f.sign(
@@ -220,16 +220,16 @@ async fn a_slug_can_no_longer_name_an_access_control_document() {
 }
 
 // The residual from the previous round: an ACL is exempt from containment
-// (it is never listed via `ldp:contains`), but `Guard::materialize`
-// still materializes any missing ancestor containers for
-// `PUT /.aux/a/b/c.acl` exactly as it would for `PUT /a/b/c`. Bob's grant
-// here is `acl:Control` via the ROOT ACL's `acl:default` — inherited onto
-// every descendant, `/a/`, `/a/b/`, and `/a/b/c` alike — and deliberately
-// nothing else, so he has no `acl:Append` anywhere. That is enough to
-// authorize writing `/a/b/c`'s ACL (the guard rewrites an ACL PUT to
-// require Control on the subject, which Bob holds), but must NOT be
-// enough to let his request silently create `/a/` and `/a/b/` and link
-// them together — containers he holds no Append on.
+// (it is never listed via `ldp:contains`), but `Guard::materialize` still
+// materializes any missing ancestor containers for `PUT /.aux/a/b/c.acl`
+// exactly as it would for `PUT /a/b/c`. Bob's grant here is `acl:Control`
+// via the ROOT ACL's `acl:default` (inherited onto every descendant,
+// `/a/`, `/a/b/`, and `/a/b/c` alike), and deliberately nothing else, so
+// he has no `acl:Append` anywhere. That is enough to authorize writing
+// `/a/b/c`'s ACL (the guard rewrites an ACL PUT to require Control on the
+// subject, which Bob holds), but must NOT be enough to let his request
+// silently create `/a/` and `/a/b/` and link them together, containers he
+// holds no Append on.
 #[tokio::test]
 async fn deep_acl_put_needs_append_on_ancestors_it_materializes() {
     let f = fixture().await;
@@ -273,17 +273,16 @@ async fn deep_acl_put_needs_append_on_ancestors_it_materializes() {
 
 // The counterweight to THIS test above's counterweight: when the ACL's
 // immediate parent already exists, creating the ACL is a zero-mutation
-// event — an `Aux` target is never a containment member (that's
-// `Guard::materialize`'s `may_be_member` match on the `Target`
-// variant, a property of the type rather than something `add_containment`
-// has to notice at runtime), and `ensure_container` is a no-op on a
-// container that already has its type triples. So an agent holding
-// `acl:Control` on the ACL's subject (here, via `/.aux/box/.acl`'s own
-// `acl:default`) and NOTHING else — in particular no `acl:Append` on
-// `/box/` — must still be able to write
-// that subject's ACL. Requiring `Append` here would refuse a legitimate
-// "you may manage access below here" delegation for a request that
-// never touches `/box/`'s containment triples at all.
+// event, an `Aux` target is never a containment member (that's
+// `Guard::materialize`'s `may_be_member` match on the `Target` variant, a
+// property of the type rather than something `add_containment` has to
+// notice at runtime), and `ensure_container` is a no-op on a container
+// that already has its type triples. So an agent holding `acl:Control` on
+// the ACL's subject (here, via `/.aux/box/.acl`'s own `acl:default`) and
+// NOTHING else, in particular no `acl:Append` on `/box/`, must still be
+// able to write that subject's ACL. Requiring `Append` here would refuse
+// a legitimate "you may manage access below here" delegation for a
+// request that never touches `/box/`'s containment triples at all.
 #[tokio::test]
 async fn acl_put_under_an_existing_container_needs_no_append_on_it() {
     let f = fixture().await;
@@ -308,7 +307,7 @@ async fn acl_put_under_an_existing_container_needs_no_append_on_it() {
         .body(Body::from(box_acl_body)).unwrap();
     assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
 
-    // Sanity: Bob genuinely has no Append on /box/ — an ordinary POST
+    // Sanity: Bob holds no Append on /box/, an ordinary POST
     // must fail. Otherwise a CREATED below would prove nothing about the
     // exemption this test targets.
     let bob_app = f.app_also_trusting(bob);
@@ -341,8 +340,8 @@ async fn acl_put_under_an_existing_container_needs_no_append_on_it() {
 
 // ACL squatting: a `Control`-only delegate writes an ACL for a path that
 // does not exist and never did, naming only themselves. Nearest-ACL-wins
-// makes that document govern the ghost path permanently — the owner can
-// no longer create it (no Write), rewrite or delete the ACL (no Control),
+// makes that document govern the ghost path permanently, the owner can no
+// longer create it (no Write), rewrite or delete the ACL (no Control),
 // and deleting the container above does not reclaim it, because an ACL is
 // not a containment member. Revoking the delegation changes nothing. The
 // path would be bricked for everyone with no HTTP route to repair it.
@@ -370,8 +369,9 @@ async fn acl_for_a_resource_that_does_not_exist_is_refused() {
         .body(Body::from(box_acl_body)).unwrap();
     assert_eq!(f.app.clone().oneshot(put_box_acl).await.unwrap().status(), StatusCode::CREATED);
 
-    // Bob's Control over /box/ghost is genuine (inherited via acl:default)
-    // — the refusal below is about the subject's absence, not about him.
+    // Bob's Control over /box/ghost is genuine (inherited via
+    // acl:default), the refusal below is about the subject's absence, not
+    // about him.
     let bob_app = f.app_also_trusting(bob);
     let squat = f.sign(Request::builder().method("PUT").uri("/.aux/box/ghost.acl"), bob, "PUT", "/.aux/box/ghost.acl")
         .header(header::CONTENT_TYPE, "text/turtle")
@@ -422,8 +422,8 @@ async fn acl_for_a_deep_resource_that_does_not_exist_creates_no_ancestors() {
         "the 404 must not have materialized /a/b/");
 }
 
-// The counterweight: authoring an ACL the ordinary way — for a resource
-// that exists — must keep working, or the check above would have simply
+// The counterweight: authoring an ACL the ordinary way, for a resource
+// that exists, must keep working, or the check above would have
 // switched ACL authoring off.
 #[tokio::test]
 async fn acl_for_an_existing_resource_is_created() {
@@ -447,8 +447,8 @@ async fn acl_for_an_existing_resource_is_created() {
     // An auxiliary that outlives its subject must still be removable, or
     // its grants would be permanent: nearest-ACL-wins would keep handing
     // them to whoever recreates the path. No HTTP route produces that
-    // state any more — DELETE cascades into every auxiliary by
-    // construction — so the subject is dropped at the store level here,
+    // state any more (DELETE cascades into every auxiliary by
+    // construction), so the subject is dropped at the store level here,
     // and the guarantee has to hold regardless.
     //
     // This test used to assert that such a stale ACL also stays
@@ -468,7 +468,7 @@ async fn acl_for_an_existing_resource_is_created() {
 // An ACL over `aux::MAX_AUX_TRIPLES` is refused with a `413`, and refused
 // whole: nothing of it is stored, so the resource keeps being governed by
 // whatever governed it before. The body here is tens of kilobytes against
-// a 64 MiB limit, so the status can only have come from the triple cap —
+// a 64 MiB limit, so the status can only have come from the triple cap,
 // axum's own limit never sees a body this small.
 #[tokio::test]
 async fn an_acl_over_the_triple_cap_is_refused_with_413() {
@@ -496,9 +496,9 @@ async fn an_acl_over_the_triple_cap_is_refused_with_413() {
 
 // ACL-of-an-ACL. A document that governs itself is permanent: whoever
 // names only themselves in it keeps Control over it forever, and no
-// cascade reaches it. The refusal is now structural — `resolve` will not
+// cascade reaches it. The refusal is now structural (`resolve` will not
 // classify a path whose auxiliary subject is itself in the reserved
-// namespace — so it arrives before any handler logic runs, which is why
+// namespace), so it arrives before any handler logic runs, which is why
 // the body no longer carries an explanation. Bob's grant is left in place
 // so the refusal cannot be mistaken for an authorization failure: he does
 // hold `acl:Control` below `/box/`.
@@ -512,7 +512,7 @@ async fn acl_of_an_acl_is_refused_over_put() {
     assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
 
     // Bob gets Control on /.aux/box/.acl itself, delegated via that same
-    // document's own acl:default — i.e. exactly the ancestor route the
+    // document's own acl:default, i.e. exactly the ancestor route the
     // finding used.
     let box_acl_body = format!(
         "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
@@ -550,7 +550,7 @@ async fn acl_of_an_acl_is_refused_over_put() {
 // access-control document past a container's Append check: `ghost.acl`
 // for a subject that never existed, `.acl.acl`, and the legitimate
 // `doc.acl` counterweight. None of those requests can name an auxiliary
-// any more — a slug is one segment appended to the container's own path,
+// any more, a slug is one segment appended to the container's own path,
 // and every auxiliary lives in the reserved namespace. What remains worth
 // pinning is that POST cannot reach one by addressing it directly either:
 // an auxiliary is not a container, so there is nothing to POST into, and

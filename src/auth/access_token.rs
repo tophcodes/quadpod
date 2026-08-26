@@ -56,7 +56,7 @@ pub async fn verify_access_token(
     let jwk = select_key(&jwks.keys, kid)?;
 
     // Verify the JWS signature against the resolved PUBLIC key, with the
-    // verifier built for the pinned ES256 algorithm — not whatever `alg`
+    // verifier built for the pinned ES256 algorithm, not whatever `alg`
     // the header claims.
     let verifier = ES256
         .verifier_from_jwk(jwk)
@@ -64,7 +64,7 @@ pub async fn verify_access_token(
     let (verified_payload, _verified_header) =
         jwt::decode_with_verifier(token, &verifier).map_err(|_| AuthError::BadSignature)?;
 
-    // From here on, every claim comes from `verified_payload` — its
+    // From here on, every claim comes from `verified_payload`, its
     // signature has been checked against the issuer's key.
     let exp = verified_payload
         .claim("exp")
@@ -124,8 +124,8 @@ fn parse_audience(claim: Option<&Value>) -> Vec<String> {
 /// internally to pick a JWKS/key; it is exposed here for callers (the
 /// trusted-issuer allowlist pre-check in `authenticate`) that need the raw
 /// `iss` BEFORE any fetch happens. The returned value must NEVER be used to
-/// accept a token — only ever to reject one early, since it is not yet
-/// backed by a verified signature.
+/// accept a token, only ever to reject one early, since it is not yet backed
+/// by a verified signature.
 pub fn peek_untrusted_issuer(token: &str) -> Result<String, AuthError> {
     let parts: Vec<&str> = token.split('.').collect();
     let [_header_part, payload_part, _signature_part] = parts[..] else {
@@ -241,7 +241,7 @@ mod tests {
     }
 
     /// Hand-build a compact JWS from a header/payload/signature segment,
-    /// bypassing josekit's signer entirely — this is how a forged,
+    /// bypassing josekit's signer entirely: this is how a forged,
     /// non-ES256 token is constructed for the algorithm-confusion tests
     /// below.
     fn build_jws(header: &Value, payload: &Value, signature_segment: &str) -> String {
@@ -278,7 +278,7 @@ mod tests {
         assert!(verify_access_token(&forged, &resolver, 1_000).await.is_err());
     }
 
-    /// An HS256-"signed" token (arbitrary signature bytes — the pinned
+    /// An HS256-"signed" token (arbitrary signature bytes, the pinned
     /// ES256 verifier must reject on the mismatched `alg` header before
     /// ever attempting to check the signature) must also be rejected. This
     /// is the other half of the algorithm-confusion boundary: a symmetric

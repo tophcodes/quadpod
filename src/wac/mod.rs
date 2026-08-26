@@ -43,7 +43,7 @@ impl AccessModes {
 ///
 /// Both halves come from one `prp` resolution and two `pdp::decide` calls, so a
 /// response that reports access and the decision that granted it cannot
-/// disagree — they are the same evaluation of the same document. `decide` is
+/// disagree: they are the same evaluation of the same document. `decide` is
 /// pure, so the second call costs nothing beside the ancestor walk that
 /// produced the ACL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

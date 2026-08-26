@@ -1,4 +1,4 @@
-//! The OIDC discovery document — what `/.well-known/openid-configuration`
+//! The OIDC discovery document, what `/.well-known/openid-configuration`
 //! serves. `authorization_endpoint` and `token_endpoint` are deliberately
 //! absent until they exist (#58); `scopes_supported` carries `webid`, the
 //! Solid-OIDC §10 conformance declaration.

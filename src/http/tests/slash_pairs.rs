@@ -13,7 +13,7 @@ async fn owner_put(f: &Fixture, path: &str) -> StatusCode {
 
 // Solid Protocol §3.1: "If two URIs differ only in the trailing slash […]
 // the other URI MUST NOT correspond to another resource." Both orders,
-// because neither half of the pair is privileged — a container may not
+// because neither half of the pair is privileged, a container may not
 // appear beside a resource any more than the reverse.
 #[tokio::test]
 async fn a_trailing_slash_pair_is_refused_in_both_orders() {
@@ -50,7 +50,7 @@ async fn either_half_alone_still_creates_and_is_still_writable() {
 
 // The 409 depends on whether some OTHER resource exists, so answering it
 // before the denial would turn it into an existence oracle for the whole
-// namespace — the same trap `denial_does_not_reveal_existence` pins for
+// namespace, the same trap `denial_does_not_reveal_existence` pins for
 // the target itself. Authorization runs first; the pair check never does.
 #[tokio::test]
 async fn the_slash_pair_conflict_is_not_an_existence_oracle() {
@@ -93,7 +93,7 @@ async fn materializing_an_ancestor_cannot_build_the_pair_either() {
 }
 
 // A `Slug` is a hint, so a name whose counterpart is taken is treated the
-// way a taken name always has been — the server picks another — rather
+// way a taken name always has been (the server picks another), rather
 // than failing a request that never named that URL in the first place.
 #[tokio::test]
 async fn post_allocates_around_a_taken_counterpart() {

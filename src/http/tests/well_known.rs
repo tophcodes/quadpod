@@ -1,9 +1,9 @@
 //! The reserved `/.well-known/` space: discovery and JWKS when the OP is
-//! on, 404 for every other name, 405 for every write — OP on or off.
+//! on, 404 for every other name, 405 for every write, OP on or off.
 //!
-//! That the segment is reserved in the URI space itself — so no write can
+//! That the segment is reserved in the URI space itself, so no write can
 //! allocate a resource under it, and an adjacent name like
-//! `/.well-known-x` stays ordinary — is pinned in `crate::space`, which is
+//! `/.well-known-x` stays ordinary, is pinned in `crate::space`, which is
 //! where the refusal lives.
 
 use super::fixture::*;
@@ -102,13 +102,13 @@ async fn the_op_on_pod_refuses_writes_too() {
 }
 
 /// Every write method, on names the pod serves and on one it does not,
-/// answered `405` by the router before any handler runs or any WAC
-/// decision is taken. Even an authorized owner cannot plant a document in
-/// the reserved space (RFC 8414 spoofing surface — see docs/uri-space.md).
+/// answered `405` by the router before any handler runs or any WAC decision
+/// is taken. Even an authorized owner cannot plant a document in the
+/// reserved space (RFC 8414 spoofing surface, see docs/uri-space.md).
 ///
 /// `credentials` signs as the owner with an issuer the app under test
-/// trusts — the external test IdP with the OP off, the pod's own OP with it
-/// on — so what is measured is the router's refusal, not authentication's.
+/// trusts (the external test IdP with the OP off, the pod's own OP with it
+/// on), so what is measured is the router's refusal, not authentication's.
 async fn every_write_is_405(
     f: &Fixture,
     credentials: impl Fn(
@@ -170,7 +170,7 @@ fn op_credentials(
 ///
 /// The two fetches are driven here rather than by `HttpJwksResolver`
 /// itself because the served `jwks_uri` is absolute at the configured base
-/// (`https://pod.toph.so/`), which is not where the test listener is —
+/// (`https://pod.toph.so/`), which is not where the test listener is,
 /// following it verbatim would leave the machine. Its *path* is what is
 /// fetched, and that the path is one this pod routes is part of what the
 /// test asserts.

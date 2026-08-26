@@ -57,20 +57,20 @@ pub struct Config {
 
     /// A host the operator vouches for: the private-IP filter and the
     /// https-only rule do not apply to it. Repeatable. `host` opens every
-    /// port on that host; `host:port` opens only that port. Everything else
-    /// — redirect refusal, IP pinning, body cap, timeout — still applies.
-    /// Pair it with `--trusted-issuer` so an untrusted issuer is rejected
-    /// before any fetch is attempted.
+    /// port on that host; `host:port` opens only that port. Everything
+    /// else, redirect refusal, IP pinning, body cap, timeout, still
+    /// applies. Pair it with `--trusted-issuer` so an untrusted issuer is
+    /// rejected before any fetch is attempted.
     #[arg(long = "allow-insecure-host", env = "POD_ALLOW_INSECURE_HOSTS", value_delimiter = ',')]
     pub allow_insecure_hosts: Vec<String>,
 
-    /// Address to bind. Plain HTTP — keep it behind the reverse proxy.
+    /// Address to bind. Plain HTTP, keep it behind the reverse proxy.
     #[arg(long, env = "POD_LISTEN", default_value = "127.0.0.1:3000")]
     pub listen: SocketAddr,
 
     /// Overwrite the root ACL with the owner's default grant on startup,
     /// even if one already exists. The only way back from a root ACL that
-    /// grants nobody (not even the owner) Control — see
+    /// grants nobody (not even the owner) Control, see
     /// `wac::provision::provision_root_acl`. Off by default: every other
     /// start must leave an operator's or owner's own root ACL exactly as
     /// they left it. Accepts boolish values: 1, 0, true, false, yes, no, on,
@@ -127,7 +127,7 @@ pub struct Config {
 /// Where `--base-uri` becomes the space it names.
 ///
 /// A `value_parser` rather than a check after the parse, so that a bad value
-/// is a clap error like any other — which is what lets [`blame_file`] point at
+/// is a clap error like any other, which lets [`blame_file`] point at
 /// the config file when the value came from there. A check in `main.rs` cannot
 /// be pointed anywhere, because by then the error is a string.
 fn parse_space(s: &str) -> Result<StorageSpace, SpaceError> {
@@ -148,9 +148,10 @@ fn parse_owner_webid(s: &str) -> Result<NamedNode, InvalidOwnerWebId> {
 /// surfaces only as failing requests.
 ///
 /// The field names are `Config`'s own, so there is no second vocabulary to keep
-/// in sync with the flags. The *types* differ where TOML has a better one —
-/// `max_body_bytes` is an integer here and a string on the command line — which
-/// is why [`FileConfig::as_defaults`] exists rather than a direct assignment.
+/// in sync with the flags. The *types* differ where TOML has a better one
+/// (`max_body_bytes` is an integer here and a string on the command line),
+/// which is why [`FileConfig::as_defaults`] exists rather than a direct
+/// assignment.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -186,10 +187,10 @@ impl FileConfig {
         })
     }
 
-    /// Every key the file set, rendered as the strings clap will parse, keyed
-    /// by argument id — `Config`'s field names, which is what `Command::mut_arg`
+    /// Every key the file set, rendered as the strings clap will parse, keyed by
+    /// argument id, `Config`'s field names, which is what `Command::mut_arg`
     /// takes. The id differs from the long flag for every multi-word one, by
-    /// kebab-casing alone (`base_uri` / `--base-uri`) — except two, which are
+    /// kebab-casing alone (`base_uri` / `--base-uri`), except two, which are
     /// renamed outright: `trusted_issuers` (`--trusted-issuer`) and
     /// `allow_insecure_hosts` (`--allow-insecure-host`). [`blame_file`] takes
     /// its own long-flag-keyed map rather than this one because of those two.
@@ -233,7 +234,7 @@ impl FileConfig {
 /// Pass 1: the `--config` path, from the argv or `POD_CONFIG`.
 ///
 /// Runs before anything else is known and must survive an argv it cannot
-/// fully understand — including a missing required `--owner-webid` and flags
+/// fully understand, including a missing required `--owner-webid` and flags
 /// it has never heard of. A `clap::Command` with `ignore_errors(true)` cannot
 /// do this: on an unrecognized flag it loses track of whether the next token
 /// is that flag's value or the next flag, and can walk past `--config`
@@ -275,13 +276,12 @@ where
 /// picks up file support from the same derive that gives it its flag.
 ///
 /// Two visible consequences follow from defaults being how the file is
-/// represented. With a file supplying a required argument, `--help`'s usage
-/// line changes from `quadpod --owner-webid <OWNER_WEBID>` to `quadpod
-/// [OPTIONS]` — correct, since help reflects the effective configuration, but
-/// a visible change. And a repeatable flag given on the command line replaces
-/// the file's whole list rather than appending to it, because clap skips
-/// defaults entirely for an argument that is present — the same rule as every
-/// other rung.
+/// represented. With a file supplying a required argument, `--help`'s usage line
+/// changes from `quadpod --owner-webid <OWNER_WEBID>` to `quadpod [OPTIONS]`,
+/// correct, since help reflects the effective configuration, but a visible
+/// change. And a repeatable flag given on the command line replaces the file's
+/// whole list rather than appending to it, because clap skips defaults entirely
+/// for an argument that is present, the same rule as every other rung.
 fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>) -> clap::Command {
     use clap::CommandFactory;
     let mut cmd = Config::command();
@@ -289,31 +289,30 @@ fn command_with(defaults: std::collections::BTreeMap<&'static str, Vec<String>>)
         // `required(false)` alongside the default: clap's own required check
         // looks only at whether the value came from the command line or the
         // environment (`ValueSource::is_explicit`), never at whether a
-        // default was set — so a required argument with nothing but a
-        // default still reports missing. Explicitly lifting the requirement
-        // is what lets a file-supplied value satisfy it. Chained only onto
-        // ids the file actually supplied, not onto the whole argument list —
-        // see `a_file_that_omits_owner_webid_still_refuses_the_start`.
+        // default was set, so a required argument with nothing but a default
+        // still reports missing. Explicitly lifting the requirement is what
+        // lets a file-supplied value satisfy it. Chained only onto ids the
+        // file supplied, rather than onto the whole argument list, see
+        // `a_file_that_omits_owner_webid_still_refuses_the_start`.
         cmd = cmd.mut_arg(id, move |a| a.default_values(values).required(false));
     }
     cmd
 }
 
-/// Re-point a clap error at the file that actually caused it.
+/// Re-point a clap error at the file that caused it.
 ///
 /// A file-supplied value arrives as a default, so clap phrases its complaint in
 /// terms of a flag the operator never typed. `from_file` maps each long flag
 /// the file supplied to its TOML key and the values the file gave it. Knowing
-/// the file supplied that *key* is not enough — a flag overrides a default, so
+/// the file supplied that *key* is not enough, a flag overrides a default, so
 /// the value clap rejected may be the flag's own and the file may say nothing
 /// about it. The file is blamed only when the rejected value is one it
-/// actually supplied; a value the operator retypes identically to the file's
-/// is attributed to the file regardless, since it is in both places and
-/// naming the file is not wrong. Anything else is passed through exactly as
-/// clap wrote it.
+/// supplied; a value the operator retypes identically to the file's is
+/// attributed to the file regardless, since it is in both places and naming the
+/// file is not wrong. Anything else is passed through exactly as clap wrote it.
 ///
 /// Keyed by long flag rather than by argument id because that is what clap puts
-/// in the error, and the two differ wherever `#[arg(long = "…")]` renames one —
+/// in the error, and the two differ wherever `#[arg(long = "…")]` renames one,
 /// `--trusted-issuer` carries the id `trusted_issuers`.
 fn blame_file(
     err: clap::Error,
@@ -353,7 +352,7 @@ impl Config {
         Self::try_load_from(std::env::args_os())
     }
 
-    /// [`Config::load`] against a supplied argv, which is what makes the file
+    /// [`Config::load`] against a supplied argv, which makes the file
     /// reachable from a test: the path arrives as `--config <tmpfile>` rather
     /// than from a fixed location.
     pub fn try_load_from<I, T>(argv: I) -> Result<Self, clap::Error>
@@ -402,7 +401,7 @@ impl Config {
     /// The outbound-fetch posture for this process: the SSRF-safe default
     /// plus whatever hosts the operator named on the command line. Entries
     /// are trimmed and empty ones dropped before parsing, mirroring
-    /// `auth_config()`'s treatment of `trusted_issuers` — a comma-separated
+    /// `auth_config()`'s treatment of `trusted_issuers`, a comma-separated
     /// env value like `"localhost:3001, css.local,,"` must not leave
     /// whitespace- or empty-string entries in the set that can never match
     /// a URL host.
@@ -411,12 +410,12 @@ impl Config {
     }
 
     /// Same as [`Config::fetch_policy`], but also returns every entry that
-    /// could not be understood — for `main.rs`, which must refuse to start
+    /// could not be understood, for `main.rs`, which must refuse to start
     /// rather than run with fewer hosts than the operator configured. Since
     /// entries are trimmed and empty ones dropped right here (same
     /// `.map(str::trim).filter(|s| !s.is_empty())` as above), any rejected
     /// entry reaching `main.rs` was a real, non-blank string the operator
-    /// typed — not comma-separated-list noise.
+    /// typed, not comma-separated-list noise.
     pub fn try_fetch_policy(
         &self,
     ) -> (crate::auth::safe_fetch::FetchPolicy, Vec<String>) {
@@ -590,8 +589,8 @@ mod tests {
         assert!(set.contains("https://idp.example/"));
     }
 
-    // The rejection is the parser's, which is what lets `blame_file` name the
-    // config file when the value came from there — a check after the parse
+    // The rejection is the parser's, which lets `blame_file` name the
+    // config file when the value came from there, a check after the parse
     // could only name a flag.
     #[test]
     fn non_iri_owner_webid_is_rejected() {
@@ -621,7 +620,7 @@ mod tests {
     // advertise, and clap's `value_delimiter` does not trim or drop what it splits: a
     // whitespace- or empty-string entry must not survive into the working fetch policy, and
     // the startup warning (built from `insecure_host_entries()`) must not confirm a setting
-    // that does nothing — mirrors `auth_config()`'s `.map(str::trim).filter(|s|
+    // that does nothing, mirrors `auth_config()`'s `.map(str::trim).filter(|s|
     // !s.is_empty())` treatment of `trusted_issuers`.
     #[test]
     fn fetch_policy_trims_and_drops_empty_insecure_host_entries() {
@@ -642,7 +641,7 @@ mod tests {
     }
 
     // A malformed or ambiguous entry must be reported by `try_fetch_policy`,
-    // not silently dropped — `main.rs` uses this to refuse to start rather
+    // not silently dropped, `main.rs` uses this to refuse to start rather
     // than run with fewer hosts than the operator configured.
     #[test]
     fn try_fetch_policy_reports_entries_it_could_not_understand() {
@@ -819,7 +818,7 @@ mod tests {
     }
 
     // The pre-parser runs before anything is known, so it must survive an argv
-    // it cannot fully understand — here a required flag it has never heard of.
+    // it cannot fully understand, here a required flag it has never heard of.
     // That is the case the hand-written scan exists for, and the one most
     // likely to break silently.
     #[test]
@@ -888,7 +887,7 @@ mod tests {
     }
 
     // §5.2: a file value satisfies a required argument. Not because clap
-    // treats a default as present — it does not — but because `command_with`
+    // treats a default as present (it does not), but because `command_with`
     // chains `.required(false)` onto every id the file supplied.
     #[test]
     fn a_file_satisfies_the_required_owner_webid() {
@@ -898,9 +897,9 @@ mod tests {
     }
 
     // The bound on `required(false)`: it is chained only onto ids the file
-    // actually supplied, so an argument the file is silent about keeps its
-    // requirement. Widening it — to `mut_args`, or across the whole argument
-    // list — would let a pod start with no owner, and nothing else in this
+    // supplied, so an argument the file is silent about keeps its
+    // requirement. Widening it, to `mut_args`, or across the whole argument
+    // list, would let a pod start with no owner, and nothing else in this
     // suite would notice.
     #[test]
     fn a_file_that_omits_owner_webid_still_refuses_the_start() {
@@ -980,7 +979,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    // The lookup bridges an id and a long flag that are different strings —
+    // The lookup bridges an id and a long flag that are different strings:
     // it is not specific to the two arguments renamed outright
     // (`trusted_issuers`/`allow_insecure_hosts`), which cannot fail
     // validation and so cannot be covered by a test like this one.
@@ -1044,7 +1043,7 @@ mod tests {
         ]).unwrap();
         // `.err().expect(…)` rather than `unwrap_err()`: the latter would
         // need `Option<KeySet>: Debug`, i.e. a Debug rendering of private
-        // key material — see the same note in `op::keys`'s own tests.
+        // key material, see the same note in `op::keys`'s own tests.
         let err = c.op_keys().err().expect("refuses");
         assert!(err.contains("--op-signing-keys"), "{err}");
         assert!(!p.exists(), "no key material for a refused configuration");

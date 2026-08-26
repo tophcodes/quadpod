@@ -12,7 +12,7 @@ use super::{Agent, AuthError};
 /// (optional) issuer allowlist / audience config, and the replay set the
 /// accepted proof's `jti` is recorded in. Bundled into one struct (rather
 /// than four separate parameters) to keep `authenticate`'s argument count
-/// sane — these are always supplied together by the caller (`AppState` in
+/// sane: these are always supplied together by the caller (`AppState` in
 /// `http.rs`), unlike the per-request data (`auth_header`, `dpop_header`,
 /// `htm`, `htu`, `now_unix`).
 pub struct AuthDeps<'a> {
@@ -26,39 +26,36 @@ pub struct AuthDeps<'a> {
 ///
 /// If both headers are absent, the request is unauthenticated (`Agent::Public`).
 /// Otherwise, valid Solid-OIDC credentials are required: `Authorization` MUST
-/// use the `DPoP` scheme (a `Bearer` token, or any other scheme, is rejected —
-/// Solid-OIDC access tokens are DPoP-bound, never usable as bearer tokens),
-/// and a `DPoP` proof header MUST be present. The access token is verified,
-/// then its `webid` claim must be authorized by the token's issuer: a
-/// signature-verified token only proves the token is self-consistent with
-/// SOME issuer's key — it does NOT prove that issuer is entitled to speak
-/// for the claimed webid. Without this check an attacker running their own
-/// IdP could mint a token naming any victim's webid and it would verify
-/// fine. `webid_verifier` closes that hole by dereferencing the webid's
-/// profile and confirming it declares the token's issuer via
-/// `solid:oidcIssuer`. Only then is the DPoP proof verified and bound to
-/// the token's `cnf.jkt`. Any failure along the way is an error — this
-/// never falls back to `Public` once credentials were presented. Fails
+/// use the `DPoP` scheme (a `Bearer` token, or any other scheme, is rejected,
+/// Solid-OIDC access tokens are DPoP-bound, never usable as bearer tokens), and
+/// a `DPoP` proof header MUST be present. The access token is verified, then its
+/// `webid` claim must be authorized by the token's issuer: a signature-verified
+/// token only proves the token is self-consistent with SOME issuer's key, it
+/// does NOT prove that issuer is entitled to speak for the claimed webid.
+/// Without this check an attacker running their own IdP could mint a token
+/// naming any victim's webid and it would verify fine. `webid_verifier` closes
+/// that hole by dereferencing the webid's profile and confirming it declares the
+/// token's issuer via `solid:oidcIssuer`. Only then is the DPoP proof verified
+/// and bound to the token's `cnf.jkt`. Any failure along the way is an error,
+/// this never falls back to `Public` once credentials were presented. Fails
 /// closed.
 ///
-/// Before any JWKS fetch, if `config.trusted_issuers` is `Some(set)` the
-/// token's `iss` (peeked WITHOUT signature verification, via
-/// [`peek_untrusted_issuer`]) must match a member of `set` — compared via
-/// [`issuer_matches`] (trailing-slash-insensitive, the same normalization
-/// used for the WebID-issuer binding) — or the request is rejected as
-/// [`AuthError::UntrustedIssuer`]. This untrusted peek is used ONLY to
-/// reject early, never to accept. This shrinks the SSRF surface (an
-/// untrusted issuer never triggers an outbound fetch) as defense-in-depth
-/// over the WebID-issuer binding, which remains the primary control. If
-/// `trusted_issuers` is `None`, every issuer proceeds to that binding check
-/// (open federation).
+/// Before any JWKS fetch, if `config.trusted_issuers` is `Some(set)` the token's
+/// `iss` (peeked WITHOUT signature verification, via [`peek_untrusted_issuer`])
+/// must match a member of `set` (compared via [`issuer_matches`]
+/// (trailing-slash-insensitive, the same normalization used for the WebID-issuer
+/// binding)), or the request is rejected as [`AuthError::UntrustedIssuer`]. This
+/// untrusted peek is used ONLY to reject early, never to accept. This shrinks
+/// the SSRF surface (an untrusted issuer never triggers an outbound fetch) as
+/// defense-in-depth over the WebID-issuer binding, which remains the primary
+/// control. If `trusted_issuers` is `None`, every issuer proceeds to that
+/// binding check (open federation).
 ///
 /// After the access token's signature is verified, if `config.expected_audience`
-/// is `Some(value)`, `value` must appear in the token's (verified) `aud`
-/// claim or the request is rejected as [`AuthError::WrongAudience`] —
-/// defense-in-depth so a token minted for a different resource server isn't
-/// accepted here. If `expected_audience` is `None`, this check is skipped
-/// (backward-compatible).
+/// is `Some(value)`, `value` must appear in the token's (verified) `aud` claim
+/// or the request is rejected as [`AuthError::WrongAudience`], defense-in-depth
+/// so a token minted for a different resource server isn't accepted here. If
+/// `expected_audience` is `None`, this check is skipped (backward-compatible).
 pub async fn authenticate(
     auth_header: Option<&str>,
     dpop_header: Option<&str>,
@@ -214,7 +211,7 @@ mod tests {
         // validly self-signed token naming alice's webid. `TestIdp` always
         // sets `iss` to "https://idp.example/", so the resolver must be
         // keyed there for JWKS resolution (and thus signature
-        // verification) to succeed — the point of this test is that the
+        // verification) to succeed, the point of this test is that the
         // signature check passing is NOT enough: alice's profile does NOT
         // list this issuer, so the webid-issuer trust binding must still
         // reject it.
@@ -277,7 +274,7 @@ mod tests {
     async fn allowlisted_issuer_without_trailing_slash_accepts_token_with_one() {
         // `TestIdp` always sets `iss` to "https://idp.example/" (with a
         // trailing slash). Configuring the allowlist WITHOUT one must still
-        // accept it — the allowlist match must use the same
+        // accept it, the allowlist match must use the same
         // trailing-slash-insensitive normalization as the WebID-issuer
         // binding, or a perfectly valid config locks everyone out.
         let idp = TestIdp::new();

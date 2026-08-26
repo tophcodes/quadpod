@@ -26,7 +26,7 @@ async fn an_origin_is_reflected_and_vary_keeps_accept() {
     );
     // One field line carrying both, not one line each. RFC 9110 §5.3 lets a
     // list-valued field repeat, but a client that reads only the first line
-    // then sees half the list — and that is what the conformance harness
+    // then sees half the list, and that is what the conformance harness
     // does. Asserting over `get_all` would pass either way, which is why
     // this asserts the line count first.
     let vary: Vec<&str> = res.headers().get_all(header::VARY)
@@ -83,7 +83,7 @@ async fn allow_and_accept_patch_advertise_the_method() {
 
 /// Protocol §5.3: the three `Accept-*` headers are one MUST, and the two
 /// new ones are checked on every target shape for the reason the test
-/// above gives — `allowed_methods` has three arms.
+/// above gives: `allowed_methods` has three arms.
 #[tokio::test]
 async fn accept_put_advertises_every_writable_format_and_version() {
     let f = fixture().await;
@@ -195,7 +195,7 @@ async fn cors_headers_survive_a_401() {
     assert!(res.headers().get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_some());
 }
 
-// A preflight carries no credentials by construction — the browser sends
+// A preflight carries no credentials by construction, the browser sends
 // it before, and without, the credentialed request.
 #[tokio::test]
 async fn options_answers_without_credentials() {

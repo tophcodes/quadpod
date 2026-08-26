@@ -2,7 +2,7 @@
 
 use super::fixture::*;
 
-/// The next event on a topic, or a failure — never a hang. A
+/// The next event on a topic, or a failure, never a hang. A
 /// `broadcast::Receiver` whose sender is still alive blocks forever when
 /// nothing is published, and libtest has no per-test timeout: an
 /// unbounded `recv` turns "no event was emitted" into a suite that never
@@ -20,7 +20,7 @@ async fn stays_silent(rx: &mut crate::notify::Receiver, why: &str) {
 }
 
 /// A create is reported on the resource's own channel, and on its parent's
-/// as `Add` — not as a second `Create` (§3.2).
+/// as `Add`, not as a second `Create` (§3.2).
 #[tokio::test]
 async fn a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent() {
     let f = fixture().await;
@@ -52,7 +52,7 @@ async fn a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent() {
     // Independent of `state_of`: a GET on the container itself, at the
     // same media type and version §5.1 fixes, is the validator the pod
     // would hand a client for the same state. Catches an Add reporting
-    // back the child's state instead of the topic's — the one place the
+    // back the child's state instead of the topic's, the one place the
     // "state describes the topic, not the object" rule can break.
     let container_etag = f.app.clone().oneshot(f.owner_request("GET", "/c/")
         .header(header::ACCEPT, "application/n-quads")
@@ -62,7 +62,7 @@ async fn a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent() {
         "the Add's state must be the container's own validator, not the child's");
 }
 
-/// `/c/` did not exist either, so the same write created it — and a
+/// `/c/` did not exist either, so the same write created it, and a
 /// container's own creation is its own fact, reported beside the `Add`
 /// that filled it.
 #[tokio::test]
@@ -84,9 +84,9 @@ async fn a_put_that_materializes_a_container_emits_its_create_too() {
 }
 
 /// `Materialized::created` always includes the request's own target, and
-/// for a container target `as_container` does not screen it back out —
-/// so a fresh container's own channel must hear its `Create` exactly
-/// once, not once from `publish_own` and again from `publish_containment`.
+/// for a container target `as_container` does not screen it back out, so a
+/// fresh container's own channel must hear its `Create` exactly once, not
+/// once from `publish_own` and again from `publish_containment`.
 #[tokio::test]
 async fn a_put_that_creates_a_container_emits_exactly_one_create_on_its_own_topic() {
     let f = fixture().await;
@@ -167,18 +167,18 @@ async fn a_binary_put_emits_the_add_on_its_parent() {
     assert_eq!(add.target.as_deref(), Some(parent.graph_iri()));
 }
 
-/// A refused write emits nothing: the tail returns before touching the
-/// bus. The unparseable body is refused at `classify_body`, before
-/// `Guard::materialize` ever runs, so `materialized` is empty and the
-/// parent assertion below is vacuous on its own — it would pass whether
-/// or not `emit_put`'s status gate exists (issue #41).
+/// A refused write emits nothing: the tail returns before touching the bus.
+/// The unparseable body is refused at `classify_body`, before
+/// `Guard::materialize` ever runs, so `materialized` is empty and the parent
+/// assertion below is vacuous on its own. It would pass whether or not
+/// `emit_put`'s status gate exists (issue #41).
 ///
-/// The second half is the case that discriminates: `/d/` does not exist
-/// yet, so `PUT`ting a blob under it really materializes the container
-/// and really links it into its parent before the blob write — the only
-/// step that can still fail — fails. `FailingBlobs`, not `FailingStore`:
-/// a failing `SparqlStore` takes its `500` inside `materialize` itself
-/// and never reaches the tail (see `a_post_whose_write_fails_emits_nothing`).
+/// The second half is the case that discriminates: `/d/` does not exist yet,
+/// so `PUT`ting a blob under it materializes the container and
+/// links it into its parent before the blob write, the only step that can
+/// still fail, fails. `FailingBlobs`, not `FailingStore`: a failing
+/// `SparqlStore` takes its `500` inside `materialize` itself and never
+/// reaches the tail (see `a_post_whose_write_fails_emits_nothing`).
 #[tokio::test]
 async fn a_refused_put_emits_nothing() {
     let f = fixture_with_blobs(Arc::new(FailingBlobs), 64 * 1024 * 1024).await;
@@ -205,7 +205,7 @@ async fn a_refused_put_emits_nothing() {
         .body(Body::from(&b"\x89PNG\r\n\x1a\n"[..])).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR, "the fixture's premise");
 
-    // `/d/` was really materialized: `Guard::materialize` commits its
+    // `/d/` was materialized: `Guard::materialize` commits its
     // container and containment writes to the real store before
     // `put_blob` ever runs, so the 500 above leaves it behind.
     let d = f.app.clone().oneshot(f.owner_request("GET", "/d/")
@@ -218,9 +218,9 @@ async fn a_refused_put_emits_nothing() {
         "the container was materialized, but the write still failed").await;
 }
 
-/// The allocated child is always new, so `POST` is always a `Create` — and
-/// the container that received it hears `Add`, with the child as
-/// `object`. `/c/` is made to exist first (as
+/// The allocated child is always new, so `POST` is always a `Create`, and
+/// the container that received it hears `Add`, with the child as `object`.
+/// `/c/` is made to exist first (as
 /// `a_put_that_creates_emits_create_on_the_target_and_add_on_the_parent`
 /// does), so this write's only containment change there is the `Add`.
 #[tokio::test]
@@ -268,7 +268,7 @@ async fn a_post_emits_create_on_the_child_and_add_on_the_container() {
 }
 
 /// Every other refusal in `post_impl` returns before the tail, so a
-/// storage failure is the only way a non-2xx reaches `emit_post` — and its
+/// storage failure is the only way a non-2xx reaches `emit_post`, and its
 /// success guard is all that stands between that and a `Create` for a
 /// child that was never written, plus an `Add` naming it.
 ///
@@ -361,7 +361,7 @@ async fn a_patch_that_creates_emits_create_and_add() {
 }
 
 /// §6.3: a `PUT` on an auxiliary reaches `put_impl`'s tail and emits, and
-/// that is the whole argument for the aux `PATCH` fix — the two verbs must
+/// that is the whole argument for the aux `PATCH` fix, the two verbs must
 /// agree about the same topic. First write creates it, the second updates
 /// it, and its subject's container hears neither: an auxiliary is never a
 /// member (§4.2).
@@ -408,8 +408,8 @@ async fn a_put_on_an_auxiliary_emits_create_then_update() {
         "an auxiliary is never a container member, so containment did not change").await;
 }
 
-/// Design §4.3: an auxiliary `PATCH` never creates — `aux::patch` refuses
-/// an absent one — so it is always an `Update`, reported on the
+/// Design §4.3: an auxiliary `PATCH` never creates (`aux::patch` refuses
+/// an absent one), so it is always an `Update`, reported on the
 /// auxiliary's own topic. An auxiliary is never a container member, so
 /// its parent's containment does not change either.
 #[tokio::test]
@@ -450,7 +450,7 @@ async fn a_patch_on_an_auxiliary_emits_update() {
 }
 
 /// Deleting `emit_patch`'s `!status.is_success()` guard would let this
-/// through with a bogus `Update` — the tail is reached, patch or no.
+/// through with a bogus `Update`, the tail is reached, patch or no.
 #[tokio::test]
 async fn a_refused_patch_emits_nothing() {
     let f = fixture().await;
@@ -458,7 +458,7 @@ async fn a_refused_patch_emits_nothing() {
     let target = f.space.resolve("/c/notes").unwrap();
     let mut on_target = f.events.subscribe(crate::notify::Topic::from(&target));
 
-    // `solid:deletes` names a triple that is not there — the simplest 409.
+    // `solid:deletes` names a triple that is not there, the simplest 409.
     let res = patch_n3(&f, "/c/notes",
         "<> a solid:InsertDeletePatch ; solid:deletes \
          { <#it> <http://schema.org/name> \"absent\" . } .\n").await;
@@ -575,9 +575,9 @@ async fn deleting_an_auxiliary_emits_no_parent_event() {
 }
 
 /// `delete_impl` collects only the auxiliaries `authorize_aux` reported
-/// present. One it found absent must not reach `emit_delete`, or a
-/// `DELETE` would announce the removal of an auxiliary that never was —
-/// on the topic of every kind in `AuxKind::ALL`, as each new kind is added.
+/// present. One it found absent must not reach `emit_delete`, or a `DELETE`
+/// would announce the removal of an auxiliary that never was, on the topic
+/// of every kind in `AuxKind::ALL`, as each new kind is added.
 #[tokio::test]
 async fn a_delete_says_nothing_about_an_auxiliary_that_was_not_there() {
     let f = fixture().await;
@@ -612,10 +612,10 @@ async fn a_refused_delete_emits_nothing() {
 
 /// §9's first mandated test, on the wire: `state` is byte-identical to the
 /// `ETag` of an immediately following `GET` at the media type and version
-/// §5.1 fixes. Against a resource that actually holds RDF 1.2, with the
-/// unversioned read of the same state asserted to differ — on a 1.1
-/// fixture the two reads return the same tag and the version half of §5.2
-/// goes unchecked.
+/// §5.1 fixes. Against a resource that holds RDF 1.2, with the
+/// unversioned read of the same state asserted to differ, on a 1.1 fixture
+/// the two reads return the same tag and the version half of §5.2 goes
+/// unchecked.
 #[tokio::test]
 async fn the_state_is_the_versioned_n_quads_etag_of_a_1_2_resource() {
     let f = fixture().await;
@@ -644,7 +644,7 @@ async fn the_state_is_the_versioned_n_quads_etag_of_a_1_2_resource() {
 
 /// A deep create is six events, and the root hears exactly one of them:
 /// `Add` naming the container directly beneath it. Not `Create` for the
-/// grandchild — `as:Create` only ever runs on the new resource's own
+/// grandchild, `as:Create` only ever runs on the new resource's own
 /// channel (design §3.2).
 #[tokio::test]
 async fn a_deep_create_tells_the_root_only_about_its_own_child() {

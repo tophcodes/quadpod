@@ -9,7 +9,7 @@
 //! The store decorator lives here rather than in `src/` because
 //! `docs/constraints.md` pins `SparqlStore` to one implementor under `src/`,
 //! and that rule is about a backend carrying ADR-2's atomicity obligation. A
-//! decorator that forwards every call is not a second backend — but the check
+//! decorator that forwards every call is not a second backend, but the check
 //! cannot tell, and weakening it would weaken it against a real one too.
 
 use std::sync::{Arc, Mutex};
@@ -96,7 +96,7 @@ const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
 /// Public access is what makes this file credential-free: `auth::testsupport`
 /// is `#[cfg(test)]` and so invisible to an integration test, and minting DPoP
 /// proofs by hand here would measure the auth layer rather than the store. The
-/// store-call counts are identical either way — `pdp::decide` is pure, and the
+/// store-call counts are identical either way: `pdp::decide` is pure, and the
 /// one branch that differs for an anonymous agent (reusing the user decision
 /// as the public one) touches nothing stored.
 async fn app() -> (axum::Router, Arc<CountingStore>, Arc<quadpod::notify::Bus>) {
@@ -204,7 +204,7 @@ async fn a_put_on_an_existing_resource_stays_within_budget() {
     let res = app.oneshot(put_request("/seeded", "\"two\"")).await.unwrap();
     // Every successful PUT to a resource answers `201 Created` regardless of
     // whether the resource previously existed (`src/http.rs`'s `put_impl`
-    // returns `created(&target)` unconditionally) — matched here rather than
+    // returns `created(&target)` unconditionally), matched here rather than
     // the `204` the brief assumed.
     assert_eq!(res.status(), StatusCode::CREATED);
 
@@ -264,8 +264,8 @@ async fn a_post_stays_within_budget() {
 /// ancestor chain, the one read of the ACL documents that probe found,
 /// `exists` on the subject, the shelf-registry read, and the single update
 /// that drops the subject's graphs and takes it out of its parent's
-/// containment. The unlink shares that update because it must — see
-/// `aux::delete_subject` and `tests/delete_atomicity.rs` — so a delete that
+/// containment. The unlink shares that update because it must (see
+/// `aux::delete_subject` and `tests/delete_atomicity.rs`), so a delete that
 /// costs two updates is both slower and wrong.
 const DELETE_BUDGET: usize = 5;
 

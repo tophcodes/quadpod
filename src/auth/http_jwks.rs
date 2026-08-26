@@ -1,12 +1,12 @@
 //! Production `JwksResolver`: OIDC discovery over HTTP, with a TTL cache.
 //!
-//! Unlike `StaticJwksResolver` (used in every hermetic test in this crate),
-//! this performs real network calls: `GET <issuer>/.well-known/openid-configuration`
-//! to find the issuer's `jwks_uri`, then `GET <jwks_uri>` for the keys
-//! themselves. Both requests happen at most once per issuer per
-//! [`CACHE_TTL`]; the cache is a process-lifetime, in-memory map (no
-//! cross-replica sharing, no persistence across restarts) — the same kind
-//! of v1 limitation already noted for `auth::dpop`'s replay store.
+//! Unlike `StaticJwksResolver` (used in every hermetic test in this crate), this
+//! performs real network calls: `GET <issuer>/.well-known/openid-configuration` to
+//! find the issuer's `jwks_uri`, then `GET <jwks_uri>` for the keys themselves. Both
+//! requests happen at most once per issuer per [`CACHE_TTL`]; the cache is a
+//! process-lifetime, in-memory map (no cross-replica sharing, no persistence across
+//! restarts), the same kind of v1 limitation already noted for `auth::dpop`'s replay
+//! store.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -42,8 +42,8 @@ pub struct HttpJwksResolver {
 
 impl HttpJwksResolver {
     /// Production constructor: fetches are SSRF-guarded with the policy the
-    /// operator configured — [`FetchPolicy::default`] (https-only, private
-    /// IPs blocked) unless they named hosts via `--allow-insecure-host`.
+    /// operator configured, [`FetchPolicy::default`] (https-only, private IPs
+    /// blocked) unless they named hosts via `--allow-insecure-host`.
     ///
     /// `client` is shared with every other guarded fetcher in the process, so
     /// discovery and JWKS fetches reuse connections and TLS sessions with each
@@ -52,7 +52,7 @@ impl HttpJwksResolver {
         Self::build(client, policy)
     }
 
-    /// Construct with an explicit [`FetchPolicy`] — used by hermetic tests
+    /// Construct with an explicit [`FetchPolicy`], used by hermetic tests
     /// that fetch from a local (`127.0.0.1`) test server and so must allow
     /// http and private IPs. Test-only: a permissive policy must be
     /// unconstructable in a production build, so production code must go
@@ -73,7 +73,7 @@ impl HttpJwksResolver {
 
     /// Perform the OIDC-discovery + JWKS fetch, uncached. Any SSRF-guard
     /// rejection, network failure, non-2xx status, or unexpected JSON
-    /// shape fails closed as `AuthError::UnknownIssuer` — from the
+    /// shape fails closed as `AuthError::UnknownIssuer`, from the
     /// caller's point of view, an issuer whose keys can't be resolved is
     /// exactly as unusable as one that was never configured at all.
     async fn fetch(&self, issuer: &str) -> Result<Jwks, AuthError> {

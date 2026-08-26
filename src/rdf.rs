@@ -23,7 +23,7 @@ fn media_type(ct: &str) -> &str {
 /// a higher one. `PartialOrd` is derived from the variant order, so the whole
 /// capability question is `needed <= available`.
 ///
-/// One type for three roles — what a store can hold
+/// One type for three roles, what a store can hold
 /// ([`SparqlStore::rdf_version`](crate::store::SparqlStore::rdf_version)),
 /// what a representation claims (the `version` media-type parameter), and what
 /// a deployment declares. Nothing translates between a store-side vocabulary
@@ -34,7 +34,7 @@ fn media_type(ct: &str) -> &str {
 pub enum RdfVersion {
     /// RDF 1.1 syntax, without a version directive.
     Rdf11,
-    /// RDF 1.2 syntax **without** triple terms — directional language-tagged
+    /// RDF 1.2 syntax **without** triple terms, directional language-tagged
     /// strings, and nothing else new. Not a curiosity: it is the exact name
     /// for a store that can hold one addition and not the other.
     Rdf12Basic,
@@ -52,7 +52,7 @@ impl RdfVersion {
         }
     }
 
-    /// **The only place the `version` media-type parameter is read** — see
+    /// **The only place the `version` media-type parameter is read**, see
     /// `docs/constraints.md`. `Content-Type` on write and `Accept` on read ask
     /// the same question of the same syntax; a second reader is how `1.2`
     /// comes to mean one thing on the way in and another on the way out. Same
@@ -61,7 +61,7 @@ impl RdfVersion {
     /// An **absent** parameter is [`Rdf11`](Self::Rdf11). That is deliberately
     /// stricter than RDF 1.2 Concepts, which says systems can assume `1.2`
     /// when none is given: every deployed Solid client is an RDF 1.1 parser,
-    /// and the cost of being wrong is asymmetric — too conservative is merely
+    /// and the cost of being wrong is asymmetric, too conservative is merely
     /// less useful, too eager is unreadable.
     ///
     /// `None` is an **unrecognised** label, which the write path answers with
@@ -90,21 +90,21 @@ impl RdfVersion {
 /// [`Format`] answers "can I parse this as RDF?" and its `media_type` is a
 /// `&'static str`, so every `Content-Type` the RDF path emits is safe by
 /// construction. A non-RDF resource's type comes from the client and reaches
-/// two interpolation sites — a SPARQL literal and a response header — so it
+/// two interpolation sites (a SPARQL literal and a response header), so it
 /// needs a constructor that can refuse.
 ///
 /// RFC 9110 §5.6.2: `token "/" token`, optionally followed by `; token=token`
 /// parameters. Every byte of the trimmed input is checked against tchar plus
 /// `/`, `;`, `=`, and space before the `type/subtype` shape is parsed, so the
-/// stored string can never contain a byte outside that alphabet — not even
-/// one sitting at a boundary a structural parse would trim away first.
+/// stored string can never contain a byte outside that alphabet, not even one
+/// sitting at a boundary a structural parse would trim away first.
 /// Quoted-string parameter values are refused rather than escaped: the
 /// alphabet contains neither `"` nor `\`, so a value that passes here cannot
 /// leave the SPARQL literal it is interpolated into, and that safety is a
-/// property of the alphabet the stored string is drawn from, not of a
-/// correct escape at every site. The cost is that `multipart/...;
-/// boundary="--x"` is rejected, which is acceptable because multipart is a
-/// request encoding rather than a stored representation.
+/// property of the alphabet the stored string is drawn from, not of a correct
+/// escape at every site. The cost is that `multipart/...; boundary="--x"` is
+/// rejected, which is acceptable because multipart is a request encoding
+/// rather than a stored representation.
 ///
 /// Carries its `http::HeaderValue` alongside the raw string, both built by
 /// the one constructor. `#[derive(PartialEq, Eq)]` compares both fields
@@ -145,7 +145,7 @@ impl MediaType {
         // before validating it, so a stray whitespace or control byte sitting
         // right at a `;` or `=` boundary would otherwise be trimmed away
         // before `is_token` ever sees it, yet still survive into the stored
-        // string. Neither check subsumes the other — this one catches a rogue
+        // string. Neither check subsumes the other, this one catches a rogue
         // byte hiding at a trimmed boundary, the structural parse below
         // catches a malformed `type/subtype` or a valueless parameter.
         if !s.bytes().all(is_media_type_byte) {
@@ -177,7 +177,7 @@ impl MediaType {
         self.header.clone()
     }
 
-    /// `type/subtype`, lowercased, parameters dropped — what an `Accept`
+    /// `type/subtype`, lowercased, parameters dropped, what an `Accept`
     /// comparison is made against, since media-type tokens are
     /// case-insensitive (RFC 9110 §8.3.1) but parameter values need not be.
     pub fn essence(&self) -> String {
@@ -189,8 +189,8 @@ impl MediaType {
 ///
 /// The point of the newtype is that "Turtle cannot carry named graphs" is
 /// stated **once**, here, instead of living in a predicate every caller has to
-/// remember to consult. It also keeps oxigraph's `RdfFormat` — an enum with
-/// variants we deliberately do not support — out of our own signatures.
+/// remember to consult. It also keeps oxigraph's `RdfFormat`, an enum with
+/// variants we deliberately do not support, out of our own signatures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Format(RdfFormat);
 
@@ -198,7 +198,7 @@ pub struct Format(RdfFormat);
 /// parameter that read as `negotiate(accept, true, …)` at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
-    /// A default graph and nothing else — every supported format can serve it.
+    /// A default graph and nothing else, every supported format can serve it.
     Graph,
     /// Carries named graphs, so a graph format serves only part of it (§6.2).
     Dataset,
@@ -208,7 +208,7 @@ impl Format {
     /// Every format the write path parses, and therefore every format
     /// `Accept-Put` and `Accept-Post` name. One array rather than a second
     /// literal list beside the parser: `aux_links` builds from `AuxKind::ALL`
-    /// for the same reason, and against the same failure — an advertisement
+    /// for the same reason, and against the same failure, an advertisement
     /// and a gate that disagree are both individually plausible.
     pub const ALL: [Self; 5] = [
         Self(RdfFormat::Turtle),
@@ -240,7 +240,7 @@ impl Format {
     }
 
     /// §6.3: whether named graphs survive this format. `text/turtle` and
-    /// `application/n-triples` cannot carry them — oxigraph refuses such a
+    /// `application/n-triples` cannot carry them: oxigraph refuses such a
     /// write outright rather than dropping the graph name, so this is the
     /// difference between a designed answer and a runtime error.
     pub fn carries_dataset(&self) -> bool {
@@ -248,13 +248,13 @@ impl Format {
     }
 
     /// `declared` is what the representation claimed, read from its
-    /// `Content-Type` by [`RdfVersion::from_media_type`] — the only reader of
-    /// that parameter. A body richer than its own declaration is refused:
-    /// the document contradicts what it said about itself, which is a
-    /// malformed request rather than an unsupported one.
+    /// `Content-Type` by [`RdfVersion::from_media_type`], the only reader of
+    /// that parameter. A body richer than its own declaration is refused: the
+    /// document contradicts what it said about itself, which is a malformed
+    /// request rather than an unsupported one.
     ///
     /// Callers that are not the wire pass [`RdfVersion::Rdf12`]. The version
-    /// contract is a property of the wire, not of parsing — refusing 1.2 in a
+    /// contract is a property of the wire, not of parsing, refusing 1.2 in a
     /// fetched WebID document or in this pod's own validation report would
     /// add a failure mode with nothing behind it.
     pub fn parse(&self, bytes: &[u8], base_iri: &str, declared: RdfVersion)
@@ -269,7 +269,7 @@ impl Format {
         }
         let parsed = Dataset::new(out);
         // `Cargo.toml` declares oxigraph's `rdf-12`, so the parser accepts
-        // both of RDF 1.2's additions — triple terms *and* directional
+        // both of RDF 1.2's additions, triple terms *and* directional
         // language-tagged strings. The check asks [`Dataset::rdf_version`],
         // the one classifier, rather than matching on a term kind here:
         // matching caught triple terms and let every directional literal
@@ -283,9 +283,9 @@ impl Format {
 
     /// §6.4: a deterministic function of its input. Quads are sorted before
     /// serialization, exactly as [`Skolemized::etag`](crate::dataset::Skolemized::etag)
-    /// sorts before hashing — one canonical order for both, so two states
-    /// that share a validator serialize identically. Repeatability alone is
-    /// not enough: oxigraph returns `CONSTRUCT` results in insertion order.
+    /// sorts before hashing, one canonical order for both, so two states that share a
+    /// validator serialize identically. Repeatability alone is not enough: oxigraph
+    /// returns `CONSTRUCT` results in insertion order.
     pub fn serialize(&self, dataset: &Dataset) -> Result<Vec<u8>, RdfError> {
         // Sorted for the same reason Skolemized::etag sorts: oxigraph
         // returns CONSTRUCT results in insertion order, so without this two
@@ -309,7 +309,7 @@ impl Format {
 /// copy of the q-value parse is how the two come to disagree about `q=0`.
 ///
 /// The fourth element is the entry with its parameters still attached. The
-/// third has them stripped, because matching is by media range — but the
+/// third has them stripped, because matching is by media range, but the
 /// `version` parameter belongs to the range that *wins*, so negotiation needs
 /// the unstripped text to hand to [`RdfVersion::from_media_type`].
 fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str, &str)> {
@@ -331,9 +331,9 @@ fn ranked_accept(accept: &str) -> Vec<(f32, usize, &str, &str)> {
 
 /// §6.1: whether `accept` admits a resource whose only representation is `mt`.
 ///
-/// Not negotiation — there is nothing to choose between. RFC 9110 §12.5.1
-/// makes a more specific media range override a less specific one, so the
-/// decision is by specificity rather than by order or by the highest q.
+/// Not negotiation: there is nothing to choose between. RFC 9110 §12.5.1 makes
+/// a more specific media range override a less specific one, so the decision
+/// is by specificity rather than by order or by the highest q.
 pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
     let accept = accept.trim();
     if accept.is_empty() {
@@ -363,7 +363,7 @@ pub(crate) fn accept_allows(accept: &str, mt: &MediaType) -> bool {
 
 /// §6.3: select the highest-ranked acceptable media range the server can
 /// serve, over the whole `Accept` list with q-values, rather than the first
-/// recognised entry — which would answer `text/turtle, application/ld+json`
+/// recognised entry, which would answer `text/turtle, application/ld+json`
 /// with the lossy one.
 ///
 /// `stored` is what the representation arrived as (§6.4); `*/*` resolves to
@@ -389,7 +389,7 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>)
 
     // RFC 9110 §12.5.1: q=0 means the client explicitly rejects that media
     // range, not merely ranks it last. A named type at q=0 must also be
-    // excluded from what a wildcard elsewhere in the list resolves to —
+    // excluded from what a wildcard elsewhere in the list resolves to,
     // `*/*, text/turtle;q=0` means "anything but Turtle".
     let rejected: Vec<String> = ranked.iter()
         .filter(|(q, _, mt, _)| *q == 0.0 && !mt.ends_with("/*"))
@@ -426,7 +426,7 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>)
             return Some((f, version));
         }
     }
-    // Nothing offered can serve the resource fully — the first pass only
+    // Nothing offered can serve the resource fully, the first pass only
     // accepts a format that can. §6.2: a graph format against a Shape::Dataset
     // resource still answers with what it can carry (the default graph, plus
     // Link headers naming what it left out), so a second pass repeats the
@@ -434,7 +434,7 @@ pub(crate) fn negotiate(accept: &str, shape: Shape, stored: Option<Format>)
     // too, and scoped by their type exactly as above: `text/*` admits only
     // `text/turtle`, and skipping it would answer `406` to a client that named
     // a range this server can serve. Only a media type this server never
-    // recognises at all falls through to the `None` below — the one remaining
+    // recognises at all falls through to the `None` below, the one remaining
     // `406`.
     let lax_fallback = || {
         [ "text/turtle", "application/ld+json" ].iter()
@@ -475,7 +475,7 @@ mod tests {
     /// `ALL` is what `Accept-Put` is built from, and `from_content_type` is
     /// what the write path admits. A format in one and not the other is
     /// either an advertisement for a type that is refused, or a type that
-    /// works and cannot be discovered — so the two are one array, and this is
+    /// works and cannot be discovered, so the two are one array, and this is
     /// that array's test.
     #[test]
     fn every_advertised_format_is_a_format_the_write_path_parses() {
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(seen.len(), Format::ALL.len(), "two entries share a media type");
     }
 
-    /// §2.1: the labels are ordered by containment — data valid at a lower
+    /// §2.1: the labels are ordered by containment, data valid at a lower
     /// label is valid at a higher one. The whole capability check is a `<=`
     /// against this order, so the order is load-bearing.
     #[test]
@@ -502,7 +502,7 @@ mod tests {
         assert!(RdfVersion::Rdf12Basic < RdfVersion::Rdf12);
     }
 
-    /// §4: silence means 1.1 — deliberately stricter than RDF 1.2 Concepts,
+    /// §4: silence means 1.1, deliberately stricter than RDF 1.2 Concepts,
     /// which says a missing parameter means 1.2.
     #[test]
     fn a_missing_version_parameter_means_1_1() {
@@ -526,7 +526,7 @@ mod tests {
     }
 
     /// §6: an unrecognised label is a 415, so it must be distinguishable from
-    /// an absent one — `None`, not a silent fallback to 1.1.
+    /// an absent one, `None`, not a silent fallback to 1.1.
     #[test]
     fn an_unknown_version_label_is_refused_not_defaulted() {
         assert_eq!(RdfVersion::from_media_type("text/turtle;version=1.3"), None);
@@ -559,7 +559,7 @@ mod tests {
     /// The gap this closes: a directional language-tagged string is a
     /// `Term::Literal`, so the old `Term::Triple` match never saw it and it
     /// walked into storage. Refusing it *as a version* also measures that the
-    /// parser produces one — `Rdf12Basic` is only reachable if it did.
+    /// parser produces one: `Rdf12Basic` is only reachable if it did.
     #[test]
     fn a_directional_literal_is_refused_too() {
         let fmt = Format::from_content_type("text/turtle").unwrap();
@@ -706,7 +706,7 @@ mod tests {
         assert_eq!(neg("text/*", Shape::Graph, None), Some(turtle));
         // Nothing supported at all is the only remaining 406.
         assert_eq!(neg("image/png", Shape::Graph, None), None);
-        // `*/*` with nothing stored falls back to Turtle first (§6.4) — only
+        // `*/*` with nothing stored falls back to Turtle first (§6.4), only
         // when Turtle cannot carry the resource does JSON-LD win.
         assert_eq!(neg("*/*", Shape::Graph, None), Some(turtle));
         assert_eq!(neg("*/*", Shape::Dataset, None), Some(jsonld));
@@ -722,7 +722,7 @@ mod tests {
 
         assert_eq!(neg("text/turtle;q=0", Shape::Graph, None), None);
         // The only nominally-acceptable entry is refused, and the other is
-        // unsupported outright — nothing left to serve.
+        // unsupported outright, nothing left to serve.
         assert_eq!(neg("image/png, text/turtle;q=0", Shape::Graph, None), None);
         // `*/*` must not resolve to a type excluded elsewhere in the list.
         assert_ne!(neg("*/*, text/turtle;q=0", Shape::Graph, None), Some(Format::from_content_type("text/turtle").unwrap()));
@@ -735,23 +735,23 @@ mod tests {
         assert_eq!(neg("Text/*", Shape::Graph, None), Some(turtle));
     }
 
-    // §6.2: a client that names only a graph format still gets an answer —
-    // the default graph — rather than a 406. The earlier test above only
+    // §6.2: a client that names only a graph format still gets an answer
+    // (the default graph), rather than a 406. The earlier test above only
     // covers the *preference* for a fuller format when one is also offered;
     // this is the case where a graph format is all there is.
     #[test]
     fn a_lone_graph_format_still_serves_a_dataset_shaped_resource() {
         let turtle = Format::from_content_type("text/turtle").unwrap();
         assert_eq!(neg("text/turtle", Shape::Dataset, None), Some(turtle));
-        // q=0 still refuses it outright — this is a fallback, not an override.
+        // q=0 still refuses it outright: this is a fallback, not an override.
         assert_eq!(neg("text/turtle;q=0", Shape::Dataset, None), None);
-        // A genuinely unsupported type gets no such fallback.
+        // An unsupported type gets no such fallback.
         assert_eq!(neg("image/png", Shape::Dataset, None), None);
     }
 
     // §6.3: `text/*` admits `text/turtle`, and `406` is for when *nothing*
     // acceptable is supported at all. A range that resolves to a format this
-    // server serves is not that case — even when the format can only carry
+    // server serves is not that case, even when the format can only carry
     // part of the resource, which is precisely what §6.2 answers with the
     // default graph. `*/*` and `application/*` reach a dataset-capable format
     // in the first pass, so `text/*` is the range where the second pass is
@@ -850,7 +850,7 @@ mod tests {
     }
 
     // RFC 9110 §12.5.1: q=0 is a refusal, and a more specific media range
-    // overrides a less specific one — so the answer cannot be derived from
+    // overrides a less specific one, so the answer cannot be derived from
     // order or from the highest q alone.
     #[test]
     fn accept_allows_honours_q_zero_and_specificity() {

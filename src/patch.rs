@@ -22,24 +22,23 @@ use std::collections::HashMap;
 /// Why a patch document is not one.
 #[derive(Debug, thiserror::Error)]
 pub enum PatchError {
-    /// Not parseable as N3 at all — `400`.
+    /// Not parseable as N3 at all, `400`.
     #[error("invalid N3: {0}")]
     Syntax(String),
-    /// Parsed, but violates §5.1 — `422`.
+    /// Parsed, but violates §5.1, `422`.
     #[error("not a valid N3 Patch: {0}")]
     Shape(&'static str),
-    /// Names the reserved namespace literally — `400`, and checked here rather
+    /// Names the reserved namespace literally, `400`, and checked here rather
     /// than after substitution, because a binding may legitimately be a skolem
     /// IRI (§6.3).
     #[error("the urn:quadpod: namespace is reserved")]
     Reserved,
-    /// Carries an RDF 1.2 term — `400`, the same answer
-    /// [`crate::rdf::Format::parse`] gives a body richer than it declared.
+    /// Carries an RDF 1.2 term, `400`, the same answer [`crate::rdf::Format::parse`] gives a body
+    /// richer than it declared.
     ///
-    /// **Both** of RDF 1.2's additions, not only triple terms: a directional
-    /// language-tagged string is an ordinary `Literal`, so a refusal that
-    /// matches on `N3Term::Triple` alone lets it through into the store —
-    /// which is exactly the half-check `Format::parse` used to have
+    /// **Both** of RDF 1.2's additions, not only triple terms: a directional language-tagged string
+    /// is an ordinary `Literal`, so a refusal that matches on `N3Term::Triple` alone lets it
+    /// through into the store, which is exactly the half-check `Format::parse` used to have
     /// (`docs/decisions.md`, ADR-6).
     ///
     /// A patch is always read at RDF 1.1. `text/n3` is not one of the five
@@ -52,7 +51,7 @@ pub enum PatchError {
 
 /// One position of a triple pattern: ground, or the `n`th variable.
 ///
-/// A blank node in `solid:where` becomes a [`PatternTerm::Var`] — it matches
+/// A blank node in `solid:where` becomes a [`PatternTerm::Var`], it matches
 /// like SPARQL's pattern blank node and is unreachable from the insertion and
 /// deletion formulae, which may contain no blank nodes at all (§5.1). So there
 /// is no blank-node variant, and there is nothing for a later caller to
@@ -110,7 +109,7 @@ const SOLID_DELETES: &str = "http://www.w3.org/ns/solid/terms#deletes";
 const SOLID_INSERTS: &str = "http://www.w3.org/ns/solid/terms#inserts";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// Assigns each distinct client name — variable or condition blank node — the
+/// Assigns each distinct client name, variable or condition blank node, the
 /// next free index, so §6.1's renumbering happens in exactly one place.
 ///
 /// Conditions are walked first and are the only formula allowed to *create* an
@@ -118,7 +117,7 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 /// unbound variable, which is why `bind` and `lookup` are separate.
 ///
 /// Variables and condition blank nodes share this map, so a blank-node key is
-/// prefixed (`_:`) to keep it distinct from a variable of the same spelling —
+/// prefixed (`_:`) to keep it distinct from a variable of the same spelling,
 /// `?x` and `_:x` are different names.
 #[derive(Default)]
 struct Renumber(HashMap<String, usize>);
@@ -149,7 +148,7 @@ impl Patch {
     /// Refuses: no patch resource, more than one, more than one of any formula
     /// predicate, a blank node in the insertions or deletions, a variable in
     /// them that no condition binds. Ignores triples belonging to neither the
-    /// patch resource nor its formulae — the specification constrains the patch
+    /// patch resource nor its formulae, the specification constrains the patch
     /// resource and does not forbid a document from carrying anything else.
     pub fn parse(body: &[u8], base: &str) -> Result<Self, PatchError> {
         let parser = N3Parser::new()
@@ -206,7 +205,7 @@ impl Patch {
     ///
     /// `Some` exactly when the conditions are empty: §5.1 admits a variable in
     /// the insertions only if a condition binds it, so no conditions means no
-    /// variables, and the other positions are ground already — a literal
+    /// variables, and the other positions are ground already, a literal
     /// subject or predicate is refused by [`Patch::parse`]. The remaining
     /// `None` arms are therefore unreachable, and stay so that this is a total
     /// function rather than one with a panic in it.
@@ -259,7 +258,7 @@ fn patch_subject(quads: &[N3Quad]) -> Result<N3Term, PatchError> {
 /// document*. Without the second, `solid:inserts _:nope` reads as a formula
 /// with no contents and the patch answers `204` for having done nothing.
 ///
-/// An empty formula — `solid:inserts { }` — reaches this function in exactly
+/// An empty formula, `solid:inserts { }`, reaches this function in exactly
 /// that shape: `oxttl` gives it a blank-node object and emits no quad naming
 /// it, so the two documents are indistinguishable here and get the same
 /// refusal. Omitting the predicate is how a patch says it inserts nothing;
@@ -286,7 +285,7 @@ fn formula(
     }
 }
 
-/// Whether `b` is the `graph_name` of anything in the document — which is what
+/// Whether `b` is the `graph_name` of anything in the document, which is what
 /// makes it a formula rather than a blank node that merely sits where one
 /// belongs.
 fn names_a_formula(quads: &[N3Quad], b: &BlankNode) -> bool {
@@ -327,8 +326,8 @@ fn patterns(
 const LITERAL_SUBJECT: &str = "a literal in subject position";
 const LITERAL_PREDICATE: &str = "a literal in predicate position";
 
-/// §5.1: only the object position admits a literal. N3 is wider than RDF here —
-/// `oxttl` parses a literal subject or predicate inside a formula — so the two
+/// §5.1: only the object position admits a literal. N3 is wider than RDF here
+/// (`oxttl` parses a literal subject or predicate inside a formula), so the two
 /// positions that RDF forbids are refused as a shape violation, and every later
 /// stage may take a subject and a predicate to be a name or a variable.
 fn non_literal(t: PatternTerm, violation: &'static str) -> Result<PatternTerm, PatchError> {
@@ -347,7 +346,7 @@ fn term(t: &N3Term, names: &mut Renumber, binding: Binding) -> Result<PatternTer
             Ok(PatternTerm::Named(n.clone()))
         }
         // A directional language-tagged string is RDF 1.2, and it is a
-        // `Literal` — so it reaches this arm and not the one below.
+        // `Literal`, so it reaches this arm and not the one below.
         N3Term::Literal(l) if l.direction().is_some() => Err(PatchError::Rdf12Term),
         N3Term::Literal(l) => Ok(PatternTerm::Literal(l.clone())),
         N3Term::Variable(v) => match binding {
@@ -366,7 +365,7 @@ fn term(t: &N3Term, names: &mut Renumber, binding: Binding) -> Result<PatternTer
         // A patch is the only way into the store that does not go through
         // `Format::parse`, so the version refusal has to be repeated here.
         // It builds no `Dataset`, which is why it cannot ask
-        // `Dataset::rdf_version` — the one classifier — and why this arm and
+        // `Dataset::rdf_version` (the one classifier), and why this arm and
         // the literal arm above are pinned by their own rule in
         // `docs/constraints.md`.
         N3Term::Triple(_) => Err(PatchError::Rdf12Term),
@@ -396,7 +395,7 @@ mod tests {
 
     /// A patch is read as RDF 1.1, and neither of RDF 1.2's additions gets
     /// in. **Measured: `oxttl`'s N3 parser refuses both before this module
-    /// sees a term at all** — `<<( … )>>` is "not a valid RDF value" and
+    /// sees a term at all**, `<<( … )>>` is "not a valid RDF value" and
     /// `@en--ltr` is "rdf:dirLangString is not supported in N3". So these
     /// assert the refusal, not its route: the `N3Term::Triple` and
     /// directional-`Literal` arms in `term` are depth behind the parser, and
@@ -439,7 +438,7 @@ mod tests {
     // node that is ALSO the object of the solid:where / solid:deletes /
     // solid:inserts triple. The `where` and `deletes` formulae here hold
     // IDENTICAL triples, which is what kills the implementation that collects
-    // quads without regard to graph_name — that one would put all three
+    // quads without regard to graph_name, that one would put all three
     // formulae into all three fields and still pass any patch whose formulae
     // happen to differ, which is most of them.
     #[test]
@@ -468,7 +467,7 @@ mod tests {
 
     // §6.1: the client's spelling never leaves this module. Asserted on the
     // parsed term rather than on a rendered query, because the type is what
-    // enforces it — PatternTerm has no String-carrying variable variant.
+    // enforces it: PatternTerm has no String-carrying variable variant.
     #[test]
     fn variables_become_indices_in_first_occurrence_order() {
         let patch = p(&format!(
@@ -482,7 +481,7 @@ mod tests {
         assert_eq!(patch.variables(), 2);
         assert_eq!(patch.conditions()[0].subject, PatternTerm::Var(0));
         assert_eq!(patch.conditions()[0].object, PatternTerm::Var(1));
-        // The same name resolves to the same index across formulae — this is
+        // The same name resolves to the same index across formulae: this is
         // what makes a binding substitutable at all.
         assert_eq!(patch.insertions()[0].subject, PatternTerm::Var(1));
         assert_eq!(patch.insertions()[0].object, PatternTerm::Var(0));
@@ -490,7 +489,7 @@ mod tests {
 
     // `?x` and `_:x` are two names, which is what the `_:` key prefix in
     // `Renumber` buys. Without it both bind index 0, and the conditions
-    // silently become `?x ex:knows ?x` — a pattern that matches a different
+    // silently become `?x ex:knows ?x`, a pattern that matches a different
     // set of triples than the one the client wrote, with no error anywhere.
     #[test]
     fn a_variable_and_a_blank_node_spelled_alike_are_different_names() {
@@ -525,7 +524,7 @@ mod tests {
         assert_eq!(patch.insertions()[0].subject, named(BASE));
     }
 
-    // A patch with no conditions is legal and common — it is the shape the
+    // A patch with no conditions is legal and common: it is the shape the
     // whole `protected-operation` fixture sends.
     #[test]
     fn a_patch_may_have_only_insertions() {
@@ -598,7 +597,7 @@ mod tests {
 
     // §5.1: the object of a formula predicate is a blank node that occurs as a
     // `graph_name` in the same document. A blank node that names no formula is
-    // not an empty one — nothing in the document says what to insert — and
+    // not an empty one (nothing in the document says what to insert), and
     // reading it as empty answers `204` for a patch that did nothing.
     #[test]
     fn a_formula_predicate_whose_object_names_no_formula_is_refused() {
@@ -670,7 +669,7 @@ mod tests {
     }
 
     // The two LENIENT cases. A fail-closed implementation gets both wrong,
-    // and no refusal test can catch that — only these can.
+    // and no refusal test can catch that, only these can.
     #[test]
     fn what_the_shape_rules_deliberately_allow() {
         // Triples belonging to neither the patch resource nor its formulae are
@@ -692,7 +691,7 @@ mod tests {
         assert!(empty.insertions().is_empty());
         assert!(empty.deletions().is_empty());
 
-        // A blank node in the CONDITIONS is fine — it matches like SPARQL's
+        // A blank node in the CONDITIONS is fine, it matches like SPARQL's
         // pattern blank node and becomes a variable no formula can name.
         let bnode_condition = p(&format!(
             "{PREFIXES}_:patch a solid:InsertDeletePatch ;\n\
@@ -744,7 +743,7 @@ mod tests {
     }
 
     // §7: the only shape that can create a resource. `Some` exactly when the
-    // conditions are empty — §5.1 admits a variable in the insertions only if
+    // conditions are empty, §5.1 admits a variable in the insertions only if
     // a condition binds it, so no conditions means no variables to leave in.
     #[test]
     fn ground_insertions_exist_exactly_when_nothing_is_matched() {

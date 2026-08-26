@@ -14,8 +14,8 @@ async fn an_over_long_path_segment_is_a_414() {
 }
 
 // Whole-branch review: `uses_reserved_namespace` sliced an IRI at a fixed
-// byte offset with no char-boundary check, so this body — legal Turtle,
-// and `<urn:quadpodé:x>` is a legal IRI oxrdf accepts — panicked the
+// byte offset with no char-boundary check, so this body, legal Turtle,
+// and `<urn:quadpodé:x>` is a legal IRI oxrdf accepts, panicked the
 // handler and aborted the connection with no response at all. The
 // response's exact status is not the point; that one comes back at all,
 // instead of the connection dying, is.
@@ -78,7 +78,7 @@ async fn paths_normalization_would_alias_are_400() {
 }
 
 // A raw request path of `/a%23b` decodes (the way `classify` decodes it)
-// to `/a#b`, which `resolve` refuses as `NotNormalized` — a `400`, and it
+// to `/a#b`, which `resolve` refuses as `NotNormalized`, a `400`, and it
 // must stay a `400` rather than becoming a misleading `401`. The `htu` a
 // client signs is the WIRE form, `%23` and all (see `derive_htu`), which
 // is exactly what `owner_request` builds; before the wire-form fix this
@@ -107,8 +107,8 @@ async fn an_undecodable_path_is_400_even_when_authenticated() {
     assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
 }
 
-// The trailing slash is not a segment normalization would remove — it is
-// what distinguishes a container from a resource — so it must keep
+// The trailing slash is not a segment normalization would remove (it is
+// what distinguishes a container from a resource), so it must keep
 // working exactly as it did before the `NotNormalized` rule existed.
 #[tokio::test]
 async fn trailing_slash_container_still_resolves() {
@@ -128,22 +128,22 @@ async fn trailing_slash_container_still_resolves() {
 // erases, so without `verify_dpop`'s own exact `htu` comparison this
 // request would authenticate: the owner signs `PUT /foo` and an on-path
 // adversary re-delivers the identical bytes as `PUT /foo/`, installing
-// the body as the *container* of the same name — a different resource
+// the body as the *container* of the same name, a different resource
 // from the one the client addressed and authorized. It must be a 401,
 // from the middleware, before any handler sees it.
 //
-// This used to be pinned against an auxiliary pair
-// (`PUT /.aux/foo.acl` re-delivered as `PUT /.aux/foo/.acl`), but the
-// auxiliary URL shape changed: the kind is now a suffix, so those two
-// paths' segment lists (`[".aux","foo.acl"]` vs `[".aux","foo",".acl"]`)
-// differ in a non-empty segment, not an empty one — `normalize_htu`
-// never treats them as equal, so an ordinary `htu` mismatch already
-// answers 401 without this tightening. Worse, appending the slash
-// directly (`/.aux/foo.acl` -> `/.aux/foo.acl/`) *does* still collapse
-// under `normalize_htu`, but `/.aux/foo.acl/` ends in no kind's suffix,
-// so it resolves to `Reserved` -> 404 regardless of what `verify_dpop`
-// decides. Both are a real improvement, and both are why this
-// regression now has to live in the resource space instead.
+// This used to be pinned against an auxiliary pair (`PUT /.aux/foo.acl`
+// re-delivered as `PUT /.aux/foo/.acl`), but the auxiliary URL shape
+// changed: the kind is now a suffix, so those two paths' segment lists
+// (`[".aux","foo.acl"]` vs `[".aux","foo",".acl"]`) differ in a
+// non-empty segment, not an empty one, `normalize_htu` never treats them
+// as equal, so an ordinary `htu` mismatch already answers 401 without
+// this tightening. Worse, appending the slash directly (`/.aux/foo.acl`
+// -> `/.aux/foo.acl/`) *does* still collapse under `normalize_htu`, but
+// `/.aux/foo.acl/` ends in no kind's suffix, so it resolves to
+// `Reserved` -> 404 regardless of what `verify_dpop` decides. Both are a
+// real improvement, and both are why this regression now has to live in
+// the resource space instead.
 #[tokio::test]
 async fn a_proof_for_a_resource_cannot_write_its_container_counterpart() {
     let f = fixture().await;
@@ -166,8 +166,8 @@ async fn a_proof_for_a_resource_cannot_write_its_container_counterpart() {
 }
 
 // The same re-targeting, through a percent-escape instead of a trailing
-// slash. The owner signs `PUT /.aux/a%41.acl` — whose subject the handlers
-// read as `/aA` — and an on-path adversary re-delivers the identical bytes
+// slash. The owner signs `PUT /.aux/a%41.acl` (whose subject the handlers
+// read as `/aA`), and an on-path adversary re-delivers the identical bytes
 // as `PUT /.aux/a%2541.acl`, whose subject is `/a%41`, a DIFFERENT
 // resource. While `htu` was the percent-DECODED graph IRI and the exact
 // comparison decoded both sides, the two collapsed to the same string and
@@ -196,9 +196,9 @@ async fn a_proof_for_one_acl_cannot_be_redirected_by_a_double_escape() {
     assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }
 
-// The other half: a client that signs the wire form it actually requests
+// The other half: a client that signs the wire form it requests
 // must get through, end to end. `%41` is a plain `A`, so this once failed
-// with a `401` even for the honest client — `dpop-verifier` compared the
+// with a `401` even for the honest client, `dpop-verifier` compared the
 // still-encoded proof against a `derive_htu` that had already decoded it.
 #[tokio::test]
 async fn a_percent_encoded_path_authenticates_for_its_own_request() {
@@ -208,7 +208,7 @@ async fn a_percent_encoded_path_authenticates_for_its_own_request() {
         .body(Body::from("<#it> <http://schema.org/name> \"Toph\" .")).unwrap();
     let res = f.app.clone().oneshot(put).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
-    // The handler decoded the path, so the resource is `/aA` — the `htu`
+    // The handler decoded the path, so the resource is `/aA`, the `htu`
     // being the wire form changed the credential check, not the storage.
     assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/aA");
 

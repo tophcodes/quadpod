@@ -94,8 +94,8 @@ impl Default for TestIdp {
     }
 }
 
-/// A stand-in Solid-OIDC client: a DPoP keypair — EC P-256 signing ES256
-/// ([`TestClient::new`]) or RSA signing RS256 ([`TestClient::new_rsa`]) — and
+/// A stand-in Solid-OIDC client: a DPoP keypair (EC P-256 signing ES256
+/// ([`TestClient::new`]) or RSA signing RS256 ([`TestClient::new_rsa`])), and
 /// methods to mint DPoP proofs as it would present them alongside an access
 /// token.
 pub struct TestClient {
@@ -109,8 +109,8 @@ impl TestClient {
         Self::from_private(private_jwk)
     }
 
-    /// A client whose DPoP key is RSA, so its proofs are signed `RS256` —
-    /// the shape the official Solid conformance harness presents, and the one
+    /// A client whose DPoP key is RSA, so its proofs are signed `RS256`, the
+    /// shape the official Solid conformance harness presents, and the one
     /// this pod refused before `verify_rs256_proof` existed.
     ///
     /// 2048 bits because that is the floor `josekit` enforces on the
@@ -128,12 +128,12 @@ impl TestClient {
     /// Key *generation* has no such floor (`Jwk::generate_rsa_key` delegates
     /// to `RsaKeyPair::generate`, which does not check key size), but
     /// `josekit`'s `RS256.signer_from_jwk` enforces the floor on the
-    /// *signing* side too — so a client built with a sub-2048-bit key here
-    /// cannot mint a genuinely-signed proof via [`Self::mint_dpop`] (its
-    /// `signer()` would panic). Use
-    /// [`Self::mint_dpop_with_dummy_signature`] instead: the rejection this
-    /// exists to test happens while building the verifier, before any
-    /// signature is ever inspected, so a genuine one is not needed.
+    /// *signing* side too, so a client built with a sub-2048-bit key here
+    /// cannot mint a validly signed proof via [`Self::mint_dpop`] (its
+    /// `signer()` would panic). Use [`Self::mint_dpop_with_dummy_signature`]
+    /// instead: the rejection this exists to test happens while building the
+    /// verifier, before any signature is ever inspected, so a genuine one is
+    /// not needed.
     pub fn new_rsa_with_bits(bits: u32) -> Self {
         let private_jwk = Jwk::generate_rsa_key(bits).expect("generate client RSA key");
         Self::from_private(private_jwk)
@@ -149,7 +149,7 @@ impl TestClient {
         }
     }
 
-    /// The RFC 7638 thumbprint of this client's DPoP public key — what an IdP
+    /// The RFC 7638 thumbprint of this client's DPoP public key, what an IdP
     /// would put in the access token's `cnf.jkt`.
     ///
     /// The EC arm delegates to `dpop-verifier`, which is also what the pod's
@@ -242,7 +242,7 @@ impl TestClient {
     /// This is the algorithm-confusion shape, and the reason it is minted
     /// this way rather than with a junk signature: a rejection has to come
     /// from the alg↔key-type rule, not from the signature failing to verify
-    /// anyway. Both directions come out of this one helper — an EC client
+    /// anyway. Both directions come out of this one helper, an EC client
     /// claiming `RS256` is an RS256 header over an EC JWK (with a genuine
     /// ES256 signature), and an RSA client claiming `ES256` is an ES256
     /// header over an RSA JWK (with a genuine RS256 signature). It also mints
@@ -251,7 +251,7 @@ impl TestClient {
     /// accept.
     ///
     /// Built by hand rather than through `jwt::encode_with_signer`, which
-    /// always writes the signer's own `alg` into the header — the header and
+    /// always writes the signer's own `alg` into the header, the header and
     /// the signature are exactly what `mint_dpop` would produce, except for
     /// that one field.
     pub fn mint_dpop_claiming_alg(
@@ -312,9 +312,9 @@ impl TestClient {
         )
     }
 
-    /// Mint a genuinely-signed RS256 proof whose embedded `jwk` header
+    /// Mint a validly signed RS256 proof whose embedded `jwk` header
     /// carries this client's PRIVATE key material (`d`, plus the RSA CRT
-    /// parameters) — the shape RFC 9449 §4.2 forbids a DPoP proof from ever
+    /// parameters), the shape RFC 9449 §4.2 forbids a DPoP proof from ever
     /// containing. Used to test `verify_rs256_proof`'s explicit `d` check.
     pub fn mint_dpop_with_private_jwk_in_header(
         &self,

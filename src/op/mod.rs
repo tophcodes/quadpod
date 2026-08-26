@@ -1,5 +1,5 @@
 //! The OP core: the pod's own signing keys and everything a verifier needs
-//! to check a signature — the public JWKS, the OIDC discovery document, and
+//! to check a signature, the public JWKS, the OIDC discovery document, and
 //! minting of DPoP-bound access tokens carrying a `webid` claim.
 //!
 //! This module issues; `crate::auth` verifies. Nothing here names an HTTP

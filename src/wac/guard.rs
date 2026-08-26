@@ -3,7 +3,7 @@
 //! decide synchronously against what it resolved; `materialize` performs the
 //! writes a decision allows.
 //!
-//! Fails closed in every direction — a missing ACL, a store error, or an
+//! Fails closed in every direction, a missing ACL, a store error, or an
 //! unroutable path all deny. The only path to `Ok(())` is an ACL that
 //! explicitly grants the requested mode to this agent.
 
@@ -18,11 +18,11 @@ use crate::{
 use super::{pdp, prp, Decision, Mode};
 
 /// Why the guard refused, in the terms the guard reasons in. What each one
-/// costs a client — status, body, challenge header — is decided where HTTP
+/// costs a client, status, body, challenge header, is decided where HTTP
 /// lives, by `impl IntoResponse for Denial` in `src/http.rs`; the variants are
 /// what a caller matches on and what this module's tests assert.
 ///
-/// Every variant is one refusal a method below actually produces, and no two
+/// Every variant is one refusal a method below produces, and no two
 /// of them are answered alike.
 #[derive(Debug)]
 pub enum Denial {
@@ -49,14 +49,14 @@ pub enum Denial {
 /// ([`Denial::Unauthenticated`]), a verified one that theirs are insufficient
 /// ([`Denial::Forbidden`]). Neither learns whether the resource exists: no
 /// refusal that reads a probed existence fact is produced before the
-/// corresponding [`Guard::authorize`] has returned `Ok` — knowing early, which
+/// corresponding [`Guard::authorize`] has returned `Ok`, knowing early, which
 /// [`Guard::probe`] does for the whole chain, is fine; answering early from
 /// what it knows is not (design §7).
 ///
 /// The single place that split is decided, which is what a handler-side
 /// refusal would break: [`Guard::deny`] is how the one refusal this module
-/// cannot make itself — a patch's required modes, known only after the body is
-/// parsed — reaches it without re-running [`Guard::authorize`] and resolving
+/// cannot make itself, a patch's required modes, known only after the body is
+/// parsed, reaches it without re-running [`Guard::authorize`] and resolving
 /// the ACL a second time.
 fn deny(agent: &Agent) -> Denial {
     match agent {
@@ -81,8 +81,8 @@ fn required_mode_for_aux(kind: AuxKind) -> Mode {
 /// Built once from the target, it resolves every existence fact the request
 /// needs in one query and reads the governing ACLs in one more. The three
 /// decision methods are then synchronous and hold no store parameter, so a
-/// second resolution of the same ACL — which would repeat the walk and could
-/// straddle a concurrent write — is not something a later edit has to
+/// second resolution of the same ACL, which would repeat the walk and could
+/// straddle a concurrent write, is not something a later edit has to
 /// remember not to write.
 ///
 /// **Not** an answer to a set-valued question. A query interface would ask
@@ -97,7 +97,7 @@ pub struct Guard<'a> {
     store: &'a dyn SparqlStore,
     agent: Agent,
     target: Target,
-    /// The subject and every container above it, nearest first — the one
+    /// The subject and every container above it, nearest first, the one
     /// chain a request touches (design §3).
     chain: Vec<ResourceUrl>,
     /// Graph IRIs the probe found present.
@@ -112,7 +112,7 @@ impl<'a> Guard<'a> {
     /// Refuses nothing: its only failure is a store error, which is a `500`
     /// whatever exists. Every refusal that reads a probed fact is produced by
     /// a method below, after the corresponding [`Guard::authorize`] returned
-    /// `Ok` — design §7's rule, which is about the ordering of *answers*, not
+    /// `Ok`, design §7's rule, which is about the ordering of *answers*, not
     /// of queries.
     pub async fn probe(
         store: &'a dyn SparqlStore,
@@ -129,8 +129,8 @@ impl<'a> Guard<'a> {
         let mut chain = vec![subject.clone()];
         chain.extend(subject.ancestors().iter().map(|c| c.as_resource().clone()));
 
-        // Everything anyone in this request may ask about, unconditionally —
-        // a probe set that varied by method would be a second derivation of the
+        // Everything anyone in this request may ask about, unconditionally, a
+        // probe set that varied by method would be a second derivation of the
         // same table (design §4).
         let auxes: Vec<_> = chain
             .iter()
@@ -156,8 +156,8 @@ impl<'a> Guard<'a> {
     ///
     /// Nearest wins entirely: ancestor rules are never merged in, because
     /// merging would make revoking access on a subtree impossible. `inherited`
-    /// is true for anything above `start`, which is what makes `acl:default`
-    /// apply rather than `acl:accessTo`.
+    /// is true for anything above `start`, which is why `acl:default`
+    /// applies rather than `acl:accessTo`.
     fn decide_from(&self, start: usize, required: Mode) -> Result<Decision, Denial> {
         let found = self.chain[start..]
             .iter()
@@ -194,11 +194,11 @@ impl<'a> Guard<'a> {
         self.decide_from(0, required)
     }
 
-    /// The same question for the container above the target — `None` at the
+    /// The same question for the container above the target, `None` at the
     /// root, which has none. `DELETE` needs it because removing a member
     /// rewrites the parent's containment triples.
     pub fn authorize_parent(&self, mode: Mode) -> Result<Option<Decision>, Denial> {
-        // chain[0] is the subject, so chain[1] is its parent — absent only at
+        // chain[0] is the subject, so chain[1] is its parent, absent only at
         // the root, whose `ancestors()` is empty.
         if self.chain.len() < 2 {
             return Ok(None);
@@ -206,7 +206,7 @@ impl<'a> Guard<'a> {
         self.decide_from(1, mode).map(Some)
     }
 
-    /// The same question for the target's auxiliary of `kind` — `None` when
+    /// The same question for the target's auxiliary of `kind`, `None` when
     /// no such auxiliary exists, so there is nothing to authorize.
     ///
     /// `DELETE` needs it for every kind: deleting a subject takes its
@@ -222,7 +222,7 @@ impl<'a> Guard<'a> {
     }
 
     /// Refuse, in the way that tells this agent the truth without leaking
-    /// anything — the free [`deny`]'s split between
+    /// anything, the free [`deny`]'s split between
     /// [`Denial::Unauthenticated`] and [`Denial::Forbidden`].
     ///
     /// For the one refusal the decision methods cannot make: a patch's
@@ -234,22 +234,22 @@ impl<'a> Guard<'a> {
         deny(&self.agent)
     }
 
-    /// Whether the target itself — not its trailing-slash counterpart — is
+    /// Whether the target itself, not its trailing-slash counterpart, is
     /// present. The fact `PATCH`'s create-vs-update branch needs: unlike
     /// [`Guard::is_taken`], a counterpart existing does not make this `true`.
     pub fn target_exists(&self) -> bool {
         self.present.contains(self.target.graph_iri())
     }
 
-    /// Whether this URL is already spoken for — either it names a resource, or
+    /// Whether this URL is already spoken for, either it names a resource, or
     /// its trailing-slash counterpart does, which Solid Protocol §3.1 forbids
     /// from coexisting with it.
     ///
     /// `false` for an `Aux` target's counterpart half: an auxiliary never has
     /// one ([`ResourceUrl::slash_counterpart`] is a resource-space concept
     /// only), though the target itself can of course still be taken outright.
-    /// For a `Container`, the counterpart checked is its own resource URL's —
-    /// a `Link: rel="type"` can make an allocated child a container, and the
+    /// For a `Container`, the counterpart checked is its own resource URL's, a
+    /// `Link: rel="type"` can make an allocated child a container, and the
     /// pair rule reads the same from that side.
     ///
     /// Reads only the probe's already-resolved presence set, so answering it
@@ -278,7 +278,7 @@ impl<'a> Guard<'a> {
     pub async fn materialize(self) -> Result<Materialized, Denial> {
         let subject = &self.chain[0];
         // Target-existence only, never the counterpart: materializing a target
-        // whose counterpart merely exists is not "already there" — it is the
+        // whose counterpart merely exists is not "already there": it is the
         // slash-pair conflict [`Guard::materialize`] refuses further down.
         let target_existed = self.present.contains(self.target.graph_iri());
         let may_be_member = !matches!(self.target, Target::Aux(_));
@@ -311,7 +311,7 @@ impl<'a> Guard<'a> {
         }
 
         // Every ancestor is authorized by here, so a missing subject may finally
-        // be reported — before the plan below materializes anything for a write
+        // be reported, before the plan below materializes anything for a write
         // that could never succeed.
         if matches!(self.target, Target::Aux(_)) && !self.present.contains(subject.graph_iri()) {
             return Err(Denial::AuxSubjectMissing);
@@ -424,7 +424,7 @@ mod tests {
         r.err()
     }
 
-    /// Whether `parent`'s containment graph records `child_iri` as a member —
+    /// Whether `parent`'s containment graph records `child_iri` as a member,
     /// the direct triple check, stronger than merely asking if the container
     /// holds *some* member.
     async fn contains(store: &OxigraphStore, parent: &ContainerUrl, child_iri: &str) -> bool {
@@ -482,7 +482,7 @@ mod tests {
     }
 
     // The resource's own empty ACL wins over the ancestor grant it was written to
-    // override — the fixture that fails if the chain is searched in the wrong
+    // override, the fixture that fails if the chain is searched in the wrong
     // direction, or if an empty ACL is treated as an absent one.
     #[tokio::test]
     async fn a_guard_lets_an_own_empty_acl_win() {
@@ -529,7 +529,7 @@ mod tests {
     }
 
     // /box does not exist itself, but its trailing-slash counterpart /box/
-    // does — the Protocol §3.1 half `existed` alone never answered.
+    // does, the Protocol §3.1 half `existed` alone never answered.
     #[tokio::test]
     async fn is_taken_is_true_when_only_the_counterpart_exists() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -538,7 +538,7 @@ mod tests {
     }
 
     // A `Link: rel="type"` can make an allocated child a container, so a
-    // container's counterpart is its own resource URL's counterpart — the one
+    // container's counterpart is its own resource URL's counterpart, the one
     // case `is_taken`'s `Container` arm has to single out.
     #[tokio::test]
     async fn is_taken_checks_the_containers_own_resource_counterpart() {
@@ -547,7 +547,7 @@ mod tests {
         assert!(guard_for(&store, alice(), "/box/").await.is_taken());
     }
 
-    // An `Aux` target has no counterpart concept at all — `is_taken` must
+    // An `Aux` target has no counterpart concept at all, `is_taken` must
     // answer only from the aux's own presence, never fall through to a
     // counterpart lookup that `ResourceUrl::slash_counterpart` cannot even
     // form for it.
@@ -573,8 +573,8 @@ mod tests {
         // Only acl:accessTo: decide_from(1, ...) reaches /box/ at offset 0
         // (inherited = false), so this is the predicate a correct index needs.
         // A wrongly-indexed decide_from(0, ...) would see /box/ at offset 1
-        // (inherited = true) and require acl:default, which is absent here —
-        // so only the correct index finds a match.
+        // (inherited = true) and require acl:default, which is absent here, so
+        // only the correct index finds a match.
         seed_acl(&store, "/box/", &format!(
             "<#o> <{ACL_AGENT}> <{ALICE}> ; <{ACL_ACCESS_TO}> <https://pod.toph.so/box/> ; \
              <{ACL_MODE}> <{ACL_WRITE}> ."
@@ -598,10 +598,10 @@ mod tests {
         assert!(g.authorize_aux(AuxKind::Acl).unwrap().is_none());
     }
 
-    // Control on the subject is what an ACL auxiliary requires — Write is not
+    // Control on the subject is what an ACL auxiliary requires (Write is not
     // enough, or a narrowing ACL could be erased by someone holding merely
     // Write. The auxiliary under test here is /box/doc's own .acl, which is
-    // also the ACL that governs /box/doc at chain[0] — so its own grant to
+    // also the ACL that governs /box/doc at chain[0]), so its own grant to
     // Alice is what decide_from(0, ...) resolves against, deliberately Write
     // only rather than empty, so the denial comes from the mode requirement.
     #[tokio::test]
@@ -615,8 +615,8 @@ mod tests {
         assert!(matches!(refusal(g.authorize_aux(AuxKind::Acl)), Some(Denial::Forbidden)));
     }
 
-    // An existing target gains no containment triple — its parent already records
-    // it — so materializing over one must not demand Append at the level above.
+    // An existing target gains no containment triple (its parent already records
+    // it), so materializing over one must not demand Append at the level above.
     // This is the "you may edit this file" grant, where an agent holds Write on
     // one document and nothing on the container around it.
     #[tokio::test]
@@ -674,17 +674,17 @@ mod tests {
             "the walk must never touch the root");
     }
 
-    // Alice holds only `acl:default` at /box/ — enough to Append one level
-    // *below* /box/ by inheritance, but decide_from(1) evaluates /box/
-    // itself directly (offset 0, not inherited), which needs `acl:accessTo`
-    // and finds none: denied. That denial must win over the slash-pair
-    // check even though /box/sub (no trailing slash) already exists and
-    // /box/sub/ is exactly the target — if the check ran before the walk,
-    // it would answer `SlashPair` and reveal /box/sub's existence to an agent
-    // who is about to be refused for /box/ anyway. Asserting `Forbidden` is
-    // what makes this fixture fail loudly if that check is ever hoisted above
-    // the loop (see `materialize`'s doc comment): a hoist here would flip
-    // `Forbidden` to `SlashPair`.
+    // Alice holds only `acl:default` at /box/, enough to Append one level
+    // *below* /box/ by inheritance, but decide_from(1) evaluates /box/ itself
+    // directly (offset 0, not inherited), which needs `acl:accessTo` and
+    // finds none: denied. That denial must win over the slash-pair check even
+    // though /box/sub (no trailing slash) already exists and /box/sub/ is
+    // exactly the target, if the check ran before the walk, it would answer
+    // `SlashPair` and reveal /box/sub's existence to an agent who is about to
+    // be refused for /box/ anyway. Asserting `Forbidden` is what makes this
+    // fixture fail loudly if that check is ever hoisted above the loop (see
+    // `materialize`'s doc comment): a hoist here would flip `Forbidden` to
+    // `SlashPair`.
     #[tokio::test]
     async fn a_guarded_write_denied_on_an_ancestor_never_reaches_the_slash_pair_check() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -699,14 +699,14 @@ mod tests {
              the slash-pair refusal for /box/sub's counterpart, or the ordering leaks it");
     }
 
-    // Alice holds only `acl:accessTo` at the root — a direct grant that does
+    // Alice holds only `acl:accessTo` at the root, a direct grant that does
     // not inherit. /box/ does not exist yet, so the walk does not break
     // immediately (unlike the aux case where the nearest ancestor already
     // exists and record_child is false); it reaches decide_from(1), which
     // resolves against the root ACL from an inherited position (offset > 0)
-    // and needs `acl:default`, absent here: denied. That denial must win
-    // over the aux-subject-exists check even though /box/ghost does not
-    // exist either — if the check ran before the walk, it would answer
+    // and needs `acl:default`, absent here: denied. That denial must win over
+    // the aux-subject-exists check even though /box/ghost does not exist
+    // either, if the check ran before the walk, it would answer
     // `AuxSubjectMissing` and confirm the subject's absence to an agent who is
     // about to be refused for /box/ anyway. Asserting `Forbidden` is what
     // makes this fixture fail loudly if that check is ever hoisted above the

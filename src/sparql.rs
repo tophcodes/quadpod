@@ -14,10 +14,10 @@ use std::fmt;
 /// A literal, rendered with its quotes and escapes.
 ///
 /// The escaping is oxrdf's: `oxigraph::model::Literal`'s `Display` already
-/// produces the quoted, escaped N-Triples form — the quotes are not added
-/// here — which is what `resource::serialize_for_insert` already relies on
+/// produces the quoted, escaped N-Triples form (the quotes are not added
+/// here), which is what `resource::serialize_for_insert` already relies on
 /// for every triple this pod writes. Rendering through it rather than beside
-/// it is the point — a second escaper is a second thing to get right, and the
+/// it is what this type is for: a second escaper is a second thing to get right, and the
 /// two would drift silently because both would still produce output.
 pub struct Literal(String);
 
@@ -38,7 +38,7 @@ mod tests {
     use super::*;
     use oxigraph::model::Literal as OxLiteral;
 
-    // The escaping is oxrdf's, not ours — this pins that we render through it
+    // The escaping is oxrdf's, not ours. This pins that we render through it
     // rather than beside it. A second escaper is how two write paths come to
     // disagree about one backslash.
     #[test]
@@ -59,7 +59,7 @@ mod tests {
 
     // The whole point: what comes out can be concatenated into an update and
     // still parse. Asserted by round-tripping through the store, not by
-    // eyeballing the string — a rendering that merely *looks* escaped but is
+    // eyeballing the string, a rendering that merely *looks* escaped but is
     // not would pass a string comparison against a hand-written expectation.
     #[tokio::test]
     async fn a_rendered_literal_survives_an_actual_insert() {

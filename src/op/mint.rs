@@ -1,5 +1,5 @@
 //! Minting DPoP-bound access tokens. The claims mirror exactly what
-//! `crate::auth::access_token` verifies; there is no HTTP path to this —
+//! `crate::auth::access_token` verifies; there is no HTTP path to this:
 //! callers are the pod's own machinery (#23, #49, #58).
 
 use josekit::jwt::JwtPayload;

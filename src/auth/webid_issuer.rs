@@ -1,12 +1,12 @@
-//! WebID↔issuer trust binding — closing the full-impersonation hole.
+//! WebID↔issuer trust binding, closing the full-impersonation hole.
 //!
 //! [`verify_access_token`](super::verify_access_token) only proves that a
 //! token was signed by the key of whatever issuer the token itself names.
 //! That is not enough: an attacker who runs their own IdP can mint a token
 //! naming ANY webid at all (`{iss: https://attacker.example/, webid:
 //! https://alice.example/card#me}`), sign it with their own key, and it
-//! verifies fine — the token is internally self-consistent. Nothing so far
-//! confirms that Alice's IdP actually IS `attacker.example`.
+//! verifies fine, the token is internally self-consistent. Nothing so far
+//! confirms that Alice's IdP IS `attacker.example`.
 //!
 //! Solid-OIDC closes this by requiring the WebID's own profile document to
 //! declare its authorized issuer(s) via the `solid:oidcIssuer` predicate. A
@@ -88,7 +88,7 @@ const CACHE_TTL: Duration = Duration::from_secs(120);
 ///
 /// This is not only a politeness to a flapping host. `authorizes` runs on a
 /// signature-verified token, but with no `trusted_issuers` allowlist
-/// configured that proves nothing about the `webid` claim — anyone running
+/// configured that proves nothing about the `webid` claim, anyone running
 /// their own IdP can sign one naming any URL. Without this, each such request
 /// is one fresh outbound fetch to an attacker-chosen address.
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -114,8 +114,8 @@ pub struct HttpWebIdIssuers {
 
 impl HttpWebIdIssuers {
     /// Production constructor: fetches are SSRF-guarded with the policy the
-    /// operator configured — [`FetchPolicy::default`] (https-only, private
-    /// IPs blocked) unless they named hosts via `--allow-insecure-host`. The
+    /// operator configured, [`FetchPolicy::default`] (https-only, private IPs
+    /// blocked) unless they named hosts via `--allow-insecure-host`. The
     /// webid is attacker-influenced input just like the token's `iss`.
     ///
     /// `client` is shared with every other guarded fetcher in the process, so
@@ -125,7 +125,7 @@ impl HttpWebIdIssuers {
         Self::build(client, policy)
     }
 
-    /// Construct with an explicit [`FetchPolicy`] — used by hermetic tests
+    /// Construct with an explicit [`FetchPolicy`], used by hermetic tests
     /// that fetch from a local (`127.0.0.1`) test server and so must allow
     /// http and private IPs. Test-only: a permissive policy must be
     /// unconstructable in a production build, so production code must go
@@ -221,7 +221,7 @@ fn insert_bounded<V>(
 impl WebIdIssuerVerifier for HttpWebIdIssuers {
     /// A profile that parsed but does not declare `issuer` is `Ok(false)`; a
     /// profile that could not be fetched or parsed is `Err`. The cache
-    /// preserves that distinction — the first outcome is a fact about the
+    /// preserves that distinction, the first outcome is a fact about the
     /// WebID and is cached as the issuer list, the second is a failure and
     /// goes to the negative cache.
     async fn authorizes(&self, webid: &str, issuer: &str) -> Result<bool, AuthError> {
@@ -318,7 +318,7 @@ mod tests {
     }
 
     /// Like [`spawn_profile_server`] but declares `issuers` (possibly several)
-    /// and counts how many times the profile was actually fetched — the only
+    /// and counts how many times the profile was fetched, the only
     /// way to tell a cache hit from a silent refetch.
     async fn spawn_counting_profile_server(
         issuers: &[&str],
@@ -395,7 +395,7 @@ mod tests {
     }
 
     /// A cached profile still answers `false` for an issuer it does not
-    /// declare — the cache must not turn "fetched once" into "authorized".
+    /// declare, the cache must not turn "fetched once" into "authorized".
     #[tokio::test]
     async fn a_cached_profile_still_refuses_an_undeclared_issuer() {
         let (webid, hits) = spawn_counting_profile_server(&["https://idp.example/"]).await;
@@ -498,8 +498,8 @@ mod tests {
     /// Spin up a local profile-document server serving the SAME
     /// `solid:oidcIssuer` declaration as [`spawn_profile_server`], but as
     /// **JSON-LD** (expanded form) with `Content-Type: application/ld+json`
-    /// instead of Turtle — proving `authorizes` content-negotiates the
-    /// parse format rather than always assuming Turtle.
+    /// instead of Turtle, proving `authorizes` content-negotiates the parse
+    /// format rather than always assuming Turtle.
     async fn spawn_jsonld_profile_server(issuer: &str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -588,7 +588,7 @@ mod tests {
     /// A profile document that declares `solid:oidcIssuer` on the RIGHT
     /// predicate/object but the WRONG subject (someone else's WebID, not
     /// the one being queried) must not authorize the requested webid. This
-    /// proves the match enforces the subject binding too — not just that
+    /// proves the match enforces the subject binding too, not just that
     /// the predicate and object happen to appear somewhere in the graph.
     #[tokio::test]
     async fn subject_mismatch_is_not_authorized() {

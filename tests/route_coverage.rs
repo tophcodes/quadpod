@@ -1,13 +1,13 @@
 //! Every route, every verb but OPTIONS, no credentials: the answer must
 //! always be a refusal, with one exemption. This is the structural safeguard
-//! for the per-handler guard design — a handler added later without an
+//! for the per-handler guard design, a handler added later without an
 //! `authorize` call fails here rather than silently exposing the store. The
 //! `?validate` view is swept too, since it is a second handler reached
 //! through the same routes.
 //!
 //! The exemption is the reserved `/.well-known/` space, and it is the only
-//! one. Those documents are public by design — a verifier reads issuer
-//! metadata before it holds any credential to present — so a credential-less
+//! one. Those documents are public by design (a verifier reads issuer
+//! metadata before it holds any credential to present), so a credential-less
 //! `GET` is answered rather than refused. The exemption is bounded to reads:
 //! the router carries no write method for that space at all, so nothing
 //! there can be planted, and no store is reached on the read either. Their
@@ -90,20 +90,20 @@ async fn no_route_serves_an_unauthenticated_request() {
         "/", "/seeded", "/.aux/seeded.acl", "/.aux/.acl", "/box/", "/box/child",
         "/does-not-exist", "/a/b/c",
         // The `?validate` view is a second handler (`validate_view`) reached
-        // through the same `GET` routes, with its own `Guard::probe` call —
-        // a query string on an otherwise-covered path is what exercises it.
+        // through the same `GET` routes, with its own `Guard::probe` call, a
+        // query string on an otherwise-covered path is what exercises it.
         "/seeded?validate", "/box/?validate",
     ];
     // HEAD is served by the same handler axum's `get()` route installs, so it
-    // is guarded like GET — but this test exists to be structural, and a verb
+    // is guarded like GET, but this test exists to be structural, and a verb
     // that reaches a handler belongs in the list whether or not it currently
     // shares one. Only the status is asserted: a HEAD response has no body.
     //
     // OPTIONS is absent on purpose, and is the only such verb. A CORS preflight
     // carries no credentials by construction, and the answer is derived from
-    // the request URL's shape alone — it reaches no store, so it reveals
-    // nothing that routing itself does not. The exemption is from
-    // authorization, not from `classify`:
+    // the request URL's shape alone, it reaches no store, so it reveals nothing
+    // that routing itself does not. The exemption is from authorization, not
+    // from `classify`:
     // `the_unallocated_reserved_namespace_serves_nothing_either` below does
     // include OPTIONS, and holds it to the same 404.
     let methods = ["GET", "HEAD", "PUT", "POST", "DELETE", "PATCH"];
@@ -127,9 +127,9 @@ async fn no_route_serves_an_unauthenticated_request() {
 }
 
 /// The reserved namespace is not storage, so a path in it that names no
-/// auxiliary resource is refused before authorization can even apply — there
+/// auxiliary resource is refused before authorization can even apply: there
 /// is no resource to hold an ACL. Nothing is served either way, which is what
-/// the test above is really about; the status differs because the reason
+/// the test above is about; the status differs because the reason
 /// does.
 #[tokio::test]
 async fn the_unallocated_reserved_namespace_serves_nothing_either() {

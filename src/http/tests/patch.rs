@@ -27,9 +27,9 @@ async fn a_patch_changes_one_triple_and_answers_204() {
 }
 
 // §8: `text/n3` is a perfectly good body, so `415` would be a claim about
-// the wrong thing — the conflict is with a target that has no triples.
-// The byte assertion is the half a status check cannot see: a `409` that
-// also destroyed the object passes a status-only test.
+// the wrong thing, the conflict is with a target that has no triples. The
+// byte assertion is the half a status check cannot see: a `409` that also
+// destroyed the object passes a status-only test.
 #[tokio::test]
 async fn a_patch_at_a_blob_is_409_and_the_bytes_survive() {
     let f = fixture().await;
@@ -61,8 +61,8 @@ async fn a_patch_setting_containment_on_a_container_is_409() {
     assert!(!ttl.contains("forged"), "containment is server-managed: {ttl}");
 }
 
-// A container's LDP type lives only in its body — the pod emits no
-// `Link: rel="type"` — so a patch that deletes it would leave the container
+// A container's LDP type lives only in its body (the pod emits no `Link:
+// rel="type"`), so a patch that deletes it would leave the container
 // untyped to every client. `put_impl` re-asserts the server's type triples
 // after writing a container body; a patch is answered the same way, which
 // keeps the client free to patch the container's other triples.
@@ -170,7 +170,7 @@ async fn an_anonymous_patch_is_401_not_405() {
 }
 
 // §6.4. Both halves matter: the first alone is satisfied by a message that
-// names nothing, the second alone by one that also prints the binding —
+// names nothing, the second alone by one that also prints the binding,
 // which for a blank-node subject is a skolem IRI the client has never seen.
 #[tokio::test]
 async fn a_409_names_the_patch_and_never_a_skolem_iri() {
@@ -267,7 +267,7 @@ async fn an_acl_url_accepts_a_patch() {
 
 // §8: `authorize` substitutes Control for an Aux target regardless of the
 // mode the handler asks for, so §9's tiering does not apply here. An agent
-// holding Write on the subject but not Control must be refused — otherwise
+// holding Write on the subject but not Control must be refused, otherwise
 // anyone who may edit a resource may rewrite the policy over it.
 #[tokio::test]
 async fn patching_an_acl_needs_control_not_write() {
@@ -309,10 +309,10 @@ async fn patching_an_acl_needs_control_not_write() {
 // The converse of the test above, and the only one that pins §8's skip of
 // the §9 mode check: `authorize` substituted Control for the auxiliary, so
 // an agent holding Control and nothing else is exactly who may rewrite the
-// policy. Asking §9's question again would demand Append on top of
-// Control — which Control does not subsume — and refuse them. The owner's
-// own ACL grants Read, Write and Control together, so no test using it can
-// tell the skip from its absence.
+// policy. Asking §9's question again would demand Append on top of Control
+// (which Control does not subsume), and refuse them. The owner's own ACL
+// grants Read, Write and Control together, so no test using it can tell
+// the skip from its absence.
 #[tokio::test]
 async fn control_alone_may_patch_an_acl() {
     let f = fixture().await;
@@ -350,7 +350,7 @@ async fn control_alone_may_patch_an_acl() {
 }
 
 // A patch does not create an auxiliary. The subject is present here, so
-// the subject-missing `404` would be a false statement about the store —
+// the subject-missing `404` would be a false statement about the store,
 // and an insert-only patch, whose `WHERE` the subject guard satisfies,
 // would otherwise leave its triples in a graph nothing marks present.
 #[tokio::test]
@@ -367,7 +367,7 @@ async fn patching_an_absent_acl_whose_subject_exists_is_404_and_writes_nothing()
         "the subject exists, so the subject-missing body would be untrue");
 
     assert!(f.stored("/.aux/profile.acl").await.is_none());
-    // Not just unmarked: `stored` gates on the presence marker, so it
+    // Unmarked is only half of it: `stored` gates on the presence marker, so it
     // reports `None` for a graph full of triples nobody ever made present.
     let iri = f.url("/.aux/profile.acl").graph_iri().to_string();
     let leftover = f.store
@@ -435,7 +435,7 @@ async fn an_insert_only_patch_creates_the_resource() {
 
 // §7: the same ancestor materialization and containment linking `PUT`
 // uses, not a second creation path. Asserted on the parent's containment
-// rather than on the child's existence — a creation that skipped the
+// rather than on the child's existence, a creation that skipped the
 // ancestor walk still produces a readable child.
 #[tokio::test]
 async fn creating_by_patch_materializes_ancestors_and_containment() {
@@ -458,7 +458,7 @@ async fn creating_by_patch_materializes_ancestors_and_containment() {
 }
 
 // A container's type triples are the server's, so a container a patch
-// creates carries them exactly as one `PUT` creates does — otherwise the
+// creates carries them exactly as one `PUT` creates does, otherwise the
 // creation answers `201` for something no client can read as a container.
 #[tokio::test]
 async fn an_insert_only_patch_creates_a_container_with_its_type() {
@@ -516,8 +516,8 @@ async fn a_deletions_only_patch_on_an_absent_resource_is_409() {
 
 // `patch_shape_conflict`: a patch's effect never exists as a `Dataset` in
 // this process, so a shape-constrained container refuses the write
-// outright rather than attempt to validate it. The inserted triple is
-// one `NoteShape` would happily admit — proving the refusal fires on the
+// outright rather than attempt to validate it. The inserted triple is one
+// `NoteShape` would happily admit, proving the refusal fires on the
 // binding alone, not on anything the patch's content would have failed.
 #[tokio::test]
 async fn a_patch_into_a_shape_constrained_container_is_409() {
@@ -582,7 +582,7 @@ async fn a_patch_to_an_acl_under_a_shape_constrained_container_still_succeeds() 
 }
 
 // `authorize`'s own comment says it "runs before the body is looked at so
-// an unauthorized caller learns nothing" — `patch_shape_conflict` runs
+// an unauthorized caller learns nothing", `patch_shape_conflict` runs
 // after the §9 mode check for the same property: a caller who was always
 // going to be denied must be denied on that ground, not told first that
 // the container happens to be shape-constrained.
@@ -609,7 +609,7 @@ async fn a_denied_patch_is_403_not_the_shape_409() {
     assert_eq!(f.app.clone().oneshot(put_acl).await.unwrap().status(), StatusCode::CREATED);
 
     // Bob holds only Append on /notes/n1, whose container binds a shape.
-    // A deletion needs Write, which he does not have — §9 must deny this
+    // A deletion needs Write, which he does not have, §9 must deny this
     // before `patch_shape_conflict` ever runs.
     let bob_app = f.app_also_trusting(bob);
     let delete = f.sign(Request::builder().method("PATCH").uri("/notes/n1"), bob, "PATCH", "/notes/n1")
@@ -624,8 +624,8 @@ async fn a_denied_patch_is_403_not_the_shape_409() {
 }
 
 // The same ordering argument from the other side: a `PATCH` at a blob is
-// refused for being a blob, not for its container's shape — even when
-// the container has one.
+// refused for being a blob, not for its container's shape, even when the
+// container has one.
 #[tokio::test]
 async fn a_patch_at_a_blob_in_a_shape_constrained_container_is_the_binary_refusal() {
     let f = fixture().await;

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 /// access token's issuer.
 ///
 /// `trusted_issuers`: if `Some(set)`, an access token whose `iss` is not in
-/// `set` is rejected BEFORE any JWKS fetch is attempted — this shrinks the
+/// `set` is rejected BEFORE any JWKS fetch is attempted, this shrinks the
 /// SSRF surface (an untrusted issuer never triggers an outbound request) and
 /// is defense-in-depth over the WebID-issuer binding, which remains the
 /// primary control. If `None`, any issuer is allowed to proceed to the

@@ -76,7 +76,7 @@ Entry form:
   `localhost:3001?q=1`, or `localhost:3001#frag`. Any of these is rejected outright.
 - **Default ports are explicit.** A URL with no port is compared against the scheme's
   default, so `http://css.local/` matches the entry `css.local:80` (or the bare
-  `css.local`), not `css.local:3001`.
+  `css.local`) and never `css.local:3001`.
 - **A trailing dot on a hostname is not stripped.** `http://localhost.:3001/` has host
   `"localhost."` (a syntactically legal absolute FQDN), which will not match the entry
   `localhost:3001`. This is the safe direction, under-matching where over-matching

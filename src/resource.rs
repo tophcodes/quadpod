@@ -93,18 +93,17 @@ pub(crate) fn serialize_for_insert(quads: &Skolemized) -> String {
 ///
 /// Like [`delete_rdf`], this reads the registry (`registered_shelves`, below)
 /// before it writes. A concurrent write to the same resource landing in that
-/// window can leave orphaned or under-dropped shelves — the same
-/// read-then-write race, accepted for the same reason: single-user v1, and
-/// `DROP GRAPH` takes no variable, so the read cannot be folded into the
-/// update (design spec §5.1).
+/// window can leave orphaned or under-dropped shelves, the same read-then-write
+/// race, accepted for the same reason: single-user v1, and `DROP GRAPH` takes no
+/// variable, so the read cannot be folded into the update (design spec §5.1).
 ///
-/// One of the two teardown sites (§7): a blob this resource held is
-/// superseded by this write. The object is deleted **after** the SPARQL
-/// update commits, matching [`aux::delete_subject`](crate::aux::delete_subject):
-/// an interrupted delete leaves an object no marker points at, which the next
-/// write to the same URL overwrites, whereas the reverse order would leave a
-/// resource marked `BinaryResource` with no object behind it — `GET` then
-/// answers `404` and blames a backend that did nothing wrong.
+/// One of the two teardown sites (§7): a blob this resource held is superseded
+/// by this write. The object is deleted **after** the SPARQL update commits,
+/// matching [`aux::delete_subject`](crate::aux::delete_subject): an interrupted
+/// delete leaves an object no marker points at, which the next write to the same
+/// URL overwrites, whereas the reverse order would leave a resource marked
+/// `BinaryResource` with no object behind it, `GET` then answers `404` and
+/// blames a backend that did nothing wrong.
 pub async fn put_dataset(
     store: &dyn SparqlStore,
     blobs: &dyn crate::blob::BlobStore,
@@ -118,7 +117,7 @@ pub async fn put_dataset(
 
     // Split by graph name; the key is minted only here, from the pair. Each
     // bucket is re-wrapped as default-graph quads because serialize_for_insert
-    // only reads subject/predicate/object — the GRAPH <...> wrapper below
+    // only reads subject/predicate/object, the GRAPH <...> wrapper below
     // supplies the graph context.
     let mut default_graph: Vec<GroundQuad> = Vec::new();
     let mut shelves: Vec<(ShelfKey, String, Vec<GroundQuad>)> = Vec::new();
@@ -140,7 +139,7 @@ pub async fn put_dataset(
     }
 
     // Both drops (§3.2 invariant 4): what the registry lists, and what we are
-    // about to write. Literal IRIs — DROP takes no variable, and DELETE WHERE
+    // about to write. Literal IRIs: DROP takes no variable, and DELETE WHERE
     // empties a graph without removing it.
     let mut update = String::new();
     for key in registered_shelves(store, r).await? {
@@ -173,7 +172,7 @@ pub async fn put_dataset(
         // normally reach an interpolation site; a client-supplied graph name
         // is the one exception, and it has been safe so far only because
         // oxigraph's own parsers reject anything that could break out of an
-        // IRIREF before it gets here — safe by accident, not by rule. Restore
+        // IRIREF before it gets here, safe by accident, not by rule. Restore
         // the property explicitly rather than inherit it by luck.
         NamedNode::new(name).map_err(|_| ResourceError::InvalidIri)?;
         registry.push_str(&format!(
@@ -186,8 +185,8 @@ pub async fn put_dataset(
     store.update(&update).await?;
 
     // §5.2: this write replaces the representation including its kind, so a
-    // blob that was here is superseded. Runs after the update commits — see
-    // the doc comment above. Unconditional — deleting an absent object
+    // blob that was here is superseded. Runs after the update commits, see
+    // the doc comment above. Unconditional, deleting an absent object
     // succeeds, and a check plus a delete is two round-trips with a window
     // between them. Over-long keys have no object to remove.
     if let Some(key) = crate::blob::BlobKey::of(r) {
@@ -202,8 +201,8 @@ pub async fn put_dataset(
 /// (§5.1): an interrupted marker write leaves an object no read path can see
 /// and the next write to the same URL overwrites, whereas the reverse order
 /// would leave a resource that exists and cannot be served. The registry read
-/// happens before the drops for the same reason it does in [`put_dataset`] —
-/// it lives in the graph being dropped.
+/// happens before the drops for the same reason it does in [`put_dataset`].
+/// It lives in the graph being dropped.
 pub async fn put_blob(
     store: &dyn SparqlStore,
     blobs: &dyn crate::blob::BlobStore,
@@ -282,7 +281,7 @@ pub enum PatchResult {
 /// One pattern term as SPARQL text.
 ///
 /// Named nodes render through `NamedNode`'s own `Display`, literals through
-/// [`crate::sparql::Literal`] — the escaper this pod already trusts — and a
+/// [`crate::sparql::Literal`] (the escaper this pod already trusts), and a
 /// variable renders from its index, never from anything the client wrote.
 fn render_term(t: &crate::patch::PatternTerm) -> String {
     match t {
@@ -324,7 +323,7 @@ fn render_bound(t: &oxigraph::model::Term) -> Result<String, ResourceError> {
 /// single mapping bound it to.
 ///
 /// `bindings` holds the one solution the conditions produced, or nothing when
-/// there were no conditions — in which case §5.1 leaves no variable for these
+/// there were no conditions, in which case §5.1 leaves no variable for these
 /// patterns to carry.
 fn substitute(
     patterns: &[crate::patch::Pattern],
@@ -357,16 +356,15 @@ fn ground_term(
 
 /// Apply a patch to an **existing** RDF resource.
 ///
-/// At most a `SELECT`, an `ASK`, and one `UPDATE` — never more. The `SELECT`
-/// runs only when the patch has conditions, with `LIMIT 2` and scoped to this
+/// At most a `SELECT`, an `ASK`, and one `UPDATE`, never more. The `SELECT` runs
+/// only when the patch has conditions, with `LIMIT 2` and scoped to this
 /// resource's graph, enough to tell zero from one from several without
-/// materialising a large result. The `ASK` runs only when there is a
-/// deletion set to ask about. Then one
-/// `WITH … DELETE … INSERT … WHERE …` whose `WHERE` is the ground deletion set,
-/// so the presence check §6 requires *is* the write: an absent deletion triple
-/// makes the pattern fail to match and nothing happens, which is
-/// [`PatchResult::DeletionMissing`]. A separate check followed by
-/// `DELETE DATA`/`INSERT DATA` would leave a window in which a concurrent
+/// materialising a large result. The `ASK` runs only when there is a deletion
+/// set to ask about. Then one `WITH … DELETE … INSERT … WHERE …` whose `WHERE`
+/// is the ground deletion set, so the presence check §6 requires *is* the write:
+/// an absent deletion triple makes the pattern fail to match and nothing
+/// happens, which is [`PatchResult::DeletionMissing`]. A separate check followed
+/// by `DELETE DATA`/`INSERT DATA` would leave a window in which a concurrent
 /// removal makes the delete skip silently while the insert still runs.
 ///
 /// Only the resource's default graph is touched. N3 Patch cannot name a graph,
@@ -391,8 +389,8 @@ pub async fn patch_dataset(
 /// structured type because its one non-empty caller builds it from a subject
 /// IRI it already holds, and a second shape would be a type for one use.
 ///
-/// Takes any [`GraphName`] rather than a [`ResourceUrl`], which is what lets an
-/// auxiliary reach it — and is exactly why it is not `pub`: an auxiliary write
+/// Takes any [`GraphName`] rather than a [`ResourceUrl`], which lets an
+/// auxiliary reach it, and is exactly why it is not `pub`: an auxiliary write
 /// that reaches this without a guard is the defect `docs/constraints.md`
 /// records against `put_rdf`. `aux::patch` is its only non-resource caller.
 pub(crate) async fn patch_guarded(
@@ -431,7 +429,7 @@ pub(crate) async fn patch_guarded(
     // Step 5: the presence check IS the WHERE clause. Every term is ground, so
     // the pattern matches at most once; an absent deletion triple makes it
     // fail to match and nothing happens. The `ASK` only reports which of the
-    // two outcomes happened — under concurrency the two can disagree, and then
+    // two outcomes happened, under concurrency the two can disagree, and then
     // the `WHERE` wins and the status is merely stale, never the store. Run it
     // only when there is a deletion set to ask about; an empty one is never
     // consulted below.
@@ -456,7 +454,7 @@ pub(crate) async fn patch_guarded(
 
 /// §6 step 2: the resource graph, the registry, and one `CONSTRUCT` per shelf.
 /// `query_triples` has no graph field, so a single query cannot recover which
-/// shelf a triple came from — 2+N in-process queries, and no fast path that
+/// shelf a triple came from, 2+N in-process queries, and no fast path that
 /// skips the shelves, because the ETag covers the resource rather than the
 /// response body.
 pub async fn get_dataset(
@@ -481,7 +479,7 @@ pub async fn get_dataset(
 
     // One CONSTRUCT per shelf: query_triples has no graph field, so a single
     // query cannot recover which shelf a triple came from. The graph name comes
-    // from the registry, not from the key — the key is not reversible.
+    // from the registry, not from the key, the key is not reversible.
     for key in registered_shelves(store, r).await? {
         let k = key.graph_iri();
         let names = store.query_triples(&format!(
@@ -509,7 +507,7 @@ pub async fn get_dataset(
 /// §6.4: what the representation arrived as, for `*/*` and for the
 /// `mediaType` LWS requires per container member. Stored as its media-type
 /// literal, returned as the media type; the RDF path narrows it to a
-/// [`Format`] — the string form exists in the registry and nowhere else.
+/// [`Format`], the string form exists in the registry and nowhere else.
 pub async fn stored_media_type(
     store: &dyn SparqlStore,
     r: &ResourceUrl,
@@ -546,8 +544,8 @@ pub async fn registered_shelves(
 }
 
 /// `triples` carries no graph name, and `serialize_for_insert` does not read
-/// one — the caller supplies it via the `GRAPH <...>` wrapper around the
-/// rendered body — so every quad is tagged `GraphName::DefaultGraph` here
+/// one (the caller supplies it via the `GRAPH <...>` wrapper around the
+/// rendered body), so every quad is tagged `GraphName::DefaultGraph` here
 /// purely to satisfy [`Dataset`]'s shape.
 pub(crate) fn as_quads(triples: &[Triple]) -> Vec<oxigraph::model::Quad> {
     triples.iter()
@@ -561,7 +559,7 @@ pub(crate) fn as_quads(triples: &[Triple]) -> Vec<oxigraph::model::Quad> {
 /// Replace a graph's contents and mark it present, in one update.
 ///
 /// `triples` may be client-supplied (a `PUT`/`POST` body), so blank nodes are
-/// expected here and skolemized rather than rejected — [`insert_marked`] is
+/// expected here and skolemized rather than rejected, [`insert_marked`] is
 /// the path for content that is ground before it arrives.
 pub async fn put_rdf(
     store: &dyn SparqlStore,
@@ -632,7 +630,7 @@ pub async fn get_rdf(
 /// Which of `graphs` are present, as the set of their graph IRIs.
 ///
 /// One query for the whole set. The ancestor chains an authorization walks are
-/// nested — the ACL candidates for `/a/b/` are a suffix of those for `/a/b/c` —
+/// nested (the ACL candidates for `/a/b/` are a suffix of those for `/a/b/c`),
 /// so asking level by level re-asks what an earlier level already answered.
 ///
 /// Lives here because the system graph holding the marker is this module's to
@@ -682,8 +680,8 @@ pub async fn exists(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool,
 
 /// Delete a graph and its presence marker. Returns whether it existed.
 ///
-/// The drops run unconditionally — `DROP SILENT` on an absent graph is a
-/// no-op — so content that somehow exists without a marker (which should
+/// The drops run unconditionally (`DROP SILENT` on an absent graph is a
+/// no-op), so content that somehow exists without a marker (which should
 /// never happen, but `!exists` must not make it permanent) is still
 /// reachable and removable.
 ///
@@ -691,7 +689,7 @@ pub async fn exists(store: &dyn SparqlStore, g: &impl GraphName) -> Result<bool,
 /// drops, so a `put_rdf` landing in between is destroyed while this call
 /// still returns `false` and its caller answers 404. That is the same
 /// read-then-write race the rest of this non-transactional layer carries,
-/// and it has no authorization consequence — but it is a real trade, not a
+/// and it has no authorization consequence, but it is a real trade, not a
 /// free win.
 pub async fn delete_rdf(
     store: &dyn SparqlStore,
@@ -746,8 +744,8 @@ mod tests {
     }
 
     /// An existing subject with an auxiliary written for it. `delete_rdf` is
-    /// bounded to auxiliaries — a subject is deleted by `aux::delete_subject`,
-    /// which cascades — so the deletion tests below exercise it on one, built
+    /// bounded to auxiliaries (a subject is deleted by `aux::delete_subject`,
+    /// which cascades), so the deletion tests below exercise it on one, built
     /// through the only API that can create one.
     async fn subject_with_acl(store: &OxigraphStore, subject: &ResourceUrl, turtle: &str) -> AuxUrl {
         put_rdf(store, subject, &[]).await.unwrap();
@@ -759,7 +757,7 @@ mod tests {
 
     // §4's "a writer cannot smuggle a blank node past the constructor" had a
     // test here while `Skolemized` wrapped `Quad`. `insert_marked` now takes
-    // `&[GroundQuad]`, so the expression that smuggles one does not compile —
+    // `&[GroundQuad]`, so the expression that smuggles one does not compile,
     // see `tests/unrepresentable.rs`.
 
     #[tokio::test]
@@ -773,7 +771,7 @@ mod tests {
         assert_eq!(got[0].predicate.as_str(), "http://schema.org/name");
     }
 
-    // §4, on the one path a client body actually takes: nothing before this
+    // §4, on the one path a client body takes: nothing before this
     // test writes a blank node through `put_rdf`, so a no-op `skolemize` or a
     // `put_rdf` that quietly dropped every triple whenever the body held a
     // blank node would both leave the suite green. The second triple, on a
@@ -845,7 +843,7 @@ mod tests {
         assert!(!found.contains(gone.graph_iri()));
     }
 
-    // An empty graph that is marked present is present — the same distinction
+    // An empty graph that is marked present is present, the same distinction
     // `exists` draws, and the reason presence is a stored fact rather than a
     // triple count.
     #[tokio::test]
@@ -885,7 +883,7 @@ mod tests {
         assert!(!delete_rdf(&store, &acl).await.unwrap(), "already gone");
     }
 
-    // An empty graph must be deletable too — otherwise it would be
+    // An empty graph must be deletable too, otherwise it would be
     // unreachable state: exists, but no way to remove it.
     #[tokio::test]
     async fn an_empty_graph_can_be_deleted() {
@@ -929,7 +927,7 @@ mod tests {
         assert!(!exists(&store, &foo).await.unwrap());
     }
 
-    // This state is not supposed to occur — every writer in this module goes
+    // This state is not supposed to occur, every writer in this module goes
     // through put_rdf/insert_marked, both of which write the marker in the
     // same update as the content. This test pins the fail-closed answer in
     // case it ever does: content with no marker reads as absent rather than
@@ -1003,7 +1001,7 @@ mod tests {
 
     // §3.2 invariant 4: a shelf the registry no longer lists is not litter, it
     // is content the next write to the same (resource, graph name) pair would
-    // INSERT INTO — so the resource would return triples nobody wrote.
+    // INSERT INTO, so the resource would return triples nobody wrote.
     #[tokio::test]
     async fn a_replacing_write_leaves_no_shelf_behind() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -1033,13 +1031,12 @@ mod tests {
     // the store directly, bypassing the registry entirely.
 
     // §3.2 invariant 4, probed directly. Unlike `a_replacing_write_leaves_no_shelf_behind`,
-    // graph A and graph B are different names, so the second `put_dataset`'s
-    // own drop loop (built from *this* write's shelves) cannot be the thing
-    // that empties A's shelf by re-dropping the same key it just wrote. Only
-    // the first loop — built from `registered_shelves`, i.e. what the
-    // registry said existed *before* this write — can drop A. So this test
-    // fails if that first loop is removed, where the existing same-name test
-    // does not.
+    // graph A and graph B are different names, so the second `put_dataset`'s own drop loop
+    // (built from *this* write's shelves) cannot be the thing that empties A's shelf by
+    // re-dropping the same key it just wrote. Only the first loop, built from
+    // `registered_shelves`, i.e. what the registry said existed *before* this write, can
+    // drop A. So this test fails if that first loop is removed, where the existing
+    // same-name test does not.
     #[tokio::test]
     async fn a_replacing_write_with_a_different_graph_name_leaves_the_old_shelf_empty() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -1065,7 +1062,7 @@ mod tests {
 
     // Module invariant at the top of this file: "existence is a stored fact,
     // not an inference from triple count." A dataset with no named graphs
-    // writes no `sys:hasSubgraph` registry entries — nothing here should let
+    // writes no `sys:hasSubgraph` registry entries, nothing here should let
     // that also skip the presence marker itself.
     #[tokio::test]
     async fn put_dataset_with_no_named_graphs_still_marks_presence() {
@@ -1104,7 +1101,7 @@ mod tests {
     // No test before this one writes default-graph content to the same
     // resource twice. `put_dataset`'s drop list includes `DROP SILENT GRAPH
     // <iri>` alongside the shelf drops precisely so the default graph is
-    // replaced rather than accumulated — this exercises that specific drop.
+    // replaced rather than accumulated, this exercises that specific drop.
     #[tokio::test]
     async fn a_second_default_graph_write_replaces_not_accumulates() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -1200,7 +1197,7 @@ mod tests {
     }
 
     // §3.1's invariant: a binary resource always has a stored media type.
-    // This state should not occur — one INSERT DATA writes both — so the test
+    // This state should not occur (one INSERT DATA writes both), so the test
     // pins the fail-closed answer for when it somehow does.
     #[tokio::test]
     async fn a_binary_resource_without_a_media_type_fails_closed() {
@@ -1222,8 +1219,8 @@ mod tests {
     }
 
     // §3.2.3's invariant: a shelf the registry lists must have a
-    // `sys:graphName`. This state should never occur — every writer of the
-    // registry writes both in the same update — but pins the fail-closed
+    // `sys:graphName`. This state should never occur (every writer of the
+    // registry writes both in the same update), but pins the fail-closed
     // answer for when it somehow does: refusing beats serving content under
     // a name `get_dataset` invented itself.
     #[tokio::test]
@@ -1237,7 +1234,7 @@ mod tests {
 
         put_dataset(&store, &blobs, &r, &ds, ttl).await.unwrap();
 
-        // Derived the same way the module itself derives it — never by
+        // Derived the same way the module itself derives it, never by
         // writing the string `"urn:quadpod:sys:"` here.
         let key = ShelfKey::of(&r, g.as_ref());
         let sys = sys_graph_iri(&r);
@@ -1254,7 +1251,7 @@ mod tests {
     }
 
     // §5.2: PUT replaces the representation including its kind. The assertion
-    // is against the BlobStore directly, not through the marker — reading back
+    // is against the BlobStore directly, not through the marker, reading back
     // through the registry is how `b4d2346` found orphans invisible.
     #[tokio::test]
     async fn writing_rdf_over_a_blob_removes_the_object() {
@@ -1339,9 +1336,9 @@ mod tests {
             "an untouched triple must survive: {rendered:?}");
     }
 
-    // §6 step 3. The mutant is the obvious implementation as one
-    // `DELETE … INSERT … WHERE`, which applies to EVERY match — it would pass
-    // a one-match test perfectly and silently rewrite both rows here.
+    // §6 step 3. The mutant is the obvious implementation as one `DELETE …
+    // INSERT … WHERE`, which applies to EVERY match. It would pass a
+    // one-match test perfectly and silently rewrite both rows here.
     #[tokio::test]
     async fn a_mapping_must_be_unique() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -1383,7 +1380,7 @@ mod tests {
     }
 
     // §6 step 5: the deletion-presence check IS the write's WHERE clause. The
-    // assertion that matters is the second one — a version that checks
+    // assertion that matters is the second one, a version that checks
     // presence in a separate query and then writes with DELETE DATA/INSERT
     // DATA reports the same status here and still performs the insertion.
     #[tokio::test]
@@ -1437,7 +1434,7 @@ mod tests {
         );
     }
 
-    // §5.1: a condition need not bind any variable — "does this exact triple
+    // §5.1: a condition need not bind any variable, "does this exact triple
     // exist" is the ordinary conditional-insert idiom. The counting query must
     // still be valid SPARQL when there is nothing to project.
     #[tokio::test]

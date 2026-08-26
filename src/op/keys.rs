@@ -33,20 +33,19 @@ pub enum KeyError {
 }
 
 /// The pod's signing keys, in publication order: the first key signs, all
-/// keys are served in the public JWKS. Every key has a `kid` — one missing
-/// in the file gets its RFC 7638 thumbprint at load time, so the `kid` is
-/// stable across restarts and deterministic for the same key. Every key is
-/// `EC` or `RSA`: a key of any other type is refused at load time rather than
+/// keys are served in the public JWKS. Every key has a `kid`, one missing in
+/// the file gets its RFC 7638 thumbprint at load time, so the `kid` is stable
+/// across restarts and deterministic for the same key. Every key is `EC` or
+/// `RSA`: a key of any other type is refused at load time rather than
 /// published with no algorithm the pod could sign it with.
 pub struct KeySet {
     keys: Vec<josekit::jwk::Jwk>,
 }
 
 impl KeySet {
-    /// The key set at `path`. A missing file is generated — one ES256
-    /// (P-256) key, written 0600 — mirroring `--rdf-store rocksdb:` creating
-    /// its directory. An existing file, read-only included, is never
-    /// rewritten.
+    /// The key set at `path`. A missing file is generated, one ES256 (P-256)
+    /// key, written 0600, mirroring `--rdf-store rocksdb:` creating its
+    /// directory. An existing file, read-only included, is never rewritten.
     pub fn load_or_generate(path: &Path) -> Result<Self, KeyError> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -140,9 +139,9 @@ impl KeySet {
         // built here: a key `josekit` cannot sign with (RSA without `alg`, an
         // EC curve other than P-256, `use` restricted away from signing)
         // would otherwise reach `sign_jwt` and panic on the first mint, long
-        // after start. Only the first key is held to this — the rest need
-        // only be publishable, which `to_public_key` above already decided,
-        // so a rotation state carrying a verify-only predecessor stays legal.
+        // after start. Only the first key is held to this, the rest need only
+        // be publishable, which `to_public_key` above already decided, so a
+        // rotation state carrying a verify-only predecessor stays legal.
         signer_for(&set.keys[0]).map_err(|e| KeyError::Malformed {
             path: path.into(),
             reason: e.to_string(),
@@ -179,9 +178,9 @@ impl KeySet {
     /// for the discovery document's
     /// `id_token_signing_alg_values_supported`.
     ///
-    /// A key carrying no `alg` still signs — an EC P-256 key signs `ES256`
-    /// — so its algorithm is inferred from the key itself rather than
-    /// omitted: a set of one such key would otherwise advertise no
+    /// A key carrying no `alg` still signs (an EC P-256 key signs
+    /// `ES256`), so its algorithm is inferred from the key itself rather
+    /// than omitted: a set of one such key would otherwise advertise no
     /// algorithm at all while the pod signs every token with it.
     pub fn signing_algs(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -210,7 +209,7 @@ impl KeySet {
 }
 
 /// The algorithm a key is published under: its declared `alg`, or the one
-/// its own members imply — `ES256` for an EC P-256 key, `RS256` for RSA.
+/// its own members imply, `ES256` for an EC P-256 key, `RS256` for RSA.
 /// `None` where neither rule applies (an EC curve other than P-256), since
 /// there is then no algorithm to advertise the key under.
 fn alg_of(jwk: &josekit::jwk::Jwk) -> Option<&str> {
@@ -222,7 +221,7 @@ fn alg_of(jwk: &josekit::jwk::Jwk) -> Option<&str> {
     }
 }
 
-/// The signer for `jwk`: `RS256` for a key declaring it, `ES256` otherwise —
+/// The signer for `jwk`: `RS256` for a key declaring it, `ES256` otherwise,
 /// the only two algorithms this pod signs with.
 ///
 /// One function so the probe in [`KeySet::load_or_generate`] and
@@ -248,13 +247,13 @@ pub(crate) fn remove_test_key_file(path: &std::path::Path) {
     std::fs::remove_file(path).ok();
 }
 
-/// The RFC 7638 thumbprint of `jwk`, base64url-encoded without padding — the
+/// The RFC 7638 thumbprint of `jwk`, base64url-encoded without padding, the
 /// `kid` a key in the file gets when it carries none.
 ///
 /// RFC 7638 §3.2 fixes the required members per key type: `crv`, `kty`, `x`,
 /// `y` for EC, `e`, `kty`, `n` for RSA. Those members and only those, as a
-/// JSON object with no whitespace and keys in lexicographic order, SHA-256'd
-/// — a `BTreeMap` through `serde_json` emits exactly that, the same
+/// JSON object with no whitespace and keys in lexicographic order, SHA-256'd,
+/// a `BTreeMap` through `serde_json` emits exactly that, the same
 /// construction the verifying side (`crate::auth::dpop`, `dpop-verifier`)
 /// uses, so a `kid` derived here is the same string a client computing this
 /// key's thumbprint arrives at.
@@ -393,7 +392,7 @@ mod tests {
     }
 
     /// An EC P-256 key with no `alg` loads and signs `ES256`, so that is
-    /// what the set — and the discovery document built from it — must
+    /// what the set, and the discovery document built from it, must
     /// advertise. Collecting only explicit `alg` members would publish an
     /// empty list for a pod that signs every token.
     #[test]

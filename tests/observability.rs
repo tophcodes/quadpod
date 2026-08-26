@@ -8,8 +8,8 @@
 //! Its own test binary, and therefore its own process, because `tracing`'s
 //! callsite-interest cache and max-level filter are global. A subscriber
 //! installed by one test while the rest of a binary is making requests sees
-//! whichever callsites happened to be registered first — this file installs
-//! one before anything runs and is the only thing running.
+//! whichever callsites happened to be registered first, this file installs one
+//! before anything runs and is the only thing running.
 //!
 //! The failing store decorator lives here for the reason `tests/call_budget.rs`
 //! states for its counting one: `docs/constraints.md` pins `SparqlStore` to a
@@ -35,7 +35,7 @@ use quadpod::{
 };
 use tower::ServiceExt;
 
-/// The message the armed store fails with — what the log must carry and the
+/// The message the armed store fails with, what the log must carry and the
 /// response must not.
 const BACKEND_MESSAGE: &str = "the disk went away";
 

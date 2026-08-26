@@ -1,6 +1,6 @@
 //! The HTTP layer's tests. They live in the crate because they reach private
-//! items of `http` — `classify`, `accept_write`, `put_status`,
-//! `allowed_methods`, `wac_allow_value` — which an integration binary under
+//! items of `http` (`classify`, `accept_write`, `put_status`,
+//! `allowed_methods`, `wac_allow_value`), which an integration binary under
 //! `tests/` cannot see. Each file below is one subject; [`fixture`] holds the
 //! `Fixture` and everything more than one of them needs.
 

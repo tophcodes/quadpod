@@ -29,7 +29,7 @@ async fn created_resource_advertises_the_acl_location() {
         .contains("https://pod.toph.so/.aux/foo.acl"));
 }
 
-// An ACL resource does not advertise an ACL of its own — it is governed
+// An ACL resource does not advertise an ACL of its own: it is governed
 // by acl:Control on its subject resource, and /.aux/.aux/foo.acl.acl
 // never exists.
 #[tokio::test]
@@ -58,7 +58,7 @@ async fn acl_resource_advertises_no_further_acl() {
 }
 
 // A client must not string-derive an auxiliary URL, so the advertisement
-// has to arrive before the auxiliary exists — that is exactly the moment
+// has to arrive before the auxiliary exists: that is exactly the moment
 // it needs it, to create the first one.
 #[tokio::test]
 async fn the_acl_link_is_advertised_even_when_the_acl_does_not_exist() {

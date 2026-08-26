@@ -1,9 +1,9 @@
 //! Bootstrap of the root ACL.
 //!
 //! WAC has no implicit grants: with no ACL anywhere, the PRP walk terminates
-//! empty and every request is denied — including the owner's, which would
-//! make a fresh pod unusable. Provisioning writes the one authorization that
-//! makes the pod owner's own pod reachable.
+//! empty and every request is denied, including the owner's, which would make
+//! a fresh pod unusable. Provisioning writes the one authorization that makes
+//! the pod owner's own pod reachable.
 //!
 //! There is deliberately no owner bypass in `super::guard`: after this runs,
 //! the ACL alone decides. An owner who deletes their own `acl:Control` rule
@@ -11,7 +11,7 @@
 //! deleted) root ACL is worse: existence is a stored marker independent of
 //! triple count (see `resource::exists`), so an empty ACL still exists, still
 //! wins over the ancestor fallback it would otherwise have, and grants
-//! Control to nobody — not even the owner. `DELETE /.aux/.acl` needs Control
+//! Control to nobody, not even the owner. `DELETE /.aux/.acl` needs Control
 //! on `/`, which that same empty ACL just revoked from everyone, so there is
 //! no HTTP route back and restarting the server does not re-provision either:
 //! the existence check below is what makes provisioning idempotent, and it
@@ -44,13 +44,13 @@ use super::pdp::{
 ///
 /// `reset` is the `--reset-root-acl` / `POD_RESET_ROOT_ACL` operator escape
 /// hatch (see the module docs): when set, it overwrites whatever is there,
-/// existing or not — the one way back from a root ACL that grants Control to
+/// existing or not, the one way back from a root ACL that grants Control to
 /// nobody. Threaded in as a plain parameter rather than read from `Config`
-/// here, so this function has exactly one place — its caller — that decides
+/// here, so this function has exactly one place, its caller, that decides
 /// whether a reset was asked for.
 ///
 /// `aux::put` refuses to write an auxiliary whose subject does not exist, and
-/// the root ACL's subject is the root container — so this ensures the root
+/// the root ACL's subject is the root container, so this ensures the root
 /// container first rather than trusting the caller to have done so. `main.rs`
 /// already calls `provision_root` before this, but a caller that got the
 /// order wrong must not silently produce an unreachable pod.
@@ -116,7 +116,7 @@ mod tests {
 
     fn sp() -> StorageSpace { StorageSpace::new("https://pod.toph.so/").unwrap() }
 
-    /// Probe a guard for `path` as `agent`, panicking on a store failure —
+    /// Probe a guard for `path` as `agent`, panicking on a store failure,
     /// these tests read `provision_root_acl`'s effect through the same
     /// enforcement point a request would.
     async fn guard_for<'a>(store: &'a OxigraphStore, agent: Agent, path: &str) -> Guard<'a> {
@@ -188,7 +188,7 @@ mod tests {
     // Finding 1b. The scenario the flag exists for: an emptied root ACL
     // still exists (existence is a stored marker, not a triple count), so it
     // still wins over the fallback it would otherwise provide and grants
-    // Control to nobody, not even the owner — there is no HTTP route back.
+    // Control to nobody, not even the owner: there is no HTTP route back.
     // `reset: true` is the only thing that gets the owner's grant back.
     #[tokio::test]
     async fn reset_flag_overwrites_an_emptied_root_acl() {
@@ -201,7 +201,7 @@ mod tests {
         let g = sp().root().as_resource().aux(AuxKind::Acl).graph_iri().to_string();
         store.update(&format!("DELETE WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}")).await.unwrap();
 
-        // Without the flag, the owner stays locked out — this is the bug the
+        // Without the flag, the owner stays locked out: this is the bug the
         // flag exists to escape, pinned here so the counterweight below means
         // something.
         provision_root_acl(&store, &sp(), &owner(), false).await.unwrap(); // restart, no flag
@@ -248,7 +248,7 @@ mod tests {
     // The WebID is interpolated into Turtle; an unvalidated one would be an
     // injection vector (the Plan-1 lesson). No runtime test remains for this:
     // `owner_webid: &NamedNode` makes `provision_root_acl("not an iri> } ; DROP
-    // ALL ; #", ...)` a compile error rather than a runtime rejection — the
-    // expression that would exercise it does not compile, the same shape as
-    // the invariants in `tests/unrepresentable.rs`.
+    // ALL ; #", ...)` a compile error rather than a runtime rejection, the
+    // expression that would exercise it does not compile, the same shape as the
+    // invariants in `tests/unrepresentable.rs`.
 }

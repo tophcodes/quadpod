@@ -24,14 +24,14 @@ const SH_VIOLATION: &str = "http://www.w3.org/ns/shacl#Violation";
 ///
 /// `rudof_lib` pulls in `oxhttp` and `ShaclValidationMode::Native` does not
 /// disable SHACL-SPARQL, so a shape carrying `sh:sparql [ sh:select "…
-/// SERVICE <http://169.254.169.254/…> …" ]` makes this pod issue that
-/// request and echoes the response back as `sh:value` in the report — a
-/// blind write of a shapes document turns into server-side request forgery
-/// with exfiltration, entirely outside `auth::safe_fetch` (issue #6).
-/// Checked against the parsed graph, not the query text: a blocklist over a
-/// query language this pod does not implement is not a defence, and every
-/// SHACL-SPARQL embedding — a constraint, a target, a rule (`sh:SPARQLRule`),
-/// or an update executable (`sh:SPARQLUpdateExecutable`) — names its query
+/// SERVICE <http://169.254.169.254/…> …" ]` makes this pod issue that request
+/// and echoes the response back as `sh:value` in the report, a blind write of
+/// a shapes document turns into server-side request forgery with
+/// exfiltration, entirely outside `auth::safe_fetch` (issue #6). Checked
+/// against the parsed graph, not the query text: a blocklist over a query
+/// language this pod does not implement is not a defence, and every
+/// SHACL-SPARQL embedding, a constraint, a target, a rule (`sh:SPARQLRule`),
+/// or an update executable (`sh:SPARQLUpdateExecutable`), names its query
 /// through one of these five predicates.
 const SH_SPARQL: &str = "http://www.w3.org/ns/shacl#sparql";
 const SH_SELECT: &str = "http://www.w3.org/ns/shacl#select";
@@ -41,7 +41,7 @@ const SH_CONSTRUCT: &str = "http://www.w3.org/ns/shacl#construct";
 /// `sh:SPARQLUpdateExecutable`'s query predicate (SHACL-AF).
 const SH_UPDATE: &str = "http://www.w3.org/ns/shacl#update";
 
-/// Whether `triples` mentions SHACL-SPARQL anywhere — as the predicate that
+/// Whether `triples` mentions SHACL-SPARQL anywhere, as the predicate that
 /// carries a query, or as an object, so a shape naming one of these terms
 /// indirectly (for instance through a property path) is refused too.
 fn mentions_shacl_sparql(triples: &[oxigraph::model::Triple]) -> bool {
@@ -71,7 +71,7 @@ pub enum ShapeError {
 ///
 /// Held as a [`Dataset`] rather than as rudof's own type because the same
 /// value is both the thing decisions are read off and the thing served to a
-/// client — and serving it goes through this pod's one serializer.
+/// client, and serving it goes through this pod's one serializer.
 pub struct Report(Dataset);
 
 impl Report {
@@ -110,7 +110,7 @@ fn turtle() -> Format {
 ///
 /// Both documents cross the boundary as Turtle text. rudof reads and writes
 /// its own serializations, and going through text keeps this pod's parser the
-/// only thing that ever builds a [`Dataset`] — including the one built from
+/// only thing that ever builds a [`Dataset`], including the one built from
 /// the report.
 pub fn validate(shapes_turtle: &str, body: &Dataset) -> Result<Report, ShapeError> {
     let data = turtle()
@@ -169,7 +169,7 @@ pub struct Shape {
 ///
 /// The binding does not inherit: this reads `container`'s own graph and
 /// walks nowhere. A document outside this pod's space is refused rather than
-/// fetched — shapes are data here, not links.
+/// fetched: a shape is data here rather than a link.
 pub async fn load(
     store: &dyn SparqlStore,
     space: &StorageSpace,
@@ -178,10 +178,10 @@ pub async fn load(
     let container_iri = container.graph_iri();
     // The one predicate, about `container` itself and nothing else. A bare
     // `CONSTRUCT { ?s ?p ?o }` over the whole container graph is O(members),
-    // because `ldp:contains` lives in that same graph — paid on every write,
+    // because `ldp:contains` lives in that same graph, paid on every write,
     // including into a container that binds no shape at all. Fixing the
     // subject also means a triple stated about some *other* subject that
-    // happens to sit in this graph — `<#other> ldp:constrainedBy <x>` — does
+    // happens to sit in this graph, `<#other> ldp:constrainedBy <x>`, does
     // not bind the container it never named.
     let triples: Vec<oxigraph::model::Triple> = store
         .query_triples(&format!(
@@ -190,14 +190,14 @@ pub async fn load(
         ))
         .await
         .map_err(ResourceError::from)?;
-    // `Ok(None)` below covers two different states of `container` — one
+    // `Ok(None)` below covers two different states of `container` (one
     // that exists but carries no binding, and one that does not exist at
-    // all — because both mean the same thing to a caller: nothing
+    // all), because both mean the same thing to a caller: nothing
     // constrains writes here. The query above answers empty for both, so
     // there is nothing further to distinguish.
     //
-    // A binding whose object is not an IRI — `<> ldp:constrainedBy
-    // "not-an-iri"` — is refused rather than silently dropped: the author
+    // A binding whose object is not an IRI, `<> ldp:constrainedBy
+    // "not-an-iri"`, is refused rather than silently dropped: the author
     // stated a binding this pod cannot use, which is the same not-knowing
     // that makes a broken constraint document fail closed (§3.1). Dropping
     // it would let a container that carries only such a binding read as
@@ -213,7 +213,7 @@ pub async fn load(
             }
         }
     }
-    // Exactly one binding, or none — never a pick among several. The
+    // Exactly one binding, or none, never a pick among several. The
     // triples come back from a `CONSTRUCT` with no `ORDER BY`, so "the
     // first one" would be an artefact of the store's term ordering rather
     // than anything the author expressed. Two bindings mean the author
@@ -233,7 +233,7 @@ pub async fn load(
     };
 
     // `strip_prefix` alone confuses `https://pod.toph.so/x` with
-    // `https://pod.toph.so.evil.example/x` — the latter also starts with the
+    // `https://pod.toph.so.evil.example/x`, the latter also starts with the
     // trimmed base as a byte string. The remainder must begin with `/`, the
     // boundary a same-origin path always has, or the IRI names a different
     // origin entirely.
@@ -248,7 +248,7 @@ pub async fn load(
     // because nothing downstream decodes `rest` either: the resource it
     // resolves to has a graph IRI built byte-for-byte from `rest`, so it is
     // byte-identical to the IRI the client wrote. Two distinct stored IRIs
-    // therefore always resolve to two distinct graphs — no percent-encoding
+    // therefore always resolve to two distinct graphs, no percent-encoding
     // variant can alias one stored binding onto a graph a different IRI
     // names.
     let Ok(Target::Resource(r)) = space.resolve(rest) else {
@@ -262,8 +262,8 @@ pub async fn load(
             // `kind_of` and this read are two separate store reads, so the
             // document can be deleted in between. Falling back to an empty
             // shapes graph here would make the write it was meant to
-            // constrain pass trivially — an empty SHACL graph conforms
-            // unconditionally — turning a fail-closed feature fail-open.
+            // constrain pass trivially, an empty SHACL graph conforms
+            // unconditionally, turning a fail-closed feature fail-open.
             // Report the same `Missing` a document that was never there
             // reports, rather than tolerate the race.
             let triples = get_rdf(store, &r).await?.ok_or(ShapeError::Missing)?;
@@ -455,7 +455,7 @@ mod tests {
     }
 
     /// Two bindings on one container state two policies, and the server has
-    /// no honest way to choose between them (§3.1) — refused, not resolved
+    /// no honest way to choose between them (§3.1), refused, not resolved
     /// by whichever triple the store happens to return first.
     #[tokio::test]
     async fn two_bindings_on_one_container_are_unsupported() {
@@ -475,7 +475,7 @@ mod tests {
     }
 
     /// A binding whose object is a literal, not an IRI, must not be dropped
-    /// as if the container carried no binding at all — §3.1's fail-closed
+    /// as if the container carried no binding at all, §3.1's fail-closed
     /// argument for a broken constraint document applies equally here: the
     /// author stated a binding this pod cannot use, so a write that should
     /// have been checked must not silently proceed unvalidated.
@@ -518,10 +518,10 @@ mod tests {
     /// The classic prefix-confusion bug: `https://pod.toph.so.evil.example/x`
     /// starts with `https://pod.toph.so` as a byte string, but is a different
     /// origin entirely. Without the `starts_with('/')` guard, the stripped
-    /// remainder — `.evil.example/x` — happens to still get refused, by
+    /// remainder, `.evil.example/x`, happens to still get refused, by
     /// `StorageSpace::resolve`'s unrelated rooted-path check. The guard
-    /// exists so the origin boundary is stated here, at the point it
-    /// matters, rather than relying on that incidental rejection elsewhere.
+    /// exists so the origin boundary is stated here, at the point it matters,
+    /// rather than relying on that incidental rejection elsewhere.
     #[tokio::test]
     async fn a_domain_confusable_constraint_document_is_unsupported() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -540,7 +540,7 @@ mod tests {
     }
 
     /// SHACL-SPARQL turns a shapes document into an SSRF primitive with the
-    /// response echoed back in the report — `sh:sparql`/`sh:select` here
+    /// response echoed back in the report, `sh:sparql`/`sh:select` here
     /// stands in for the reachable-metadata-endpoint case the review
     /// demonstrated. Refused before rudof ever sees the query.
     const EVIL_SHAPE_SPARQL: &str = r#"
@@ -578,11 +578,11 @@ mod tests {
     }
 
     /// SHACL-AF's `sh:SPARQLRule` names its query through `sh:construct`, not
-    /// through `sh:sparql`/`sh:select`/`sh:ask` — a shape carrying one is just
+    /// through `sh:sparql`/`sh:select`/`sh:ask`, a shape carrying one is just
     /// as capable of a `SERVICE`-based SSRF as `EVIL_SHAPE_SPARQL` above, and
     /// stays safe today only because rudof 0.3.7 does not execute rules. That
-    /// is an upstream property, not one this code enforces, so the refusal
-    /// has to cover this predicate too rather than lean on it.
+    /// is an upstream property, not one this code enforces, so the refusal has
+    /// to cover this predicate too rather than lean on it.
     const EVIL_SHAPE_SPARQL_RULE: &str = r#"
         @prefix sh: <http://www.w3.org/ns/shacl#> .
         <http://example.org/EvilRuleShape> a sh:NodeShape ;
@@ -617,7 +617,7 @@ mod tests {
         assert!(matches!(load(&store, &sp, &c).await, Err(ShapeError::Unsupported(_))));
     }
 
-    /// The refusal is specific to SHACL-SPARQL — an ordinary Core shape,
+    /// The refusal is specific to SHACL-SPARQL, an ordinary Core shape,
     /// which is all this design supports, still loads.
     #[tokio::test]
     async fn an_ordinary_core_shape_still_loads() {
@@ -645,7 +645,7 @@ mod tests {
     }
 
     /// The narrowed lookup fixes the predicate to `LDP_CONSTRAINED_BY` *and*
-    /// the subject to the container's own IRI — a binding some other subject
+    /// the subject to the container's own IRI, a binding some other subject
     /// happens to carry in this graph must not constrain the container.
     #[tokio::test]
     async fn a_binding_on_another_subject_does_not_bind_the_container() {
@@ -665,7 +665,7 @@ mod tests {
         assert!(load(&store, &sp, &c).await.unwrap().is_none());
     }
 
-    /// A shape written with a blank node — `sh:property [ … ]` — must not
+    /// A shape written with a blank node, `sh:property [ … ]`, must not
     /// surface the skolem IRI this pod minted for it (§3.2.2): it is this
     /// pod's bookkeeping, not the client's, and it is not stable across a
     /// re-PUT of the same document.

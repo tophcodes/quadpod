@@ -63,7 +63,7 @@ async fn authenticated_stranger_is_403() {
     assert_eq!(stranger_app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
 
-// The denial must not depend on whether the resource exists — otherwise
+// The denial must not depend on whether the resource exists, otherwise
 // the status code is an existence oracle for the whole namespace.
 #[tokio::test]
 async fn denial_does_not_reveal_existence() {
@@ -119,18 +119,18 @@ async fn owner_can_grant_another_agent_read_via_an_acl() {
     assert_eq!(bob_app.oneshot(read_acl).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
 
-// Most of this suite authenticates as OWNER, who holds every
-// mode through the root ACL — so a test suite built only from those
-// could never notice if put_impl's parent-Append check were deleted.
-// Bob here holds Write on the (not yet existing) target resource
-// directly, but nothing at all on its parent container, so creation
-// must still be refused.
+// Most of this suite authenticates as OWNER, who holds every mode
+// through the root ACL, so a test suite built only from those could
+// never notice if put_impl's parent-Append check were deleted. Bob here
+// holds Write on the (not yet existing) target resource directly, but
+// nothing at all on its parent container, so creation must still be
+// refused.
 #[tokio::test]
 async fn creating_a_resource_needs_append_on_the_parent_not_just_write_on_the_target() {
     let f = fixture().await;
     let bob = "https://bob.example/card#me";
     // Grant Bob Write on /newfile before it exists. That grant has to
-    // come from the ROOT ACL's `acl:default` — a direct /.aux/newfile.acl
+    // come from the ROOT ACL's `acl:default`, a direct /.aux/newfile.acl
     // cannot be created for a resource that does not exist yet (see
     // `acl_for_a_resource_that_does_not_exist_is_refused`). It also has
     // to be `acl:default` only: Bob must end up with Write on the child
@@ -187,13 +187,13 @@ async fn deleting_a_resource_needs_write_on_the_parent_not_just_the_target() {
     assert_eq!(bob_app.oneshot(del).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
 
-// post_impl's container-level check requires Mode::Append specifically
-// — Read must not be enough to POST. Bob is granted Read directly on the
+// post_impl's container-level check requires Mode::Append specifically,
+// Read must not be enough to POST. Bob is granted Read directly on the
 // container (via acl:accessTo) and, separately, Append inherited BY ITS
 // CHILDREN (via acl:default) so that if the container-level Append
-// requirement were weakened to Read, the request would sail through
-// this test's own child-level check too and the mutation would be
-// caught turning FORBIDDEN into CREATED.
+// requirement were weakened to Read, the request would sail through this
+// test's own child-level check too and the mutation would be caught
+// turning FORBIDDEN into CREATED.
 #[tokio::test]
 async fn posting_into_a_container_needs_append_not_just_read() {
     let f = fixture().await;
@@ -226,10 +226,10 @@ async fn posting_into_a_container_needs_append_not_just_read() {
 
 // This test used to assert a 400: an empty body meant DROP-and-insert-
 // nothing, so "revoke everything" left no ACL behind and the walk resumed
-// at the root — a revoke that WIDENED access. Existence is a stored fact
+// at the root, a revoke that WIDENED access. Existence is a stored fact
 // now, so the same request means what it says: an ACL that grants
 // nothing, which no ancestor can override. The property under test is
-// unchanged — an empty ACL must never widen access — only the mechanism
+// unchanged, an empty ACL must never widen access, only the mechanism
 // that delivers it.
 #[tokio::test]
 async fn an_emptied_acl_revokes_rather_than_falling_back_to_the_ancestor() {
@@ -259,8 +259,8 @@ async fn an_emptied_acl_revokes_rather_than_falling_back_to_the_ancestor() {
         .body(Body::from("")).unwrap();
     assert_eq!(f.app.clone().oneshot(wipe).await.unwrap().status(), StatusCode::CREATED);
 
-    // The ACL still exists — it is now the policy "nothing is granted
-    // here" — so the walk stops at it and the root's acl:default rules
+    // The ACL still exists (it is now the policy "nothing is granted
+    // here"), so the walk stops at it and the root's acl:default rules
     // never come back into play.
     assert_eq!(
         f.stored("/.aux/box/.acl").await,
@@ -277,7 +277,7 @@ async fn an_emptied_acl_revokes_rather_than_falling_back_to_the_ancestor() {
     assert_eq!(bob_app.oneshot(write).await.unwrap().status(), StatusCode::FORBIDDEN);
 
     // ...and the owner locked themselves out of the subtree too, which is
-    // what an empty ACL means — including of DELETE, which needs Control
+    // what an empty ACL means, including of DELETE, which needs Control
     // here and this ACL grants that to nobody, not even the owner. There
     // is no HTTP route back for a subtree ACL emptied this way; only the
     // root has an operator-level escape hatch (`--reset-root-acl`, see
@@ -302,7 +302,7 @@ async fn empty_body_put_on_a_container_still_creates_it() {
 }
 
 // Creating /box/sub/file also CREATES /box/sub/ and writes a containment
-// triple into /box/ — a container Bob holds nothing on. Bob's grant here
+// triple into /box/, a container Bob holds nothing on. Bob's grant here
 // is acl:default only, i.e. "everything below /box/", deliberately
 // without acl:accessTo </box/>. Checking only the immediate parent lets
 // him mutate /box/ anyway: its content and ETag change and it stops being
@@ -347,7 +347,7 @@ async fn creating_a_deep_resource_needs_append_on_every_ancestor_it_materializes
 
     // Sanity, and the proof that the refusal was about mutating /box/ and
     // nothing else: once the owner has created /box/sub/ himself, the very
-    // same request from Bob succeeds — his Write on the target and Append
+    // same request from Bob succeeds, his Write on the target and Append
     // on /box/sub/ were never in doubt, and /box/ is no longer touched.
     let mk_sub = f.owner_request("PUT", "/box/sub/")
         .header(header::CONTENT_TYPE, "text/turtle")
@@ -356,12 +356,12 @@ async fn creating_a_deep_resource_needs_append_on_every_ancestor_it_materializes
     assert_eq!(bob_app.oneshot(deep()).await.unwrap().status(), StatusCode::CREATED);
 }
 
-// The other half of `Guard::materialize`'s exemption, and the one
-// that makes calling it unconditionally safe: overwriting a resource that
+// The other half of `Guard::materialize`'s exemption, and the one that
+// makes calling it unconditionally safe: overwriting a resource that
 // already exists adds no containment triple its parent does not already
 // hold, so it must NOT start demanding `Append` there. Bob here holds
 // Read+Write on one document and deliberately nothing on the container
-// around it — the ordinary "you may edit this file" grant. Without the
+// around it, the ordinary "you may edit this file" grant. Without the
 // `is_member` half of the exemption (false whenever the target already
 // exists) every such edit would 403.
 #[tokio::test]
@@ -392,8 +392,8 @@ async fn overwriting_an_existing_resource_needs_no_append_on_its_container() {
         .body(Body::from(doc_acl_body)).unwrap();
     assert_eq!(f.app.clone().oneshot(put_doc_acl).await.unwrap().status(), StatusCode::CREATED);
 
-    // Sanity: Bob genuinely has no Append on /box/, so the CREATED below
-    // really is the exemption doing the work.
+    // Sanity: Bob holds no Append on /box/, so the CREATED below
+    // is the exemption doing the work.
     let bob_app = f.app_also_trusting(bob);
     let sanity = f.sign(Request::builder().method("POST").uri("/box/"), bob, "POST", "/box/")
         .header(header::CONTENT_TYPE, "text/turtle")
@@ -410,22 +410,21 @@ async fn overwriting_an_existing_resource_needs_no_append_on_its_container() {
 // An auxiliary is never a containment member, so it can OUTLIVE the
 // container it sits in. A PUT to such an orphan re-runs the ancestor
 // walk, which materializes that container again and writes a fresh
-// `ldp:contains` triple into ITS parent — here the root. The write must
+// `ldp:contains` triple into ITS parent, here the root. The write must
 // still be authorized level by level, even though the caller passed the
 // check on the target itself.
 //
 // The orphan is `/box/doc`'s ACL. It is the shape that keeps Bob
 // authorized on the target after his delegation is revoked: the guard's
-// nearest-ACL search finds that ACL directly — the document Bob wrote
-// about himself — with no ancestor ever consulted. That is precisely the
-// case that matters — Bob
-// passes the target check on his own say-so and must still be stopped
-// from touching `/`.
+// nearest-ACL search finds that ACL directly, the document Bob wrote
+// about himself, with no ancestor ever consulted. That is precisely the
+// case that matters, Bob passes the target check on his own say-so and
+// must still be stopped from touching `/`.
 //
 // No HTTP route produces this orphan: `aux::delete_subject` takes every
 // auxiliary with its subject, by construction. It is fabricated at the
 // store level below, and the guard this test pins stays load-bearing
-// defence-in-depth regardless — it must refuse to serve a write into this
+// defence-in-depth regardless. It must refuse to serve a write into this
 // state however the store ends up in it.
 #[tokio::test]
 async fn put_to_an_orphaned_auxiliary_still_needs_append_on_what_it_materializes() {
@@ -439,8 +438,8 @@ async fn put_to_an_orphaned_auxiliary_still_needs_append_on_what_it_materializes
         assert_eq!(f.app.clone().oneshot(mk).await.unwrap().status(), StatusCode::CREATED);
     }
 
-    // The delegation: Bob may manage access below /box/ and nothing else
-    // — no Append on /box/, nothing at all on /.
+    // The delegation: Bob may manage access below /box/ and nothing
+    // else, no Append on /box/, nothing at all on /.
     let box_acl_body = format!(
         "<#owner> <http://www.w3.org/ns/auth/acl#agent> <{OWNER}> ; \
          <http://www.w3.org/ns/auth/acl#accessTo> <https://pod.toph.so/box/> ; \
@@ -502,7 +501,7 @@ async fn put_to_an_orphaned_auxiliary_still_needs_append_on_what_it_materializes
     );
 
     // Sanity: Bob's own document still grants him Control over its
-    // subject, so he really does pass the check on the target itself. A
+    // subject, so he passes the check on the target itself. A
     // FORBIDDEN below would otherwise prove nothing.
     let read = f.sign(
             Request::builder().method("GET").uri("/.aux/box/doc.acl"), bob, "GET", "/.aux/box/doc.acl")
@@ -527,7 +526,7 @@ async fn put_to_an_orphaned_auxiliary_still_needs_append_on_what_it_materializes
 }
 
 // The counterweight to the test above: an agent holding Append on one
-// container and NOTHING anywhere else — in particular nothing on `/` —
+// container and NOTHING anywhere else, in particular nothing on `/`,
 // must still be able to POST into it. If the ancestor walk did not stop
 // at the first existing container, this is the flow it would break.
 #[tokio::test]
@@ -567,8 +566,8 @@ async fn append_only_agent_can_still_post_into_its_inbox() {
 // A POST authorizes an operation on the CONTAINER: the server allocates the
 // child's name, so `acl:accessTo` on the container is the only grant a client
 // can be expected to hold for it. This is the shape node-solid-server ships as
-// the default inbox ACL of every new pod — `acl:accessTo <./>; acl:mode
-// acl:Append`, with no `acl:default` anywhere — so refusing it would make the
+// the default inbox ACL of every new pod (`acl:accessTo <./>; acl:mode
+// acl:Append`, with no `acl:default` anywhere), so refusing it would make the
 // canonical Solid inbox unusable.
 //
 // WAC's create rule reads "on the resource to be created", which taken alone
@@ -605,7 +604,7 @@ async fn post_needs_only_access_to_append_on_the_container() {
 }
 
 // The other direction of the same rule, and the reason the check above cannot
-// simply be dropped in favour of the child's: an `acl:default` grant says what
+// be dropped in favour of the child's: an `acl:default` grant says what
 // the container's MEMBERS allow, not what may be added to the container. A
 // caller holding Append only through `acl:default` may write an existing child
 // it reaches that way, but may not create a new one.
@@ -643,9 +642,8 @@ async fn post_is_refused_when_append_is_granted_only_to_the_children() {
 // ancestor hands down through acl:default. If deleting the resource also
 // deleted that ACL, an agent holding merely Write could remove the
 // narrowing, recreate the resource, and have the guard's nearest-ACL
-// search walk back up to the wider ancestor grant — escalating themselves
-// to Control without
-// ever being allowed to touch the ACL directly.
+// search walk back up to the wider ancestor grant, escalating themselves
+// to Control without ever being allowed to touch the ACL directly.
 #[tokio::test]
 async fn deleting_a_resource_needs_control_over_the_acl_it_would_cascade_into() {
     let f = fixture().await;
@@ -698,7 +696,7 @@ async fn deleting_a_resource_needs_control_over_the_acl_it_would_cascade_into() 
 
     let bob_app = f.app_also_trusting(bob);
 
-    // Sanity: Bob really does hold Write on the log — he may edit it. A
+    // Sanity: Bob holds Write on the log, he may edit it. A
     // FORBIDDEN below would otherwise prove nothing.
     let edit = f.sign(Request::builder().method("PUT").uri("/projects/audit-log"), bob, "PUT", "/projects/audit-log")
         .header(header::CONTENT_TYPE, "text/turtle")

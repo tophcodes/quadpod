@@ -23,7 +23,7 @@ async fn put_deep_resource_creates_ancestor_containment() {
         .body(Body::from("<#it> <http://schema.org/name> \"x\" .")).unwrap();
     assert_eq!(f.app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
 
-    // GET the parent container /a/b/ — it must list the doc via ldp:contains
+    // GET the parent container /a/b/. It must list the doc via ldp:contains
     let get = f.owner_request("GET", "/a/b/")
         .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();
     let res = f.app.oneshot(get).await.unwrap();
@@ -128,7 +128,7 @@ async fn post_with_slug_creates_named_child() {
 
 // A `Slug` names a child of the container POSTed to, so at the root it can
 // aim straight at a reserved segment. `classify` refuses both names, so the
-// POST answers `404` and allocates nothing — including with the `Link:
+// POST answers `404` and allocates nothing, including with the `Link:
 // rel="type"` container form, which is the shape `/.well-known/` itself
 // would take. Without the space-level reservation the `.well-known` row
 // would be a `201` for a resource the `/.well-known/` routes shadow on GET
@@ -165,7 +165,7 @@ async fn post_slug_collision_gets_distinct_url() {
 
 // LDP §5.2.3.4: a POST whose `Link: rel="type"` names a container asks for
 // a container, and Solid §3.1 makes the trailing slash the only thing that
-// distinguishes the two — so the allocated name must carry it.
+// distinguishes the two, so the allocated name must carry it.
 #[tokio::test]
 async fn post_with_container_type_link_creates_a_container() {
     let f = fixture().await;
@@ -193,7 +193,7 @@ async fn post_with_container_type_link_creates_a_container() {
 }
 
 // A `Slug` is a hint, and §3.1 makes the other half of a slash pair as
-// unavailable as the name itself — so a POSTed container whose name is
+// unavailable as the name itself, so a POSTed container whose name is
 // held by an existing *resource* gets another name, not the `409` a
 // client-named PUT would get. Same rule `Guard::is_taken` already applies
 // in the other direction.
@@ -236,13 +236,13 @@ async fn posted_container_may_not_set_containment() {
     assert_eq!(f.app.oneshot(get).await.unwrap().status(), StatusCode::NOT_FOUND);
 }
 
-// This test used to assert a 400 with the reasoning that an empty body
-// left the container linking a child that did not exist — the child 404d
-// forever and a later DELETE never reached the containment removal. Existence
-// is a stored fact now, so the created child exists, is listed, is
-// readable and is deletable; the dangling-link hazard the 400 defended
-// against is gone, and what remains is a resource with no triples, which
-// is exactly what an empty body says.
+// This test used to assert a 400 with the reasoning that an empty body left
+// the container linking a child that did not exist, the child 404d forever
+// and a later DELETE never reached the containment removal. Existence is a
+// stored fact now, so the created child exists, is listed, is readable and is
+// deletable; the dangling-link hazard the 400 defended against is gone, and
+// what remains is a resource with no triples, which is exactly what an empty
+// body says.
 #[tokio::test]
 async fn post_empty_body_creates_an_empty_child_that_is_really_there() {
     let f = fixture().await;
@@ -260,7 +260,7 @@ async fn post_empty_body_creates_an_empty_child_that_is_really_there() {
     assert_eq!(res.headers().get(header::LOCATION).unwrap(), "https://pod.toph.so/inbox/note");
     assert_eq!(f.stored("/inbox/note").await, Some(Vec::new()), "an empty child exists");
 
-    // It is listed, readable, and — the part that used to be impossible —
+    // It is listed, readable, and, the part that used to be impossible,
     // removable, which leaves the container deletable again.
     let get = f.owner_request("GET", "/inbox/")
         .header(header::ACCEPT, "text/turtle").body(Body::empty()).unwrap();

@@ -33,7 +33,7 @@ async fn a_directional_literal_needs_a_declaration() {
     assert_eq!(declared.status(), StatusCode::CREATED, "{}", declared.status());
 }
 
-/// §6: an unrecognised label is not a silent fallback to 1.1 — a client
+/// §6: an unrecognised label is not a silent fallback to 1.1, a client
 /// that named a version this server does not know must not be quietly
 /// served a different one.
 #[tokio::test]
@@ -47,7 +47,7 @@ async fn an_unknown_version_label_is_a_415() {
 }
 
 /// §6, the conflict that protects §5's read. Without it, GET as 1.1,
-/// edit, PUT back deletes every triple term with a 2xx and no warning —
+/// edit, PUT back deletes every triple term with a 2xx and no warning:
 /// the read-side projection must not become the template for its own
 /// destruction. Mirrors §6.2.1's named-graph refusal exactly.
 #[tokio::test]
@@ -156,7 +156,7 @@ async fn a_put_carrying_a_triple_term_is_a_400() {
 }
 
 // §2.1's refusal has to hold in both parsers that can build a `Dataset`:
-// `Format::parse` above, and here `patch::Patch::parse` — the only other
+// `Format::parse` above, and here `patch::Patch::parse`, the only other
 // way a triple term could reach the store, since a patch body never goes
 // through `Format::parse` at all.
 #[tokio::test]

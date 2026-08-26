@@ -16,20 +16,19 @@ pub fn body_sets_containment(triples: &[Triple]) -> bool {
     triples.iter().any(|t| t.predicate.as_str() == LDP_CONTAINS)
 }
 
-/// `triples` minus the two things this pod adds to a container's stored
-/// graph on write: `ldp:contains` (accumulated by [`add_containment`]) and
-/// the `rdf:type` pair [`ensure_container`] asserts about `container_iri`,
-/// the container's own IRI. What remains is exactly the graph a `PUT`/`POST`
-/// into this container was validated against — shape validation runs on the
-/// client's own body, before either is added
-/// (`docs/architecture.md`, Writing).
+/// `triples` minus the two things this pod adds to a container's stored graph
+/// on write: `ldp:contains` (accumulated by [`add_containment`]) and the
+/// `rdf:type` pair [`ensure_container`] asserts about `container_iri`, the
+/// container's own IRI. What remains is exactly the graph a `PUT`/`POST` into
+/// this container was validated against, shape validation runs on the client's
+/// own body, before either is added (`docs/architecture.md`, Writing).
 ///
 /// The `rdf:type` pair is filtered only on `container_iri`: `ensure_container`
 /// never asserts it about any other subject, so a client-authored `<other> a
-/// ldp:Container` — which the write path validated and accepted — must
-/// survive here too. `ldp:contains` stays subject-agnostic: a client body
-/// carrying it is rejected by `body_sets_containment` before it is ever
-/// stored, so no client-authored occurrence reaches this function.
+/// ldp:Container`, which the write path validated and accepted, must survive
+/// here too. `ldp:contains` stays subject-agnostic: a client body carrying it
+/// is rejected by `body_sets_containment` before it is ever stored, so no
+/// client-authored occurrence reaches this function.
 pub fn without_server_managed(triples: Vec<Triple>, container_iri: &str) -> Vec<Triple> {
     triples
         .into_iter()
@@ -61,10 +60,10 @@ fn node(iri: &str) -> Result<NamedNode, ResourceError> {
 
 /// Create `c` if it is absent, and mark it present either way.
 ///
-/// The type triples go in through `insert_marked` rather than a bare
-/// `INSERT DATA`: existence is a stored marker, so content written without
-/// one is invisible — the container would read as absent forever, and every
-/// "did this ancestor already exist" probe above it would be wrong. It is
+/// The type triples go in through `insert_marked` rather than a bare `INSERT
+/// DATA`: existence is a stored marker, so content written without one is
+/// invisible, the container would read as absent forever, and every "did
+/// this ancestor already exist" probe above it would be wrong. It is
 /// additive rather than a `put_rdf`, because an existing container's members
 /// must survive.
 pub async fn ensure_container(
@@ -130,8 +129,8 @@ pub async fn provision_root(
 /// Whether a `Link` header asks, per LDP §5.2.3.4, for the created resource to
 /// be a container.
 ///
-/// Only the link *target* counts — a container IRI appearing in a parameter
-/// value says nothing — and the `rel` is a space-separated token list, so
+/// Only the link *target* counts (a container IRI appearing in a parameter
+/// value says nothing), and the `rel` is a space-separated token list, so
 /// `type` has to be one of its tokens rather than the whole value. Splitting
 /// values on `,` is safe for what this reads: a comma inside a quoted
 /// parameter can only break a value into pieces that no longer parse as
@@ -188,7 +187,7 @@ mod tests {
         sp().resolve(path).unwrap().graph_iri().to_string()
     }
 
-    /// The `rdf:type` pair is filtered on the container's own subject only —
+    /// The `rdf:type` pair is filtered on the container's own subject only,
     /// `ensure_container` never asserts it about any other subject, so a
     /// client-authored type triple on a different subject in the same graph
     /// (`<#x>` here) must survive, exactly as `body_sets_containment` already
@@ -222,7 +221,7 @@ mod tests {
     }
 
     // Existence is a stored marker, so a container written without one reads
-    // as absent — and the traversal that asks "did this ancestor already
+    // as absent, and the traversal that asks "did this ancestor already
     // exist" would then rebuild and re-link it on every write. Creating a
     // container must mark it, and re-ensuring an existing one must not
     // discard its members.

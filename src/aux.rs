@@ -23,7 +23,7 @@ pub enum AuxError {
     #[error("the auxiliary's subject resource does not exist")]
     SubjectMissing,
     /// The subject is there; the auxiliary itself is not. Only operations that
-    /// require an existing auxiliary report this — [`put`] writes one instead.
+    /// require an existing auxiliary report this, [`put`] writes one instead.
     #[error("the auxiliary resource does not exist")]
     Missing,
     /// The document offered to [`put`] holds more triples than
@@ -38,36 +38,35 @@ pub enum AuxError {
 /// The largest auxiliary document [`put`] accepts, in triples.
 ///
 /// The only auxiliary kind today is the ACL, and an ACL is read on the request
-/// path, not just written: the WAC guard re-reads the applicable one and
+/// path as well as written: the WAC guard re-reads the applicable one and
 /// decides on it per level of the ancestor chain, for every request in the
 /// subtree it governs. So the size of a stored ACL is a tax on later reads,
-/// which is what makes a bound belong on the write rather than on the reader
-/// alone. Nothing else bounds it — an auxiliary is an ordinary RDF resource
+/// so the bound belongs on the write rather than on the reader
+/// alone. Nothing else bounds it, an auxiliary is an ordinary RDF resource
 /// written through `PUT`, so without this its size is whatever
 /// `Config::max_body_bytes` admits, and a body of that size is hundreds of
 /// thousands of triples.
 ///
 /// A thousand is chosen to sit far from both edges. A real ACL is a handful of
-/// authorizations of half a dozen triples each — the root ACL this pod
-/// provisions is seven — so legitimate use is two orders of magnitude below
+/// authorizations of half a dozen triples each (the root ACL this pod
+/// provisions is seven), so legitimate use is two orders of magnitude below
 /// this, and a WebID-per-authorization document naming a hundred and forty
-/// distinct agents would still be admitted. On the other
-/// side, the decision itself is linear in the document (`wac::pdp` groups it
-/// by subject once), so a thousand triples is a decision measured in
-/// microseconds even repeated per ancestor — and it stays that way
-/// for any pass over the ACL that is quadratic by accident, since a thousand
-/// squared is a million comparisons, not the 10¹⁰ that an uncapped body
-/// permits.
+/// distinct agents would still be admitted. On the other side, the decision
+/// itself is linear in the document (`wac::pdp` groups it by subject once), so
+/// a thousand triples is a decision measured in microseconds even repeated per
+/// ancestor, and it stays that way for any pass over the ACL that is quadratic
+/// by accident, since a thousand squared is a million comparisons, not the
+/// 10¹⁰ that an uncapped body permits.
 pub const MAX_AUX_TRIPLES: usize = 1_000;
 
 /// The `404` body for an auxiliary write refused for [`AuxError::SubjectMissing`].
 ///
 /// Two call sites answer this: [`crate::wac::guard::Guard::materialize`] (the
 /// ancestor-authorization walk, which can tell a missing subject apart from a
-/// missing ancestor before writing anything) and `http::put_impl`'s
-/// `aux::put` match arm (the in-update guard, for the window between that
-/// check and the write). Both are wanted — see their call sites — so the
-/// message lives here once rather than drifting between two copies.
+/// missing ancestor before writing anything) and `http::put_impl`'s `aux::put`
+/// match arm (the in-update guard, for the window between that check and the
+/// write). Both are wanted (see their call sites), so the message lives here once
+/// rather than drifting between two copies.
 pub const AUX_SUBJECT_MISSING_MESSAGE: &str =
     "an auxiliary resource cannot be created for a resource that does not exist";
 
@@ -75,7 +74,7 @@ pub const AUX_SUBJECT_MISSING_MESSAGE: &str =
 /// moment of the write.
 ///
 /// A group-graph-pattern fragment, so it can be appended to the `WHERE` of
-/// whichever update is doing the writing — [`conditional_put_update`] builds
+/// whichever update is doing the writing, [`conditional_put_update`] builds
 /// one around it, [`patch`] folds it into the patch's own. One function
 /// because two copies of this string are two things that can drift apart, and
 /// the direction they drift in is a write that lands without a subject.
@@ -120,20 +119,20 @@ fn conditional_put_update(aux: &AuxUrl, triples: &[Triple]) -> String {
     )
 }
 
-/// Write an auxiliary resource. Fails when its subject does not exist —
+/// Write an auxiliary resource. Fails when its subject does not exist,
 /// otherwise a policy document could be planted on a path that was never
 /// created, where nearest-ACL-wins would make it permanent and unremovable.
 ///
 /// The write is guarded inside the update (see [`conditional_put_update`]);
 /// the `exists` call afterwards only decides what the caller is told. It runs
-/// *after* the update on purpose, and it asks about the **auxiliary**, not
-/// the subject — the question the return value actually answers is "did my
-/// write land", and only that phrasing survives every interleaving. Asking
-/// about the subject would report `Ok(())` when a subject was deleted and
-/// recreated around the guarded update: nothing was written, yet the client
-/// would believe the path is protected while nearest-ACL-wins quietly hands
-/// it the ancestor's rules. Claiming success for an unwritten policy
-/// document is the dangerous direction.
+/// *after* the update on purpose, and it asks about the **auxiliary**, not the
+/// subject, the question the return value answers is "did my write
+/// land", and only that phrasing survives every interleaving. Asking about the
+/// subject would report `Ok(())` when a subject was deleted and recreated
+/// around the guarded update: nothing was written, yet the client would
+/// believe the path is protected while nearest-ACL-wins quietly hands it the
+/// ancestor's rules. Claiming success for an unwritten policy document is the
+/// dangerous direction.
 ///
 /// A document over [`MAX_AUX_TRIPLES`] is refused before the update is built,
 /// so an oversized ACL never reaches the store and therefore never reaches the
@@ -159,15 +158,15 @@ pub async fn put(
 /// Apply a patch to an auxiliary that already exists. A patch does not create
 /// one: an absent auxiliary is [`AuxError::Missing`], or
 /// [`AuxError::SubjectMissing`] when the subject it would belong to is absent
-/// too — the case [`put`] refuses for the same reason.
+/// too, the case [`put`] refuses for the same reason.
 ///
 /// That check runs *before* the patch, where [`put`]'s runs after. A check
 /// that can only refuse is safe against an interleaved `DELETE`; the
 /// two-round-trip objection in [`conditional_put_update`] is about a check
 /// that then writes. It has to run first, because afterwards the two ways a
-/// patch can leave the auxiliary absent — it was never there, or the subject
-/// was deleted under the write — are indistinguishable, and the first is not
-/// a missing subject.
+/// patch can leave the auxiliary absent, it was never there, or the subject
+/// was deleted under the write, are indistinguishable, and the first is not a
+/// missing subject.
 ///
 /// The write itself carries the guard [`conditional_put_update`] uses, folded
 /// into the patch's own `WHERE` so the precondition and the write stay one
@@ -200,38 +199,38 @@ pub async fn patch(
 /// shelf its dataset registered, and its membership triple in its parent
 /// container, in a single store update. Returns whether the subject existed.
 ///
-/// The drops run unconditionally — they are `DROP SILENT`, a no-op on an
-/// absent graph — and the existence check only decides the returned boolean.
-/// An early return on `!exists` would leave an already-orphaned auxiliary in
-/// place and unreported, and since this is the only cascade path that orphan
-/// would be permanent: recreating the subject would resurrect its grants.
-/// Same reasoning as [`crate::resource::delete_rdf`]. The unlink is
-/// unconditional for the same reason and heals the same way: a parent left
-/// pointing at a subject that is already gone loses the triple on the next
-/// `DELETE` of that path, which is otherwise a `404` that repairs nothing.
+/// The drops run unconditionally (they are `DROP SILENT`, a no-op on an absent
+/// graph), and the existence check only decides the returned boolean. An early
+/// return on `!exists` would leave an already-orphaned auxiliary in place and
+/// unreported, and since this is the only cascade path that orphan would be
+/// permanent: recreating the subject would resurrect its grants. Same reasoning
+/// as [`crate::resource::delete_rdf`]. The unlink is unconditional for the same
+/// reason and heals the same way: a parent left pointing at a subject that is
+/// already gone loses the triple on the next `DELETE` of that path, which is
+/// otherwise a `404` that repairs nothing.
 ///
 /// The shelf registry is read before any drop, and its drops are ordered
 /// before the system graph's: the registry lives in the very graph this
 /// cascade drops, and reading it after would find nothing to drop, leaving
 /// the shelves as the one part of the resource a `DELETE` cannot remove
-/// (design spec §7). A container's registry is simply empty, so the same
+/// (design spec §7). A container's registry is empty, so the same
 /// cascade is correct for it without a branch.
 ///
 /// The unlink rides in that same sequence rather than in a call of its own
-/// because [`SparqlStore`]'s atomicity obligation stops at one `update`: as
-/// two, a failure between them leaves the parent listing a member whose
-/// graphs are gone, and nothing can repair it — containment is server-managed,
-/// so no client may write the triple away. The parent is derived here from the
-/// subject rather than passed in, so no caller can delete a subject and forget
-/// to unlink it; the root has no parent and is simply not unlinked. Where the
-/// triple's shape lives is unchanged — [`crate::container::containment_removal`]
-/// builds it, next to the `add_containment` that writes it.
+/// because [`SparqlStore`]'s atomicity obligation stops at one `update`: as two,
+/// a failure between them leaves the parent listing a member whose graphs are
+/// gone, and nothing can repair it, containment is server-managed, so no client
+/// may write the triple away. The parent is derived here from the subject rather
+/// than passed in, so no caller can delete a subject and forget to unlink it;
+/// the root has no parent and is never unlinked. Where the triple's shape
+/// lives is unchanged, [`crate::container::containment_removal`] builds it, next
+/// to the `add_containment` that writes it.
 ///
-/// This is the one delete cascade (§7). A container subject's *children*
-/// remain the caller's business — `http::delete_impl` refuses a non-empty
-/// container before it gets here — but everything else a subject can hold,
-/// including a blob it stored bytes as and the link its parent holds to it,
-/// goes with it here.
+/// This is the one delete cascade (§7). A container subject's *children* remain
+/// the caller's business (`http::delete_impl` refuses a non-empty container
+/// before it gets here), but everything else a subject can hold, including a
+/// blob it stored bytes as and the link its parent holds to it, goes with it
+/// here.
 pub async fn delete_subject(
     store: &dyn SparqlStore,
     blobs: &dyn crate::blob::BlobStore,
@@ -357,7 +356,7 @@ mod tests {
         );
     }
 
-    /// `count` authorizations, each one triple, on distinct subjects — the
+    /// `count` authorizations, each one triple, on distinct subjects, the
     /// cheapest way to reach a given triple count, and the shape that costs a
     /// reader the most: every subject distinct is what makes a per-subject
     /// rescan quadratic.
@@ -375,8 +374,8 @@ mod tests {
 
     // The cap is a refusal, not a truncation: nothing of an oversized document
     // reaches the store, so the auxiliary stays absent rather than half
-    // written. One triple over is enough — the boundary itself is what the
-    // test below pins.
+    // written. One triple over is enough, the boundary itself is what the test
+    // below pins.
     #[tokio::test]
     async fn an_auxiliary_over_the_triple_cap_is_refused_and_stores_nothing() {
         let store = OxigraphStore::in_memory().unwrap();
@@ -416,7 +415,7 @@ mod tests {
         assert_eq!(graph_contents(&store, acl.graph_iri()).await.len(), MAX_AUX_TRIPLES);
     }
 
-    // A refused write must not destroy what is already there — the same rule
+    // A refused write must not destroy what is already there, the same rule
     // the suppressed-subject write follows. The refusal happens before the
     // update is built, so the existing policy document is untouched and the
     // resource stays governed by it.
@@ -544,7 +543,7 @@ mod tests {
     // The reason this function exists at all: without the guard a patch could
     // write a policy document onto a path that no longer exists, which is the
     // defect `docs/constraints.md` records for `put_rdf`. Asserted on the
-    // store, because the error alone is returned either way — `exists` reports
+    // store, because the error alone is returned either way, `exists` reports
     // the auxiliary absent whether or not the update wrote into its graph.
     #[tokio::test]
     async fn patching_an_acl_whose_subject_is_gone_writes_nothing() {
@@ -583,14 +582,14 @@ mod tests {
     // before `patch_guarded` ever runs.
     //
     // The window the guard is for is the subject disappearing *between* that
-    // check and the write, which no in-memory interleaving can stage — so the
+    // check and the write, which no in-memory interleaving can stage, so the
     // state is staged directly instead: the auxiliary keeps its graph and its
     // presence marker, only the subject's are dropped. The opening check then
     // passes and the write itself is what has to refuse.
     //
     // Asserted on the auxiliary's graph, not on the returned value. The
     // trailing `exists` finds the auxiliary still present and so reports
-    // success either way — whether the guard held the write back or the write
+    // success either way, whether the guard held the write back or the write
     // landed is invisible from the return.
     #[tokio::test]
     async fn a_patch_whose_subject_vanishes_under_the_write_writes_nothing() {
@@ -668,7 +667,7 @@ mod tests {
         assert!(!delete_subject(&store, &blobs, &res("/nope")).await.unwrap());
     }
 
-    // Finding 1b/3: the asymmetric state — auxiliaries present, subject not.
+    // Finding 1b/3: the asymmetric state, auxiliaries present, subject not.
     // An early return on `!exists` would leave this orphan in place, and as
     // the only cascade path that would make it permanent: nearest-ACL-wins
     // would hand the recreated path a policy nobody can remove.
@@ -714,9 +713,9 @@ mod tests {
     // pins the failure side, where only a decorated store can see it).
     //
     // Second half: it runs even for a subject that is already gone. A parent
-    // pointing at nothing is otherwise permanent — containment is
+    // pointing at nothing is otherwise permanent (containment is
     // server-managed, so the client's only lever is a `DELETE` that answers
-    // `404` — and this is the call that repairs it.
+    // `404`), and this is the call that repairs it.
     #[tokio::test]
     async fn deleting_a_subject_takes_its_parents_containment_triple_with_it() {
         use crate::container::{add_containment, container_is_empty, ensure_container};
@@ -749,12 +748,12 @@ mod tests {
 
     // Whole-branch review, finding 1: `delete_subject` dropped the resource
     // graph and the registry that pointed at its shelves, but never the
-    // shelves themselves — a DELETE that erased the registry's only record of
+    // shelves themselves, a DELETE that erased the registry's only record of
     // them without erasing the data (design spec §7). Every assertion above
     // reads back through `exists`/`get_rdf`, which the deleted registry makes
     // report "gone" either way, so none of them could have caught this. This
-    // one derives the shelf's IRI the same way the write path did — through
-    // `ShelfKey::of` — and probes the store directly, bypassing the registry
+    // one derives the shelf's IRI the same way the write path did, through
+    // `ShelfKey::of`, and probes the store directly, bypassing the registry
     // entirely.
     #[tokio::test]
     async fn deleting_a_subject_empties_its_shelves_too() {
@@ -803,7 +802,7 @@ mod tests {
     }
 
     // The cascade is correct for a resource that never had a blob, and it
-    // must not report failure for one — `delete` on an absent key succeeds.
+    // must not report failure for one, `delete` on an absent key succeeds.
     #[tokio::test]
     async fn the_cascade_still_works_for_an_rdf_resource() {
         let store = OxigraphStore::in_memory().unwrap();
