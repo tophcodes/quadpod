@@ -18,7 +18,7 @@ Two consecutive runs produced identical counts. The numbers below are reproducib
 | karate (everything that ran) | 41 | 652 | 37 | 615 |
 | harness's MUST-linked subset | 38 | 649 | 33 | 608 |
 
-## Second run: after Plan 9 (dataset-valued resources)
+## Second run: after dataset-valued resources
 
 | | |
 |---|---|
@@ -30,10 +30,10 @@ Two consecutive runs produced identical counts. The numbers below are reproducib
 | karate (everything that ran) | 41 | 652 | 43 | 609 |
 
 Same 41 features, same 652 scenarios. Nothing aborted or got skipped that used to run.
-Passed rose by 6, not the 1 that Plan 9 alone accounts for. All three of Bucket 3's
+Passed rose by 6, not the 1 that dataset-valued resources alone account for. All three of Bucket 3's
 defects are gone, not just D3:
 
-- **D3** (named graphs dropped on write) is the one Plan 9 fixed:
+- **D3** (named graphs dropped on write) is the one that work fixed:
   `content-negotiation-named-graphs` (its one active scenario, at line 16) now passes.
 - **D1** (`POST` ignoring `Link: rel="type"`) and **D2** (no `Allow` on GET/HEAD) were
   already fixed, by `0336247` and `3cb0723`, both of which land after `ef49c5d`, the commit the
@@ -93,7 +93,7 @@ reports `control`. The five CORS features that did **not** move (`simple-request
 `text/plain` fixture in their `Background` and abort there on this tree, because this
 branch has no non-RDF support; their CORS assertions never ran here.
 
-### `feat/non-rdf-resources` alone: after Plan 10 (non-RDF resources)
+### `feat/non-rdf-resources` alone
 
 | | |
 |---|---|
@@ -115,7 +115,7 @@ into an `accessTo`-only container, 6 `DELETE` via inherited-only access) that th
 measurement was the first to surface, because they only exist once a resource can be
 created to test them against. `content-type-reject` also went from `0/3` to `2/3`,
 independent of unblocking: it was never blocked by the fixture abort, it was wrong
-(design spec §9), and Plan 10 fixed it.
+and `feat/non-rdf-resources` fixed it.
 
 Both measurements are complete records of what each slice did alone; both are superseded
 by the merge below wherever they disagree with it.
@@ -224,7 +224,7 @@ scenarios outside it (`post-target-not-found` 4, `preflight` 1, `preflight-reque
 checkable way:
 
 - **`main`'s ranking still lists non-RDF resources as rank 1, open.** It is closed:
-  Plan 10 shipped it, in the other branch this document now merges.
+  `feat/non-rdf-resources` shipped it, in the other branch this document now merges.
 - **The blob branch's ranking lists `WAC-Allow`, CORS headers, and `OPTIONS` as its
   ranks 2, 3, and 4, all open.** `WAC-Allow` is not open: `main`'s work resolves every
   one of its 58 scenarios once the fixture that used to block them exists, with no
@@ -252,9 +252,9 @@ Ranked by scenarios still failing, the merged tree's gaps are:
 
 `66 + 10 + 6 + 6 + 4 + 2 + 1 = 95`.
 
-Resolved and off this list entirely: non-RDF resources (540 scenarios, Plan 10),
+Resolved and off this list entirely: non-RDF resources (540 scenarios, `feat/non-rdf-resources`),
 `WAC-Allow` (58 scenarios, PR #1), the `acl-object` family (12 scenarios, resolved by
-Plan 10 alone: these scenarios never touch `WAC-Allow`, `OPTIONS`, or CORS headers, so
+`feat/non-rdf-resources` alone: these scenarios never touch `WAC-Allow`, `OPTIONS`, or CORS headers, so
 they needed only the fixture, not the interaction), `content-type-reject`'s `PUT`/`POST`
 legs (Bucket 3), and `OPTIONS` as a route (only its `https`-only redirect edge case
 remains, folded into rank 6 above). `accept-acah` and `enumerate-headers`, by contrast,
@@ -688,7 +688,7 @@ matters: it fails if the fix is ever "simplified" into dropping the container ch
 Features this pod deliberately does not have, or environment limits the harness cannot
 clear.
 
-### Non-RDF resources: RESOLVED (Plan 10, `feat/non-rdf-resources`)
+### Non-RDF resources: RESOLVED (`feat/non-rdf-resources`)
 
 `PUT`/`POST` with a non-RDF `Content-Type` stores the body as a blob (`docs/architecture.md`, Storage model) instead of
 answering `415`. Every feature this used to abort now runs to completion.
@@ -898,7 +898,7 @@ ancestor-materialisation decision, surfacing as `409` instead of `201`.
 
 ## Bucket 3: Defect (3 scenarios failing)
 
-### `content-type-reject`: RESOLVED (Plan 10), reclassified from Bucket 2 and fixed
+### `content-type-reject`: RESOLVED (`feat/non-rdf-resources`), reclassified from Bucket 2 and fixed
 
 Previously filed here as a pending decision (see the second run's document, now
 superseded): "`format_for_content_type` is the single gate … RFC 9110 supports `415` …
@@ -933,7 +933,7 @@ POST always creates a *resource* and `Location` never ends in `/`.
 cheapest item on the whole list, filed as a defect rather than a gap because it was never
 a deliberate omission, where `WAC-Allow` is a feature.
 
-### D3: RESOLVED (Plan 9): JSON-LD named graphs were dropped on write
+### D3: RESOLVED: JSON-LD named graphs were dropped on write
 
 `content-negotiation-named-graphs:16` (1 scenario). `rdf::parse` used to iterate quads
 and discard `q.graph_name`, flattening everything into the resource's single graph. Plan

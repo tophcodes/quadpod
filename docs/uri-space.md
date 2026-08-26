@@ -268,7 +268,8 @@ representation exists, and it makes no claim about completeness. No registered r
 may change. Moving it later is a breaking change for anything that reads it, so it gets
 settled, as a permanent identifier or as a hosted document at that address, before this pod is
 deployed anywhere, and at the latest before 1.0. The internal `urn:quadpod:` namespace is a
-different thing entirely: it never leaves the server (see the design specs), while this one is
+different thing entirely: it never leaves the server ([`architecture.md`](architecture.md)),
+while this one is
 part of the contract.
 
 ## Design rationale

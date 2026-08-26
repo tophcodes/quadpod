@@ -153,10 +153,10 @@ act with that user's full authority.
 
 **Extraction and projection** (#63). Deriving triples from a blob's bytes, and making
 quad-store-only RDF visible as files. Bytes stay authoritative and nothing writes back into
-them. Designed in [`docs/superpowers/specs/`](docs/superpowers/specs/), unimplemented, and
-ending in open questions: what an extractor may reject (#74), how the derived index is
-partitioned so two extractors cannot overwrite each other (#65), and what revoking an
-extractor's trust does to configurations it already wrote (#68).
+them. Designed and unimplemented, ending in open questions the epic carries: what an
+extractor may reject (#74), how the derived index is partitioned so two extractors cannot
+overwrite each other (#65), and what revoking an extractor's trust does to configurations it
+already wrote (#68).
 
 **A SPARQL query endpoint.** The store is a quad store and nothing exposes it as one. No issue
 tracks it yet. The deciding question is access control: a query endpoint that reads across

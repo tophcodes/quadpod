@@ -131,7 +131,7 @@ Three things to know before drawing conclusions from it:
 - **A failed scenario and an aborted feature are different.** Several features
   build their fixtures in a `callonce` `Background`; if that setup request
   fails, the whole feature errors out at once rather than failing row by row.
-  A `text/plain` fixture used to do this: before Plan 10, the pod answered
+  A `text/plain` fixture used to do this: before non-RDF resources landed, the pod answered
   `415` to any non-RDF media type, which took out all six WAC
   `protected-operation` features before their assertions ran. It no longer
   does; `text/plain` and any other non-RDF type now store as a blob.

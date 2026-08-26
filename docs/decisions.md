@@ -216,7 +216,7 @@ where the subject is one this pod owns, it is not wanted.
 What the pod refuses is the rest of the job: **no third-party subjects**, since it signs only for
 identities it is authoritative for, and **no registration for anyone but the owner**.
 Gaining a key does not make this a public IdP; every subject the epic will serve is the
-owner's, and that bound holds past this slice.
+owner's, and that bound outlives the work that landed the signing core.
 
 **Why the pod signs at all.** `pod.toph.so` has to remain its own issuer across the JSS cutover
 (tophcodes/infra#51). An identity minted by an external IdP is an identity that leaves with it, and a pod
