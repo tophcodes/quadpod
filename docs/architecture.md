@@ -5,11 +5,11 @@ describes the pod as it is, and changes in the same commit as the code it descri
 
 Two neighbours carry parts of the picture and are not repeated here:
 
-- [`decisions.md`](decisions.md) — decisions whose reasoning is long enough, or contested
+- [`decisions.md`](decisions.md): decisions whose reasoning is long enough, or contested
   often enough, that it needs its own room.
-- [`constraints.md`](constraints.md) — rules that must stay true, each with the command
+- [`constraints.md`](constraints.md): rules that must stay true, each with the command
   that decides it. The machine-checkable half of this document.
-- [`uri-space.md`](uri-space.md) — the client-facing URL contract, normative for what a
+- [`uri-space.md`](uri-space.md): the client-facing URL contract, normative for what a
   client may address.
 
 ## What it is
@@ -19,8 +19,8 @@ triple; there is no mirror and no sync process. Bytes that are not RDF live besi
 blob backend, described by triples in a server-owned graph.
 
 The pod speaks LDP over HTTP, enforces Web Access Control, and verifies Solid-OIDC
-credentials. With `--op-signing-keys` set it also signs its own — the core of an identity
-provider, not yet one a browser app can log in to; see [Limits](#limits).
+credentials. With `--op-signing-keys` set it also signs its own. That is the core of an
+identity provider, and no browser app can log in to it yet; see [Limits](#limits).
 
 ## Storage model
 
@@ -37,15 +37,15 @@ Turtle, because the name was never a format claim. Extensionless URLs are the
 recommendation; serialization does not belong in a path.
 
 **RDF is stored parsed, blobs are stored whole.** A round-trip through an RDF resource
-preserves triples, not bytes — prefixes, comment lines and whitespace do not survive. A
-blob survives byte for byte. Which of the two a write becomes is decided by
+preserves triples and discards bytes: prefixes, comment lines and whitespace do not
+survive. A blob survives byte for byte. Which of the two a write becomes is decided by
 `Content-Type`: a media type the pod can parse as RDF becomes a graph, anything else
 becomes bytes.
 
 **Containers are the trailing slash.** `/foo/` is an `ldp:Container`, `/foo` is a
 resource, and they can coexist only if nothing tries to make one the parent of the other.
-The apex is always the root storage container — `ldp:Container` and `pim:Storage` — since
-HTTP normalizes an empty path to `/`.
+The apex is always the root storage container, both `ldp:Container` and `pim:Storage`,
+since HTTP normalizes an empty path to `/`.
 
 ### Three graphs per resource
 
@@ -55,14 +55,14 @@ HTTP normalizes an empty path to `/`.
 | `<res>.acl` | the access control policy for `<res>` | yes, its own resource with its own URL |
 | `urn:quadpod:sys:<res>` | server bookkeeping: blob key, size, hash, content type, ETag, timestamps, the presence marker | never |
 
-The split is not filing convenience. An ACL is a document its owner writes, reads and
-grants others control over, so it is a resource with a URL, discoverable through
+The split follows from who writes each graph. An ACL is a document its owner writes, reads
+and grants others control over, so it is a resource with a URL, discoverable through
 `Link: rel="acl"` and governed by `acl:Control` like anything else. Server-asserted
-bookkeeping is the opposite: it must never appear in a namespace a client can address, so
-it lives under a `urn:` scheme no request path can name. `resource.rs` is the only module
-that mints those IRIs, which is what lets the presence marker be a stored fact rather than
-a triple count — an empty ACL and an absent ACL mean opposite things, and counting triples
-cannot tell them apart.
+bookkeeping must never appear in a namespace a client can address, so it lives under a
+`urn:` scheme no request path can name. `resource.rs` is the only module that mints those
+IRIs, which is how the presence marker can be a stored fact rather than a triple count.
+An empty ACL and an absent ACL mean opposite things, and counting triples cannot tell them
+apart.
 
 The root container's `/.acl` is the anchor of the whole scheme: it is where the walk up
 the container hierarchy terminates, so provisioning creates it before anything else.
@@ -103,19 +103,18 @@ the container hierarchy terminates, so provisioning creates it before anything e
           └────────────┘   └────────────┘
 ```
 
-Every write passes through this path. That is a load-bearing property rather than a
-description: because there is no second way in, the change-event bus below is complete by
-construction, and the presence markers, shelf IRIs, containment triples and ETags that the
-LDP layer maintains cannot be bypassed.
+Every write passes through this path, and that is load-bearing: because there is no second
+way in, the change-event bus below is complete by construction, and the presence markers,
+shelf IRIs, containment triples and ETags that the LDP layer maintains cannot be bypassed.
 
 ## Authentication
 
 Every credential takes the same path in, this pod's own included. A caller presents a
 DPoP-bound Solid-OIDC access token; the pod checks the proof, resolves the token's issuer,
 fetches that issuer's keys, fetches the WebID profile named by the `webid` claim, and
-confirms the profile authorizes that issuer. The `DPoP` scheme is required — a `Bearer`
-credential is refused, because a Solid-OIDC access token is DPoP-bound by construction and a
-token presented without its proof is a token that has left its holder.
+confirms the profile authorizes that issuer. The `DPoP` scheme is required and a `Bearer`
+credential is refused, because a Solid-OIDC access token is DPoP-bound by construction and
+a token presented without its proof is a token that has left its holder.
 
 Proofs signed ES256 or RS256 are both accepted, with the thumbprint computed to match
 (see [ADR-3](decisions.md#adr-3)).
@@ -125,11 +124,11 @@ Proofs signed ES256 or RS256 are both accepted, with the thumbprint computed to 
 decide what a signature covers.
 
 Three of these fetches happen while the request is still unauthenticated, at URLs the
-token itself supplies — a blind SSRF primitive if left open. `auth/safe_fetch.rs` is the
-control: HTTPS only, no private or link-local addresses, no redirects, bounded bodies and
-timeouts, with the address filter inside the resolver so a name cannot answer public for
-the check and private for the connection. `--allow-insecure-host` opens a named exception
-for local development.
+token itself supplies, which is a blind SSRF primitive if left open. `auth/safe_fetch.rs`
+is the control: HTTPS only, no private or link-local addresses, no redirects, bounded
+bodies and timeouts, with the address filter inside the resolver so a name cannot answer
+public for the check and private for the connection. `--allow-insecure-host` opens a named
+exception for local development.
 
 **With `--op-signing-keys` set the pod also issues** ([ADR-9](decisions.md#adr-9)). `op::keys`
 loads a private key set from that path, generating an ES256 key on first start and never
@@ -150,18 +149,18 @@ Three parts with three different jobs:
   is why the trailing-slash-pair rule lives here too.
 - **The PRP** fetches policy: the resource's own `.acl` if it has one, otherwise the
   nearest ancestor container's, terminating at the root. Because a resource is a graph,
-  this is a SPARQL query rather than a filesystem walk.
+  this is a SPARQL query instead of a filesystem walk.
 - **The PDP** decides. `wac::pdp::decide` is a pure function over ACL triples plus request
-  context — no I/O, no ancestry walking, not `async`, not fallible. Policy is an input to
-  it, never something it goes and gets.
+  context. No I/O, no ancestry walking, no `async`, no failure case. Policy is an input to
+  it, and it never goes and gets policy itself.
 
-Nearest ACL wins outright: a resource's own policy replaces its ancestors' rather than
-merging with them. A rule does not need an explicit `a acl:Authorization`
+Nearest ACL wins outright: a resource's own policy replaces its ancestors' and does not
+merge with them. A rule does not need an explicit `a acl:Authorization`
 ([ADR-5](decisions.md#adr-5)).
 
 Only an `AuxUrl` may be deleted on its own, and only a `ResourceUrl` or `ContainerUrl` may
-be written directly. Those bounds are types, not conventions, so a call site that would
-plant an ACL over a subject that does not exist fails to compile.
+be written directly. Those bounds are types rather than conventions, so a call site that
+would plant an ACL over a subject that does not exist fails to compile.
 
 ## Writing
 
@@ -169,7 +168,7 @@ plant an ACL over a subject that does not exist fails to compile.
 Solid Protocol requires of every RDF source. `Accept-Put` and `Accept-Post` advertise what
 a write may carry; `Accept-Patch` advertises `text/n3`.
 
-**PATCH is N3 Patch, and only N3 Patch.** `application/sparql-update` is not accepted
+**PATCH is N3 Patch, and only N3 Patch.** `application/sparql-update` is refused
 ([ADR-8](decisions.md#adr-8)).
 
 **RDF 1.2 is supported and declared.** A representation announces itself with the
@@ -179,8 +178,8 @@ Solid client is a 1.1 parser ([ADR-6](decisions.md#adr-6)).
 
 **Shape validation is opt-in per container.** A container binds a shape with
 `ldp:constrainedBy`; writes into it are validated with SHACL and refused with `422` on
-violation. Containers without a binding validate nothing — mandatory validation would
-break interoperability with generic Solid apps, which is the point of being a pod.
+violation. Containers without a binding validate nothing. Mandatory validation would break
+interoperability with generic Solid apps, which is what being a pod is for.
 
 **Conditional requests** work on ETags, with `If-Match` and `If-None-Match` on both reads
 and writes.
@@ -189,10 +188,11 @@ and writes.
 
 Every write emits a change event on an in-process bus, keyed by topic. Because all writes
 go through LDP, the bus sees all of them and no store-level change feed is needed. The
-notification `state` is the resource's existing ETag rather than a second validator.
+notification `state` is the resource's existing ETag, so no second validator has to be
+computed.
 
-The bus is a registry keyed by topic rather than one broadcast channel, so a subscriber
-anywhere in the pod is not a reason every write computes a validator — nothing reads state
+The bus is a registry keyed by topic instead of one broadcast channel, so a subscriber
+anywhere in the pod is not a reason every write computes a validator. Nothing reads state
 for a topic with no live channel.
 
 There is no subscription endpoint yet, so nothing outside the process can receive these.
@@ -200,8 +200,8 @@ There is no subscription endpoint yet, so nothing outside the process can receiv
 ## Configuration and deployment
 
 The pod speaks plain HTTP and binds to loopback. TLS, certificates and wildcard DNS are
-the reverse proxy's job. Every minted URL — graph names, `Location`, `Link: rel="acl"`,
-containment, `htu` — derives from the configured base URI.
+the reverse proxy's job. Every minted URL derives from the configured base URI: graph
+names, `Location`, `Link: rel="acl"`, containment, `htu`.
 
 | Flag | Environment | Meaning |
 |---|---|---|
@@ -217,8 +217,8 @@ containment, `htu` — derives from the configured base URI.
 | `--allow-insecure-host` | `POD_ALLOW_INSECURE_HOSTS` | SSRF-policy exception, development only |
 | `--config` | `POD_CONFIG` | file holding the same keys |
 
-Both stores default to `memory`, so an unconfigured pod is uniformly ephemeral rather than
-half-persistent. A `rocksdb:` directory may be opened by exactly one process
+Both stores default to `memory`, so an unconfigured pod is uniformly ephemeral. A
+`rocksdb:` directory may be opened by exactly one process
 ([ADR-7](decisions.md#adr-7)), which makes deployment a stop-then-start and rules out a
 second replica over the same directory. `--op-signing-keys` requires a base URI at the
 origin root and refuses the start otherwise, because the discovery document it implies hangs
@@ -230,16 +230,16 @@ off `/.well-known/`.
 
 The Solid Protocol and WAC suites run from `conformance/run.sh`;
 [`conformance-findings.md`](conformance-findings.md) is the measurement log, kept dated
-and append-only because a measurement without its date is not a measurement.
+and append-only because a measurement without its date has nothing to be compared against.
 
 ## Limits
 
-Present-tense statements of what this pod does not do, not a list of things once deferred:
+Present-tense statements of what this pod does not do:
 
-- **No endpoint issues a token.** The OP core exists — key set, JWKS, discovery document,
-  and minting — but nothing hands a credential to a caller: no authorization endpoint, no
-  token endpoint, no client registration, no human login (#58, #59, #60). A browser app
-  cannot log in against this pod.
+- **No endpoint issues a token.** The OP core exists: key set, JWKS, discovery document
+  and minting. Nothing hands a credential to a caller, because there is no authorization
+  endpoint, no token endpoint, no client registration and no human login (#58, #59, #60).
+  A browser app cannot log in against this pod.
 - **No SPARQL endpoint.** There is no query interface and no `application/sparql-update`
   write path. The store is reached only through LDP.
 - **No notification delivery.** The change-event bus exists; no channel type is served.
