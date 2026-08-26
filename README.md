@@ -14,11 +14,11 @@ It is a single Rust binary. Under the hood it embeds [Oxigraph](https://github.c
 an RDF quad store, over RocksDB.
 
 The unusual part is what it stores data *in*. Most Solid servers keep resources as files in a
-directory tree. This one keeps every resource as a named graph inside one quad store, so
-permissions live in the same store as the data they protect, and "which resources may this
-agent read?" is a query. A file-tree server answers that question from a second system that
-has to stay in sync with the first. Bytes that are not RDF, images and PDFs, live beside the
-graphs in a blob store and are described by triples the server owns.
+directory tree. This one keeps every resource as a named graph inside one quad store, so the
+whole pod is a single dataset and a question that spans resources is one query. Access
+control lives in that same dataset, so it comes along for free. Bytes that are not RDF,
+images and PDFs, live beside the graphs in a blob store and are described by triples the
+server owns.
 
 ## Try it
 
