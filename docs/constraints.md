@@ -8,31 +8,29 @@ A non-indented line is a rule. An indented `check:` line is the command that
 verifies it. A non-zero exit means the rule is broken. `arch-check` runs them
 all; `arch-check --only <substring>` runs one.
 
-Every rule here was demonstrated to go red against a real violation before it
-was added. A check that cannot fail is worse than no check: this project has
-already shipped a test that asked for its property in a form where it held
-trivially.
+Every rule here goes red against a real violation. A check that cannot fail is
+worse than no check.
 
 ## Type model
 
 Only `AuxUrl` may be deleted on its own; only `ResourceUrl` and `ContainerUrl` may be written directly.
     → the doc comments on
     `space::DirectlyWritable` / `DirectlyDeletable`; `tests/unrepresentable.rs`.
-    Plan 7 found `aux::` was a convention rather than a construction:
-    `put_rdf(&foo.aux(Acl))` compiled and skipped the subject-existence guard,
+    `aux::` is a convention rather than a construction: without these bounds
+    `put_rdf(&foo.aux(Acl))` compiles and skips the subject-existence guard,
     planting a policy document that nearest-ACL-wins then makes permanent. Two
-    of Plan 6's seven defect classes are unrepresentable only because of these
-    two `impl` lines. The compiler enforces the bound at every call site;
-    nothing enforces that the bound keeps its membership.
+    defect classes are unrepresentable only because of these two `impl` lines.
+    The compiler enforces the bound at every call site; nothing enforces that
+    the bound keeps its membership.
     check: [ "$(rg -o 'impl DirectlyDeletable for [A-Za-z]+' src | wc -l)" = 1 ] && [ "$(rg -o 'impl DirectlyWritable for [A-Za-z]+' src | wc -l)" = 2 ]
 
 `space::GraphName` stays sealed.
     → `space.rs`'s own comment on the trait; Every implementor's `graph_iri` is interpolated verbatim into SPARQL, so only
-    types minted through `StorageSpace::resolve` may implement it. Plan 7's review
-    found the trait unsealed and compiled the repro: `impl GraphName for String`
-    fed a raw request path straight into `INSERT DATA`. `mod sealed` being private
-    is compile-enforced; nothing holds the supertrait bound on `GraphName`, and
-    deleting five characters unseals all three traits at once.
+    types minted through `StorageSpace::resolve` may implement it. Unsealed,
+    `impl GraphName for String` compiles and feeds a raw request path straight
+    into `INSERT DATA`. `mod sealed` being private is compile-enforced; nothing
+    holds the supertrait bound on `GraphName`, and deleting five characters
+    unseals all three traits at once.
     check: rg -q 'pub trait GraphName: sealed::Sealed' src/space.rs
 
 ## Storage addressing
@@ -110,14 +108,13 @@ Only `blob::BlobKey` builds an object key.
     offload point, so the property reduces to the handle having one reader.
     The check counts `self.inner`, which is why the doc comment above says
     "store handle" rather than spelling the field, because prose would count as
-    a second reader. It was demonstrated red against the real violation it
-    exists for: before the offload, all four trait methods evaluated inline
-    and the count was 4.
+    a second reader. Without the offload all four trait methods evaluate
+    inline and the count is 4.
     check: [ "$(rg -c 'self\.inner' src/store.rs)" = 1 ] && rg -q 'spawn_blocking' src/store.rs
     
 `GuardedClient` is the only `reqwest::Client` this crate builds.
     → `safe_fetch.rs`'s own comment on the
-    type. `guarded_get` no longer validates addresses for the connection it is
+    type. `guarded_get` does not validate addresses for the connection it is
     about to make. Its client does, in the DNS resolver it was built with. That
     is what allows one client to be shared, and it is also what makes a bare
     `reqwest::Client` dangerous here: it satisfies nothing at the type level but
@@ -158,13 +155,12 @@ Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     check: [ "$(rg -o 'impl (crate::)?(store::)?SparqlStore for [A-Za-z]+' src --glob '!src/http/tests/fixture.rs' | wc -l)" = 1 ] && [ "$(rg -o 'impl (crate::)?(store::)?SparqlStore for [A-Za-z]+' src/http/tests/fixture.rs | wc -l)" = 1 ]
 
 `ResourceUrl::ancestors` is the only multi-hop walk up the container chain.
-    → tests/unrepresentable.rs's header; Plan 6 finding F2. Plan 6 had two
-    separate walks (`ensure_ancestors` mutated every ancestor to the root while
-    only the immediate parent was authorized), and the fix was to derive the
-    authorization loop and the materialization plan from one `ancestors()` call.
-    The weakest rule here: it catches the shape the defect took (a loop over
-    `.parent()`) but not a recursive re-derivation, and single-hop `.parent()`
-    calls are legitimate everywhere.
+    → tests/unrepresentable.rs's header. Two separate walks drift: one that
+    mutates every ancestor to the root while only the immediate parent is
+    authorized. The authorization loop and the materialization plan both derive
+    from a single `ancestors()` call. The weakest rule here: it catches a loop
+    over `.parent()` but not a recursive re-derivation, and single-hop
+    `.parent()` calls are legitimate everywhere.
     check: ! rg -qU '(while|for)[^;{]*\.parent\(\)' src --glob '!src/space.rs'
 
 There is one content-negotiation path, one parser and one ETag.
@@ -200,11 +196,11 @@ The write advertisement is built from `Format::ALL`.
     check: ! rg -q 'crate::store|SparqlStore' src/patch.rs
 
 No `#[allow]` attributes in `src/`.
-    → Plan 6 Task 1 recorded this as a global constraint, and it was
-    load-bearing once already: it forced a plan-mandated `Result<String, ()>`
-    (which trips `clippy::result_unit_err`) to become a named error type. The
-    dataset skeleton suspended it deliberately, with `// skeleton:` comments;
-    this rule is what removes them.
+    → A global constraint. The lint an `#[allow]` would silence is the one
+    naming the defect: `clippy::result_unit_err` on a `Result<String, ()>` is
+    what turns it into a named error type. The dataset skeleton suspends this
+    rule deliberately, with `// skeleton:` comments; this rule is what removes
+    them.
     check: ! rg -q '#\[allow' src
 
 Only `aux` patches an auxiliary.
@@ -279,12 +275,11 @@ The RDF version of a dataset is classified in exactly one place.
     → The write-side refusal and the
     read-side projection ask the same question, and two classifiers is how
     they drift apart, silently, because both answer and one answers wrong.
-    That already happened once: the refusal this replaced matched
-    `Term::Triple` and never looked at `Literal::direction`, so every
-    directional language-tagged string walked into storage while the rule
-    above it claimed the wire was RDF 1.1. The check counts the
-    classification *body*, not the name: `SparqlStore::rdf_version` has the
-    same signature for a different question (what a backend can hold).
+    A refusal that matches `Term::Triple` and never looks at
+    `Literal::direction` walks every directional language-tagged string into
+    storage while the rule above it claims the wire is RDF 1.1. The check
+    counts the classification *body*, not the name: `SparqlStore::rdf_version`
+    has the same signature for a different question (what a backend can hold).
     check: [ "$(rg -o 'Term::Triple\(_\) => RdfVersion' src | wc -l)" = 1 ]
 
 The N3 Patch path refuses both RDF 1.2 additions, not just triple terms.
