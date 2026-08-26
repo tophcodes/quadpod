@@ -1,8 +1,9 @@
 # quadpod
 
-> **Pre-release (0.1.0).** This pod verifies credentials and issues none, so nothing can log
-> in to it interactively. Point it at an identity provider you already run. There is no
-> released binary or container image. Don't put data in it that you cannot afford to lose.
+> **Under active development, well before a first release.** This pod verifies credentials
+> and issues none, so nothing can log in to it interactively. Point it at an identity
+> provider you already run. There is no released binary and no container image. Interfaces
+> change without notice. Don't put data in it that you cannot afford to lose.
 
 quadpod is a personal data server. Applications store your data on it over HTTP: `PUT` a
 document, `GET` it back. Who may read what is yours to decide, and the application does not

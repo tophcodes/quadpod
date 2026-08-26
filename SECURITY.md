@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-None yet. quadpod is pre-release: there is no tagged release, no published binary and
-no container image, so every report is against `main` and gets fixed there.
+None yet. quadpod is under active development, well before a first release: there is no
+tagged release, no published binary and no container image, so every report is against
+`main` and gets fixed there.
 
 ## Reporting a vulnerability
 
