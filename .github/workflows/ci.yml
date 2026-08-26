@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build needs bindgen and libclang for Oxigraph, which only the flake
+      # provides — a bare `cargo build` fails.
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: nix develop -c cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: nix develop -c cargo test
