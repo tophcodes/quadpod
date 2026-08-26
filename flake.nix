@@ -20,6 +20,12 @@
           buildInputs = with pkgs; [
             cargo
             rustc
+            # clippy and rustfmt belong here, or `cargo clippy` inside the shell
+            # picks up whatever driver the host has. A driver built by a
+            # different rustc than the one that compiled the dependencies fails
+            # the whole tree with E0514.
+            clippy
+            rustfmt
             clang
             libclang
             pkg-config
