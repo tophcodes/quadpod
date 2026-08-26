@@ -5,7 +5,7 @@ lives in [`architecture.md`](architecture.md) and [`decisions.md`](decisions.md)
 this file only holds the check, so a rule cannot quietly stop being enforced.
 
 A non-indented line is a rule. An indented `check:` line is the command that
-verifies it — non-zero exit means the rule is broken. `arch-check` runs them
+verifies it. A non-zero exit means the rule is broken. `arch-check` runs them
 all; `arch-check --only <substring>` runs one.
 
 Every rule here was demonstrated to go red against a real violation before it
@@ -18,7 +18,7 @@ trivially.
 Only `AuxUrl` may be deleted on its own; only `ResourceUrl` and `ContainerUrl` may be written directly.
     → the doc comments on
     `space::DirectlyWritable` / `DirectlyDeletable`; `tests/unrepresentable.rs`.
-    Plan 7 found `aux::` was a convention rather than a construction —
+    Plan 7 found `aux::` was a convention rather than a construction:
     `put_rdf(&foo.aux(Acl))` compiled and skipped the subject-existence guard,
     planting a policy document that nearest-ACL-wins then makes permanent. Two
     of Plan 6's seven defect classes are unrepresentable only because of these
@@ -31,7 +31,7 @@ Only `AuxUrl` may be deleted on its own; only `ResourceUrl` and `ContainerUrl` m
     types minted through `StorageSpace::resolve` may implement it. Plan 7's review
     found the trait unsealed and compiled the repro: `impl GraphName for String`
     fed a raw request path straight into `INSERT DATA`. `mod sealed` being private
-    is compile-enforced; the supertrait bound staying on `GraphName` is not —
+    is compile-enforced; nothing holds the supertrait bound on `GraphName`, and
     deleting five characters unseals all three traits at once.
     check: rg -q 'pub trait GraphName: sealed::Sealed' src/space.rs
 
@@ -40,7 +40,7 @@ Only `AuxUrl` may be deleted on its own; only `ResourceUrl` and `ContainerUrl` m
 Only `resource` builds a system-graph IRI.
     → `resource.rs`'s
     module header. The presence marker is what makes existence a stored fact
-    rather than a triple count — the ambiguity that made an empty ACL mean the
+    rather than a triple count. That ambiguity made an empty ACL mean the
     opposite of what its author wrote. Its safety argument is that no
     user-addressable path can name a `urn:quadpod:` graph; a second place deriving
     `urn:quadpod:sys:<iri>` is a second place that can scope it wrong, and the shelf
@@ -70,18 +70,18 @@ A SPARQL literal is never interpolated by hand.
     erroring. `src/http.rs` and `src/dataset.rs` are excluded: their `\"{`
     matches build an HTTP `Link` header, a `Warning` header and an `ETag`
     (`blob_etag`) in `src/http.rs`, and an `ETag` (`Skolemized::etag`) in
-    `src/dataset.rs` — all quoted per their own RFC, never SPARQL. Two of the
+    `src/dataset.rs`, all quoted per their own RFC and never SPARQL. Two of the
     HTTP tests are excluded for the same reason, by name rather than as a
     subtree: `src/http/tests/acl.rs` asserts on that `Warning` header and
     `src/http/tests/events.rs` interpolates a Turtle request body, while their
-    sibling files really do hand-build SPARQL against the store and stay
+    sibling files hand-build SPARQL against the store and stay
     covered.
     check: ! rg -q '\\"\{' src --glob '!src/sparql.rs' --glob '!src/http.rs' --glob '!src/http/tests/acl.rs' --glob '!src/http/tests/events.rs' --glob '!src/dataset.rs'
 
 Only `blob::BlobKey` builds an object key.
     → The key is the resource's
     own path, so two resources sharing one object is a cross-resource read and
-    write — the same failure `ShelfKey` guards against one layer up. It is also
+    write, the same failure `ShelfKey` guards against one layer up. It is also
     what the derived-key argument rests on: an interrupted write heals only
     because every writer computes the same key from the same URL.
     check: ! rg -q 'Path::(from|parse)' src --glob '!src/blob.rs'
@@ -93,7 +93,7 @@ Only `blob::BlobKey` builds an object key.
     the SSRF filter off globally, and the blanket-permissive policy cannot be
     constructed in a release build. This is the control between an
     unauthenticated pre-auth fetch and the cloud-metadata endpoint. No test can
-    observe a missing `cfg` gate — tests run with `cfg(test)` on — so it is a
+    observe a missing `cfg` gate, since tests run with `cfg(test)` on, so it is a
     published operator promise with nothing else enforcing it.
     check: rg -qU '#\[cfg\(test\)\]\s*\n\s*pub fn permissive' src/auth/safe_fetch.rs
 
@@ -105,12 +105,12 @@ Only `blob::BlobKey` builds an object key.
     of concurrent reads a stall on *every* request in flight, including those
     that never touch the store. Nothing catches it: the method is already
     `async`, so the blocking body compiles, and against the in-memory store an
-    evaluation is microseconds — the tests cannot see the difference, and only
+    evaluation is microseconds: the tests cannot see the difference, and only
     a durable backend under load makes it visible. `blocking` is the one
     offload point, so the property reduces to the handle having one reader.
     The check counts `self.inner`, which is why the doc comment above says
-    "store handle" rather than spelling the field — prose would count as a
-    second reader. It was demonstrated red against the real violation it
+    "store handle" rather than spelling the field, because prose would count as
+    a second reader. It was demonstrated red against the real violation it
     exists for: before the offload, all four trait methods evaluated inline
     and the count was 4.
     check: [ "$(rg -c 'self\.inner' src/store.rs)" = 1 ] && rg -q 'spawn_blocking' src/store.rs
@@ -118,13 +118,13 @@ Only `blob::BlobKey` builds an object key.
 `GuardedClient` is the only `reqwest::Client` this crate builds.
     → `safe_fetch.rs`'s own comment on the
     type. `guarded_get` no longer validates addresses for the connection it is
-    about to make — its client does, in the DNS resolver it was built with. That
+    about to make. Its client does, in the DNS resolver it was built with. That
     is what allows one client to be shared, and it is also what makes a bare
     `reqwest::Client` dangerous here: it satisfies nothing at the type level but
     resolves through the system resolver, so an SSRF filter that reads as present
     at every call site is absent at the only place it acts. The private field
     makes `GuardedClient::new` the only constructor today; nothing stops a second
-    one, or an `inner()`, being added — the same membership gap the
+    one, or an `inner()`, being added, which is the same membership gap the
     `DirectlyWritable` rule exists for. Counts constructions, not mentions: the
     `reqwest::Client` type is named in `GuardedClient`'s own field.
     check: [ "$(rg -o 'reqwest::Client::(builder|new)' src | wc -l)" = 1 ]
@@ -132,14 +132,14 @@ Only `blob::BlobKey` builds an object key.
 Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     → `rudof_lib` pulls
     `http-client` into the tree, which gives a bare `SparqlEvaluator::new()`
-    a live `SERVICE` handler by default — a capability this pod's own
+    a live `SERVICE` handler by default, a capability this pod's own
     server-authored queries never use and nothing here should be able to
     reach for. The compiler does not require the opt-out:
     `.without_default_http_service_handler()` is a builder call a future
-    query site can simply omit and still compile. `SparqlEvaluator` also
+    query site can omit and still compile. `SparqlEvaluator` also
     implements `Default`, so `SparqlEvaluator::default()` constructs the same
-    live-`SERVICE` evaluator and must count as a construction site too — a
-    check pinned to `::new()` alone is a check a rewrite to `::default()`
+    live-`SERVICE` evaluator and must count as a construction site too: a
+    check pinned to `::new()` alone is one that a rewrite to `::default()`
     walks straight past while staying green.
     check: [ "$(rg -o 'SparqlEvaluator::(new|default)\(\)' src | wc -l)" = "$(rg -o 'without_default_http_service_handler' src | wc -l)" ]
 
@@ -154,13 +154,13 @@ Every `SparqlEvaluator` disables the default HTTP `SERVICE` handler.
     `impl crate::store::SparqlStore for FailingStore` and passed unseen. That
     `#[cfg(test)]` double is a backend outage the HTTP handlers have to answer,
     not a second backend, so it is carved out by file and pinned to one there in
-    turn — a real second implementor goes red wherever it lands.
+    turn, so a real second implementor goes red wherever it lands.
     check: [ "$(rg -o 'impl (crate::)?(store::)?SparqlStore for [A-Za-z]+' src --glob '!src/http/tests/fixture.rs' | wc -l)" = 1 ] && [ "$(rg -o 'impl (crate::)?(store::)?SparqlStore for [A-Za-z]+' src/http/tests/fixture.rs | wc -l)" = 1 ]
 
 `ResourceUrl::ancestors` is the only multi-hop walk up the container chain.
     → tests/unrepresentable.rs's header; Plan 6 finding F2. Plan 6 had two
-    separate walks — `ensure_ancestors` mutated every ancestor to the root while
-    only the immediate parent was authorized — and the fix was to derive the
+    separate walks (`ensure_ancestors` mutated every ancestor to the root while
+    only the immediate parent was authorized), and the fix was to derive the
     authorization loop and the materialization plan from one `ancestors()` call.
     The weakest rule here: it catches the shape the defect took (a loop over
     `.parent()`) but not a recursive re-derivation, and single-hop `.parent()`
@@ -179,7 +179,7 @@ The write advertisement is built from `Format::ALL`.
     → `Accept-Put` and
     `Accept-Post` name the media types `classify_body` admits, and a
     hand-maintained second list is how the header comes to advertise a type
-    the parser refuses — a disagreement invisible from either side, because
+    the parser refuses, a disagreement invisible from either side, because
     both halves keep looking plausible on their own. `aux_links` builds from
     `AuxKind::ALL` against the same failure. Anchored on the loop rather than
     on the absence of literals: `http.rs` legitimately names
@@ -194,7 +194,7 @@ The write advertisement is built from `Format::ALL`.
     acceptable, `resource::patch_dataset` decides what it does to a resource.
     Give `patch` a store and the two questions merge, the shape validation stops
     being testable without one, and the module that holds client-authored
-    structure gains the ability to execute it. The narrower grep is deliberate —
+    structure gains the ability to execute it. The narrower grep is deliberate:
     the word "store" appears in this module's prose, and a rule that trips over
     its own doc comment is a rule someone deletes.
     check: ! rg -q 'crate::store|SparqlStore' src/patch.rs
@@ -212,15 +212,15 @@ Only `aux` patches an auxiliary.
     rule, whose defect this is the patch-shaped version of. `patch_guarded` takes
     any `GraphName` so an auxiliary can reach it, and an auxiliary reaching it
     without the subject-existence guard plants a policy document on a path that
-    no longer exists — permanent, because nearest-ACL-wins then hands it out.
+    no longer exists, permanently, because nearest-ACL-wins then hands it out.
     The type system cannot express "guarded" here; this check can.
     What the grep pins is narrower than the sentence above it: that no other
-    file names the symbol at all, doc comment included — it does not stop
+    file names the symbol at all, doc comment included. It does not stop
     `aux.rs` itself from passing an empty guard. What pins that is one test,
     `aux::tests::a_patch_whose_subject_vanishes_under_the_write_writes_nothing`:
     it stages the auxiliary present with its subject gone, the only state that
     reaches the guarded write, and asserts the auxiliary's graph is unchanged.
-    No other test reaches the guard — the ones that look as though they do are
+    No other test reaches the guard. The ones that look as though they do are
     refused by `aux::patch`'s opening `exists` check, because `delete_subject`
     cascades the auxiliary away with its subject. Replacing the guard argument
     with `""` makes that one test fail and no other.
@@ -231,8 +231,8 @@ The `Accept` header is parsed in exactly one place.
     `accept_allows` ask different questions of the same header. The existing
     negotiation rule pins that two *named* functions do not return; this pins
     the property those names stood for. The q-value parse is what a second
-    reader cannot avoid rewriting, which is what makes this fail against a real
-    violation rather than against a naming convention.
+    reader cannot avoid rewriting, so this fails against a real violation
+    rather than against a naming convention.
     check: [ "$(rg -o 'strip_prefix\("q="\)' src | wc -l)" = 1 ]
 
 ## Shape validation
@@ -251,16 +251,16 @@ Only `shapes` reads the constraint binding.
     `src/http.rs` and `src/http/tests/shapes.rs` are excluded from the first
     conjunct rather than cleared outright: the shape tests `PUT` a Turtle body
     to set a binding up, which is data, not a read, but it is still the IRI in
-    text — so the second conjunct pins today's count across the two instead,
+    text, so the second conjunct pins today's count across the two instead,
     and a new occurrence in either, reader or fixture, goes red. The count
     includes one non-fixture occurrence: the `422` refusal's own `Link:
-    rel="…ldp#constrainedBy"` header (§3.1) — the response naming the shape
-    that refused it is not a second *read* of the binding, since it is built
-    from the `Shape` `shapes::load` already returned, but it is one more
+    rel="…ldp#constrainedBy"` header (§3.1): the response naming the shape
+    that refused it is no second *read* of the binding, since it is built
+    from the `Shape` `shapes::load` already returned, and it is one more
     place the HTTP layer spells the IRI, so it counts here rather than being
     carved out like the fixtures are. The third conjunct is what stops the
     import: `LDP_CONSTRAINED_BY` stays private, so nothing outside
-    `shapes.rs` can name it to compare against — and any restricted-visibility
+    `shapes.rs` can name it to compare against. Any restricted-visibility
     modifier (`pub(crate)`, `pub(super)`, `pub(in path)`) counts as exported
     for this purpose, since `shapes` is a top-level module and `pub(super)`
     is exactly `pub(crate)` here, so the pattern below matches all of them.
@@ -278,7 +278,7 @@ The query string is read in exactly one place.
 The RDF version of a dataset is classified in exactly one place.
     → The write-side refusal and the
     read-side projection ask the same question, and two classifiers is how
-    they drift apart — silently, because both answer and one answers wrong.
+    they drift apart, silently, because both answer and one answers wrong.
     That already happened once: the refusal this replaced matched
     `Term::Triple` and never looked at `Literal::direction`, so every
     directional language-tagged string walked into storage while the rule
@@ -294,14 +294,14 @@ The N3 Patch path refuses both RDF 1.2 additions, not just triple terms.
     `Dataset::rdf_version`, and the refusal has to be repeated in `patch.rs`.
     It is repeated over **both** additions, because a directional
     language-tagged string is an ordinary `Literal` and a match on
-    `N3Term::Triple` alone lets it through — the exact half-check
+    `N3Term::Triple` alone lets it through, which is the exact half-check
     `Format::parse` shipped with.
     **Honest about its own strength:** measured, `oxttl`'s N3 parser already
     refuses both at the syntax level (`<<(` is "not a valid RDF value",
     `@en--ltr` is "rdf:dirLangString is not supported in N3"), so today these
     two arms are depth behind the parser rather than the live refusal. The
     rule pins them so they are still there if `oxttl` gains RDF 1.2 syntax for
-    N3 — which is the only way they become load-bearing.
+    N3, which is the only way they become load-bearing.
     check: rg -q 'N3Term::Triple\(_\) => Err' src/patch.rs && rg -q 'l.direction\(\).is_some\(\) => Err' src/patch.rs
 
 The `version` media-type parameter is read in exactly one place.
@@ -331,15 +331,15 @@ The config file is never found, only named.
     it matches *any* string literal ending in `.toml`, whatever expression it
     sits in, so `Path::new`, `PathBuf::from`, a bare `.join(...)` argument and
     a `static` all count the same as a `const` or `let`. A narrower pattern
-    anchored on `const`/`let` was tried and abandoned — `PathBuf::from` and
-    `Path::new` are how a path actually gets written in Rust, so it missed the
+    anchored on `const`/`let` was tried and abandoned: `PathBuf::from` and
+    `Path::new` are how a path gets written in Rust, so it missed the
     likeliest shape of the very convenience the rule exists to stop.
     **This over-matches, and that is the accepted trade.** A legitimate
     `.toml`-suffixed literal in a test fixture trips it too; twice during
     implementation it did, and both fixtures were rewritten around the check.
     If you hit it and your literal is data a test writes rather than a path
-    the pod looks for, build the name with `.with_extension("toml")` — as
-    `config.rs`'s `write_temp_toml` does — rather than loosening this rule.
+    the pod looks for, build the name with `.with_extension("toml")`, as
+    `config.rs`'s `write_temp_toml` does, rather than loosening this rule.
     A false positive here argues with you out loud; a false negative would
     let a search path in without a word. Demonstrated red,
     each injected into and then reverted out of `src/config.rs` in turn,
@@ -353,9 +353,9 @@ The config file is never found, only named.
     build their temp filename through `std::env::temp_dir().join(...)` and
     `.with_extension("toml")` rather than a `.toml`-suffixed string literal.
     **What it does not catch:** a search path built by joining a non-literal
-    base — `std::env::current_dir().unwrap().join("quadpod").with_extension("toml")`,
+    base, such as `std::env::current_dir().unwrap().join("quadpod").with_extension("toml")`,
     the very idiom this rule's own prose recommends above for a test
-    fixture's filename — produces no matching string literal and passes
+    fixture's filename, produces no matching string literal and passes
     unseen, and a search path whose filename does not end in `.toml` at all
     is invisible to a check anchored on that suffix, even though `--config`
     itself accepts any path. Both were verified to pass unseen against the
@@ -366,12 +366,12 @@ Precedence is clap's, never hand-written.
     → `config.rs`'s module header,
     which states the property this pins. File values reach clap as defaults,
     so flag > env > file > default falls out of clap's own resolution with no
-    merge logic anywhere. The alternative — reading `ArgMatches::value_source`
-    and overwriting whatever came from a default — needs one arm per field,
+    merge logic anywhere. The alternative, reading `ArgMatches::value_source`
+    and overwriting whatever came from a default, needs one arm per field,
     and a field whose arm is forgotten silently ignores the file. Nothing but
-    a missing test would catch that, which is what makes it worth a rule.
+    a missing test would catch that, and that is why it is worth a rule.
     Scoped to all of `src`, not just `config.rs`: `Config::load()`'s result is
-    actually consumed in `main.rs`, so a merge helper placed there instead
+    consumed in `main.rs`, so a merge helper placed there instead
     would be the same hand-written precedence and a check confined to
     `config.rs` would not see it. Demonstrated red against a
     `value_source("listen")` merge helper injected into `main.rs`.
@@ -380,8 +380,8 @@ Precedence is clap's, never hand-written.
 
 The guard names the store exactly twice: the field it holds and the probe that fills it.
     → The decision methods are
-    synchronous and hold no store, so a second resolution of the same ACL — which
-    would repeat the ancestor walk and could straddle a concurrent write — is not
+    synchronous and hold no store, so a second resolution of the same ACL, which
+    would repeat the ancestor walk and could straddle a concurrent write, is not
     something a later edit has to remember not to write. Restoring a store parameter
     to any of the three makes this three. Anchored on the declaration rather than on
     a regex over one signature, so it cannot be satisfied by a method spelled
@@ -390,7 +390,7 @@ The guard names the store exactly twice: the field it holds and the probe that f
 
 `wac` names no HTTP type and calls nothing in `http`.
     → issue #46; the doc comment on `wac::guard::Denial`. `pdp` is pure and
-    `prp` owns the I/O, which is what makes the decision table-testable;
+    `prp` owns the I/O, and that is what makes the decision table-testable;
     `guard` undid half of that by answering every refusal as an
     `axum::response::Response` and calling `crate::http::internal_error` for a
     store failure. A refusal built inside the decision layer is a status code
@@ -398,7 +398,7 @@ The guard names the store exactly twice: the field it holds and the probe that f
     renderings instead of decisions, and it costs a `clippy::result_large_err`
     on four hot signatures. `Denial` is the seam: the guard says which refusal,
     `impl IntoResponse for Denial` in `src/http.rs` says what it costs.
-    Nothing but this rule holds the direction — the dependency compiles either
+    Nothing but this rule holds the direction: the dependency compiles either
     way, and one `crate::http::` call is all it takes to go back.
     Anchored on both halves, because they are two different ways in: `axum`
     catches a type named directly (`Response`, `StatusCode`, a `header::`
@@ -407,13 +407,13 @@ The guard names the store exactly twice: the field it holds and the probe that f
     axum re-exports, which is a direct dependency here and would otherwise
     slip past a check spelled `axum` alone. `http::` does not match the
     `https://` and `http://` IRIs this subtree's fixtures are full of, and
-    `crate::http` without a trailing `::` — a rustdoc link, not a call — is
+    `crate::http` without a trailing `::`, a rustdoc link rather than a call, is
     deliberately still allowed. Demonstrated red, each injected into and then
     reverted out of `src/wac/guard.rs` in turn, against `use
     axum::response::Response;`, a bare `axum::http::StatusCode::OK` expression,
     `crate::http::internal_error(&e)`, and `use http::StatusCode;`;
     demonstrated green on the tree as it stands.
-    **What it does not catch:** HTTP smuggled in without either spelling — a
+    **What it does not catch:** HTTP smuggled in without either spelling. A
     `Denial` variant named after a status code, a bare `404` handed back for a
     caller to trust, or a response type re-exported from a third module under
     another name. It pins the import, not the layering.
@@ -427,28 +427,28 @@ Only `internal_error` builds a `500`.
     fixed `INTERNAL_ERROR_BODY` safe: the detail is dropped from the response
     only because the same call put it in the log. A second site that builds a
     `500` breaks both halves at once, and it breaks them in the direction that
-    is invisible — the client still gets a plausible answer, the operator gets
+    is invisible: the client still gets a plausible answer, the operator gets
     nothing, and no test fails. Before this rule the crate had thirty-odd such
     sites, each answering with the backend's own error text.
-    Anchored on the two ways a `500` response is actually written rather than
+    Anchored on the two ways a `500` response is written rather than
     on the status name: `StatusCode::INTERNAL_SERVER_ERROR` appears
     legitimately in `put_status` and `shape_status`, which return a *status*
     that `put_error`/`shape_status` then route through `internal_error`, in
     two auth test handlers that mock a failing upstream, and in every test that
-    asserts one — none of those build a response, and none of them match.
+    asserts one. None of those build a response, and none of them match.
     Demonstrated red, each injected into and then reverted out of
     `src/http.rs` in turn, against
     `StatusCode::INTERNAL_SERVER_ERROR.into_response()` and
-    `(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()` — the
+    `(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()`, the
     second being the exact shape the issue was filed about; demonstrated green
     on the tree as it stands, where the single match is `internal_error`'s own
     body.
-    **What it does not catch:** a `500` spelled some other way —
+    **What it does not catch:** a `500` spelled some other way:
     `Response::builder().status(500)`, a `StatusCode::from_u16(500)`, or a
     handler returning a bare `StatusCode` that axum renders itself. It also
     says nothing about `4xx`, which deliberately keep their own text. And it
     pins the construction, not the logging: deleting the `tracing::error!`
-    from `internal_error` leaves this rule green — `tests/observability.rs` is
+    from `internal_error` leaves this rule green, and `tests/observability.rs` is
     what fails then.
     check: [ "$(rg -o 'INTERNAL_SERVER_ERROR[,)]?\.into_response\(\)|\(StatusCode::INTERNAL_SERVER_ERROR,' src | wc -l)" = 1 ]
 
@@ -483,8 +483,8 @@ Only `notify` fixes a format for `state`.
     names `application/n-quads` in `Format::media_type` and `http.rs` in
     `SERVABLE`, both legitimately, so a literal-based check is red on arrival.
     What distinguishes this call is that every other `.etag(` site passes a
-    negotiated format — `etag_candidates`, `get_impl` and `legacy_graph_read`
-    all pass a variable — and only `state` pins one. Narrower than its
+    negotiated format (`etag_candidates`, `get_impl` and `legacy_graph_read`
+    all pass a variable), and only `state` pins one. Narrower than its
     sentence: it catches the copy-paste, not a second site that re-derives
     N-Quads under another name.
     check: ! rg -q 'etag\(nquads\(\)' src --glob '!src/notify.rs'
@@ -495,8 +495,8 @@ Only `notify` fixes a format for `state`.
     `StorageSpace::resolve` is a subscription to a path the space never
     admitted. The private tuple field makes `From<&Target>` the only
     constructor today, and the compiler holds that only while the field stays
-    private — widening it to `pub(crate)` opens the constructor to the whole
-    crate, which is the shape the violation actually takes. Narrower than its
+    private: widening it to `pub(crate)` opens the constructor to the whole
+    crate, which is the shape the violation takes. Narrower than its
     sentence: it catches a topic minted anywhere but `notify.rs`, not a second
     `From` impl added beside the first one there.
     check: ! rg -q 'Topic\(' src --glob '!src/notify.rs'

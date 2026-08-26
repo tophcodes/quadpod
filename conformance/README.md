@@ -24,9 +24,9 @@ the current figures and the triage both live.
 |---|---|---|
 | `3001` | Community Solid Server 7.2.0, in Docker | **Identity provider only** |
 | `3000` | this pod, built from the working tree | the server under test |
-| — | `solidproject/conformance-test-harness`, in Docker | the runner |
+| n/a | `solidproject/conformance-test-harness`, in Docker | the runner |
 
-**The CSS is scaffolding for the test, not a component of this pod.** This pod
+**The CSS is scaffolding for the test.** This pod
 exposes no token endpoint, so nothing here hands the harness a credential and a
 conformance run needs *some* Solid-OIDC IdP to mint one.
 The CSS is the cheapest one to stand up. Nothing in the pod depends on it,
@@ -42,7 +42,7 @@ the pod's DPoP check compares against `--base-uri` byte for byte, so
 
 ## What you need installed
 
-- **Docker** — for CSS, the harness, and (via the CSS image's Node) for
+- **Docker**, for CSS, the harness, and (via the CSS image's Node) for
   running `createCredentials.js`. The two images are pulled on first use.
 - **Nix**, for `nix develop -c cargo build`. Bare `cargo` does not work in this
   repo: oxigraph needs bindgen/libclang, which only the flake dev shell
@@ -56,10 +56,10 @@ certificate.
 
 ## What it does
 
-1. Cleans up after any previous run — kills a pod left behind by an
+1. Cleans up after any previous run: kills a pod left behind by an
    interrupted run, removes both containers, wipes `.run/` and `reports/`,
-   then checks both ports are actually free and stops with a clear message if
-   not.
+   then checks both ports are free and stops with a clear message if
+   they are not.
 2. Builds the pod.
 3. Starts CSS and waits for it to answer.
 4. Extracts `createCredentials.js` from the *harness* image (it ships in
@@ -67,26 +67,26 @@ certificate.
    and runs it against CSS. That registers alice and bob, creates their pods,
    and prints client credentials. It runs both users concurrently, so the
    runner reads its output by key, never by line.
-5. Writes `.run/harness.env` and `.run/test-subjects.ttl` — see
+5. Writes `.run/harness.env` and `.run/test-subjects.ttl`. See
    [`harness.env.example`](harness.env.example) for what each key means.
 6. Starts the pod with `--owner-webid` set to alice, `--trusted-issuer` and
    `--allow-insecure-host` naming the CSS.
    **No ACL is written anywhere**: the pod provisions its own root ACL for the
    owner at boot. The suite's CSS script `PUT`s `<root>/.acl`, which here would
-   be an ordinary resource write that silently achieves nothing — ACLs live in
+   be an ordinary resource write that silently achieves nothing, because ACLs live in
    the reserved `/.aux/` namespace, as `/.aux/{path}.acl` (`/foo` → `/.aux/foo.acl`,
    `/box/` → `/.aux/box/.acl`, the root → `/.aux/.acl`), and are found through
    the `Link` header.
-7. Runs the harness against the `protocol` and `web-access-control` manifests
-   — the two the harness's own `application.yaml` links by default. The
+7. Runs the harness against the `protocol` and `web-access-control` manifests,
+   the two the harness's own `application.yaml` links by default. The
    `sparql-update` manifest stays off; it is commented out upstream, and this
-   pod refuses `application/sparql-update` by design ([ADR-8](../docs/decisions.md#adr-8))
-   — `PATCH` here is N3 Patch.
+   pod refuses `application/sparql-update` by design ([ADR-8](../docs/decisions.md#adr-8)).
+   `PATCH` here is N3 Patch.
 8. Stops everything.
 
 Cleanup between runs is a **pod restart**. The store is in-memory
-(`OxigraphStore::in_memory()`), so every run starts from an empty pod — better
-isolation than the upstream scripts get, and why the runner needs no teardown
+(`OxigraphStore::in_memory()`), so every run starts from an empty pod. That is better
+isolation than the upstream scripts get, and it is why the runner needs no teardown
 logic on the pod side at all.
 
 ## Where the report lands
@@ -109,8 +109,8 @@ docker invocation: karate writes its intermediate JSON to a **relative**
 `target/karate-reports/`, resolved against the container's working directory.
 That directory is `/app`, owned by uid 185, so under `--user $(id -u)` the
 write fails and the harness dies in `Results.of()` *before rendering the
-report* — the symptom is a stack trace and an empty `reports/`. The working
-directory cannot simply be moved either: the harness reads
+report*. The symptom is a stack trace and an empty `reports/`. The working
+directory cannot be moved either: the harness reads
 `config/application.yaml` relative to it too, and a `-w` elsewhere trades this
 failure for `Missing mandatory option: 'subjects'`.
 
@@ -121,26 +121,26 @@ lifetime; it is written `0600` inside a `0700` directory.
 ## How to read it
 
 Open `report.html`. It lists every test case with its scenarios, and each
-scenario's requests and responses — enough to reproduce a failure with `curl`
+scenario's requests and responses, which is enough to reproduce a failure with `curl`
 without re-running the suite.
 
 Three things to know before drawing conclusions from it:
 
 - **The exit code is the harness's.** It is non-zero while any scenario fails.
-  A report on disk is the deliverable; a green report is not the bar yet.
+  A report on disk is the deliverable, and a green report is a later bar.
 - **A failed scenario and an aborted feature are different.** Several features
   build their fixtures in a `callonce` `Background`; if that setup request
   fails, the whole feature errors out at once rather than failing row by row.
-  A `text/plain` fixture used to do this — before Plan 10, the pod answered
+  A `text/plain` fixture used to do this: before Plan 10, the pod answered
   `415` to any non-RDF media type, which took out all six WAC
   `protected-operation` features before their assertions ran. It no longer
   does; `text/plain` and any other non-RDF type now store as a blob.
-- **Some failures are decisions, not defects.** `post-target-not-found`
+- **Some failures are decisions the pod made.** `post-target-not-found`
   expects `404` where this pod deliberately materialises missing ancestors
   and answers `201`; `DELETE` of a resource the suite reserved a name for but
   never created expects `403` where this pod, having authorized the request,
   finds nothing there and answers `404`. Triage lives in
-  `docs/conformance-findings.md`, not here.
+  `docs/conformance-findings.md`.
 
 ## Knobs
 

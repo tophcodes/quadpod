@@ -9,7 +9,7 @@ every request carries a fresh signed proof over the method and target URI. The
 request is to also accept a plain bearer token, as an alternative rather than a
 replacement.
 
-## What that actually gives up
+## What that gives up
 
 DPoP exists so that a stolen token is not enough. Possession of the token
 without the private key buys nothing, which matters when a token can leak
@@ -25,7 +25,7 @@ For a server-side daemon on a machine the pod's owner controls, reached over a
 private network, the attacker who can read the token can generally also read the
 key file next to it. The proof adds ceremony without changing the threat model,
 and it adds a dependency on clock skew and on the client implementing a signing
-flow correctly — which is where real integrations break.
+flow correctly, which is where real integrations break.
 
 For anything reached from a browser, from third-party code, or across a network
 the owner does not control, the trade is not honest and DPoP should stay
