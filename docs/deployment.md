@@ -173,6 +173,17 @@ quadpod \
 A production deployment reaching a real IdP over https needs none of this and should
 pass no `--allow-insecure-host` at all.
 
+## What `--base-uri` has to be set to
+
+Every URL the pod mints derives from `--base-uri`, and a DPoP proof's `htu` is compared
+against it byte for byte. Behind a reverse proxy that means the public URL the client used.
+Whatever the proxy forwards inside the network is the wrong value, and the failure is total
+rather than partial: every authenticated request is refused, because no proof's `htu` can
+match a name the client never typed.
+
+With `--op-signing-keys` set it must also be an origin root, since the discovery document it
+implies hangs off `/.well-known/`.
+
 ## Where the data lives
 
     --rdf-store memory            (default) triples in this process, gone on restart

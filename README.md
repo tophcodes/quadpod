@@ -62,17 +62,15 @@ format claim.
 
 ## What works
 
-Measured against `solidproject/conformance-test-harness` with the `protocol` and
-`web-access-control` manifests: **638 of 652 scenarios pass, 34 of 41 features fully green**
-(ninth run, 2026-08-08). Conditions worth knowing: plain HTTP on loopback, an in-memory store
-so the persistence path is not exercised, and Community Solid Server 7.2.0 standing in as the
-identity provider because this pod has no token endpoint yet.
+The official Solid conformance suite runs against this pod with one command,
+`./conformance/run.sh`, over the `protocol` and `web-access-control` manifests. Current
+figures live in [`docs/conformance-findings.md`](docs/conformance-findings.md), where every
+run is dated, reconciled against the one before it and triaged failure by failure. A copy of
+them here would go stale without anyone noticing.
 
-Of the 14 remaining failures: **3 are open Web Access Control defects** (`DELETE` of a
-container authorized only through inheritance, where the pod denies what it should allow), 8
-are decisions not yet settled, and 3 need `https` or a media type this pod refuses by design.
-Every run is dated and reconciled against the previous one in
-[`docs/conformance-findings.md`](docs/conformance-findings.md).
+Read them knowing what the run is: plain HTTP on loopback, an in-memory store so the
+persistence path is never exercised, and Community Solid Server standing in as the identity
+provider, because this pod has no token endpoint yet.
 
 - **Linked Data Platform (LDP) over HTTP**: containers, resources, auxiliary resources, and
   containment maintained by the server.
@@ -130,53 +128,39 @@ failure mode is silent: a client that assumes the sibling URL and writes `/foo.a
 
 ## Roadmap
 
-No dates. The order states dependencies, and the numbers link to
-[the issue tracker](https://github.com/tophcodes/quadpod/issues).
+No dates. The order states dependencies, and
+[the issue tracker](https://github.com/tophcodes/quadpod/issues) carries the detail, the
+open questions and the current state of each.
 
-**Being an identity provider** ([#57](https://github.com/tophcodes/quadpod/issues/57)). The
-signing core mints DPoP-bound tokens already, and no HTTP path reaches it. Missing: the
-Authorization Code flow with PKCE (#58), Client ID Documents and dynamic registration (#59),
-authenticating the human (#60), and the algorithm and audience contract (#62). Until these
-exist no browser application can log in, and no separate process can obtain a credential.
-Alongside them the pod gains an identity of its own so it can authenticate outbound requests
-(#22, #23, #49).
+**Being an identity provider.** The signing core mints DPoP-bound tokens and no HTTP path
+reaches it, so no browser application can log in and no separate process can obtain a
+credential. Alongside it the pod gains an identity of its own, so it can authenticate
+outbound requests.
 
-**Notifications** (#20). Every write emits a change event on an internal bus; no channel type
-is served, so nothing outside the process can receive one. The Subscription API with
-`WebSocketChannel2023` (#18) and `WebhookChannel2023` (#19) are what turn it into a protocol.
-Extraction waits on this.
+**Notifications.** Every write emits a change event on an internal bus, and no channel type
+is served, so nothing outside the process can receive one. Extraction waits on this.
 
-**Storage description and origin-based access control.** Two spec-surface gaps that matter for
-interoperability: the storage root does not yet advertise itself as `pim:Storage` with a
-storage description resource (#16), which is the first thing a generic Solid app looks for;
-and `acl:origin` is not enforced, so an authenticated user's browser applications currently
-act with that user's full authority.
+**Storage description and origin-based access control.** Two interoperability gaps. The
+storage root does not advertise itself as `pim:Storage`, which is the first thing a generic
+Solid app looks for, and `acl:origin` is not enforced, so a user's browser applications act
+with that user's full authority.
 
-**Extraction and projection** (#63). Deriving triples from a blob's bytes, and making
+**Extraction and projection.** Deriving triples from a blob's bytes, and making
 quad-store-only RDF visible as files. Bytes stay authoritative and nothing writes back into
-them. Designed and unimplemented, ending in open questions the epic carries: what an
-extractor may reject (#74), how the derived index is partitioned so two extractors cannot
-overwrite each other (#65), and what revoking an extractor's trust does to configurations it
-already wrote (#68).
+them. Designed, unimplemented.
 
-**A SPARQL query endpoint.** The store is a quad store and nothing exposes it as one. No issue
-tracks it yet. The deciding question is access control: a query endpoint that reads across
-graphs is a second enforcement point, and WAC has one.
+**A SPARQL query endpoint.** The store is a quad store and nothing exposes it as one. The
+shape it must take is settled ([ADR-12](docs/decisions.md#adr-12)): a read-only projection,
+with access control the remaining open question, since a query that reads across graphs is a
+second enforcement point and WAC has one.
 
-**Convergent writes.** Several writers changing one resource from clients that were offline,
-with the server merging so that a client holding no replica and speaking only `PUT` stays a
-valid client. A CRDT under the hood, opt-in per container. Designed, unimplemented.
+**Convergent writes, then partial replicas.** Several writers changing one resource from
+clients that were offline, merged server-side so that a client speaking only `PUT` stays a
+valid client. Replicas answering as one base URI follow from it, and cannot precede it
+([ADR-11](docs/decisions.md#adr-11)). Both designed, neither implemented.
 
-**Partial replicas.** Replicas answering as one base URI, each carrying a subtree's content,
-only its existence, or neither, and answering `421 Misdirected Request` for what exists
-elsewhere. Depends on convergent writes: what a replica withholds has to be declared as
-non-participation in the merge, or convergence restores exactly what was withheld. See
-[ADR-11](docs/decisions.md#adr-11).
-
-**Limited OWL reasoning, materialized** (#76). Entailments computed and stored instead of
-derived per query, so a reader that does no reasoning sees the same resource as one that does.
-
-**Closing the conformance gap** (#53, #54): the 3 defects and 8 undecided cases above.
+**Limited OWL reasoning, materialized.** Entailments computed and stored instead of derived
+per query, so a reader that does no reasoning sees the same resource as one that does.
 
 **Seams without designs.** Multi-tenancy, ACP (Access Control Policy, the successor to WAC)
 and an HTML view each have a place they would attach and nothing more.
@@ -209,36 +193,20 @@ cost worth knowing about.
 
 ## Configuration
 
-| Flag | Environment | Meaning |
-|---|---|---|
-| `--base-uri` | `POD_BASE_URI` | the public URL this pod answers as |
-| `--owner-webid` | `POD_OWNER_WEBID` | who the root ACL grants control to |
-| `--trusted-issuer` | `POD_TRUSTED_ISSUERS` | issuers whose tokens are considered. **Without one, every issuer is trusted** |
-| `--rdf-store` | `POD_RDF_STORE` | `memory` or `rocksdb:<dir>` |
-| `--blob-store` | `POD_BLOB_STORE` | `memory` or `local:<dir>` |
-| `--op-signing-keys` | `POD_OP_SIGNING_KEYS` | private JWKS the pod signs with; unset means it issues nothing |
-| `--listen` | `POD_LISTEN` | socket, loopback by default |
+Flags and their environment variables are listed by `quadpod --help`, and the full table with
+what each one means is in [`docs/architecture.md`](docs/architecture.md). `--config` takes a
+file holding the same keys.
 
-`--config` takes a file holding the same keys. The full table is in
-[`docs/architecture.md`](docs/architecture.md).
+Three things are worth knowing before the first run, because each fails quietly:
 
-Both stores default to `memory`, so an unconfigured pod is uniformly ephemeral. Set both, or
-restarting loses everything.
+- **`--trusted-issuer` is not optional in practice.** Without one, every issuer is trusted.
+- **Both stores default to `memory`**, so an unconfigured pod is uniformly ephemeral. Set
+  `--rdf-store` and `--blob-store`, or restarting loses everything.
+- **`--base-uri` must be the public URL the client used**, not what a reverse proxy forwards
+  inside the network.
 
-Behind a reverse proxy, every URL the pod mints derives from `--base-uri`, and a DPoP proof's
-`htu` is compared against it byte for byte. Set it to the public URL the client used. What
-the proxy forwards inside the network is the wrong value. With `--op-signing-keys` set it
-must also be an origin root, since the discovery document it implies hangs off
-`/.well-known/`.
-
-Back up three things together, or the restore is inconsistent: the RocksDB directory, the
-blob directory, and the file named by `--op-signing-keys`. Losing the last invalidates every
-token the pod has issued.
-
-Pointing `--blob-store` at a directory that already holds files makes the backing tree
-readable with ordinary tools, since the blob key is the resource's own path. Give the pod a
-directory of its own: files it did not write have no containment triple, no ETag and no ACL,
-so `ls` and `GET` will disagree about what exists.
+[`docs/deployment.md`](docs/deployment.md) covers those last two properly, along with what to
+back up so a restore is consistent, and why a blob directory has to belong to the pod alone.
 
 ## Documentation
 
