@@ -367,3 +367,49 @@ already exists, since the store is a trait rather than the process-wide static i
 **What would reopen it.** Replicas ceasing to share a base URI. If an origin identifies the
 copy, location is carried by the identifier, every reference names the copy it meant, and
 none of the three answers above has anything to distinguish.
+
+<a id="adr-12"></a>
+
+## ADR-12: The store is the truth, LDP and SPARQL are projections, and only LDP writes
+
+Every interface over the quad store is a projection of it. LDP is the projection that
+writes. A query interface, when one exists, reads and never writes: no
+`application/sparql-update`, no update operation reachable by any name.
+
+**Why.** A projection that accepts writes needs an inverse, and an inverse exists only where
+the projection is injective on the part being written. This is the view-update problem, and
+it does not become easier by being expressed in RDF. A read-only projection owes nothing:
+it may name graphs differently from the interface that wrote them, expose a subset, or
+withhold the server's own bookkeeping, and none of those choices can corrupt anything.
+
+The same argument rules out the inverse arrangement, where the store is primary and LDP
+resources are overlapping views over it. Views that overlap
+turn one write into an ambiguous update of several of them, and make the conditional-request
+machinery incoherent: one write invalidates validators the writer never named.
+
+[ADR-8](#adr-8) already refuses `application/sparql-update` as a patch format on a narrower
+argument, the blast radius of a client-authored database command. This decision is the wider
+one and does not depend on it: even a perfectly safe update language would still be writing
+through a view.
+
+**A projected graph name must lead back to the resource that holds it.** A projection is
+free to rename, and renaming is unavoidable: two resources may each hold a named graph
+called `urn:example:g1`, and a projection that keeps both original names merges two
+resources, with them two access-control decisions, into one graph. Keeping the names apart
+by requiring them to be unique pod-wide is worse: a write would then fail on account of a
+resource the writer may not read, and the refusal announces that resource's existence.
+
+So the projection mints its own graph names, and the rule they must satisfy is that a client
+holding one can find the URL to write to. A name derived from the holding resource's URL
+satisfies this by dereference and needs no vocabulary to explain it.
+
+**Renaming stops at graph names.** A projection never rewrites a term. A graph name that
+also appears as a subject or an object, the shape RDF-based signatures and provenance both
+rely on, therefore stops co-referring inside the projection. Nothing is formally broken,
+RDF gives graph names no semantics, and the practical loss is real: repairing the
+co-reference costs a join through whatever the projection publishes about the mapping. That
+cost is accepted, because the alternative is a projection that reports triples nobody wrote.
+
+**What would reopen it.** A write interface that is not a projection: a second front end
+addressing the same resources LDP addresses, by the same identifiers, with the same
+conditional requests. That is not a view, and this decision would not apply to it.
