@@ -101,14 +101,21 @@ pub async fn authenticate(
 }
 
 /// Parse an `Authorization` header of the form `DPoP <token>`, requiring the
-/// `DPoP` scheme exactly (a `Bearer` scheme, or any other, is rejected).
+/// `DPoP` scheme (a `Bearer` scheme, or any other, is rejected).
+///
+/// The scheme is matched case-insensitively, which RFC 9110 §11.1 requires:
+/// "the authentication scheme is case-insensitive". Every Solid client in
+/// practice sends the `DPoP` spelling, so this refuses nothing it used to
+/// accept; it only stops refusing a client that is within its rights. The
+/// token itself is case-SENSITIVE and is passed through untouched, it is a
+/// compact JWS whose base64url alphabet distinguishes case.
 fn parse_dpop_scheme(auth_header: Option<&str>) -> Result<&str, AuthError> {
     let header = auth_header
         .ok_or_else(|| AuthError::DpopInvalid("missing Authorization header".to_string()))?;
     let (scheme, token) = header
         .split_once(' ')
         .ok_or_else(|| AuthError::Malformed("malformed Authorization header".to_string()))?;
-    if scheme != "DPoP" {
+    if !scheme.eq_ignore_ascii_case("DPoP") {
         return Err(AuthError::DpopInvalid(format!(
             "unsupported Authorization scheme: {scheme}"
         )));
@@ -201,6 +208,65 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    /// RFC 9110 §11.1: the authentication scheme is case-insensitive. A
+    /// client spelling it `dpop` or `DPOP` is presenting the same credential
+    /// and must be answered the same way.
+    #[tokio::test]
+    async fn the_dpop_scheme_is_matched_case_insensitively() {
+        for spelling in ["DPoP", "dpop", "DPOP", "dPoP"] {
+            let idp = TestIdp::new();
+            let client = TestClient::new();
+            let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+            let mut webids = StaticWebIdIssuers::new();
+            webids.allow("https://alice.example/card#me", "https://idp.example/");
+            let cfg = AuthConfig::default();
+            let at = idp.mint_access_token(
+                "https://alice.example/card#me",
+                &client.jkt(),
+                9_999_999_999,
+            );
+            let proof =
+                client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, &format!("jti-{spelling}"));
+            let replay = InMemoryJtiReplayStore::new();
+            let deps = AuthDeps {
+                resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+            };
+            let agent = authenticate(Some(&format!("{spelling} {at}")), Some(&proof), "GET",
+                "https://pod.toph.so/foo", deps, 1_010).await
+                .unwrap_or_else(|e| panic!("scheme spelled {spelling:?} must authenticate: {e}"));
+            assert_eq!(agent, Agent::WebId("https://alice.example/card#me".into()));
+        }
+    }
+
+    /// The scheme staying case-insensitive must not make it permissive:
+    /// `Bearer` is still refused, which is the whole point of requiring
+    /// proof-of-possession.
+    #[tokio::test]
+    async fn a_bearer_scheme_is_still_refused_in_any_spelling() {
+        for spelling in ["Bearer", "bearer", "BEARER"] {
+            let idp = TestIdp::new();
+            let client = TestClient::new();
+            let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+            let mut webids = StaticWebIdIssuers::new();
+            webids.allow("https://alice.example/card#me", "https://idp.example/");
+            let cfg = AuthConfig::default();
+            let at = idp.mint_access_token(
+                "https://alice.example/card#me",
+                &client.jkt(),
+                9_999_999_999,
+            );
+            let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-bearer");
+            let replay = InMemoryJtiReplayStore::new();
+            let deps = AuthDeps {
+                resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+            };
+            let r = authenticate(Some(&format!("{spelling} {at}")), Some(&proof), "GET",
+                "https://pod.toph.so/foo", deps, 1_010).await;
+            assert!(matches!(r, Err(AuthError::DpopInvalid(_))),
+                "{spelling} must not be accepted as a credential");
+        }
     }
 
     /// End to end through `authenticate`, not only `verify_access_token`: an
