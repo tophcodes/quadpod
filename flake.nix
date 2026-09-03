@@ -26,6 +26,10 @@
             # the whole tree with E0514.
             clippy
             rustfmt
+            # The advisory check CI runs. Here rather than installed in the
+            # workflow so the version is pinned by flake.lock like every other
+            # tool, and so `cargo audit` locally is the same command CI runs.
+            cargo-audit
             clang
             libclang
             pkg-config
