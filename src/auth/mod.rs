@@ -52,6 +52,8 @@ pub enum AuthError {
     Binding,
     #[error("no signing key available for this token")]
     MissingKey,
+    #[error("issuer's signing key is of a type this pod cannot verify")]
+    UnsupportedKeyType,
     #[error("blocked outbound fetch: {0}")]
     FetchBlocked(String),
     #[error("webid does not authorize this token's issuer")]

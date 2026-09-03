@@ -235,6 +235,20 @@ fn signer_for(jwk: &josekit::jwk::Jwk) -> Result<Box<dyn josekit::jws::JwsSigner
     })
 }
 
+/// Write a key file holding `jwk`, for a test that needs a key set this
+/// module would not generate on its own (an RSA one, say).
+///
+/// Here for the same reason [`remove_test_key_file`] is: only this file may
+/// touch the filesystem inside `src/op/` (`docs/constraints.md`: "Only
+/// `op::keys` touches the key file"), so a sibling test module cannot write
+/// what it wants to load. `#[cfg(test)]`-gated, so a release build has no
+/// file-writing path here beyond the generate-on-missing one above.
+#[cfg(test)]
+pub(crate) fn write_test_key_file(path: &std::path::Path, jwk: &josekit::jwk::Jwk) {
+    std::fs::write(path, serde_json::json!({ "keys": [jwk] }).to_string())
+        .expect("write test key file");
+}
+
 /// Delete a key file a test had [`KeySet::load_or_generate`] create.
 ///
 /// Sibling test modules in `op` need this because only this file may touch

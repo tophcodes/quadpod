@@ -203,6 +203,32 @@ mod tests {
         .is_err());
     }
 
+    /// End to end through `authenticate`, not only `verify_access_token`: an
+    /// issuer signing RS256 is an ordinary OIDC provider and must reach
+    /// `Agent::WebId` like any other.
+    #[tokio::test]
+    async fn an_rs256_issuer_authenticates_end_to_end() {
+        let idp = TestIdp::new_rsa();
+        let client = TestClient::new();
+        let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+        let mut webids = StaticWebIdIssuers::new();
+        webids.allow("https://alice.example/card#me", "https://idp.example/");
+        let cfg = AuthConfig::default();
+        let at = idp.mint_access_token(
+            "https://alice.example/card#me",
+            &client.jkt(),
+            9_999_999_999,
+        );
+        let proof = client.mint_dpop("https://pod.toph.so/foo", "GET", 1_000, "jti-rs256");
+        let replay = InMemoryJtiReplayStore::new();
+        let deps = AuthDeps {
+            resolver: &resolver, webid_verifier: &webids, config: &cfg, replay: &replay,
+        };
+        let agent = authenticate(Some(&format!("DPoP {at}")), Some(&proof), "GET",
+            "https://pod.toph.so/foo", deps, 1_010).await.unwrap();
+        assert_eq!(agent, Agent::WebId("https://alice.example/card#me".into()));
+    }
+
     #[tokio::test]
     async fn issuer_not_authorized_by_webid_is_rejected() {
         let idp = crate::auth::testsupport::TestIdp::new();

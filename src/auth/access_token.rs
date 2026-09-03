@@ -8,7 +8,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use josekit::jwk::Jwk;
-use josekit::jws::ES256;
+use josekit::jws::{JwsVerifier, ES256, RS256};
 use josekit::jwt;
 use serde_json::Value;
 
@@ -28,9 +28,24 @@ pub struct AccessClaims {
 /// or verification error returns the matching [`AuthError`] rather than a
 /// silent pass.
 ///
-/// The verification algorithm is pinned to ES256 regardless of what the
-/// token's own header claims (its `alg` is never read for this purpose),
-/// which forecloses `alg: none` and algorithm-confusion attacks.
+/// The verification algorithm comes from the RESOLVED KEY, never from the
+/// token's own header, which is what forecloses `alg: none` and
+/// algorithm-confusion attacks: a header claiming `none` or `HS256` cannot
+/// nominate the verifier it would like to be checked under, and josekit's
+/// `decode_with_verifier` separately refuses a token whose header algorithm
+/// disagrees with the verifier it was handed.
+///
+/// [`verifier_for`] is what maps the key to that algorithm, RS256 for RSA
+/// and ES256 for EC P-256, the same two `op::keys::signer_for` signs with.
+/// Before that pairing existed this function pinned ES256 outright, which
+/// made an RS256 issuer indistinguishable from a forgery and, worse, made
+/// this pod reject the tokens its own OP mints from an RSA key: the key set
+/// signs RS256 for a key that declares it, publishes `RS256` in the JWKS,
+/// and advertises it in `id_token_signing_alg_values_supported`, so the
+/// verify side pinning ES256 was a pod that could not read its own
+/// signature. ADR-3 settled the identical question one layer down for DPoP
+/// proofs ("accepting only ES256 was stricter than the specification
+/// without a reason"); this is that decision applied to the access token.
 pub async fn verify_access_token(
     token: &str,
     resolver: &dyn JwksResolver,
@@ -56,13 +71,10 @@ pub async fn verify_access_token(
     let jwk = select_key(&jwks.keys, kid)?;
 
     // Verify the JWS signature against the resolved PUBLIC key, with the
-    // verifier built for the pinned ES256 algorithm, not whatever `alg`
-    // the header claims.
-    let verifier = ES256
-        .verifier_from_jwk(jwk)
-        .map_err(|_| AuthError::BadSignature)?;
+    // verifier the KEY selects, not whatever `alg` the header claims.
+    let verifier = verifier_for(jwk)?;
     let (verified_payload, _verified_header) =
-        jwt::decode_with_verifier(token, &verifier).map_err(|_| AuthError::BadSignature)?;
+        jwt::decode_with_verifier(token, &*verifier).map_err(|_| AuthError::BadSignature)?;
 
     // From here on, every claim comes from `verified_payload`, its
     // signature has been checked against the issuer's key.
@@ -148,9 +160,50 @@ fn decode_segment(segment: &str) -> Result<Value, AuthError> {
         .map_err(|_| AuthError::Malformed("invalid JSON segment".to_string()))
 }
 
+/// The verifier for `jwk`, chosen by the key's own type: RS256 for an RSA
+/// key, ES256 for an EC P-256 one. The mirror of `op::keys::signer_for`, and
+/// the two have to stay in step: a key this pod signs with and cannot verify
+/// is a pod that rejects its own tokens.
+///
+/// Chosen from the KEY, never from the token header. That is the whole
+/// safety argument for widening past one algorithm: the algorithm is a
+/// property of the key the issuer published under its own `jwks_uri`, so a
+/// token can no more choose it than it can choose the key. A header claiming
+/// `none`, `HS256`, or anything else the resolved key does not support is
+/// refused by `decode_with_verifier` before a signature is inspected.
+///
+/// A key of any other type is [`AuthError::UnsupportedKeyType`] rather than
+/// [`AuthError::BadSignature`]: an issuer whose keys this pod cannot handle
+/// is a configuration fact an operator can act on, and reporting it as a
+/// forgery is exactly what makes it undiagnosable from the log.
+fn verifier_for(jwk: &Jwk) -> Result<Box<dyn JwsVerifier>, AuthError> {
+    let built: Result<Box<dyn JwsVerifier>, _> = match (jwk.key_type(), jwk.curve()) {
+        ("RSA", _) => RS256
+            .verifier_from_jwk(jwk)
+            .map(|v| Box::new(v) as Box<dyn JwsVerifier>),
+        ("EC", Some("P-256")) => ES256
+            .verifier_from_jwk(jwk)
+            .map(|v| Box::new(v) as Box<dyn JwsVerifier>),
+        _ => return Err(AuthError::UnsupportedKeyType),
+    };
+    // A key of a type this pod handles that still will not build a verifier
+    // (an RSA modulus under josekit's 2048-bit floor, a malformed member) is
+    // a key nothing can be verified against, which is a refusal, not a
+    // capability gap.
+    built.map_err(|_| AuthError::BadSignature)
+}
+
 /// Select the JWK to verify against: by `kid` if the header names one,
 /// else the first signing-capable key (no `use`/`key_ops` restriction, or
 /// one that explicitly allows verification).
+///
+/// Whichever key this returns is also what picks the algorithm
+/// ([`verifier_for`]), so a JWKS mixing key types stays coherent: the token
+/// is checked under the algorithm of the key it selected, never under one it
+/// asked for. The `kid`-less arm is best-effort by nature, and it is the
+/// issuer's own JWKS that decides whether it can be: a set holding more than
+/// one usable key and a token that names none of them is an issuer not
+/// saying which key signed. Every issuer in practice sends `kid`.
 fn select_key<'a>(keys: &'a [Jwk], kid: Option<&str>) -> Result<&'a Jwk, AuthError> {
     if let Some(kid) = kid {
         return keys
@@ -293,6 +346,89 @@ mod tests {
         let forged = build_jws(&header, &payload, &bogus_signature);
 
         assert!(verify_access_token(&forged, &resolver, 1_000).await.is_err());
+    }
+
+    /// The regression this pairing exists for. RS256 is the algorithm OIDC
+    /// Core requires every provider to support, and pinning ES256 rejected
+    /// every issuer that uses it, as a forged signature.
+    #[tokio::test]
+    async fn an_rs256_token_from_an_rsa_issuer_verifies() {
+        let idp = TestIdp::new_rsa();
+        let client = TestClient::new();
+        let resolver = StaticJwksResolver::new("https://idp.example/", idp.jwks());
+        let jkt = client.jkt();
+        let at = idp.mint_access_token("https://alice.example/card#me", &jkt, 9_999_999_999);
+
+        let claims = verify_access_token(&at, &resolver, 1_000).await.unwrap();
+        assert_eq!(claims.webid, "https://alice.example/card#me");
+        assert_eq!(claims.jkt, jkt);
+        assert_eq!(claims.issuer, "https://idp.example/");
+    }
+
+    /// Widening to a second algorithm must not let a token pick which one it
+    /// is checked under. The key the resolver hands back decides, so a token
+    /// signed by the wrong key type is refused rather than routed to a
+    /// verifier that happens to match its header.
+    #[tokio::test]
+    async fn an_es256_token_does_not_verify_against_an_rsa_jwks() {
+        let ec_idp = TestIdp::new();
+        let rsa_idp = TestIdp::new_rsa();
+        let client = TestClient::new();
+        // The resolver publishes the RSA issuer's key; the token is ES256.
+        let resolver = StaticJwksResolver::new("https://idp.example/", rsa_idp.jwks());
+        let at = ec_idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
+
+        assert!(matches!(
+            verify_access_token(&at, &resolver, 1_000).await,
+            Err(AuthError::BadSignature)
+        ));
+    }
+
+    /// And the reverse direction, so neither arm is the one carrying the
+    /// test on its own.
+    #[tokio::test]
+    async fn an_rs256_token_does_not_verify_against_an_ec_jwks() {
+        let ec_idp = TestIdp::new();
+        let rsa_idp = TestIdp::new_rsa();
+        let client = TestClient::new();
+        let resolver = StaticJwksResolver::new("https://idp.example/", ec_idp.jwks());
+        let at = rsa_idp.mint_access_token("https://alice.example/card#me", &client.jkt(), 9_999_999_999);
+
+        assert!(matches!(
+            verify_access_token(&at, &resolver, 1_000).await,
+            Err(AuthError::BadSignature)
+        ));
+    }
+
+    /// A key type this pod cannot verify is a fact about the issuer's
+    /// configuration, and it must not be reported as a forged signature:
+    /// that is what makes an operator chase an attack that is not happening.
+    #[test]
+    fn an_unsupported_key_type_is_distinguished_from_a_bad_signature() {
+        // OKP/Ed25519 is a real JWKS key type, and one `verifier_for` has no
+        // arm for.
+        let okp = Jwk::generate_ed_key(josekit::jwk::alg::ed::EdCurve::Ed25519).unwrap();
+        assert!(matches!(
+            verifier_for(&okp),
+            Err(AuthError::UnsupportedKeyType)
+        ));
+
+        // An EC key on a curve other than P-256 is the same class of answer,
+        // not an ES256 verification that fails later.
+        let p384 = Jwk::generate_ec_key(josekit::jwk::alg::ec::EcCurve::P384).unwrap();
+        assert!(matches!(
+            verifier_for(&p384),
+            Err(AuthError::UnsupportedKeyType)
+        ));
+    }
+
+    /// An RSA key below josekit's 2048-bit floor is a key nothing can be
+    /// verified against, which is a refusal rather than a capability gap:
+    /// the pod handles RSA, this particular key is unusable.
+    #[test]
+    fn an_undersized_rsa_key_is_a_refusal_not_an_unsupported_type() {
+        let weak = Jwk::generate_rsa_key(1024).unwrap();
+        assert!(matches!(verifier_for(&weak), Err(AuthError::BadSignature)));
     }
 
     #[test]
