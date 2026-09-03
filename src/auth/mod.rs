@@ -9,6 +9,7 @@
 pub mod access_token;
 pub mod agent;
 pub mod authenticate;
+mod cache;
 pub mod config;
 pub mod dpop;
 pub mod http_jwks;

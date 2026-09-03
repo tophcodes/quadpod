@@ -23,6 +23,7 @@ use oxigraph::model::{NamedOrBlankNode, Term};
 use tokio::sync::RwLock;
 
 use super::safe_fetch::{guarded_get, FetchPolicy, GuardedClient};
+use super::cache::insert_bounded;
 use super::AuthError;
 use crate::rdf::Format;
 
@@ -92,11 +93,6 @@ const CACHE_TTL: Duration = Duration::from_secs(120);
 /// their own IdP can sign one naming any URL. Without this, each such request
 /// is one fresh outbound fetch to an attacker-chosen address.
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
-
-/// Cap on entries in either cache. Both are keyed by the token's `webid`
-/// claim, which is attacker-influenced under the conditions described at
-/// [`NEGATIVE_CACHE_TTL`], so neither may grow without bound.
-const MAX_CACHE_ENTRIES: usize = 1024;
 
 /// Production `WebIdIssuerVerifier`: dereferences the WebID's profile
 /// document over HTTP and checks it for the `solid:oidcIssuer` triple,
@@ -185,36 +181,6 @@ impl HttpWebIdIssuers {
             })
             .collect())
     }
-}
-
-/// Insert into a bounded cache, making room first if the map is at
-/// [`MAX_CACHE_ENTRIES`]: expired entries go first, and if that frees nothing
-/// the least recently fetched entry is evicted.
-///
-/// Eviction rather than refusal because the entry being inserted is the one
-/// just proven live; the worst case is a cache miss, never unbounded memory.
-fn insert_bounded<V>(
-    map: &mut HashMap<String, V>,
-    key: String,
-    value: V,
-    ttl: Duration,
-    stamp: fn(&V) -> Instant,
-) {
-    if map.len() >= MAX_CACHE_ENTRIES && !map.contains_key(&key) {
-        map.retain(|_, v| stamp(v).elapsed() < ttl);
-
-        if map.len() >= MAX_CACHE_ENTRIES {
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, v)| stamp(v))
-                .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
-            }
-        }
-    }
-
-    map.insert(key, value);
 }
 
 #[async_trait]
@@ -442,57 +408,6 @@ mod tests {
 
         assert!(verifier.authorizes(&webid, "https://idp.example/").await.is_err());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-    }
-
-    /// Both caches are keyed by the token's `webid` claim, which an attacker
-    /// running their own IdP can set freely when no `trusted_issuers`
-    /// allowlist is configured. Neither may grow without bound.
-    #[test]
-    fn a_bounded_cache_does_not_grow_past_its_cap() {
-        let mut map: HashMap<String, (Vec<String>, Instant)> = HashMap::new();
-
-        for i in 0..MAX_CACHE_ENTRIES + 50 {
-            insert_bounded(
-                &mut map,
-                format!("https://example.test/{i}#me"),
-                (vec!["https://idp.example/".to_string()], Instant::now()),
-                CACHE_TTL,
-                |(_, at)| *at,
-            );
-        }
-
-        assert_eq!(map.len(), MAX_CACHE_ENTRIES);
-    }
-
-    /// Eviction must not fire on a key already present: re-fetching the same
-    /// WebID replaces its entry rather than displacing someone else's.
-    #[test]
-    fn refreshing_an_existing_entry_evicts_nothing() {
-        let mut map: HashMap<String, (Vec<String>, Instant)> = HashMap::new();
-
-        for i in 0..MAX_CACHE_ENTRIES {
-            insert_bounded(
-                &mut map,
-                format!("https://example.test/{i}#me"),
-                (vec![], Instant::now()),
-                CACHE_TTL,
-                |(_, at)| *at,
-            );
-        }
-
-        insert_bounded(
-            &mut map,
-            "https://example.test/0#me".to_string(),
-            (vec!["https://idp.example/".to_string()], Instant::now()),
-            CACHE_TTL,
-            |(_, at)| *at,
-        );
-
-        assert_eq!(map.len(), MAX_CACHE_ENTRIES);
-        assert_eq!(
-            map["https://example.test/0#me"].0,
-            vec!["https://idp.example/".to_string()]
-        );
     }
 
     /// Spin up a local profile-document server serving the SAME
