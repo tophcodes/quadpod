@@ -71,6 +71,53 @@ async fn the_jwks_route_serves_public_members_only_with_its_media_type() {
     std::fs::remove_file(&p).ok();
 }
 
+/// Liveness is served whatever the pod's configuration, and without
+/// credentials: a supervisor holds none, and a verify-only pod (no OP) is
+/// still a running pod. Answering 404 there is what would make a restart
+/// loop out of a healthy process.
+#[tokio::test]
+async fn health_is_served_unauthenticated_with_the_op_off() {
+    let f = fixture().await;
+    let res = get(&f.app, "/.well-known/health").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "application/health+json");
+    let bytes = http_body_util::BodyExt::collect(res.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(doc["status"], "pass");
+}
+
+/// And turning the OP on takes nothing away from it: the two discovery
+/// documents join `health` rather than displacing it.
+#[tokio::test]
+async fn health_is_served_with_the_op_on_too() {
+    let (f, _op, p) = fixture_with_op().await;
+    let (status, doc) = get_json(&f.app, "/.well-known/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc.unwrap()["status"], "pass");
+    std::fs::remove_file(&p).ok();
+}
+
+/// The probe reads liveness and nothing else. It must not become a way to
+/// ask an unauthenticated question about the store, which is what a
+/// readiness check here would be, so its body carries one member and no
+/// version, no issuer, no counts.
+#[tokio::test]
+async fn health_discloses_nothing_beyond_liveness() {
+    let (f, _op, p) = fixture_with_op().await;
+    let (_, doc) = get_json(&f.app, "/.well-known/health").await;
+    let obj = doc.unwrap();
+    let obj = obj.as_object().expect("a JSON object");
+    assert_eq!(
+        obj.keys().collect::<Vec<_>>(),
+        vec!["status"],
+        "liveness says only that this process is serving"
+    );
+    std::fs::remove_file(&p).ok();
+}
+
 #[tokio::test]
 async fn an_unimplemented_name_is_404_and_the_bare_forms_too() {
     let (f, _op, p) = fixture_with_op().await;
@@ -121,6 +168,7 @@ async fn every_write_is_405(
         "/.well-known/oauth-authorization-server",
         "/.well-known/openid-configuration",
         "/.well-known/jwks.json",
+        "/.well-known/health",
         "/.well-known",
         "/.well-known/",
     ] {

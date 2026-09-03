@@ -88,5 +88,40 @@ async fn main() {
     ).await.expect("provision root ACL");
     let listener = tokio::net::TcpListener::bind(cfg.listen).await.unwrap();
     tracing::info!("quadpod listening on {}", cfg.listen);
-    axum::serve(listener, router(state)).await.unwrap();
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+    tracing::info!("quadpod stopped");
+}
+
+/// Resolves on `SIGTERM` or `SIGINT`, which is what lets `axum::serve` stop
+/// accepting connections and then wait for the requests already in flight.
+///
+/// It matters more here than it would elsewhere. ADR-7 gives a `rocksdb:`
+/// directory to exactly one process, so every deployment is a stop and a
+/// start with no second replica to absorb the gap, and without this the
+/// supervisor's `SIGTERM` kills in-flight requests at whatever `.await` they
+/// were parked on. Nothing is corrupted by that (ADR-2 makes each update
+/// sequence atomic, so a killed write either took effect whole or not at
+/// all), but a caller learns the outcome of its own `PUT` by having the
+/// connection dropped, which for a non-idempotent `POST` it cannot safely
+/// retry. Draining turns that into an ordinary response.
+///
+/// `SIGTERM` is what a supervisor sends (systemd, Kubernetes, `docker
+/// stop`); `SIGINT` is Ctrl-C in a terminal. A second signal is not handled,
+/// and deliberately: the runtime's default disposition is restored for
+/// neither, so an operator who wants to stop waiting can send `SIGKILL`,
+/// which no process can trap anyway.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+
+    let received = tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = int.recv() => "SIGINT",
+    };
+    tracing::info!("{received} received, draining in-flight requests");
 }

@@ -139,13 +139,23 @@ this one is yours:
   refused by the router: no handler runs, no WAC decision is taken, and a valid credential
   does not change the answer, the owner's included. It holds whether or not the pod is
   running as an identity provider.
-- **`GET` serves the names the pod implements, and `404`s the rest.** Two names are
-  implemented, and only while the OP is on (`--op-signing-keys`):
+- **`GET` serves the names the pod implements, and `404`s the rest.** Three names are
+  implemented. One is served always; the other two only while the OP is on
+  (`--op-signing-keys`):
 
-| Path | Answer |
-|---|---|
-| `/.well-known/openid-configuration` | the OIDC discovery document, `application/json` |
-| `/.well-known/jwks.json` | the public key set, `application/jwk-set+json` |
+| Path | Answer | When |
+|---|---|---|
+| `/.well-known/health` | liveness, `{"status":"pass"}` as `application/health+json` | always |
+| `/.well-known/openid-configuration` | the OIDC discovery document, `application/json` | OP on |
+| `/.well-known/jwks.json` | the public key set, `application/jwk-set+json` | OP on |
+
+  `health` is here rather than at `/health` because `/health` is a name you are entitled to
+  store a resource at, and a route there would shadow it: the probe would be answered, the
+  graph would stay, and no write method would reach it. It is not an IANA-registered
+  well-known name (RFC 8615 §3 asks that names be registered); its shape follows
+  `draft-inadarei-api-health-check`. It reports that the process is serving and reads
+  nothing: a pod whose store is unreachable still answers it, and fails the requests that
+  need the store.
 
 Both are served to a request carrying **no credentials at all**, because a verifier reads
 issuer metadata before it holds anything to present. A request carrying *invalid* credentials

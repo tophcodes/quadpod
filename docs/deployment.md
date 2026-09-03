@@ -184,6 +184,30 @@ match a name the client never typed.
 With `--op-signing-keys` set it must also be an origin root, since the discovery document it
 implies hangs off `/.well-known/`.
 
+## Running it under a supervisor
+
+**Liveness is `GET /.well-known/health`**, unauthenticated, always served, whether or not
+the OP is on. It answers `200` with `{"status":"pass"}` as `application/health+json`.
+
+It reports one thing: this process is up and serving requests. It is deliberately not a
+readiness check and touches neither the triple store nor the blob store, because an
+unauthenticated probe that queried the store would be a store round trip anyone on the
+network could ask for, without a credential and without a rate limit in front of it. A pod
+whose store has gone away still answers this route, and fails the requests that need the
+store. If you want to alert on the store, alert on those.
+
+**`SIGTERM` drains.** The pod stops accepting connections and waits for the requests already
+in flight before the process exits; `SIGINT` (Ctrl-C) does the same. This matters more here
+than it would elsewhere, because a `rocksdb:` directory belongs to one process (below), so
+every deployment is a stop and a start with no second replica to cover the gap. Nothing is
+corrupted without it, each update sequence is atomic, but a caller learns the outcome of its
+own write by having the connection dropped, and a `POST` is not safe to retry blind.
+
+Give the supervisor a stop timeout longer than your slowest request rather than the default
+it ships with (systemd's `TimeoutStopSec` is 90s, Kubernetes' `terminationGracePeriodSeconds`
+is 30s), or it will send `SIGKILL` mid-drain and you are back where you started. A second
+`SIGTERM` is not special-cased; `SIGKILL` is how you stop waiting.
+
 ## Where the data lives
 
     --rdf-store memory            (default) triples in this process, gone on restart
