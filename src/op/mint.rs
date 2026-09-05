@@ -60,7 +60,7 @@ pub fn mint_access_token(
 mod tests {
     use super::*;
     use crate::auth::{verify_access_token, AuthError, Jwks, StaticJwksResolver};
-    use crate::op::keys::remove_test_key_file;
+    use crate::op::keys::{remove_test_key_file, write_test_key_file};
 
     /// A fresh key-file path per test. Cleaned up through
     /// [`crate::op::keys::remove_test_key_file`], the only file removal
@@ -113,6 +113,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw["aud"], serde_json::json!(["solid"]));
+
+        remove_test_key_file(&p);
+    }
+
+    /// The self-consistency the verify side used to break. `signer_for`
+    /// signs RS256 for a key declaring it, `alg_of` publishes `RS256` in the
+    /// JWKS and `signing_algs` advertises it in discovery, so an operator who
+    /// points `--op-key-file` at an RSA key gets a pod that mints RS256. With
+    /// the verifier pinned to ES256 that pod refused every token it issued,
+    /// as a bad signature, and nothing in the tree said so: every existing
+    /// test here uses the generated ES256 key.
+    #[tokio::test]
+    async fn a_token_minted_from_an_rsa_key_passes_the_pods_own_verifier() {
+        let p = temp_path();
+        let mut jwk = josekit::jwk::Jwk::generate_rsa_key(2048).unwrap();
+        jwk.set_algorithm("RS256");
+        write_test_key_file(&p, &jwk);
+
+        let keys = KeySet::load_or_generate(&p).expect("loads an RSA key");
+        assert_eq!(keys.signing_algs(), vec!["RS256".to_string()]);
+
+        let space = crate::space::StorageSpace::new("https://pod.toph.so/").unwrap();
+        let webid = NamedNode::new("https://pod.toph.so/profile#it").unwrap();
+        let now = 1_700_000_000_i64;
+        let token = mint_access_token(&keys, &space, &webid, "rsa-jkt", now);
+
+        let resolver = resolver_for(&keys);
+        let claims = verify_access_token(&token, &resolver, now + 10)
+            .await
+            .expect("the pod must verify what the pod signed");
+        assert_eq!(claims.webid, webid.as_str());
+        assert_eq!(claims.jkt, "rsa-jkt");
 
         remove_test_key_file(&p);
     }

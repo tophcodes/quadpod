@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 
 use super::jwks::Jwks;
 
-/// A stand-in external Solid-OIDC IdP: an EC P-256 signing keypair, and a
-/// method to mint access tokens as it would issue them.
+/// A stand-in external Solid-OIDC IdP: a signing keypair (EC P-256 signing
+/// ES256 ([`TestIdp::new`]) or RSA signing RS256 ([`TestIdp::new_rsa`])), and
+/// a method to mint access tokens as it would issue them.
 pub struct TestIdp {
     private_jwk: Jwk,
     public_jwk: Jwk,
@@ -24,11 +25,43 @@ pub struct TestIdp {
 
 impl TestIdp {
     pub fn new() -> Self {
-        let private_jwk = Jwk::generate_ec_key(EcCurve::P256).expect("generate IdP EC key");
+        Self::from_private(Jwk::generate_ec_key(EcCurve::P256).expect("generate IdP EC key"))
+    }
+
+    /// An IdP whose signing key is RSA, so its access tokens are signed
+    /// `RS256`. This is the ordinary shape for an OIDC provider (RS256 is
+    /// the algorithm OIDC Core requires every implementation to support),
+    /// and it is also what this pod's own OP mints from an RSA key file, so
+    /// this is how the verify side is held to reading both.
+    ///
+    /// 2048 bits because that is the floor `josekit` enforces on both the
+    /// signing and the verifying side.
+    pub fn new_rsa() -> Self {
+        Self::from_private(Jwk::generate_rsa_key(2048).expect("generate IdP RSA key"))
+    }
+
+    fn from_private(private_jwk: Jwk) -> Self {
         let public_jwk = private_jwk.to_public_key().expect("derive IdP public key");
         Self {
             private_jwk,
             public_jwk,
+        }
+    }
+
+    /// The signer this IdP's key type implies, the same pairing
+    /// `auth::access_token::verifier_for` makes on the other side.
+    fn signer(&self) -> Box<dyn JwsSigner> {
+        match self.public_jwk.key_type() {
+            "RSA" => Box::new(
+                RS256
+                    .signer_from_jwk(&self.private_jwk)
+                    .expect("build IdP RS256 signer"),
+            ),
+            _ => Box::new(
+                ES256
+                    .signer_from_jwk(&self.private_jwk)
+                    .expect("build IdP ES256 signer"),
+            ),
         }
     }
 
@@ -56,9 +89,7 @@ impl TestIdp {
         exp_unix: i64,
         aud: &[&str],
     ) -> String {
-        let signer = ES256
-            .signer_from_jwk(&self.private_jwk)
-            .expect("build IdP signer");
+        let signer = self.signer();
 
         let mut header = JwsHeader::new();
         header.set_token_type("JWT");
@@ -84,7 +115,7 @@ impl TestIdp {
                 .expect("set aud claim");
         }
 
-        jwt::encode_with_signer(&payload, &header, &signer).expect("sign access token")
+        jwt::encode_with_signer(&payload, &header, &*signer).expect("sign access token")
     }
 }
 

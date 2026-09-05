@@ -20,7 +20,11 @@ use crate::space::{GraphName, SpaceError, StorageSpace};
 pub struct InvalidOwnerWebId;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "quadpod", about = "A SPARQL-authoritative Solid pod")]
+// `version` reads `CARGO_PKG_VERSION`, so `quadpod --version` answers from
+// the manifest rather than from a string someone has to remember to bump. An
+// operator filing a bug against a binary they did not build has no other way
+// to say which one they are running.
+#[command(name = "quadpod", version, about = "A SPARQL-authoritative Solid pod")]
 pub struct Config {
     /// Public base URI of this pod. Absolute, with a trailing slash. All
     /// minted URLs and the DPoP `htu` derive from this, never from the socket.

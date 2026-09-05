@@ -79,10 +79,13 @@ provider, because this pod has no token endpoint yet.
   later. The nearest ACL wins outright and does not merge with its ancestors'. The WAC
   specification requires that, and implementations most often get it wrong.
 - **Solid-OIDC authentication**: access tokens bound to a key with DPoP (Demonstration of
-  Proof-of-Possession, RFC 9449), ES256 and RS256 proofs, and the token issuer cross-checked
-  against the `solid:oidcIssuer` in the WebID profile it claims. A plain `Bearer` credential
-  is refused: this pod requires the stronger binding, and the cost is that an issuer
-  configured to hand out non-DPoP tokens will not work against it.
+  Proof-of-Possession, RFC 9449), ES256 and RS256 for both the proof and the access token's
+  own signature, and the token issuer cross-checked against the `solid:oidcIssuer` in the
+  WebID profile it claims. Which algorithm a token is verified under follows the key the
+  issuer published, never the token's own header, so widening past one algorithm gives a
+  token no say in how it is checked. A plain `Bearer` credential is refused: this pod
+  requires the stronger binding, and the cost is that an issuer configured to hand out
+  non-DPoP tokens will not work against it.
 - **An SSRF control** on the fetches that happen while a request is still unauthenticated.
   The token names the URLs, so they are attacker-chosen. The address filter runs inside the
   DNS resolver, so a name cannot answer public for the check and private for the connection.

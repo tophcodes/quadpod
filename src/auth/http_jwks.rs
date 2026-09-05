@@ -16,6 +16,7 @@ use josekit::jwk::Jwk;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use super::cache::insert_bounded;
 use super::jwks::{Jwks, JwksResolver};
 use super::safe_fetch::{guarded_get, FetchPolicy, GuardedClient};
 use super::AuthError;
@@ -33,6 +34,16 @@ const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// An HTTP `JwksResolver` for production use: resolves an issuer's signing
 /// keys via OIDC discovery, caching the result per issuer for `CACHE_TTL`.
+///
+/// Both caches are bounded through [`insert_bounded`], the same derivation
+/// `webid_issuer` uses. That matters more here than it does there. Both
+/// modules key their caches by a string taken off an unverified credential,
+/// but this one's key is the token's `iss`, read by `peek_untrusted_issuer`
+/// before any signature is checked, and with no `--trusted-issuer` allowlist
+/// configured nothing constrains it at all: a distinct `iss` per request is
+/// a fresh entry per request. A JWKS is also resolved *before* the
+/// WebID-issuer binding runs, so while this half was unbounded it was the
+/// unbounded map sitting in front of the bounded one.
 pub struct HttpJwksResolver {
     client: GuardedClient,
     cache: RwLock<HashMap<String, (Jwks, Instant)>>,
@@ -126,7 +137,8 @@ impl JwksResolver for HttpJwksResolver {
 
         match self.fetch(issuer).await {
             Ok(jwks) => {
-                self.cache.write().await.insert(
+                insert_bounded(
+                    &mut *self.cache.write().await,
                     issuer.to_string(),
                     (
                         Jwks {
@@ -134,15 +146,20 @@ impl JwksResolver for HttpJwksResolver {
                         },
                         Instant::now(),
                     ),
+                    CACHE_TTL,
+                    |(_, at)| *at,
                 );
                 self.negative_cache.write().await.remove(issuer);
                 Ok(jwks)
             }
             Err(e) => {
-                self.negative_cache
-                    .write()
-                    .await
-                    .insert(issuer.to_string(), Instant::now());
+                insert_bounded(
+                    &mut *self.negative_cache.write().await,
+                    issuer.to_string(),
+                    Instant::now(),
+                    NEGATIVE_CACHE_TTL,
+                    |at| *at,
+                );
                 Err(e)
             }
         }
@@ -227,6 +244,34 @@ mod tests {
         // second resolve within the TTL must be served from cache, not refetched
         resolver.resolve(&issuer).await.expect("resolve from cache");
         assert_eq!(jwks_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// The bound, exercised through `resolve` rather than through the helper
+    /// alone: what an anonymous caller actually drives is this path, and it
+    /// is the negative cache that fills, one entry per distinct `iss`.
+    ///
+    /// The production `FetchPolicy` is what makes this hermetic: an
+    /// `http://` URL naming a loopback address is refused by the SSRF guard
+    /// before a socket is opened, so every one of these resolves fails
+    /// without a network round trip, which is exactly the cheap failure an
+    /// attacker would be driving.
+    #[tokio::test]
+    async fn the_negative_cache_does_not_grow_past_its_cap() {
+        let resolver = HttpJwksResolver::with_policy(FetchPolicy::default());
+
+        for i in 0..crate::auth::cache::MAX_CACHE_ENTRIES + 50 {
+            let issuer = format!("http://127.0.0.1:1/attacker-chosen-{i}/");
+            assert!(
+                resolver.resolve(&issuer).await.is_err(),
+                "the fetch policy must refuse this without a network call"
+            );
+        }
+
+        assert_eq!(
+            resolver.negative_cache.read().await.len(),
+            crate::auth::cache::MAX_CACHE_ENTRIES,
+            "an unverified `iss` must not be able to allocate without bound"
+        );
     }
 
     #[tokio::test]

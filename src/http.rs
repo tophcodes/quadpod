@@ -88,23 +88,58 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The reserved `/.well-known/` space. Implemented names, OP on:
-/// `openid-configuration` (`application/json`) and `jwks.json`
-/// (`application/jwk-set+json`, public members only). Everything else,
-/// the bare forms included, is 404.
+/// The reserved `/.well-known/` space. `health` is served whatever the pod's
+/// configuration; with the OP on, `openid-configuration`
+/// (`application/json`) and `jwks.json` (`application/jwk-set+json`, public
+/// members only) join it. Everything else, the bare forms included, is 404.
 ///
-/// No WAC guard and no store read: both documents are public by design, so
-/// there is no target to authorize and nothing here can fail.
+/// No WAC guard and no store read: every document here is public by design,
+/// so there is no target to authorize and nothing here can fail.
+///
+/// **Why liveness lives in the reserved space rather than at `/health`.**
+/// A route at `/health` would shadow the resource a user is entitled to
+/// store at `/health`: the router would answer the probe, the storage path
+/// would keep the graph, and no write method would reach it, so the resource
+/// would be unreadable and undeletable. That is the exact hazard
+/// `crate::space` already refuses `/.well-known/` for, and inventing a
+/// second reserved segment to avoid it costs a name in every pod's URI space
+/// forever. Here the segment is already reserved, already GET-only, and
+/// already the one exemption `tests/route_coverage.rs` carries, so liveness
+/// arrives without widening any of the three.
+///
+/// The cost is honest: `health` is not an IANA-registered well-known URI,
+/// and RFC 8615 §3 asks that names be registered. The shape follows
+/// `draft-inadarei-api-health-check` (a `status` member, the
+/// `application/health+json` media type) so the name is at least the one an
+/// operator would guess.
 async fn handle_well_known(
     State(state): State<AppState>,
     rest: Option<Path<String>>,
 ) -> Response {
-    let Some(keys) = &state.op_keys else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     // Unwrapped one layer first: `Option<Path<String>>::as_deref` stops at
     // `&String`, which no `&str` pattern below would match.
     let name = rest.map(|Path(name)| name);
+
+    // Answered before the OP gate: a verify-only pod is a running pod, and a
+    // supervisor that reads 404 as "down" would restart it forever.
+    //
+    // Deliberately liveness and not readiness: it reports that this process
+    // is up and serving, and it touches neither store. A probe that queried
+    // the store would be an unauthenticated store round trip on a route with
+    // no rate limit in front of it, which is a denial-of-service lever handed
+    // out for an operational convenience. A pod whose store is unreachable
+    // fails the requests that need it, with a `500` that says so.
+    if name.as_deref() == Some("health") {
+        return (
+            [(header::CONTENT_TYPE, "application/health+json")],
+            r#"{"status":"pass"}"#,
+        )
+            .into_response();
+    }
+
+    let Some(keys) = &state.op_keys else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     match name.as_deref() {
         Some("openid-configuration") => {
             axum::Json(crate::op::discovery::document(&state.space, keys)).into_response()

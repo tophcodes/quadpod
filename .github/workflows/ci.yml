@@ -36,3 +36,53 @@ jobs:
 
       - name: Test
         run: nix develop -c cargo test
+
+  # A separate job on purpose. An advisory is published on the RustSec
+  # timetable, not on this repository's, so a dependency going bad must not
+  # turn the clippy/test signal red on an unrelated pull request: the two
+  # answer different questions and are read at different times.
+  #
+  # It reads Cargo.lock and the advisory database, and compiles nothing, so
+  # it needs neither the toolchain cache nor the dev shell's compiler to
+  # match anything. It does need the network, to fetch the database.
+  #
+  # Blocking rather than `continue-on-error`, because an advisory nobody has
+  # to answer is an advisory nobody reads.
+  #
+  # Each `--ignore` below is an advisory in a crate this pod links but does
+  # not reach, with the path that brings it in and the thing that would
+  # remove it. They are listed rather than silenced wholesale so that adding
+  # one is a diff someone reviews, and so a NEW advisory still turns this
+  # red. Re-check them whenever `oxigraph` or `rudof_lib` moves:
+  #
+  #   RUSTSEC-2026-0194, RUSTSEC-2026-0195 (quick-xml, both DoS, 7.5)
+  #     Two paths, neither reachable from a request.
+  #     * quick-xml 0.37.5 <- oxrdfxml <- oxrdfio <- oxigraph. This is
+  #       oxigraph's RDF/XML parser, and `rdf::Format::ALL` is closed over
+  #       five media types (Turtle, N-Triples, JSON-LD, TriG, N-Quads) with
+  #       no RDF/XML arm, so nothing in this pod ever constructs one. Adding
+  #       RDF/XML as a supported format makes this advisory live, and the
+  #       `unreachable!()` in `Format::media_type` is what would have to
+  #       change first.
+  #     * quick-xml 0.38.4 <- calamine <- dctap <- rudof_lib. calamine is a
+  #       spreadsheet reader, pulled in because rudof_lib carries DCTAP.
+  #       This pod uses rudof for SHACL validation only, over Turtle.
+  #     Cleared by oxigraph updating oxrdfxml, and by depending on the
+  #     narrower `shacl` crate instead of `rudof_lib`.
+  #
+  #   RUSTSEC-2026-0235 (rkyv, out-of-bounds read on archive validation)
+  #     rkyv 0.7.46 <- rust_decimal <- rudof_rdf <- rudof_lib. Nothing here
+  #     deserializes an rkyv archive, and no attacker-supplied bytes reach
+  #     one. Cleared by the same narrowing.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Audit dependencies
+        run: |
+          nix develop -c cargo audit \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0235
