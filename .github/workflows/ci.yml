@@ -37,6 +37,9 @@ jobs:
       - name: Test
         run: nix develop -c cargo test
 
+      - name: Architecture constraints
+        run: nix develop -c arch-check
+
   # A separate job on purpose. An advisory is published on the RustSec
   # timetable, not on this repository's, so a dependency going bad must not
   # turn the clippy/test signal red on an unrelated pull request: the two

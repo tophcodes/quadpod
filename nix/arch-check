@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# arch-check — run the checks a repo attaches to its architecture decisions.
+#
+# Two sources, in this order:
+#   1. `checks:` in the YAML frontmatter of the decision records themselves.
+#      This is the preferred place: the rule cannot drift away from its
+#      reasoning, and archiving the record retires its checks in one move.
+#   2. docs/constraints.md, for rules that have no record worth writing.
+#
+# Exit codes:
+#   0  all checks satisfied (or nothing to check)
+#   1  at least one decision violated
+#   2  at least one check could not run (broken tooling), or bad usage
+#
+# --count and --json are data modes: they always exit 0 and carry the verdict
+# in their output.
+set -uo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: arch-check [--count | --json] [--only SUBSTRING]
+
+Relative to $CLAUDE_PROJECT_DIR (or the current directory), runs every check
+declared in the decision records and in docs/constraints.md.
+EOF
+}
+
+mode=report
+only=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --count) mode=count ;;
+    --json) mode=json ;;
+    --only)
+      only="${2:-}"
+      if [[ -z "$only" ]]; then
+        printf 'arch-check: --only braucht ein Argument\n' >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --only=*) only="${1#--only=}" ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'arch-check: unbekanntes Argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+root="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+sources=()
+rules=()
+checks=()
+parse_errors=()
+
+add_rule() {
+  sources+=("$1")
+  rules+=("$2")
+  checks+=("$3")
+  parse_errors+=("$4")
+}
+
+# Two different tools ship as `yq`: mikefarah's Go one and python-yq, which
+# wraps jq. Both parse YAML correctly; only the flag for JSON output differs.
+if yq --version 2>&1 | grep -qi mikefarah; then
+  yq_checks() { yq -o=json -I=0 '.checks // []'; }
+else
+  yq_checks() { yq -c '.checks // []'; }
+fi
+
+# --- source 1: decision records ---------------------------------------------
+# Only what sits directly in the decision directory is current truth —
+# archive/ and draft/ are excluded by not recursing.
+adr_dir=""
+for d in docs/adr adr decisions docs/decisions notes/adr; do
+  if [[ -d "$root/$d" ]]; then
+    adr_dir="$d"
+    break
+  fi
+done
+
+if [[ -n "$adr_dir" ]]; then
+  for file in "$root/$adr_dir"/*.md; do
+    [[ -f "$file" ]] || continue
+    rel="${file#"$root"/}"
+
+    frontmatter="$(awk 'NR==1 && $0=="---" {inside=1; next}
+                        inside && $0=="---" {exit}
+                        inside {print}' "$file")"
+    [[ -n "$frontmatter" ]] || continue
+    [[ "$frontmatter" == *checks:* ]] || continue
+
+    # yq, not hand-rolled parsing: the run: value goes through YAML quoting,
+    # and getting the unescaping subtly wrong changes what the check searches
+    # for without ever failing loudly.
+    if ! checks_json="$(printf '%s\n' "$frontmatter" | yq_checks 2>/dev/null)"; then
+      add_rule "$rel" "" "" "Frontmatter unlesbar"
+      continue
+    fi
+    if ! n="$(printf '%s' "$checks_json" | jq 'length' 2>/dev/null)" || [[ -z "$n" ]]; then
+      add_rule "$rel" "" "" "Frontmatter unlesbar"
+      continue
+    fi
+
+    for ((k = 0; k < n; k++)); do
+      desc="$(printf '%s' "$checks_json" | jq -r ".[$k].desc // empty")"
+      run="$(printf '%s' "$checks_json" | jq -r ".[$k].run // empty")"
+      if [[ -z "$run" ]]; then
+        add_rule "$rel" "${desc:-checks[$k]}" "" "kein run: im checks-Eintrag"
+        continue
+      fi
+      add_rule "$rel" "${desc:-$rel}" "$run" ""
+    done
+  done
+fi
+
+# --- source 2: docs/constraints.md ------------------------------------------
+# A non-indented line starts a rule; the rule text is its identity. Indented
+# lines belong to it — "check:" carries the command, anything else (a
+# "→ ADR-nnn" pointer) is for humans and ignored here. Rules without a check
+# never surface: they are prose, including markdown headings.
+constraints="$root/docs/constraints.md"
+if [[ -f "$constraints" ]]; then
+  c_rules=()
+  c_checks=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      '')
+        continue
+        ;;
+      [[:space:]]*)
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        case "$trimmed" in
+          check:*)
+            cmd="${trimmed#check:}"
+            if ((${#c_rules[@]} > 0)); then
+              c_checks[${#c_rules[@]} - 1]="${cmd# }"
+            fi
+            ;;
+        esac
+        ;;
+      *)
+        c_rules+=("$line")
+        c_checks+=("")
+        ;;
+    esac
+  done <"$constraints"
+
+  for i in "${!c_rules[@]}"; do
+    [[ -n "${c_checks[$i]}" ]] || continue
+    add_rule "docs/constraints.md" "${c_rules[$i]}" "${c_checks[$i]}" ""
+  done
+fi
+
+# --- run ---------------------------------------------------------------------
+timeout_s="${ARCH_CHECK_TIMEOUT:-30}"
+
+status=()
+reason=()
+order=()
+matched=0
+violated_n=0
+broken_n=0
+
+for i in "${!rules[@]}"; do
+  status[i]=""
+  reason[i]=""
+
+  if [[ -n "$only" && "${rules[$i]}" != *"$only"* && "${sources[$i]}" != *"$only"* ]]; then
+    continue
+  fi
+  matched=$((matched + 1))
+  order+=("$i")
+
+  if [[ -n "${parse_errors[$i]}" ]]; then
+    status[i]=broken
+    reason[i]="${parse_errors[$i]}"
+    broken_n=$((broken_n + 1))
+    continue
+  fi
+
+  rc=0
+  (cd "$root" && timeout "$timeout_s" bash -c "${checks[$i]}") >/dev/null 2>&1 || rc=$?
+
+  # A check that cannot run is broken tooling, not a violated decision — the
+  # difference matters because the Stop hook must not block over a typo.
+  case "$rc" in
+    0) status[i]=ok ;;
+    124)
+      status[i]=broken
+      reason[i]="Timeout nach ${timeout_s}s"
+      broken_n=$((broken_n + 1))
+      ;;
+    127)
+      status[i]=broken
+      reason[i]="Kommando nicht gefunden"
+      broken_n=$((broken_n + 1))
+      ;;
+    *)
+      status[i]=violated
+      violated_n=$((violated_n + 1))
+      ;;
+  esac
+done
+
+if [[ -n "$only" && $matched -eq 0 ]]; then
+  printf 'arch-check: keine Regel enthält "%s"\n' "$only" >&2
+  exit 2
+fi
+
+case "$mode" in
+  count)
+    # A broken check is not green — say so, or the SessionStart hook reports
+    # two typos as "0/2 rot".
+    if ((broken_n > 0)); then
+      printf '%d/%d rot, %d kaputt\n' "$violated_n" "$matched" "$broken_n"
+    else
+      printf '%d/%d rot\n' "$violated_n" "$matched"
+    fi
+    exit 0
+    ;;
+  json)
+    for i in "${order[@]}"; do
+      jq -nc \
+        --arg source "${sources[$i]}" \
+        --arg rule "${rules[$i]}" \
+        --arg check "${checks[$i]}" \
+        --arg status "${status[$i]}" \
+        --arg reason "${reason[$i]}" \
+        '{source: $source, rule: $rule, check: $check, status: $status}
+         + (if $reason == "" then {} else {reason: $reason} end)'
+    done | jq -sc \
+      --argjson checked "$matched" \
+      --argjson violated "$violated_n" \
+      --argjson broken "$broken_n" \
+      '{checked: $checked, violated: $violated, broken: $broken, rules: .}'
+    exit 0
+    ;;
+esac
+
+# The source path is part of the message: whoever broke the check gets the
+# route to the reasoning, not just the rule.
+for i in "${order[@]}"; do
+  [[ "${status[$i]}" == violated ]] || continue
+  printf '✗ %s\n  %s\n  verletzt durch: %s\n' \
+    "${sources[$i]}" "${rules[$i]}" "${checks[$i]}" >&2
+done
+
+for i in "${order[@]}"; do
+  [[ "${status[$i]}" == broken ]] || continue
+  if [[ -n "${checks[$i]}" ]]; then
+    printf '⚠ %s\n  %s\n  Check kaputt (%s): %s\n' \
+      "${sources[$i]}" "${rules[$i]}" "${reason[$i]}" "${checks[$i]}" >&2
+  else
+    printf '⚠ %s\n  Check kaputt (%s)\n' "${sources[$i]}" "${reason[$i]}" >&2
+  fi
+done
+
+((broken_n > 0)) && exit 2
+((violated_n == 0))

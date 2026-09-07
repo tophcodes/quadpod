@@ -18,6 +18,11 @@
       {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
+            (writeShellApplication {
+              name = "arch-check";
+              runtimeInputs = [jq yq-go ripgrep fd coreutils];
+              text = builtins.readFile ./nix/arch-check;
+            })
             cargo
             rustc
             # clippy and rustfmt belong here, or `cargo clippy` inside the shell
