@@ -481,3 +481,52 @@ this raises is from no signal to a signal always present.
 its resource, which would replace both minted terms. Or the Solid Protocol resolving the
 disputed scenario in favour of `406`, which would settle the question the other way and cost
 only the removal of a code path and two terms.
+
+<a id="adr-14"></a>
+
+## ADR-14: Conversion happens on write, and a read never synthesises triples
+
+A write decides whether bytes become quads. A `Content-Type` the pod parses as RDF makes the
+body a graph; anything else is stored whole and stays bytes. A read serialises what is
+stored. `GET` with `Accept: text/turtle` on a resource held as bytes is a `406`, and no
+amount of the pod knowing how to read that media type changes the answer.
+
+**What this does not forbid.** Serialising stored quads into the requested format. That
+mapping is total and loses nothing in either direction, which is why it is negotiation. The
+line is whether every triple in a response was put there by a client.
+
+**The other arrangement works, for a server built the other way.** A file-backed pod can
+register a converter from a document media type to quads and answer `text/turtle` on a
+Markdown file that holds no triples anywhere. The Community Solid Server is built this way:
+converters registered pairwise, a path searched between the stored type and the requested
+one, the document remaining the only copy. For a server whose storage is files, this is the
+cheaper design, and it is strictly more capable than refusing.
+
+**Why the same move costs more here.** Three consequences, and the first is the one that
+decides it:
+
+- **The projections would disagree.** [ADR-12](#adr-12) makes every interface a projection
+  of one store. Triples that exist only inside an LDP response are triples the query
+  projection cannot reach, so the pod would answer two different questions about what it
+  holds depending on which interface was asked. A file-backed server pays nothing here
+  because it has no store for the triples to be absent from.
+- **The parse failure lands on the wrong party.** A document the converter cannot read was
+  accepted at write time, so its author heard nothing. The failure surfaces later, to a
+  reader, as a resource that answers in its stored type and fails in every RDF one.
+  [ADR-10](#adr-10) accepts a late failure for extraction deliberately, and the costs
+  differ: a failed extraction leaves an empty derived index beside a resource that still
+  reads.
+- **There is no inverse.** A representation synthesised from a document cannot be written
+  back through, because the mapping is not injective for any document format worth
+  converting. The resource becomes readable in a format it can never be written in. This is
+  the view-update argument of [ADR-12](#adr-12) at the scope of a single resource.
+
+**What it costs.** A client wanting triples out of a stored document waits for an extractor
+to write the derived index, and until that runs the document is bytes. The on-read
+arrangement has no such window. The pod pays that latency once per write, where the other
+design pays a parse once per read.
+
+**What would reopen it.** The store ceasing to be the query surface, which is ADR-12
+reversed and would leave this decision with nothing to protect. Or a document format with a
+specified total mapping to RDF whose inverse holds, which would make its conversion
+negotiation under the rule above rather than extraction.
